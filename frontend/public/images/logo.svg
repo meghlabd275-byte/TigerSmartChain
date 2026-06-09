@@ -1,0 +1,33 @@
+<!-- TigerScan Logo - Scalable Vector Graphics -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- Background Circle -->
+  <circle cx="100" cy="100" r="95" fill="#1a1a2e" stroke="#FF6B00" stroke-width="4"/>
+  
+  <!-- Tiger Face -->
+  <!-- Main face -->
+  <ellipse cx="100" cy="100" rx="60" ry="55" fill="#FF6B00"/>
+  
+  <!-- Stripes -->
+  <path d="M100 50 L100 70" stroke="#1a1a2e" stroke-width="6" stroke-linecap="round"/>
+  <path d="M80 55 L75 75" stroke="#1a1a2e" stroke-width="5" stroke-linecap="round"/>
+  <path d="M120 55 L125 75" stroke="#1a1a2e" stroke-width="5" stroke-linecap="round"/>
+  <path d="M65 70 L60 85" stroke="#1a1a2e" stroke-width="4" stroke-linecap="round"/>
+  <path d="M135 70 L140 85" stroke="#1a1a2e" stroke-width="4" stroke-linecap="round"/>
+  
+  <!-- Eyes -->
+  <ellipse cx="80" cy="90" rx="12" ry="14" fill="#fff"/>
+  <ellipse cx="120" cy="90" rx="12" ry="14" fill="#fff"/>
+  <circle cx="82" cy="92" r="6" fill="#1a1a2e"/>
+  <circle cx="122" cy="92" r="6" fill="#1a1a2e"/>
+  
+  <!-- Nose -->
+  <ellipse cx="100" cy="115" rx="10" ry="7" fill="#1a1a2e"/>
+  
+  <!-- Mouth -->
+  <path d="M100 122 L100 135" stroke="#1a1a2e" stroke-width="3" stroke-linecap="round"/>
+  <path d="M85 135 Q100 145 115 135" stroke="#1a1a2e" stroke-width="3" fill="none" stroke-linecap="round"/>
+  
+  <!-- Cheek marks -->
+  <path d="M55 100 Q50 110 55 120" stroke="#FF6B00" stroke-width="3" fill="none"/>
+  <path d="M145 100 Q150 110 145 120" stroke="#FF6B00" stroke-width="3" fill="none"/>
+</svg>
