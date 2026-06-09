@@ -1,379 +1,595 @@
-// Package sync provides block synchronization.
+// Package sync provides network synchronization capabilities for TigerSmartChain.
 package sync
 
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
 	"github.com/tigersmartchain/tigersmartchain/internal/blockchain/block"
-	"github.com/tigersmartchain/tigersmartchain/internal/network/peer"
 )
 
-// SyncState represents the current sync state.
-type SyncState int
+// =============================================================================
+// NETWORK SYNC
+// =============================================================================
 
-const (
-	SyncStateIdle SyncState = iota
-	SyncStateSyncing
-	SyncStateFinished
-)
-
-// Syncer handles block synchronization.
+// Syncer handles blockchain synchronization.
 type Syncer struct {
 	mu sync.RWMutex
 
-	// State
-	state SyncState
-	// Target block number
-	targetBlock uint64
-	// Current block number
-	currentBlock uint64
-	// Fetched blocks
-	blocks []*block.Block
-	// Peer manager
-	peerMgr *peer.PeerManager
-	// Downloader
-	downloader *Downloader
-	// State sync
-	stateSync *StateSyncer
+	// Sync state
+	syncing   bool
+	progress *SyncProgress
+
+	// Peer sync status
+	peerStatus map[string]*PeerSyncStatus
+
+	// Sync configuration
+	config *SyncConfig
+
+	// Network interface
+	network Network
 }
 
-// NewSyncer creates a new syncer.
-func NewSyncer(peerMgr *peer.PeerManager) *Syncer {
+// SyncConfig holds sync configuration.
+type SyncConfig struct {
+	MaxBlockFetch  uint64
+	MaxStateFetch uint64
+	Timeout      time.Duration
+	RetryCount   int
+}
+
+// SyncProgress tracks sync progress.
+type SyncProgress struct {
+	StartingBlock uint64
+	CurrentBlock uint64
+	HighestBlock uint64
+	PulledStates uint64
+	KnownStates uint64
+	Ratio       string
+}
+
+// PeerSyncStatus tracks peer sync status.
+type PeerSyncStatus struct {
+	PeerID      string
+	HeadBlock   uint64
+	HeadHash    string
+	IsSyncing   bool
+	LastUpdate time.Time
+}
+
+// Network defines network interface for syncing.
+type Network interface {
+	// Connect to peer
+	Connect(peerID string) error
+	// Disconnect from peer
+	Disconnect(peerID string) error
+	// Get peers
+	GetPeers() []string
+	// Fetch blocks
+	FetchBlocks(from, to uint64) ([]*block.Block, error)
+	// Fetch states
+	FetchStates(root []byte) (map[string][]byte, error)
+	// Broadcast new block
+	BroadcastBlock(block *block.Block) error
+	// Request transactions
+	RequestTransactions(hashes []string) error
+}
+
+// NewSyncer creates a new syncer instance.
+func NewSyncer(config *SyncConfig) *Syncer {
 	return &Syncer{
-		state:    SyncStateIdle,
-		peerMgr: peerMgr,
-		downloader: NewDownloader(peerMgr),
-		stateSync: NewStateSyncer(),
+		peerStatus: make(map[string]*PeerSyncStatus),
+		config:     config,
 	}
 }
 
-// StartSync starts block synchronization.
-func (s *Syncer) StartSync(targetBlock uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// =============================================================================
+// FAST SYNC
+// =============================================================================
 
-	if s.state == SyncStateSyncing {
+// FastSync performs fast synchronization.
+type FastSync struct {
+	*Syncer
+}
+
+// NewFastSync creates a new fast sync instance.
+func NewFastSync(config *SyncConfig) *FastSync {
+	return &FastSync{
+		Syncer: NewSyncer(config),
+	}
+}
+
+// StartFastSync starts fast synchronization.
+func (fs *FastSync) StartFastSync(ctx context.Context, peerID string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if fs.syncing {
 		return fmt.Errorf("already syncing")
 	}
 
-	s.targetBlock = targetBlock
-	s.state = SyncStateSyncing
-	s.blocks = make([]*block.Block, 0)
+	// Get peer status
+	peerStatus, ok := fs.peerStatus[peerID]
+	if !ok {
+		return fmt.Errorf("peer not found: %s", peerID)
+	}
 
-	// Start download
-	go s.download()
+	// Start sync
+	fs.syncing = true
+	fs.progress = &SyncProgress{
+		StartingBlock: 0,
+		CurrentBlock: 0,
+		HighestBlock: peerStatus.HeadBlock,
+	}
+
+	// Run sync in background
+	go fs.runFastSync(ctx, peerID)
 
 	return nil
 }
 
-// StopSync stops synchronization.
-func (s *Syncer) StopSync() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.state = SyncStateIdle
-	s.downloader.Cancel()
-
-	return nil
-}
-
-// download downloads blocks.
-func (s *Syncer) download() {
-	s.mu.RLock()
-	state := s.state
-	s.mu.RUnlock()
-
-	for state == SyncStateSyncing {
-		// Download batch
-		batch, err := s.downloader.DownloadBatch(s.currentBlock, 100)
-		if err != nil {
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		if len(batch) == 0 {
-			break
-		}
-
-		// Process batch
-		s.mu.Lock()
-		s.blocks = append(s.blocks, batch...)
-		s.currentBlock += uint64(len(batch))
-		s.mu.Unlock()
-
-		// Check if done
-		if s.currentBlock >= s.targetBlock {
-			s.mu.Lock()
-			s.state = SyncStateFinished
-			s.mu.Unlock()
-			break
-		}
-
-		s.mu.RLock()
-		state = s.state
-		s.mu.RUnlock()
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// GetBlocks returns synced blocks.
-func (s *Syncer) GetBlocks() []*block.Block {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.blocks
-}
-
-// GetProgress returns sync progress.
-func (s *Syncer) GetProgress() (current, target uint64, percent float64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	current = s.currentBlock
-	target = s.targetBlock
-
-	if target > 0 {
-		percent = float64(current) / float64(target) * 100
-	}
-
-	return
-}
-
-// Downloader downloads blocks from peers.
-type Downloader struct {
-	mu sync.RWMutex
-
-	peerMgr   *peer.PeerManager
-	canceled bool
-}
-
-// NewDownloader creates a new downloader.
-func NewDownloader(peerMgr *peer.PeerManager) *Downloader {
-	return &Downloader{
-		peerMgr: peerMgr,
-	}
-}
-
-// DownloadBatch downloads a batch of blocks.
-func (d *Downloader) DownloadBatch(start uint64, count int) ([]*block.Block, error) {
-	d.mu.Lock()
-	d.canceled = false
-	d.mu.Unlock()
-
-	blocks := make([]*block.Block, 0, count)
-
-	// Get peers
-	peers := d.peerMgr.GetPeers()
-	if len(peers) == 0 {
-		return nil, fmt.Errorf("no peers available")
-	}
-
-	// Download from each peer
-	for _, p := range peers {
-		batch, err := d.downloadFromPeer(p, start, count-len(blocks))
-		if err != nil {
-			continue
-		}
-
-		blocks = append(blocks, batch...)
-
-		if len(blocks) >= count {
-			break
-		}
-	}
-
-	return blocks, nil
-}
-
-// downloadFromPeer downloads blocks from a specific peer.
-func (d *Downloader) downloadFromPeer(p *peer.Peer, start uint64, count int) ([]*block.Block, error) {
-	d.mu.RLock()
-	canceled := d.canceled
-	d.mu.RUnlock()
-
-	if canceled {
-		return nil, fmt.Errorf("canceled")
-	}
-
-	// In a real implementation, send request to peer
-	// For now, return empty batch
-	return make([]*block.Block, 0), nil
-}
-
-// Cancel cancels the download.
-func (d *Downloader) Cancel() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.canceled = true
-}
-
-// StateSyncer handles state synchronization.
-type StateSyncer struct {
-	mu sync.RWMutex
-
-	pending  map[string][]byte
-	complete bool
-}
-
-// NewStateSyncer creates a new state syncer.
-func NewStateSyncer() *StateSyncer {
-	return &StateSyncer{
-		pending: make(map[string][]byte),
-	}
-}
-
-// SyncState syncs account state.
-func (ss *StateSyncer) SyncState(accounts map[string][]byte) error {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-
-	for addr, state := range accounts {
-		ss.pending[addr] = state
-	}
-
-	return nil
-}
-
-// SyncTrie syncs trie nodes.
-func (ss *StateSyncer) SyncTrie(hashes [][]byte) error {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-
-	for _, hash := range hashes {
-		ss.pending[string(hash)] = hash
-	}
-
-	return nil
-}
-
-// GetPending returns pending state entries.
-func (ss *StateSyncer) GetPending() map[string][]byte {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	return ss.pending
-}
-
-// MarkComplete marks sync as complete.
-func (ss *StateSyncer) MarkComplete() {
-	ss.mu.Lock()
-	defer ss.mu.Unlock()
-	ss.complete = true
-}
-
-// IsComplete returns if sync is complete.
-func (ss *StateSyncer) IsComplete() bool {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
-	return ss.complete
-}
-
-// LightSync performs light synchronization.
-func (s *Syncer) LightSync(targetBlock uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.targetBlock = targetBlock
-	s.state = SyncStateSyncing
-
-	// Get block headers only (not full blocks)
-	go func() {
-		for s.currentBlock < s.targetBlock {
-			// Download headers
-			headers, err := s.downloader.downloadHeaders(s.currentBlock, 100)
-			if err != nil {
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			s.mu.Lock()
-			for _, h := range headers {
-				s.blocks = append(s.blocks, &block.Block{Header: h})
-				s.currentBlock++
-			}
-			s.mu.Unlock()
-
-			if len(headers) == 0 {
-				break
-			}
-		}
-
-		s.mu.Lock()
-		s.state = SyncStateFinished
-		s.mu.Unlock()
+// runFastSync runs the fast sync process.
+func (fs *FastSync) runFastSync(ctx context.Context, peerID string) {
+	defer func() {
+		fs.mu.Lock()
+		fs.syncing = false
+		fs.mu.Unlock()
 	}()
 
-	return nil
-}
-
-// downloadHeaders downloads block headers.
-func (d *Downloader) downloadHeaders(start uint64, count int) ([]*block.Header, error) {
-	// In a real implementation, request headers from peers
-	return make([]*block.Header, 0), nil
-}
-
-// FastSync performs fast synchronization using snapshots.
-func (s *Syncer) FastSync(targetBlock uint64) error {
-	s.mu.Lock()
-	s.targetBlock = targetBlock
-	s.state = SyncStateSyncing
-	s.mu.Unlock()
-
-	// Get snapshot from peer
-	snapshot, err := s.downloader.downloadSnapshot(targetBlock)
-	if err != nil {
-		return err
-	}
-
-	// Apply snapshot
-	s.stateSync.SyncState(snapshot.Accounts)
-	s.stateSync.SyncTrie(snapshot.TrieNodes)
-
-	// Sync remaining blocks
-	go s.download()
-
-	return nil
-}
-
-// downloadSnapshot downloads state snapshot.
-func (d *Downloader) downloadSnapshot(block uint64) (*Snapshot, error) {
-	return nil, nil
-}
-
-// Snapshot represents state snapshot.
-type Snapshot struct {
-	BlockNumber uint64
-	Accounts    map[string][]byte
-	TrieNodes   [][]byte
-}
-
-// GetSyncState returns current sync state.
-func (s *Syncer) GetSyncState() SyncState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.state
-}
-
-// Wait waits for sync to complete.
-func (s *Syncer) Wait(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		default:
-			s.mu.RLock()
-			state := s.state
-			s.mu.RUnlock()
+		}
 
-			if state == SyncStateFinished || state == SyncStateIdle {
-				return nil
-			}
+		fs.mu.RLock()
+		currentBlock := fs.progress.CurrentBlock
+		highestBlock := fs.progress.HighestBlock
+		fs.mu.RUnlock()
 
-			time.Sleep(100 * time.Millisecond)
+		if currentBlock >= highestBlock {
+			return
+		}
+
+		// Fetch next batch
+		from := currentBlock + 1
+		to := from + fs.config.MaxBlockFetch
+		if to > highestBlock {
+			to = highestBlock
+		}
+
+		blocks, err := fs.network.FetchBlocks(from, to)
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Process blocks
+		for _, blk := range blocks {
+			fs.mu.Lock()
+			fs.progress.CurrentBlock = blk.Header.Number
+			fs.mu.Unlock()
 		}
 	}
 }
 
-var _ = context.Background() // Use context
+// =============================================================================
+// SNAP SYNC
+// =============================================================================
+
+// SnapSync performs snapshot-based synchronization.
+type SnapSync struct {
+	*Syncer
+}
+
+// NewSnapSync creates a new snap sync instance.
+func NewSnapSync(config *SyncConfig) *SnapSync {
+	return &SnapSync{
+		Syncer: NewSyncer(config),
+	}
+}
+
+// Snapshot represents a state snapshot.
+type Snapshot struct {
+	BlockNumber uint64
+	BlockHash  []byte
+	StateRoot []byte
+	Nodes     [][]byte
+}
+
+// StartSnapSync starts snapshot synchronization.
+func (ss *SnapSync) StartSnapSync(ctx context.Context, peerID string) error {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	if ss.syncing {
+		return fmt.Errorf("already syncing")
+	}
+
+	// Get peer status
+	peerStatus, ok := ss.peerStatus[peerID]
+	if !ok {
+		return fmt.Errorf("peer not found: %s", peerID)
+	}
+
+	// Start sync
+	ss.syncing = true
+	ss.progress = &SyncProgress{
+		StartingBlock: 0,
+		CurrentBlock:  0,
+		HighestBlock: peerStatus.HeadBlock,
+		KnownStates:   0,
+		PulledStates: 0,
+	}
+
+	// Run sync in background
+	go ss.runSnapSync(ctx, peerID)
+
+	return nil
+}
+
+// runSnapSync runs the snap sync process.
+func (ss *SnapSync) runSnapSync(ctx context.Context, peerID string) {
+	defer func() {
+		ss.mu.Lock()
+		ss.syncing = false
+		ss.mu.Unlock()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		ss.mu.RLock()
+		currentBlock := ss.progress.CurrentBlock
+		highestBlock := ss.progress.HighestBlock
+		ss.mu.RUnlock()
+
+		if currentBlock >= highestBlock {
+			return
+		}
+
+		// Fetch next batch of blocks
+		from := currentBlock + 1
+		to := from + ss.config.MaxBlockFetch
+		if to > highestBlock {
+			to = highestBlock
+		}
+
+		blocks, err := ss.network.FetchBlocks(from, to)
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// Process blocks and fetch state
+		for _, blk := range blocks {
+			ss.mu.Lock()
+			ss.progress.CurrentBlock = blk.Header.Number
+			ss.mu.Unlock()
+
+			// Fetch state for this block
+			stateRoot := blk.Header.StateRoot
+			states, err := ss.network.FetchStates(stateRoot)
+			if err != nil {
+				continue
+			}
+
+			ss.mu.Lock()
+			ss.progress.PulledStates += uint64(len(states))
+			ss.mu.Unlock()
+		}
+	}
+}
+
+// =============================================================================
+// LIGHT SYNC
+// =============================================================================
+
+// LightSync handles light client synchronization.
+type LightSync struct {
+	*Syncer
+	headers    []*block.Header
+	bestHash  string
+	bestScore uint64
+}
+
+// NewLightSync creates a new light sync instance.
+func NewLightSync(config *SyncConfig) *LightSync {
+	return &LightSync{
+		Syncer:  NewSyncer(config),
+		headers: make([]*block.Header, 0),
+	}
+}
+
+// StartLightSync starts light synchronization.
+func (ls *LightSync) StartLightSync(ctx context.Context, peerID string) error {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	if ls.syncing {
+		return fmt.Errorf("already syncing")
+	}
+
+	// Get peer status
+	peerStatus, ok := ls.peerStatus[peerID]
+	if !ok {
+		return fmt.Errorf("peer not found: %s", peerID)
+	}
+
+	// Start sync
+	ls.syncing = true
+
+	// Run sync in background
+	go ls.runLightSync(ctx, peerID, peerStatus.HeadBlock)
+
+	return nil
+}
+
+// runLightSync runs the light sync process.
+func (ls *LightSync) runLightSync(ctx context.Context, peerID string, headBlock uint64) {
+	defer func() {
+		ls.mu.Lock()
+		ls.syncing = false
+		ls.mu.Unlock()
+	}()
+
+	// Fetch headers in batches
+	for blockNum := uint64(0); blockNum <= headBlock; blockNum += 100 {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		to := blockNum + 100
+		if to > headBlock {
+			to = headBlock
+		}
+
+		blocks, err := ls.network.FetchBlocks(blockNum, to)
+		if err != nil {
+			time.Sleep(time.Second)
+			continue
+		}
+
+		ls.mu.Lock()
+		for _, blk := range blocks {
+			ls.headers = append(ls.headers, blk.Header)
+		}
+		ls.syncing = blockNum < headBlock
+		ls.mu.Unlock()
+	}
+}
+
+// GetHeader returns a header by block number.
+func (ls *LightSync) GetHeader(blockNum uint64) (*block.Header, bool) {
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
+
+	if blockNum >= uint64(len(ls.headers)) {
+		return nil, false
+	}
+
+	return ls.headers[blockNum], true
+}
+
+// GetBestHeader returns the best known header.
+func (ls *LightSync) GetBestHeader() (*block.Header, bool) {
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
+
+	if len(ls.headers) == 0 {
+		return nil, false
+	}
+
+	return ls.headers[len(ls.headers)-1], true
+}
+
+// VerifyHeader verifies a header using chain consensus.
+func (ls *LightSync) VerifyHeader(header *block.Header) bool {
+	ls.mu.RLock()
+	defer ls.mu.RUnlock()
+
+	// Check if we have the header
+	for _, h := range ls.headers {
+		if h.Hash == header.Hash {
+			return true
+		}
+	}
+
+	return false
+}
+
+// =============================================================================
+// SYNC STATUS
+// =============================================================================
+
+// IsSyncing returns if currently syncing.
+func (s *Syncer) IsSyncing() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.syncing
+}
+
+// GetProgress returns sync progress.
+func (s *Syncer) GetProgress() *SyncProgress {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.progress == nil {
+		return &SyncProgress{}
+	}
+
+	return s.progress
+}
+
+// GetPeerStatus returns peer sync status.
+func (s *Syncer) GetPeerStatus(peerID string) (*PeerSyncStatus, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	status, ok := s.peerStatus[peerID]
+	return status, ok
+}
+
+// UpdatePeerStatus updates peer sync status.
+func (s *Syncer) UpdatePeerStatus(peerID string, headBlock uint64, headHash string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.peerStatus[peerID] = &PeerSyncStatus{
+		PeerID:      peerID,
+		HeadBlock:  headBlock,
+		HeadHash:   headHash,
+		LastUpdate: time.Now(),
+	}
+}
+
+// =============================================================================
+// DNS DISCOVERY
+// =============================================================================
+
+// DNSDiscovery provides DNS-based peer discovery.
+type DNSDiscovery struct {
+	mu sync.RWMutex
+
+	domains   map[string]*DNSDomain
+	records  map[string][]string
+	ttl      time.Duration
+	lastCheck time.Time
+}
+
+// DNSDomain represents a DNS domain with records.
+type DNSDomain struct {
+	Domain  string
+	Records []string
+	TTL     time.Duration
+}
+
+// NewDNSDiscovery creates a new DNS discovery instance.
+func NewDNSDiscovery(ttl time.Duration) *DNSDiscovery {
+	return &DNSDiscovery{
+		domains:  make(map[string]*DNSDomain),
+		records: make(map[string][]string),
+		ttl:     ttl,
+	}
+}
+
+// AddDomain adds a DNS domain.
+func (d *DNSDiscovery) AddDomain(domain string, records []string, ttl time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.domains[domain] = &DNSDomain{
+		Domain:  domain,
+		Records: records,
+		TTL:     ttl,
+	}
+
+	for _, record := range records {
+		d.records[record] = append(d.records[record], domain)
+	}
+}
+
+// Discover discovers peers via DNS.
+func (d *DNSDiscovery) Discover() ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Check if cache is stale
+	if time.Since(d.lastCheck) < d.ttl {
+		// Return cached records
+		var result []string
+		for _, records := range d.records {
+			result = append(result, records...)
+		}
+		return result, nil
+	}
+
+	// Return cached
+	var result []string
+	for _, records := range d.records {
+		result = append(result, records...)
+	}
+
+	d.lastCheck = time.Now()
+	return result, nil
+}
+
+// =============================================================================
+// BOOTNODES
+// =============================================================================
+
+// Bootnodes provides bootstrap node management.
+type Bootnodes struct {
+	mu sync.RWMutex
+
+	nodes     []string
+	index    int
+	fallback []string
+}
+
+// NewBootnodes creates a new bootnodes instance.
+func NewBootnodes(nodes []string) *Bootnodes {
+	return &Bootnodes{
+		nodes:     nodes,
+		index:    0,
+		fallback: nodes,
+	}
+}
+
+// GetNext returns the next bootnode.
+func (b *Bootnodes) GetNext() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.nodes) == 0 {
+		return ""
+	}
+
+	node := b.nodes[b.index%len(b.nodes)]
+	b.index++
+
+	return node
+}
+
+// Add adds a bootnode.
+func (b *Bootnodes) Add(node string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.nodes = append(b.nodes, node)
+}
+
+// Remove removes a bootnode.
+func (b *Bootnodes) Remove(node string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for i, n := range b.nodes {
+		if n == node {
+			b.nodes = append(b.nodes[:i], b.nodes[i+1:]...)
+			break
+		}
+	}
+}
+
+// GetAll returns all bootnodes.
+func (b *Bootnodes) GetAll() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	result := make([]string, len(b.nodes))
+	copy(result, b.nodes)
+	return result
+}
+
+var _ = big.NewInt(0)

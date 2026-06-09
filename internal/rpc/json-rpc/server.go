@@ -10,6 +10,9 @@ import (
 type Server struct {
 	// handlers maps method names to handlers
 	handlers map[string]Handler
+
+	// Backend for blockchain data
+	backend *Backend
 }
 
 // Handler is a JSON-RPC method handler.
@@ -24,24 +27,61 @@ func NewServer() *Server {
 	return s
 }
 
-// registerHandlers registers the default handlers.
+// registerHandlers registers all JSON-RPC handlers.
 func (s *Server) registerHandlers() {
+	// Block methods
 	s.handlers["eth_blockNumber"] = s.blockNumber
 	s.handlers["eth_getBlockByNumber"] = s.getBlockByNumber
 	s.handlers["eth_getBlockByHash"] = s.getBlockByHash
+	s.handlers["eth_getBlockReceipts"] = s.getBlockReceipts
+	s.handlers["eth_getUncleByBlockNumberAndIndex"] = s.getUncleByBlockNumberAndIndex
+	s.handlers["eth_getUncleByBlockHashAndIndex"] = s.getUncleByBlockHashAndIndex
+
+	// Transaction methods
 	s.handlers["eth_getTransactionByHash"] = s.getTransactionByHash
 	s.handlers["eth_getTransactionReceipt"] = s.getTransactionReceipt
-	s.handlers["eth_call"] = s.call
+	s.handlers["eth_getTransactionCount"] = s.getTransactionCount
 	s.handlers["eth_sendRawTransaction"] = s.sendRawTransaction
-	s.handlers["eth_estimateGas"] = s.estimateGas
+
+	// State methods
 	s.handlers["eth_getBalance"] = s.getBalance
 	s.handlers["eth_getCode"] = s.getCode
 	s.handlers["eth_getStorageAt"] = s.getStorageAt
-	s.handlers["eth_getTransactionCount"] = s.getTransactionCount
+
+	// Contract execution
+	s.handlers["eth_call"] = s.call
+	s.handlers["eth_estimateGas"] = s.estimateGas
+
+	// Filter methods
+	s.handlers["eth_newBlockFilter"] = s.newBlockFilter
+	s.handlers["eth_newPendingTransactionFilter"] = s.newPendingTransactionFilter
+	s.handlers["eth_newLogFilter"] = s.newLogFilter
+	s.handlers["eth_getFilterChanges"] = s.getFilterChanges
+	s.handlers["eth_getFilterLogs"] = s.getFilterLogs
+	s.handlers["eth_uninstallFilter"] = s.uninstallFilter
+
+	// Network methods
 	s.handlers["net_version"] = s.netVersion
 	s.handlers["net_listening"] = s.netListening
+	s.handlers["net_peerCount"] = s.netPeerCount
+
+	// Client methods
 	s.handlers["web3_clientVersion"] = s.web3ClientVersion
 	s.handlers["web3_sha3"] = s.web3Sha3
+
+	// Sync methods
+	s.handlers["eth_syncing"] = s.syncing
+
+	// Gas price
+	s.handlers["eth_gasPrice"] = s.gasPrice
+
+	// Account methods
+	s.handlers["eth_accounts"] = s.accounts
+}
+
+// SetBackend sets the backend for the server.
+func (s *Server) SetBackend(backend *Backend) {
+	s.backend = backend
 }
 
 // ServeHTTP serves the JSON-RPC request.

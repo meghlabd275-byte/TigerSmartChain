@@ -3,13 +3,69 @@ package statedb
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"math/big"
+	"strings"
 	"sync"
 
 	"github.com/tigersmartchain/tigersmartchain/internal/state/account"
 	"github.com/tigersmartchain/tigersmartchain/internal/state/trie"
 	"github.com/tigersmartchain/tigersmartchain/internal/storage"
 )
+
+// Database defines the interface for state database operations.
+type Database interface {
+	// Account operations
+	GetBalance(addr string) (*big.Int, error)
+	GetNonce(addr string) (uint64, error)
+	GetCode(addr string) ([]byte, error)
+	GetStorageAt(addr string, key string) ([]byte, error)
+
+	// Transaction receipt
+	GetTransactionReceipt(txHash string) (*Receipt, error)
+	GetBlockReceipts(blockHash string) ([]*Receipt, error)
+
+	// Logs
+	GetLogs(fromBlock, toBlock uint64, address string, topics []string) ([]*Log, error)
+
+	// Write operations
+	SetBalance(addr string, balance *big.Int) error
+	SetNonce(addr string, nonce uint64) error
+	SetCode(addr string, code []byte) error
+	SetStorageAt(addr string, key string, value []byte) error
+
+	// Commit
+	Commit() error
+}
+
+// Receipt represents a transaction receipt.
+type Receipt struct {
+	BlockHash        string   `json:"blockHash"`
+	BlockNumber     uint64   `json:"blockNumber"`
+	ContractAddress string   `json:"contractAddress"`
+	CumulativeGasUsed uint64 `json:"cumulativeGasUsed"`
+	From           string   `json:"from"`
+	GasUsed        uint64   `json:"gasUsed"`
+	Logs           []*Log  `json:"logs"`
+	LogsBloom      string   `json:"logsBloom"`
+	Status         uint64   `json:"status"`
+	To             string   `json:"to"`
+	TransactionHash string   `json:"transactionHash"`
+	TransactionIndex uint64  `json:"transactionIndex"`
+	Type            uint64  `json:"type"`
+}
+
+// Log represents a contract event log.
+type Log struct {
+	Address     string   `json:"address"`
+	Topics      []string `json:"topics"`
+	Data        string   `json:"data"`
+	BlockNumber uint64   `json:"blockNumber"`
+	TxHash     string   `json:"transactionHash"`
+	TxIndex    uint64   `json:"transactionIndex"`
+	LogIndex   uint64   `json:"logIndex"`
+}
 
 // StateDB represents the persistent state database.
 type StateDB struct {
@@ -25,6 +81,12 @@ type StateDB struct {
 
 	// Preimages
 	preimages map[string][]byte
+
+	// Receipts cache
+	receipts map[string]*Receipt
+
+	// Logs
+	logs []*Log
 }
 
 // NewStateDB creates a new state database.
@@ -36,6 +98,8 @@ func NewStateDB(store storage.Store) (*StateDB, error) {
 		preimages:  make(map[string][]byte),
 		snapshots:   make([][]byte, 0),
 		snapshotIndex: -1,
+		receipts:    make(map[string]*Receipt),
+		logs:      make([]*Log, 0),
 	}
 
 	// Load existing state
@@ -255,6 +319,202 @@ func (sdb *StateDB) Close() error {
 		return sdb.db.Close()
 	}
 
+	return nil
+}
+
+// =============================================================================
+// RECEIPT AND LOG METHODS
+// =============================================================================
+
+// GetTransactionReceipt returns a transaction receipt.
+func (sdb *StateDB) GetTransactionReceipt(txHash string) (*Receipt, error) {
+	sdb.mu.RLock()
+	defer sdb.mu.RUnlock()
+
+	receipt, ok := sdb.receipts[txHash]
+	if !ok {
+		// Try to load from storage
+		data, err := sdb.db.Get([]byte("receipt:" + txHash))
+		if err != nil {
+			return nil, fmt.Errorf("receipt not found: %s", txHash)
+		}
+		if err := json.Unmarshal(data, &receipt); err != nil {
+			return nil, err
+		}
+		return receipt, nil
+	}
+
+	return receipt, nil
+}
+
+// GetBlockReceipts returns all receipts for a block.
+func (sdb *StateDB) GetBlockReceipts(blockHash string) ([]*Receipt, error) {
+	sdb.mu.RLock()
+	defer sdb.mu.RUnlock()
+
+	result := make([]*Receipt, 0)
+	for _, receipt := range sdb.receipts {
+		if receipt.BlockHash == blockHash {
+			result = append(result, receipt)
+		}
+	}
+
+	// Try to load from storage
+	data, err := sdb.db.Get([]byte("block_receipts:" + blockHash))
+	if err == nil && len(data) > 0 {
+		if err := json.Unmarshal(data, &result); err == nil {
+			return result, nil
+		}
+	}
+
+	return result, nil
+}
+
+// GetLogs returns logs matching the filter.
+func (sdb *StateDB) GetLogs(fromBlock, toBlock uint64, address string, topics []string) ([]*Log, error) {
+	sdb.mu.RLock()
+	defer sdb.mu.RUnlock()
+
+	result := make([]*Log, 0)
+	for _, log := range sdb.logs {
+		// Check block range
+		if log.BlockNumber < fromBlock || log.BlockNumber > toBlock {
+			continue
+		}
+
+		// Check address filter
+		if address != "" && !strings.EqualFold(log.Address, address) {
+			continue
+		}
+
+		// Check topics
+		if len(topics) > 0 {
+			matched := true
+			for i, topic := range topics {
+				if topic != "" && i < len(log.Topics) && !strings.EqualFold(log.Topics[i], topic) {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+
+		result = append(result, log)
+	}
+
+	return result, nil
+}
+
+// StoreReceipt stores a transaction receipt.
+func (sdb *StateDB) StoreReceipt(receipt *Receipt) error {
+	sdb.mu.Lock()
+	defer sdb.mu.Unlock()
+
+	sdb.receipts[receipt.TransactionHash] = receipt
+
+	// Persist to storage
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	return sdb.db.Put([]byte("receipt:"+receipt.TransactionHash), data)
+}
+
+// StoreBlockReceipts stores all receipts for a block.
+func (sdb *StateDB) StoreBlockReceipts(blockHash string, receipts []*Receipt) error {
+	sdb.mu.Lock()
+	defer sdb.mu.Unlock()
+
+	for _, receipt := range receipts {
+		sdb.receipts[receipt.TransactionHash] = receipt
+	}
+
+	// Persist to storage
+	data, err := json.Marshal(receipts)
+	if err != nil {
+		return err
+	}
+	return sdb.db.Put([]byte("block_receipts:"+blockHash), data)
+}
+
+// AddLog adds a log entry.
+func (sdb *StateDB) AddLog(log *Log) error {
+	sdb.mu.Lock()
+	defer sdb.mu.Unlock()
+
+	log.LogIndex = uint64(len(sdb.logs))
+	sdb.logs = append(sdb.logs, log)
+
+	// Persist
+	data, err := json.Marshal(sdb.logs)
+	if err != nil {
+		return err
+	}
+	return sdb.db.Put([]byte("logs"), data)
+}
+
+// ClearLogs clears all logs.
+func (sdb *StateDB) ClearLogs() {
+	sdb.mu.Lock()
+	defer sdb.mu.Unlock()
+	sdb.logs = make([]*Log, 0)
+}
+
+// =============================================================================
+// DATABASE INTERFACE IMPLEMENTATION
+// =============================================================================
+
+// GetBalance returns the balance of an account.
+func (sdb *StateDB) GetBalance(addr string) (*big.Int, error) {
+	acc, ok := sdb.accountDB.GetAccount(addr)
+	if !ok {
+		return big.NewInt(0), nil
+	}
+	return acc.Balance(), nil
+}
+
+// GetNonce returns the nonce of an account.
+func (sdb *StateDB) GetNonce(addr string) (uint64, error) {
+	acc, ok := sdb.accountDB.GetAccount(addr)
+	if !ok {
+		return 0, nil
+	}
+	return acc.Nonce(), nil
+}
+
+// GetCode returns the code at an address.
+func (sdb *StateDB) GetCode(addr string) ([]byte, error) {
+	return sdb.accountDB.GetCode(addr), nil
+}
+
+// GetStorageAt returns the storage value at a key.
+func (sdb *StateDB) GetStorageAt(addr string, key string) ([]byte, error) {
+	return sdb.accountDB.GetStorage(addr, []byte(key)), nil
+}
+
+// SetBalance sets the balance of an account.
+func (sdb *StateDB) SetBalance(addr string, balance *big.Int) error {
+	sdb.accountDB.SetBalance(addr, balance)
+	return nil
+}
+
+// SetNonce sets the nonce of an account.
+func (sdb *StateDB) SetNonce(addr string, nonce uint64) error {
+	sdb.accountDB.SetNonce(addr, nonce)
+	return nil
+}
+
+// SetCode sets the code at an address.
+func (sdb *StateDB) SetCode(addr string, code []byte) error {
+	sdb.accountDB.SetCode(addr, code)
+	return nil
+}
+
+// SetStorageAt sets the storage value at a key.
+func (sdb *StateDB) SetStorageAt(addr string, key string, value []byte) error {
+	sdb.accountDB.SetStorage(addr, []byte(key), value)
 	return nil
 }
 
