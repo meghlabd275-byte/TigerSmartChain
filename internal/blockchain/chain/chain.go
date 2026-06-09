@@ -11,30 +11,64 @@ import (
 	"github.com/tigersmartchain/tigersmartchain/internal/storage"
 )
 
+// Fermi Upgrade Constants (January 2026)
 const (
-	MaxBlockSize     = 32 * 1024 * 1024 // 32MB
+	MaxBlockSize     = 128 * 1024 * 1024 // 128MB - Dynamic based on network demand
 	MaxForkDepth   = 64
 	GenesisBlock = 0
+	
+	// Fermi Upgrade (Jan 14, 2026)
+	FermiBlockTime      = 450  // milliseconds (0.45 seconds)
+	FermiFinalityBlocks = 3     // 3 blocks for finality (~1.125 seconds)
+	FermiMaxGas        = 300000000 // 300M gas (10x increase)
+	FermiTargetGas     = 150000000 // 150M target gas
 )
 
-// ChainConfig represents the chain configuration.
+// ChainConfig represents the chain configuration with Fermi support.
 type ChainConfig struct {
 	ChainID     uint64 `json:"chainId"`
 	NetworkID   uint64 `json:"networkId"`
-	BlockTime  uint64 `json:"blockTime"` // seconds
+	BlockTime  uint64 `json:"blockTime"` // milliseconds (0.45s for Fermi)
 	MaxGas    uint64 `json:"maxGas"`
 	MinGasPrice uint64 `json:"minGasPrice"`
+	
+	// Fermi upgrade features
+	DynamicGasLimit bool   `json:"dynamicGasLimit"`
+	BlobSupport    bool   `json:"blobSupport"`
+	FinalityBlocks uint64 `json:"finalityBlocks"` // ~1.125 seconds for Fermi
 }
 
-// DefaultChainConfig returns default chain configuration.
+// DefaultChainConfig returns Fermi-compatible chain configuration.
 func DefaultChainConfig() *ChainConfig {
 	return &ChainConfig{
-		ChainID:     9001,
-		NetworkID:   9001,
-		BlockTime:  3,
-		MaxGas:     30000000,
-		MinGasPrice: 1000000000, // 1 Gwei
+		ChainID:         9001,
+		NetworkID:       9001,
+		BlockTime:       FermiBlockTime,     // 0.45 seconds
+		MaxGas:          FermiMaxGas,        // 300M
+		MinGasPrice:     1000000000,        // 1 Gwei
+		DynamicGasLimit: true,               // Dynamic gas limit for Fermi
+		BlobSupport:     true,               // EIP-4844 support
+		FinalityBlocks:  FermiFinalityBlocks, // 3 blocks (~1.125s)
 	}
+}
+
+// GetBlockTimeSeconds returns block time in seconds.
+func (c *ChainConfig) GetBlockTimeSeconds() float64 {
+	return float64(c.BlockTime) / 1000.0
+}
+
+// GetFinalitySeconds returns finality in seconds.
+func (c *ChainConfig) GetFinalitySeconds() float64 {
+	return float64(c.FinalityBlocks*c.BlockTime) / 1000.0
+}
+
+// CalculateTargetTPS calculates target TPS based on block time.
+func (c *ChainConfig) CalculateTargetTPS(avgTxGas uint64) float64 {
+	if avgTxGas == 0 {
+		avgTxGas = 21000 // Default tx gas
+	}
+	targetGas := c.MaxGas / 2 // Use 50% of max for TPS calculation
+	return float64(targetGas) / float64(avgTxGas) / (float64(c.BlockTime) / 1000.0)
 }
 
 // Chain represents the blockchain chain.
