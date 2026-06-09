@@ -1,0 +1,18 @@
+{
+  "name": "@tigersmartchain/sdk",
+  "version": "1.0.0",
+  "description": "TigerSmartChain TypeScript SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest"
+  },
+  "dependencies": {
+    "ethers": "^6.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0"
+  }
+}
