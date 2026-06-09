@@ -1,102 +1,129 @@
-# TigerSmartChain (TSC) - BSC Alternative with TigerScan Explorer 🐯
+# TigerSmartChain (TSC) - BSC Alternative
 
-A high-performance BSC-like EVM-compatible blockchain with **Tiger Coin (TGR)** and built-in blockchain explorer.
+A high-performance BSC-like EVM-compatible blockchain with native **Tiger Coin (TGR)** utility token.
 
-## Native Token: Tiger Coin (TGR)
+## Native Token: Tiger Coin (TGR) 🐯
 
-| Property | Value |
-|----------|-------|
-| **Name** | Tiger Coin |
-| **Ticker** | Tiger |
-| **Symbol** | TGR |
-| **Chain ID** | 9001 |
-| **Decimals** | 18 |
-| **Total Supply** | 1 Billion |
+- **Name**: Tiger Coin
+- **Ticker**: Tiger
+- **Symbol**: TGR  
+- **Decimals**: 18
+- **Total Supply**: 1 billion (1,000,000,000 TGR)
+- **Chain ID**: 9001
 
-### Royal Tiger USD (RUSD) - Stablecoin
+Tiger Coin is the native utility token for:
+- ⛽ Transaction fees (gas)
+- 🔒 Validator staking & rewards
+- 🗳️ Governance voting
+- 🌉 Cross-chain bridge operations
+- 💰 DeFi protocols (DEX, lending, staking)
 
-| Property | Value |
-|----------|-------|
-| **Name** | Royal Tiger United State Dollar |
-| **Ticker** | RUSD |
-| **Symbol** | RUSD |
-| **Type** | Stablecoin (1:1 USD) |
+## 🌐 EVM Compatibility - Work on All EVM Chains!
 
-## EVM Compatibility - Same Addresses!
+TigerSmartChain is **100% EVM-compatible**. This means:
 
-All popular EVM tokens work on TigerSmartChain with **identical contract addresses**:
+✅ **Any EVM contract works on TigerSmartChain**
+- Deploy Ethereum, BSC, Polygon contracts directly
+- No code changes needed
+- Same bytecode, same behavior
 
-| Token | Works On |
-|-------|----------|
-| USDT | Ethereum, BSC, Polygon, Arbitrum |
-| USDC | Ethereum, BSC, Polygon, Arbitrum |
-| BNB | BSC |
-| ETH | Ethereum |
-| BTCB | BSC |
-| CAKE | BSC |
-| BUSD | BSC |
+✅ **Contracts on TigerSmartChain work on ALL EVM chains**
+- Deploy once, use everywhere
+- Ethereum ↔ TigerSmartChain ↔ BSC ↔ Polygon ↔ Arbitrum ↔ Base
+- Universal smart contract deployment
 
-**Deploy once, use everywhere!** ERC-20 = TEP-20 = BEP-20
+✅ **Token Standards Compatible**
+- ERC-20 = TEP-20 = BEP-20 (same!)
+- ERC-721 = TEP-721 = BEP-721 (same!)
+- ERC-1155 = TEP-1155 (same!)
 
-## Performance (Matching BSC)
+## Performance - Equal or Better Than BSC
 
-| Feature | TigerSmartChain | BSC |
-|---------|----------------|-----|
-| Block Time | 3 sec | 3 sec ✅ |
-| Max Gas | 30M | 30M ✅ |
-| TPS | 100+ | 100+ ✅ |
-| Consensus | PoSA | PoSA ✅ |
-| Validators | 21 | 21 ✅ |
+| Feature | TigerSmartChain | BinanceSmartChain | Status |
+|---------|-----------------|-------------------|--------|
+| Block Time | 3 seconds | 3 seconds | ✅ Match |
+| Max Gas Limit | 30M | 30M | ✅ Match |
+| TPS (Theoretical) | 100+ | 100+ | ✅ Match |
+| Consensus | PoSA | PoSA | ✅ Match |
+| Validators | 21 | 21 | ✅ Match |
+| EVM Version | Istanbul | Istanbul | ✅ Match |
+| Finality | ~3 seconds | ~3 seconds | ✅ Match |
+
+## Key Features
+
+✅ **Full EVM Compatibility**
+- MetaMask ✅
+- Remix ✅  
+- Hardhat/Foundry ✅
+- Web3.js/Ethers.js ✅
+
+✅ **PoSA Consensus**
+- Validator registration & delegation
+- Staking rewards (5% APY)
+- Slashing mechanism
+- Validator rotation
+
+✅ **Smart Contract Standards**
+- TEP20 (Fungible Token - like BEP20)
+- TEP721 (NFT - like BEP721)
+- TEP1155 (Multi Token)
+
+✅ **RPC Endpoints**
+- HTTP JSON-RPC (port 8545)
+- WebSocket RPC (port 8546)
+- gRPC (port 8547)
+
+✅ **Security**
+- Anti-DDOS protection
+- Rate limiting
+- MEV protection
+- Validator monitoring
 
 ## Quick Start
 
 ```bash
-# Build
-go build -o tigersmartchaind ./cmd/tigersmartchaind/
-
-# Initialize
+# Initialize new chain
 ./tigersmartchaind init
 
-# Start node
-./tigersmartchaind start
+# Start validator node
+./tigersmartchaind start --validator --key <private-key>
+
+# Connect to console
+./tigersmartchaind console
+
+# Stake as validator (100 TGR min)
+./tigersmartchaind validator stake --amount 100000TGR
 ```
 
-## TigerScan Explorer
+## RPC Methods
 
-Built-in blockchain explorer (TigerScan.io equivalent):
+Standard Ethereum + BSC methods:
+- eth_blockNumber, eth_getBlockByNumber, eth_getBalance
+- eth_sendTransaction, eth_call, eth_estimateGas
+- bsc_gasPrice, bsc_getValidatorInfo
+- net_version, web3_clientVersion
 
-```bash
-# Run explorer API
-cd backend && ./tigersmartchaind-api
-```
+## Block Explorer
 
-### API Endpoints
-- `GET /api/v1/blocks` - List blocks
-- `GET /api/v1/transactions` - List transactions
-- `GET /api/v1/accounts/:address` - Get account
-- `GET /api/v1/tokens` - List tokens
-- `GET /api/v1/validators` - List validators
-- `GET /api/v1/analytics/stats` - Network stats
+- Backend API: `internal/explorer/`
+- Frontend: Next.js + React
+- Real-time indexer
 
-## Project Structure
+## Bridge Support
 
-```
-TigerSmartChain/
-├── cmd/                    # CLI commands
-├── internal/               # Core blockchain
-│   ├── blockchain/        # Block, transaction
-│   ├── consensus/         # PoSA consensus
-│   ├── evm/               # EVM execution
-│   ├── state/              # State DB
-│   ├── storage/            # LevelDB
-│   ├── rpc/               # JSON-RPC
-│   └── network/            # P2P networking
-├── contracts/              # TEP20, TEP721
-├── frontend/              # TigerScan web
-├── backend/               # TigerScan API
-└── tigersmartchaind       # Main binary
-```
+Cross-chain bridges:
+- Ethereum ↔ TigerSmartChain
+- Polygon ↔ TigerSmartChain  
+- Arbitrum ↔ TigerSmartChain
+- Base ↔ TigerSmartChain
+
+## Governance
+
+- On-chain governance with TGR
+- Proposal system
+- Voting mechanism
+- Treasury
 
 ---
 
-**TigerSmartChain**: Full EVM blockchain with Tiger Coin + TigerScan 🐯
+**TigerSmartChain**: Matching BSC speed & features with Tiger Coin 🐯** 
