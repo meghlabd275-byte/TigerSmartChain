@@ -1,12 +1,12 @@
 # TigerSmartChain (TSC) 🐯
 
-A fully EVM-compatible blockchain similar to BinanceSmartChain, built on modified go-ethereum architecture.
+A fully EVM-compatible blockchain similar to BinanceSmartChain (BNB Chain), built with a multi-language architecture for maximum security and performance.
 
 ## Quick Specs
 
 | Property | Value |
 |----------|-------|
-| **Chain ID** | 9001 |
+| **Chain ID** | 6666 |
 | **Native Token** | Tiger Coin (TGR) |
 | **Ticker** | Tiger |
 | **Block Time** | 3 Seconds |
@@ -14,32 +14,62 @@ A fully EVM-compatible blockchain similar to BinanceSmartChain, built on modifie
 | **Max Gas** | 30M |
 | **Validators** | 21 |
 
-## Architecture
+## Architecture Overview
 
+TigerSmartChain uses a hybrid architecture combining Go for the blockchain node, Rust for security-critical components, and TypeScript for wallets and explorers.
+
+### Go Components (Core Blockchain)
 ```
-TigerSmartChain/
-├── cmd/                    # CLI (tigersmartchaind, validator, wallet)
-├── internal/               # Core blockchain
-│   ├── blockchain/        # block, transaction, receipt, gas, chain, genesis
-│   ├── consensus/         # posa, validator, election, rewards, slashing, governance
-│   ├── evm/              # interpreter, precompiles, opcodes, gas-meter, execution-engine
-│   ├── state/             # account, trie, snapshot, state-db
-│   ├── storage/           # leveldb, rocksdb, cache, archive
-│   ├── network/           # p2p, peer, discovery, sync, gossip
-│   ├── rpc/              # json-rpc, websocket, graphql, grpc
-│   ├── staking/           # validator, delegation, rewards, lockups
-│   ├── bridge/           # ethereum, bsc, polygon, arbitrum, base
-│   ├── governance/        # proposal, voting, treasury, timelock
-│   ├── security/         # cryptography, anti-spam, anti-ddos, anti-mev
-│   └── metrics/          # prometheus, grafana, telemetry
-├── contracts/            # TEP20, TEP721, TEP1155, staking, governance, bridge
-├── explorer/            # backend, indexer, api, frontend
-├── wallet/             # mobile, web, browser-extension, sdk
-├── sdk/               # javascript, typescript, go, rust, python
-├── tests/             # unit, integration, fuzz, load, security
-├── scripts/           # deployment scripts
-├── docker/            # Docker configurations
-└── deployment/        # Kubernetes configs
+node/                     # Blockchain node
+cmd/                      # CLI tools
+internal/                 # Core implementation
+  ├── blockchain/         # Block, transaction, receipt, chain, genesis
+  ├── consensus/          # PoSA, validator, election, rewards, slashing
+  ├── evm/               # Interpreter, precompiles, opcodes, gas-meter
+  ├── state/              # Account, trie, state-db
+  ├── storage/            # LevelDB storage
+  ├── network/           # P2P, peer, discovery, sync
+  ├── rpc/               # JSON-RPC, WebSocket
+  └── metrics/           # Prometheus
+```
+
+### Rust Components (Security-Critical)
+```
+security/crypto/          # Cryptography engine (ECDSA, hashing)
+security-engine/         # Security analysis (phishing, scam detection)
+bridge-engine/          # Cross-chain bridge
+analytics-engine/        # TVL, whale detection, rankings
+```
+
+### Solidity Contracts
+```
+contracts/
+  ├── TEP20/            # Tiger token standard (BEP20 equivalent)
+  ├── TEP721/           # NFT standard
+  ├── TEP1155/          # Multi-token standard
+  ├── staking/           # Staking pool
+  ├── governance/        # DAO governance
+  ├── treasury/          # Treasury + Vesting
+  └── bridge/            # Cross-chain bridge
+```
+
+### Explorer & Wallet
+```
+explorer/
+  ├── apps/              # Indexer, API server
+  ├── services/         # Token, NFT, analytics services
+  ├── databases/        # PostgreSQL schema
+  └── frontend/        # React components, hooks
+wallet/
+  └── web/             # Web wallet
+sdk/
+  └── typescript/      # TypeScript SDK
+```
+
+### Docker & Deployment
+```
+docker/                  # Docker configurations
+deployment/             # Kubernetes manifests
 ```
 
 ## TEP Token Standards

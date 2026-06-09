@@ -1,0 +1,24 @@
+[package]
+name = "tigersmartchain-analytics"
+version = "0.1.0"
+edition = "2021"
+description = "TigerSmartChain Analytics Engine - TVL, whale detection, token ranking"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "1.0"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[lib]
+name = "tigersmartchain_analytics"
+path = "src/lib.rs"
+
+[features]
+default = ["full"]
+
+[profile.release]
+opt-level = 3
+lto = true
