@@ -2,11 +2,12 @@
 pragma solidity ^0.8.26;
 
 /**
- * @title BNBAutoBridge
- * @dev Automatic bridge for BNB between BSC and other chains.
+ * @title GaRAutoBridge
+ * @dev Automatic bridge for TSC (TigerSmartChain) between networks.
  * Implements automated token bridging with liquidity pools.
+ * GaRAutoBridge = TigerSmartChain Auto Bridge
  */
-contract BNBAutoBridge {
+contract GaRAutoBridge {
     // Events
     event BridgeInitialized(address indexed token, uint256 amount, address indexed sender);
     event BridgeCompleted(bytes32 indexed transferId, address indexed recipient, uint256 amount);
@@ -18,6 +19,9 @@ contract BNBAutoBridge {
     uint256 public constant MIN_BRIDGE_AMOUNT = 0.01 ether;
     uint256 public constant MAX_BRIDGE_AMOUNT = 100000 ether;
     uint256 public constant BRIDGE_FEE = 3; // 0.3%
+    
+    // TSC (TigerSmartChain) token address
+    address public constant TSC_TOKEN = address(0);
     uint256 public constant SLIPPAGE_TOLERANCE = 3; // 3%
     uint256 public constant TRANSFER_TIMEOUT = 7 days;
 
