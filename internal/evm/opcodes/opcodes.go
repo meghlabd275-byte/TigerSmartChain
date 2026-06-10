@@ -161,6 +161,17 @@ const (
 	MOVEFEE Opcode = 0x47
 
 	SELFBALANCE Opcode = 0x47
+
+	// EIP-1153: Transient Storage Opcodes
+	TLOAD  Opcode = 0x5c
+	TSTORE Opcode = 0x5d
+
+	// EIP-5656: MCOPY
+	MCOPY Opcode = 0x5e
+
+	// EIP-7702: Set Code for Account Abstraction
+	AUTH Opcode = 0xf6
+	AUTHCALL Opcode = 0xf7
 )
 
 // Name returns the name of the opcode.
