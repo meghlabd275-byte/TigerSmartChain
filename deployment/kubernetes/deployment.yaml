@@ -1,0 +1,289 @@
+# TigerSmartChain Kubernetes Deployment
+# This file defines the Kubernetes resources for deploying TigerSmartChain
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tigersmartchain
+  labels:
+    app: tigersmartchain
+
+---
+# ConfigMap for node configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tigersmartchain-config
+  namespace: tigersmartchain
+data:
+  chain-id: "9001"
+  network-id: "9001"
+  block-time: "450"
+  max-gas: "300000000"
+  min-gas-price: "1000000000"
+---
+# Secret for private keys (use external secrets in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tigersmartchain-secrets
+  namespace: tigersmartchain
+type: Opaque
+stringData:
+  # Add your secrets here
+---
+# Service for P2P networking
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigersmartchain-p2p
+  namespace: tigersmartchain
+spec:
+  type: ClusterIP
+  ports:
+    - port: 30303
+      targetPort: 30303
+      protocol: TCP
+  selector:
+    app: tigersmartchain
+    role: validator
+---
+# Service for RPC
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigersmartchain-rpc
+  namespace: tigersmartchain
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8545
+      targetPort: 8545
+      protocol: TCP
+  selector:
+    app: tigersmartchain
+    role: validator
+---
+# Service for WebSocket
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigersmartchain-ws
+  namespace: tigersmartchain
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8546
+      targetPort: 8546
+      protocol: TCP
+  selector:
+    app: tigersmartchain
+    role: validator
+---
+# Service for gRPC
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigersmartchain-grpc
+  namespace: tigersmartchain
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9001
+      targetPort: 9001
+      protocol: TCP
+  selector:
+    app: tigersmartchain
+    role: validator
+---
+# StatefulSet for validator nodes
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tigersmartchain-validator
+  namespace: tigersmartchain
+spec:
+  serviceName: tigersmartchain-p2p
+  replicas: 4
+  selector:
+    matchLabels:
+      app: tigersmartchain
+      role: validator
+  template:
+    metadata:
+      labels:
+        app: tigersmartchain
+        role: validator
+    spec:
+      containers:
+        - name: tigersmartchain
+          image: tigersmartchain/node:latest
+          ports:
+            - containerPort: 30303
+              name: p2p
+            - containerPort: 8545
+              name: rpc
+            - containerPort: 8546
+              name: ws
+            - containerPort: 9001
+              name: grpc
+          env:
+            - name: CHAIN_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: tigersmartchain-config
+                  key: chain-id
+            - name: NODE_ROLE
+              value: "validator"
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8545
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8545
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 100Gi
+---
+# StatefulSet for full nodes
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tigersmartchain-fullnode
+  namespace: tigersmartchain
+spec:
+  serviceName: tigersmartchain-p2p
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tigersmartchain
+      role: fullnode
+  template:
+    metadata:
+      labels:
+        app: tigersmartchain
+        role: fullnode
+    spec:
+      containers:
+        - name: tigersmartchain
+          image: tigersmartchain/node:latest
+          ports:
+            - containerPort: 30303
+              name: p2p
+            - containerPort: 8545
+              name: rpc
+            - containerPort: 8546
+              name: ws
+          env:
+            - name: CHAIN_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: tigersmartchain-config
+                  key: chain-id
+            - name: NODE_ROLE
+              value: "fullnode"
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 50Gi
+---
+# Horizontal Pod Autoscaler for validators
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tigersmartchain-validator
+  namespace: tigersmartchain
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: tigersmartchain-validator
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+# PodDisruptionBudget for validators
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tigersmartchain-validator
+  namespace: tigersmartchain
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: tigersmartchain
+      role: validator
+---
+# NetworkPolicy for P2P
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tigersmartchain-p2p
+  namespace: tigersmartchain
+spec:
+  podSelector:
+    matchLabels:
+      app: tigersmartchain
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: tigersmartchain
+      ports:
+        - protocol: TCP
+          port: 30303
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: tigersmartchain
+      ports:
+        - protocol: TCP
+          port: 30303

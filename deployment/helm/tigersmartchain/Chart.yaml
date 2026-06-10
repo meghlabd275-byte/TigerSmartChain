@@ -1,0 +1,13 @@
+apiVersion: v2
+name: tigersmartchain
+description: A Helm chart for TigerSmartChain blockchain
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - blockchain
+  - ethereum
+  - tigersmartchain
+maintainers:
+  - name: TigerSmartChain
+    email: dev@tigersmartchain.com
