@@ -1,0 +1,299 @@
+// Package monitoring provides Prometheus alerts for TigerSmartChain.
+package monitoring
+
+// =============================================================================
+// PROMETHEUS ALERT RULES
+// =============================================================================
+
+// AlertRules returns Prometheus alert rules for TigerSmartChain.
+func AlertRules() string {
+	return `groups:
+- name: tigersmartchain.rules
+  rules:
+  # Blockchain Alerts
+  - alert: BlockNotProduced
+    expr: rate(tigersmartchain_blocks_produced_total[5m]) == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Block not produced"
+      description: "No blocks have been produced for 2 minutes"
+      
+  - alert: HighBlockTime
+    expr: tigersmartchain_block_duration_seconds > 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High block time"
+      description: "Block time is {{ $value }}s (threshold: 1s)"
+      
+  - alert: BlockGap
+    expr: tigersmartchain_block_gap > 5
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Block gap detected"
+      description: "Block gap of {{ $value }} detected"
+      
+  # Validator Alerts
+  - alert: ValidatorDown
+    expr: tigersmartchain_validator_active == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Validator is down"
+      description: "Validator {{ $labels.validator }} is down"
+      
+  - alert: ValidatorMissedBlocks
+    expr: rate(tigersmartchain_validator_missed_blocks_total[5m]) > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High missed blocks"
+      description: "Validator {{ $labels.validator }} missed {{ $value }} blocks"
+      
+  - alert: ValidatorJailed
+    expr: tigersmartchain_validator_jailed == 1
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Validator jailed"
+      description: "Validator {{ $labels.validator }} has been jailed"
+      
+  # Transaction Pool Alerts
+  - alert: MempoolFull
+    expr: tigersmartchain_mempool_size / tigersmartchain_mempool_capacity > 0.9
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Mempool is 90% full"
+      description: "Mempool utilization is {{ $value | percent }}"
+      
+  - alert: TransactionStuck
+    expr: tigersmartchain_mempool_pending_seconds > 600
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Transaction stuck"
+      description: "Transaction {{ $labels.tx }} stuck for {{ $value }}s"
+      
+  # Gas Price Alerts
+  - alert: HighGasPrice
+    expr: tigersmartchain_gas_price > 100000000000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High gas price"
+      description: "Gas price is {{ $value }} wei (>100 Gwei)"
+      
+  - alert: LowGasPrice
+    expr: tigersmartchain_gas_price < 1000000000
+    for: 10m
+    labels:
+      severity: info
+    annotations:
+      summary: "Low gas price"
+      description: "Gas price is {{ $value }} wei (<1 Gwei)"
+      
+  # Network Alerts
+  - alert: PeerCountLow
+    expr: tigersmartchain_p2p_peers < 5
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Low peer count"
+      description: "Only {{ $value }} peers connected"
+      
+  - alert: PeerDisconnected
+    expr: increase(tigersmartchain_p2p_disconnections_total[5m]) > 10
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Multiple peer disconnections"
+      description: "{{ $value }} peers disconnected"
+      
+  # Sync Alerts
+  - alert: SyncBehind
+    expr: tigersmartchain_sync_behind > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Node sync is behind"
+      description: "Node is {{ $value }} blocks behind"
+      
+  - alert: SyncStalled
+    expr: rate(tigersmartchain_sync_progress[5m]) == 0
+    for: 10m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Sync stalled"
+      description: "Sync progress has stalled"
+      
+  # Storage Alerts
+  - alert: DiskSpaceLow
+    expr: (tigersmartchain_disk_space_available / tigersmartchain_disk_space_total) < 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Disk space low"
+      description: "Only {{ $value | percent }} disk space available"
+      
+  - alert: DiskSpaceCritical
+    expr: (tigersmartchain_disk_space_available / tigersmartchain_disk_space_total) < 0.05
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Disk space critical"
+      description: "Only {{ $value | percent }} disk space available"
+      
+  # Memory Alerts
+  - alert: HighMemoryUsage
+    expr: (tigersmartchain_memory_used / tigersmartchain_memory_limit) > 0.9
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage"
+      description: "Memory usage is {{ $value | percent }}"
+      
+  - alert: MemoryExhausted
+    expr: (tigersmartchain_memory_used / tigersmartchain_memory_limit) > 0.95
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Memory exhausted"
+      description: "Memory usage is {{ $value | percent }}"
+      
+  # CPU Alerts
+  - alert: HighCPUUsage
+    expr: rate(tigersmartchain_cpu_seconds_total[5m]) > 0.9
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage"
+      description: "CPU usage is {{ $value | percent }}"
+      
+  # RPC Alerts
+  - alert: RPCLatencyHigh
+    expr: tigersmartchain_rpc_latency_p99 > 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High RPC latency"
+      description: "RPC latency p99 is {{ $value }}s"
+      
+  - alert: RPCErrors
+    expr: rate(tigersmartchain_rpc_errors_total[5m]) > 10
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High RPC error rate"
+      description: "{{ $value }} RPC errors per second"
+      
+  - alert: RPCDown
+    expr: up{job="tigersmartchain-rpc"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "RPC service is down"
+      description: "RPC service is not responding"
+      
+  # EVM Alerts
+  - alert: EVMRevert
+    expr: rate(tigersmartchain_evm_reverts_total[5m]) > 100
+    for: 5m
+    labels:
+      severity: info
+    annotations:
+      summary: "High EVM revert rate"
+      description: "{{ $value }} reverts per second"
+      
+  - alert: EVMOutOfGas
+    expr: tigersmartchain_evm_out_of_gas > 1000
+    for: 1m
+    labels:
+      severity: info
+    annotations:
+      summary: "Out of gas"
+      description: "{{ $value }} transactions ran out of gas"
+      
+  # Consensus Alerts
+  - alert: DoubleSign
+    expr: tigersmartchain_consensus_double_sign > 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Double sign detected"
+      description: "Double signing detected from {{ $labels.validator }}"
+      
+  - alert: ConsensusFailure
+    expr: tigersmartchain_consensus_round_changes > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High consensus round changes"
+      description: "{{ $value }} round changes in 5 minutes"
+      
+  # Security Alerts
+  - alert: UnauthorizedAccess
+    expr: tigersmartchain_security_unauthorized_access > 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Unauthorized access attempt"
+      description: "Unauthorized access from {{ $labels.ip }}"
+      
+  - alert: SuspiciousActivity
+    expr: tigersmartchain_security_suspicious_activity > 10
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Suspicious activity detected"
+      description: "{{ $value }} suspicious activities detected"
+      
+  # Slashing Alerts
+  - alert: ValidatorSlashed
+    expr: tigersmartchain_validator_slashed > 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Validator slashed"
+      description: "Validator {{ $labels.validator }} has been slashed"
+      
+  # MEV Alerts
+  - alert: MEVExtraction
+    expr: tigersmartchain_mev_extracted > 1000000000000000000000
+    for: 1h
+    labels:
+      severity: info
+    annotations:
+      summary: "MEV extracted"
+      description: "{{ $value }} wei extracted as MEV"
+`
+
+var _ = "tigersmartchain" // Package name

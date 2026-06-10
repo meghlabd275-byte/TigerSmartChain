@@ -1,0 +1,325 @@
+# TigerSmartChain Helm Chart Values
+# Production-ready values for Kubernetes deployment
+
+# Global settings
+global:
+  chainId: 9001
+  networkName: TigerSmartChain
+  
+# Image configuration
+image:
+  repository: tigersmartchain/node
+  tag: latest
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Service configuration
+service:
+  type: LoadBalancer
+  rpcPort: 8545
+  wsPort: 8546
+  p2pPort: 26656
+  p2pNodePort: 30056
+  ethPort: 30303
+  
+# P2P networking
+p2p:
+  listenAddress: "0.0.0.0:26656"
+  maxPeers: 50
+  maxInbound: 25
+  maxOutbound: 25
+  enablePex: true
+  bootstrapNodes: []
+  dnsSeeds: []
+  
+# RPC configuration
+rpc:
+  listenAddress: "0.0.0.0:8545"
+  wsAddress: "0.0.0.0:8546"
+  api: ["eth", "net", "web3", "debug", "txpool"]
+  corsOrigins: ["*"]
+  vhosts: ["*"]
+  maxConnections: 10000
+  rateLimit: 1000
+  enableMetrics: true
+  enablePersonal: false
+  
+# EVM configuration
+evm:
+  chainId: 9001
+  networkId: 9001
+  gasLimit: 300000000
+  gasPrice: 1000000000
+  blockTime: 450  # 0.45 seconds
+  enableEIP1559: true
+  enableEIP4844: true
+  
+# State configuration
+state:
+  trieCache: 1024
+  trieJournal: "journal"
+  snapshotInterval: 10000
+  enablePruning: true
+  enableSnapshot: true
+  
+# Database configuration
+database:
+  backend: rocksdb
+  dataPath: /data
+  cacheSize: 4096
+  maxOpenFiles: 1024
+  
+# Logging configuration
+logging:
+  level: info
+  format: json
+  outputPaths:
+    - stdout
+    - /data/logs/node.log
+  errorPaths:
+    - stderr
+    - /data/logs/error.log
+    
+# Metrics configuration
+metrics:
+  enabled: true
+  address: "0.0.0.0:6060"
+  enableExpensive: true
+  
+# Prometheus configuration
+prometheus:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    
+# Grafana configuration
+grafana:
+  enabled: true
+  dashboards:
+    enabled: true
+    annotations:
+      enabled: true
+      
+# Alertmanager configuration
+alertmanager:
+  enabled: true
+  config:
+    route:
+      groupBy: [alertname]
+      groupWait: 10s
+      groupInterval: 10s
+      repeatInterval: 12h
+    receivers:
+    - name: default
+      webhookConfigs:
+      - url: http://alertmanager-webhook:8060/alerts
+    - name: critical
+      webhookConfigs:
+      - url: http://alertmanager-webhook:8060/critical
+    inhibitRules:
+    - sourceMatch:
+      - name: alertname
+        regex: "Watchdog|AlertmanagerReceiversNotConfigured"
+      targetMatch:
+      - name: alertname
+        regex: ""
+      equal: [alertname, instance]
+
+# Validator configuration
+validator:
+  enabled: true
+  blockProducer: true
+  gasCeil: 300000000
+  gasFloor: 0
+  producerLimit: 1
+  keyPath: /data/keystore
+  passwordKey: password
+  
+# Security configuration
+security:
+  enableNodePermission: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: false
+  allowPrivilegeEscalation: false
+  
+# Resources configuration
+resources:
+  # Validator resources
+  validator:
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+      
+  # RPC resources
+  rpc:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+      
+  # Explorer resources
+  explorer:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+
+# Persistence configuration
+persistence:
+  enabled: true
+  storageClass: tigersmartchain-ssd
+  accessMode: ReadWriteOnce
+  dataSize: 100Gi
+  logSize: 10Gi
+  
+# Network policy
+networkPolicy:
+  enabled: true
+  egress:
+  - to:
+    - podSelector: {}
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+      
+# Autoscaling
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  
+# Node selector
+nodeSelector:
+  node.kubernetes.io/instance-type: compute-optimized
+  
+# Tolerations
+tolerations: []
+# - key: dedicated
+#   operator: Equal
+#   value: validator
+#   effect: NoSchedule
+  
+# Affinity
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchLabels:
+          app: tigersmartchain
+      topologyKey: kubernetes.io/hostname
+      
+# Ingress configuration
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+  hosts:
+  - host: rpc.tigersmartchain.com
+    paths:
+    - path: /
+      pathType: Prefix
+      service: rpc
+      port: 8545
+  tls:
+  - secretName: tigersmartchain-tls
+    hosts:
+    - rpc.tigersmartchain.com
+    
+# RBAC configuration
+rbac:
+  create: true
+  serviceAccount:
+    create: true
+    name: tigersmartchain
+    
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+  
+# Priority class
+priorityClass:
+  enabled: true
+  name: tigersmartchain-critical
+  value: 1000000
+  globalDefault: false
+  
+# Service monitors
+serviceMonitors:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  
+# Dashboards
+dashboards:
+  enabled: true
+  label: grafana_dashboard
+  annotations:
+    kubernetes.io/ashboard: "1"
+    
+# Logging
+logging:
+  level: info
+  format: json
+  outputPaths:
+  - name: stdout
+  - name: file
+    path: /data/logs
+    
+# Backup configuration
+backup:
+  enabled: true
+  schedule: "0 0 * * *"
+  retention: 7d
+  destination: s3://tigersmartchain-backups
+  
+# Update strategy
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+    
+# Revision history
+revisionHistoryLimit: 3
+
+# Pod management policy
+podManagementPolicy: Parallel
+
+# Topology spread constraints
+topologySpreadConstraints:
+- maxSkew: 1
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+  labelSelector:
+    matchLabels:
+      app: tigersmartchain
+- maxSkew: 1
+  topologyKey: kubernetes.io/hostname
+  whenUnsatisfiable: ScheduleAnyway
+  labelSelector:
+    matchLabels:
+      app: tigersmartchain
