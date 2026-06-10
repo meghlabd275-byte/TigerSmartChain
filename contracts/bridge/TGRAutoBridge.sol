@@ -2,12 +2,12 @@
 pragma solidity ^0.8.26;
 
 /**
- * @title GaRAutoBridge
+ * @title TGRAutoBridge
  * @dev Automatic bridge for TSC (TigerSmartChain) between networks.
  * Implements automated token bridging with liquidity pools.
- * GaRAutoBridge = TigerSmartChain Auto Bridge
+ * TGRAutoBridge = TigerSmartChain Auto Bridge
  */
-contract GaRAutoBridge {
+contract TGRAutoBridge {
     // Events
     event BridgeInitialized(address indexed token, uint256 amount, address indexed sender);
     event BridgeCompleted(bytes32 indexed transferId, address indexed recipient, uint256 amount);
