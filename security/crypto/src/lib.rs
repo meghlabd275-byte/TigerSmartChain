@@ -9,6 +9,7 @@ pub mod hashing;
 pub mod key_derivation;
 pub mod signing;
 pub mod verification;
+pub mod encryption;
 
 /// Result type for cryptographic operations.
 pub type Result<T> = core::result::Result<T, Error>;
