@@ -1,0 +1,47 @@
+[package]
+name = "tiger-gas"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "Gas tracking and estimation for TigerScan"
+license = "MIT"
+
+[dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP
+reqwest = { version = "0.11", features = ["json"], default-features = false }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Error handling
+thiserror = "1.0"
+
+# Caching
+lru = "0.12"
+
+# Metrics
+metrics = "0.21"
+
+# Math
+statrs = "0.18"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
