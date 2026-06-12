@@ -1,0 +1,109 @@
+# Helm values for TigerSmartChain Explorer
+
+# Global configuration
+global:
+  imageRegistry: docker.io
+  imagePullSecrets: []
+  storageClass: ""
+
+# API Server Configuration
+apiServer:
+  enabled: true
+  replicaCount: 3
+  image:
+    repository: tigersmartchain/api-server
+    tag: latest
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+  ingress:
+    enabled: true
+    className: nginx
+    hostname: explorer.tigersmartchain.io
+    tls: true
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+
+# Indexer Configuration
+indexer:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: tigersmartchain/indexer
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+# WebSocket Server Configuration
+websocketServer:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: tigersmartchain/websocket-server
+    tag: latest
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# PostgreSQL Configuration
+postgresql:
+  enabled: true
+  auth:
+    username: postgres
+    database: explorer
+  primary:
+    persistence:
+      size: 10Gi
+
+# Redis Configuration
+redis:
+  enabled: true
+  master:
+    persistence:
+      size: 8Gi
+
+# Monitoring
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+
+# Security
+securityContext:
+  enabled: true
+  runAsNonRoot: true
+  runAsUser: 1001
+
+# Network Policy
+networkPolicy:
+  enabled: true
+  allowIngress: true
+  allowEgress: true
+
+# Pod Disruption Budget
+pdb:
+  enabled: true
+  minAvailable: 2

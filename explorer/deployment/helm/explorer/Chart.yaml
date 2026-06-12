@@ -1,0 +1,21 @@
+# Helm Chart for TigerSmartChain Explorer
+
+apiVersion: v2
+name: tigersmartchain-explorer
+description: A comprehensive blockchain explorer for EVM chains
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+maintainers:
+  - name: TigerSmartChain Team
+    email: team@tigersmartchain.io
+
+dependencies:
+  - name: postgresql
+    version: 12.x.x
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: redis
+    version: 17.x.x
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled

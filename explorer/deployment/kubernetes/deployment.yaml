@@ -1,0 +1,470 @@
+# Kubernetes Deployment Manifests for TigerSmartChain Explorer
+
+## Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tigersmartchain
+  labels:
+    name: tigersmartchain
+
+---
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: explorer-config
+  namespace: tigersmartchain
+data:
+  DATABASE_URL: "postgres://postgres:password@postgres:5432/explorer"
+  REDIS_URL: "redis://redis:6379"
+  ETHEREUM_RPC_URL: "https://eth.llamarpc.com"
+  BSC_RPC_URL: "https://bsc-dataseed.binance.org"
+  POLYGON_RPC_URL: "https://polygon-rpc.com"
+  PORT: "8080"
+  LOG_LEVEL: "info"
+  ENABLE_CORS: "true"
+  MAX_CONNECTIONS: "1000"
+
+---
+# Secret (Note: Use external secrets in production)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: explorer-secrets
+  namespace: tigersmartchain
+type: Opaque
+stringData:
+  DATABASE_PASSWORD: "change_me_in_production"
+  REDIS_PASSWORD: "change_me_in_production"
+  JWT_SECRET: "change_me_in_production"
+  ENCRYPTION_KEY: "change_me_in_production"
+
+---
+# PostgreSQL Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: tigersmartchain
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: "explorer"
+        - name: POSTGRES_USER
+          value: "postgres"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: explorer-secrets
+              key: DATABASE_PASSWORD
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+      volumes:
+      - name: postgres-data
+        emptyDir: {}
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: tigersmartchain
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: tigersmartchain
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server", "--requirepass", "$(REDIS_PASSWORD)"]
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: explorer-secrets
+              key: REDIS_PASSWORD
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: tigersmartchain
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# API Server Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: tigersmartchain
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api-server
+  template:
+    metadata:
+      labels:
+        app: api-server
+    spec:
+      containers:
+      - name: api-server
+        image: tigersmartchain/api-server:latest
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: DATABASE_URL
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: REDIS_URL
+        - name: PORT
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: PORT
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: explorer-secrets
+              key: JWT_SECRET
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: explorer-secrets
+              key: ENCRYPTION_KEY
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# API Server Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  namespace: tigersmartchain
+spec:
+  selector:
+    app: api-server
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# API Server Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-server-hpa
+  namespace: tigersmartchain
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-server
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Indexer Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: indexer
+  namespace: tigersmartchain
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: indexer
+  template:
+    metadata:
+      labels:
+        app: indexer
+    spec:
+      containers:
+      - name: indexer
+        image: tigersmartchain/indexer:latest
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: DATABASE_URL
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: REDIS_URL
+        - name: ETHEREUM_RPC_URL
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: ETHEREUM_RPC_URL
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+
+---
+# WebSocket Server Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: websocket-server
+  namespace: tigersmartchain
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: websocket-server
+  template:
+    metadata:
+      labels:
+        app: websocket-server
+    spec:
+      containers:
+      - name: websocket-server
+        image: tigersmartchain/websocket-server:latest
+        env:
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: explorer-config
+              key: REDIS_URL
+        ports:
+        - containerPort: 8081
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+---
+# WebSocket Server Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: websocket-server
+  namespace: tigersmartchain
+spec:
+  selector:
+    app: websocket-server
+  ports:
+  - port: 80
+    targetPort: 8081
+  type: ClusterIP
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: explorer-ingress
+  namespace: tigersmartchain
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  tls:
+  - hosts:
+    - explorer.tigersmartchain.io
+    secretName: explorer-tls
+  rules:
+  - host: explorer.tigersmartchain.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-server
+            port:
+              number: 80
+
+---
+# Prometheus ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api-server-monitor
+  namespace: tigersmartchain
+spec:
+  selector:
+    matchLabels:
+      app: api-server
+  endpoints:
+  - port: metrics
+    path: /metrics
+
+---
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-server-pdb
+  namespace: tigersmartchain
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api-server
+
+---
+# ResourceQuota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: explorer-quota
+  namespace: tigersmartchain
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    persistentvolumeclaims: "10"
+    services.loadbalancers: "2"
+    services.nodeports: "0"
+
+---
+# NetworkPolicy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: explorer-network-policy
+  namespace: tigersmartchain
+spec:
+  podSelector:
+    matchLabels:
+      app: api-server
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: ingress-controller
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
