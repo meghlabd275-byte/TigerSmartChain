@@ -2,11 +2,18 @@ module github.com/tigersmartchain/tigerscan
 
 go 1.21
 
-require github.com/gin-gonic/gin v1.9.1
+require (
+	github.com/gin-gonic/gin v1.9.1
+	github.com/gorilla/websocket v1.5.1
+	github.com/lib/pq v1.10.9
+	github.com/shopspring/decimal v1.3.1
+	golang.org/x/time v0.5.0
+)
 
 require (
 	github.com/bytedance/sonic v1.9.1 // indirect
 	github.com/chenzhuoyu/base64x v0.0.0-20221115062448-fe3a3abad311 // indirect
+	github.com/frankban/quicktest v1.14.6 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.2 // indirect
 	github.com/gin-contrib/sse v0.1.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
