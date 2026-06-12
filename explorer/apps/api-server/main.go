@@ -2,9 +2,14 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,6 +20,165 @@ const (
 	Version = "1.0.0"
 	Port    = 8080
 )
+
+// RateLimiter provides API rate limiting
+type RateLimiter struct {
+	mu       sync.RWMutex
+	requests map[string][]time.Time
+	limits   map[string]*Limit
+}
+
+type Limit struct {
+	MaxRequests int
+	Window     time.Duration
+}
+
+func NewRateLimiter() *RateLimiter {
+	return &RateLimiter{
+		requests: make(map[string][]time.Time),
+		limits: map[string]*Limit{
+			"default":  {MaxRequests: 1000, Window: time.Minute},
+			"pro":     {MaxRequests: 10000, Window: time.Minute},
+			"admin":   {MaxRequests: 50000, Window: time.Minute},
+		},
+	}
+}
+
+func (rl *RateLimiter) Allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	limit := rl.limits["default"]
+	if limit == nil {
+		limit = rl.limits["default"]
+	}
+
+	now := time.Now()
+	windowStart := now.Add(-limit.Window)
+
+	// Clean old requests
+	requests := rl.requests[key]
+	var valid []time.Time
+	for _, t := range requests {
+		if t.After(windowStart) {
+			valid = append(valid, t)
+		}
+	}
+
+	if len(valid) >= limit.MaxRequests {
+		rl.requests[key] = valid
+		return false
+	}
+
+	rl.requests[key] = append(valid, now)
+	return true
+}
+
+// =============================================================================
+// SECURITY MIDDLEWARE
+// =============================================================================
+
+// SecurityConfig holds security configuration
+type SecurityConfig struct {
+	APIKeys           map[string]*APIKey
+	AllowedOrigins    []string
+	BlockedIPs      map[string]bool
+	MaxRequestSize  int64
+	RateLimiter    *RateLimiter
+}
+
+type APIKey struct {
+	Key         string
+	UserID      string
+	RateLimit   int
+	IsActive    bool
+	ExpiresAt  *time.Time
+	LastUsedAt *time.Time
+}
+
+func NewSecurityConfig() *SecurityConfig {
+	return &SecurityConfig{
+		APIKeys:        make(map[string]*APIKey),
+		AllowedOrigins: []string{"*"},
+		BlockedIPs:   make(map[string]bool),
+		MaxRequestSize: 10 * 1024 * 1024, // 10MB
+		RateLimiter: NewRateLimiter(),
+	}
+}
+
+// ValidateAddress validates an Ethereum address
+func ValidateAddress(addr string) bool {
+	addr = strings.ToLower(addr)
+	if !strings.HasPrefix(addr, "0x") {
+		addr = "0x" + addr
+	}
+	if len(addr) != 42 {
+		return false
+	}
+	addr = addr[2:]
+	for _, c := range addr {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateHash validates a transaction/block hash
+func ValidateHash(hash string) bool {
+	hash = strings.ToLower(hash)
+	if strings.HasPrefix(hash, "0x") {
+		hash = hash[2:]
+	}
+	if len(hash) != 64 {
+		return false
+	}
+	for _, c := range hash {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// GenerateAPIKey generates a new API key
+func GenerateAPIKey() (string, error) {
+	hash := sha256.New()
+	hash.Write([]byte(time.Now().String() + fmt.Sprintf("%d", time.Now().UnixNano())))
+	return "tsc_" + hex.EncodeToString(hash.Sum(nil))[:32], nil
+}
+
+// =============================================================================
+// AUDIT LOGGING
+// =============================================================================
+
+// AuditLog records security events
+type AuditLog struct {
+	UserID      string    `json:"userId"`
+	Action     string    `json:"action"`
+	Resource   string    `json:"resource"`
+	IPAddress  string    `json:"ipAddress"`
+	UserAgent  string    `json:"userAgent"`
+	Success   bool      `json:"success"`
+	ErrorMsg   string    `json:"errorMsg"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+var auditLogs = &struct {
+	mu  sync.Mutex
+	log []AuditLog
+}{log: make([]0, 1000)}
+
+func logAudit(log AuditLog) {
+	auditLogs.mu.Lock()
+	defer auditLogs.mu.Unlock()
+	log.Timestamp = time.Now()
+	auditLogs.log = append(auditLogs.log, log)
+	// Keep last 1000 logs
+	if len(auditLogs.log) > 1000 {
+		auditLogs.log = auditLogs.log[len(auditLogs.log)-1000:]
+	}
+}
 
 func main() {
 	log.Printf("TigerScan API v%s starting...", Version)
