@@ -1,0 +1,233 @@
+# Alert Manager Configuration for TigerScan
+
+groups:
+- name: tigerscan-alerts
+  interval: 30s
+  rules:
+  # High Pending Transactions
+  - alert: HighPendingTransactions
+    expr: tigerscan_pending_txs > 500
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High pending transaction count"
+      description: "There are {{ $value }} pending transactions in the mempool"
+  
+  # Very High Pending Transactions
+  - alert: CriticalPendingTransactions
+    expr: tigerscan_pending_txs > 1000
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical pending transaction count"
+      description: "There are {{ $value }} pending transactions - possible mempool congestion"
+  
+  # High Gas Price
+  - alert: HighGasPrice
+    expr: tigerscan_gas_price > 100
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High gas price detected"
+      description: "Gas price is {{ $value }} gwei"
+  
+  # Very High Gas Price
+  - alert: CriticalGasPrice
+    expr: tigerscan_gas_price > 200
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical gas price detected"
+      description: "Gas price is {{ $value }} gwei - network congestion"
+  
+  # Block Production Slow
+  - alert: SlowBlockProduction
+    expr: rate(tigerscan_block_height[10m]) < 0.2
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Slow block production"
+      description: "Block production rate is {{ $value }} blocks/sec - below expected"
+  
+  # Block Production Stopped
+  - alert: BlockProductionStopped
+    expr: rate(tigerscan_block_height[10m]) < 0.01
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Block production stopped"
+      description: "No new blocks being produced - critical issue"
+  
+  # High API Latency
+  - alert: HighAPILatency
+    expr: rate(tigerscan_api_request_duration_seconds_sum[5m]) / rate(tigerscan_api_request_duration_seconds_count[5m]) > 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High API latency"
+      description: "Average API response time is {{ $value }} seconds"
+  
+  # Very High API Latency
+  - alert: CriticalAPILatency
+    expr: rate(tigerscan_api_request_duration_seconds_sum[5m]) / rate(tigerscan_api_request_duration_seconds_count[5m]) > 5
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical API latency"
+      description: "Average API response time is {{ $value }} seconds - possible service issue"
+  
+  # High Error Rate
+  - alert: HighErrorRate
+    expr: rate(tigerscan_api_errors_total[5m]) / rate(tigerscan_api_requests_total[5m]) > 0.05
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High error rate"
+      description: "Error rate is {{ $value | humanizePercentage }}"
+  
+  # API Down
+  - alert: APIDown
+    expr: up{job="tigerscan-api"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "TigerScan API is down"
+      description: "The TigerScan API has been down for 1 minute"
+  
+  # Database Connection Issues
+  - alert: DatabaseConnectionIssues
+    expr: tigerscan_db_connections_active < 5
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Low database connections"
+      description: "Only {{ $value }} active database connections"
+  
+  # Redis Connection Issues
+  - alert: RedisConnectionIssues
+    expr: tigerscan_redis_connections_active < 1
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Redis connection lost"
+      description: "No active Redis connections - possible cache failure"
+  
+  # High Memory Usage
+  - alert: HighMemoryUsage
+    expr: (tigerscan_process_resident_memory_bytes / tigerscan_process_max_memory_bytes) > 0.85
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage"
+      description: "Memory usage is {{ $value | humanizePercentage }}"
+  
+  # Critical Memory Usage
+  - alert: CriticalMemoryUsage
+    expr: (tigerscan_process_resident_memory_bytes / tigerscan_process_max_memory_bytes) > 0.95
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical memory usage"
+      description: "Memory usage is {{ $value | humanizePercentage }} - possible OOM"
+  
+  # High CPU Usage
+  - alert: HighCPUUsage
+    expr: 100 - (avg by(instance) (rate(tigerscan_process_cpu_seconds_total[1m])) > 80
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage"
+      description: "CPU usage is {{ $value }}%"
+  
+  # Critical CPU Usage
+  - alert: CriticalCPUUsage
+    expr: 100 - (avg by(instance) (rate(tigerscan_process_cpu_seconds_total[1m])) > 95
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical CPU usage"
+      description: "CPU usage is {{ $value }}%"
+  
+  # High TPS Drop
+  - alert: TPSDrop
+    expr: rate(tigerscan_transactions_total[5m]) < 10
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Significant TPS drop"
+      description: "TPS has dropped to {{ $value }}"
+  
+  # Syncing Behind
+  - alert: SyncingBehind
+    expr: tigerscan_block_height < tigerscan_chain_head_height - 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Node syncing behind"
+      description: "Node is {{ $value }} blocks behind chain head"
+  
+  # Token Price Alert
+  - alert: TokenPriceChange
+    expr: abs(rate(tigerscan_token_price[1h])) > 0.2
+    for: 10m
+    labels:
+      severity: info
+    annotations:
+      summary: "Significant token price change"
+      description: "Token price has changed by {{ $value | humanizePercentage }} in the last hour"
+  
+  # Unusual Transaction Volume
+  - alert: UnusualTransactionVolume
+    expr: rate(tigerscan_transactions_total[1h]) > 10 * rate(tigerscan_transactions_total[24h])
+    for: 10m
+    labels:
+      severity: info
+    annotations:
+      summary: "Unusual transaction volume"
+      description: "Transaction volume is 10x higher than 24h average"
+  
+  # Large Transfer Alert
+  - alert: LargeTransfer
+    expr: tigerscan_large_transfer > 100000
+    for: 1m
+    labels:
+      severity: info
+    annotations:
+      summary: "Large transfer detected"
+      description: "A large transfer of {{ $value }} TSC detected"
+
+# Inhibition rules
+inhibit_rules:
+  # Suppress warning alerts when critical is firing
+  - source_match:
+      severity: critical
+    target_match:
+      severity: warning
+    equal:
+      - alertname
+  
+  # Suppress APIDown when node is syncing
+  - source_match:
+      alertname: APIDown
+    target_match:
+      alertname: SyncingBehind
+    equal:
+      - instance

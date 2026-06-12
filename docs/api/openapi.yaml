@@ -1,0 +1,520 @@
+# TigerScan API Documentation
+
+## Overview
+
+TigerScan provides a comprehensive REST API and WebSocket API for accessing blockchain data, tokens, NFTs, and analytics.
+
+## Base URLs
+
+- **Production:** `https://api.tigerscan.io`
+- **Testnet:** `https://api-testnet.tigerscan.io`
+- **WebSocket:** `wss://api.tigerscan.io/ws`
+
+## Authentication
+
+### API Keys
+
+Include your API key in the request header:
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" https://api.tigerscan.io/api/v2/tokens
+```
+
+### Rate Limits
+
+| Tier | Requests/Minute | Requests/Day |
+|------|-----------------|---------------|
+| Free | 5 | 1,000 |
+| Pro | 100 | 100,000 |
+| Enterprise | 1,000 | Unlimited |
+
+## Endpoints
+
+### Blocks
+
+#### Get Block by Number
+
+```bash
+GET /api/v2/block/{number}
+```
+
+**Response:**
+```json
+{
+  "status": "1",
+  "message": "OK",
+  "result": {
+    "blockNumber": 12345,
+    "hash": "0xabc123...",
+    "parentHash": "0xparent123...",
+    "miner": "0xminer...",
+    "gasUsed": 15000000,
+    "gasLimit": 30000000,
+    "timestamp": 1234567890,
+    "transactions": [...]
+  }
+}
+```
+
+#### Get Block by Hash
+
+```bash
+GET /api/v2/block/hash/{hash}
+```
+
+### Transactions
+
+#### Get Transaction
+
+```bash
+GET /api/v2/tx/{hash}
+```
+
+**Response:**
+```json
+{
+  "status": "1",
+  "message": "OK",
+  "result": {
+    "hash": "0xabc123...",
+    "blockNumber": 12345,
+    "from": "0xfrom...",
+    "to": "0xto...",
+    "value": "1000000000000000000",
+    "gasPrice": "20000000000",
+    "gasUsed": 21000,
+    "status": "1",
+    "logs": [...]
+  }
+}
+```
+
+#### Get Transaction Receipt
+
+```bash
+GET /api/v2/tx/{hash}/receipt
+```
+
+#### Get Internal Transactions
+
+```bash
+GET /api/v2/tx/{hash}/internal
+```
+
+### Tokens
+
+#### Get Token List
+
+```bash
+GET /api/v2/tokens?page=1&offset=50
+```
+
+#### Get Token Info
+
+```bash
+GET /api/v2/token/{address}
+```
+
+#### Get Token Holders
+
+```bash
+GET /api/v2/token/{address}/holders?page=1
+```
+
+**Response:**
+```json
+{
+  "status": "1",
+  "message": "OK",
+  "result": [
+    {
+      "address": "0xholder...",
+      "balance": "1000000000000000000",
+      "percent": "10.0"
+    }
+  ]
+}
+```
+
+#### Get Token Transfers
+
+```bash
+GET /api/v2/token/{address}/transfers?page=1
+```
+
+#### Get Token Price History
+
+```bash
+GET /api/v2/token/{address}/history?days=30
+```
+
+#### Get Holder Distribution
+
+```bash
+GET /api/v2/token/{address}/holderdistribution
+```
+
+### NFTs
+
+#### Get NFT List
+
+```bash
+GET /api/v2/nfts?page=1&filter=erc721
+```
+
+#### Get NFT Info
+
+```bash
+GET /api/v2/nft/{address}
+```
+
+#### Get NFT Holders
+
+```bash
+GET /api/v2/nft/{address}/holders?page=1
+```
+
+#### Get NFT Transfers
+
+```bash
+GET /api/v2/nft/{address}/transfers?page=1
+```
+
+#### Get NFT Floor Price
+
+```bash
+GET /api/v2/nft/{address}/floor
+```
+
+#### Get NFT Metadata
+
+```bash
+GET /api/v2/nft/{address}/metadata?tokenId=1
+```
+
+#### Get NFT Traits
+
+```bash
+GET /api/v2/nft/{address}/traits
+```
+
+### Accounts
+
+#### Get Account Info
+
+```bash
+GET /api/v2/account/{address}
+```
+
+#### Get Account Transactions
+
+```bash
+GET /api/v2/account/{address}/transactions?page=1
+```
+
+#### Get Account Tokens
+
+```bash
+GET /api/v2/account/{address}/tokens
+```
+
+#### Get Account NFTs
+
+```bash
+GET /api/v2/account/{address}/nfts
+```
+
+### Analytics
+
+#### Get Network Stats
+
+```bash
+GET /api/v2/stats
+```
+
+#### Get TPS
+
+```bash
+GET /api/v2/stats/tps?interval=24h
+```
+
+#### Get Gas Tracker
+
+```bash
+GET /api/v2/stats/gas
+```
+
+#### Get Rich List
+
+```bash
+GET /api/v2/stats/richlist?page=1
+```
+
+#### Get Top Tokens
+
+```bash
+GET /api/v2/stats/toptokens?page=1
+```
+
+#### Get Top NFTs
+
+```bash
+GET /api/v2/stats/topnfts?page=1
+```
+
+#### Get TVL
+
+```bash
+GET /api/v2/stats/tvl
+```
+
+#### Get Market Cap
+
+```bash
+GET /api/v2/stats/marketcap
+```
+
+### Events (WebSocket)
+
+#### Subscribe to New Blocks
+
+```javascript
+// Connect to WebSocket
+const ws = new WebSocket('wss://api.tigerscan.io/ws');
+
+// Subscribe
+ws.send(JSON.stringify({
+  event: 'new_block'
+}));
+
+// Receive messages
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(data);
+};
+```
+
+#### Subscribe to New Transactions
+
+```javascript
+ws.send(JSON.stringify({
+  event: 'new_transaction'
+}));
+```
+
+#### Subscribe to Token Transfers
+
+```javascript
+ws.send(JSON.stringify({
+  event: 'token_transfer',
+  filter: {
+    token_address: '0x123...'
+  }
+}));
+```
+
+## Chart API
+
+### TPS Chart
+
+```bash
+GET /charts/tps?interval=24h
+```
+
+### Gas Chart
+
+```bash
+GET /charts/gas?interval=24h
+```
+
+### TVL Chart
+
+```bash
+GET /charts/tvl?interval=30d
+```
+
+### Token Price Chart
+
+```bash
+GET /charts/token/{address}?interval=30d
+```
+
+### Gas Heatmap
+
+```bash
+GET /charts/heatmap?days=7
+```
+
+## Export API
+
+### Export Transactions
+
+```bash
+GET /export?type=transactions&format=json
+GET /export?type=transactions&format=csv
+```
+
+### Export Token Transfers
+
+```bash
+GET /export?type=token_transfers&address=0x123&format=json
+```
+
+### Export Blocks
+
+```bash
+GET /export?type=blocks&startBlock=10000&endBlock=20000&format=csv
+```
+
+## Error Codes
+
+| Code | Description |
+|------|------------|
+| 1 | Success |
+| 0 | Error |
+| 400 | Bad Request |
+| 401 | Unauthorized |
+| 403 | Forbidden |
+| 404 | Not Found |
+| 429 | Too Many Requests |
+| 500 | Internal Server Error |
+
+## Response Format
+
+All responses follow this format:
+
+```json
+{
+  "status": "1",
+  "message": "OK",
+  "result": { ... }
+}
+```
+
+## Batch Requests
+
+```bash
+POST /api/v2/batch
+Content-Type: application/json
+
+{
+  "queries": [
+    {"id": "1", "method": "eth_blockNumber", "params": []},
+    {"id": "2", "method": "eth_gasPrice", "params": []}
+  ]
+}
+```
+
+## SDK Examples
+
+### JavaScript
+
+```javascript
+const Tigerscan = require('tigerscan-sdk');
+
+const client = new Tigerscan({
+  apiKey: 'YOUR_API_KEY'
+});
+
+const tokens = await client.getTokens();
+const token = await client.getToken('0x123...');
+const balance = await client.getBalance('0xabc...');
+```
+
+### Python
+
+```python
+from tigerscan import Tigerscan
+
+client = Tigerscan(api_key='YOUR_API_KEY')
+tokens = client.get_tokens()
+token = client.get_token('0x123...')
+balance = client.get_balance('0xabc...')
+```
+
+### Go
+
+```go
+import "github.com/tigersmartchain/sdk/go"
+
+client := sdk.NewClient("YOUR_API_KEY")
+tokens, err := client.GetTokens()
+token, err := client.GetToken("0x123...")
+balance, err := client.GetBalance("0xabc...")
+```
+
+## WebSocket Events
+
+| Event | Description |
+|-------|-------------|
+| new_block | New block mined |
+| new_transaction | New transaction confirmed |
+| pending_transaction | New pending transaction |
+| token_transfer | Token transfer occurred |
+| nft_transfer | NFT transfer occurred |
+| gas_update | Gas price updated |
+| price_update | Token price updated |
+
+## Filtering
+
+### Filter Parameters
+
+- `startBlock` - Starting block number
+- `endBlock` - Ending block number
+- `startTime` - Starting timestamp
+- `endTime` - Ending timestamp
+- `address` - Contract address
+
+### Example
+
+```bash
+GET /api/v2/tokens?startBlock=10000&endBlock=20000
+```
+
+## Pagination
+
+All list endpoints support pagination:
+
+```bash
+GET /api/v2/tokens?page=1&offset=50
+```
+
+- `page` - Page number (default: 1)
+- `offset` - Number of results per page (default: 50, max: 10000)
+
+## Contract file_editor/Write
+
+### Read Contract
+
+```bash
+GET /api/v2/contract/{address}/read?method=name&params=[]
+```
+
+### Write Contract
+
+```bash
+POST /api/v2/contract/{address}/write
+Content-Type: application/json
+
+{
+  "method": "transfer",
+  "params": ["0xto...", "1000000"],
+  "from": "0xfrom..."
+}
+```
+
+## Rate Limit Headers
+
+Responses include rate limit information:
+
+```
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 95
+X-RateLimit-Reset: 1234567890
+```
+
+## Support
+
+- **Email:** api-support@tigerscan.io
+- **Discord:** https://discord.gg/tigerscan
+- **Twitter:** @TigerScan

@@ -1,0 +1,218 @@
+# Kubernetes Deployment for TigerScan API
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-api
+  namespace: tigerscan
+  labels:
+    app: tigerscan-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tigerscan-api
+  template:
+    metadata:
+      labels:
+        app: tigerscan-api
+    spec:
+      containers:
+      - name: tigerscan-api
+        image: tigerscan/api:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: db-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: redis-url
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: api-key
+        - name: ENVIRONMENT
+          value: production
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-api
+  namespace: tigerscan
+spec:
+  selector:
+    app: tigerscan-api
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+  - port: 443
+    targetPort: 8080
+    name: https
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-api-lb
+  namespace: tigerscan
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+spec:
+  selector:
+    app: tigerscan-api
+  ports:
+  - port: 443
+    targetPort: 8080
+    name: https
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tigerscan-api-hpa
+  namespace: tigerscan
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tigerscan-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tigerscan-config
+  namespace: tigerscan
+data:
+  config.yaml: |
+    server:
+      port: 8080
+      read_timeout: 30s
+      write_timeout: 30s
+    database:
+      max_connections: 100
+      idle_connections: 10
+    cache:
+      ttl: 5m
+      max_size: 1000
+    rate_limit:
+      requests_per_minute: 100
+      burst: 10
+    logging:
+      level: info
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tigerscan-secrets
+  namespace: tigerscan
+type: Opaque
+stringData:
+  db-url: postgres://user:pass@host:5432/tigerscan
+  redis-url: redis://host:6379
+  api-key: changeme
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tigerscan-api-network-policy
+  namespace: tigerscan
+spec:
+  podSelector:
+    matchLabels:
+      app: tigerscan-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: nginx-ingress
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - podSelector: {}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tigerscan-quota
+  namespace: tigerscan
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    pods: "50"
+    services: "10"
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tigerscan-api-pdb
+  namespace: tigerscan
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: tigerscan-api
