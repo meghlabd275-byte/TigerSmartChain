@@ -1,0 +1,384 @@
+# TigerScan Production Docker Compose
+# Optimized for production with security and performance
+
+version: '3.9'
+
+services:
+  # =============================================================================
+  # Core Services
+  # =============================================================================
+  
+  # API Server
+  api-server:
+    image: tigerscan/api-server:latest
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 60s
+    environment:
+      - DATABASE_URL=postgres://tigerscan:password@postgres:5432/tigerscan
+      - REDIS_URL=redis://:@redis:6379
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - LOG_LEVEL=info
+      - GIN_MODE=release
+      - GOMAXPROCS=4
+    volumes:
+      - api-data:/data
+    networks:
+      - tigerscan
+    depends_on:
+      - postgres
+      - redis
+      - elasticsearch
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  # GraphQL Server
+  graphql:
+    image: tigerscan/graphql:latest
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    environment:
+      - DATABASE_URL=postgres://tigerscan:password@postgres:5432/tigerscan
+      - REDIS_URL=redis://:@redis:6379
+    networks:
+      - tigerscan
+    depends_on:
+      - postgres
+      - redis
+
+  # WebSocket Server
+  websocket:
+    image: tigerscan/websocket:latest
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - tigerscan
+
+  # =============================================================================
+  # Data Services
+  # =============================================================================
+  
+  # PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+    environment:
+      - POSTGRES_USER=tigerscan
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=tigerscan
+      - POSTGRES_MAX_CONNECTIONS=200
+      - POSTGRES_SHARED_BUFFERS=2GB
+      - POSTGRES_EFFECTIVE_CACHE_SIZE=6GB
+      - POSTGRES_MAINTENANCE_WORK_MEM=512MB
+      - POSTGRES_CHECKPOINT_COMPLETION_TARGET=0.9
+      - POSTGRES_WAL_BUFFERS=16MB
+      - POSTGRES_DEFAULT_STATISTICS_TARGET=100
+      - POSTGRES_RANDOM_PAGE_COST=1.1
+      - POSTGRES_EFFECTIVE_IO_CONCURRENCY=200
+      - POSTGRES_WORK_MEM=16MB
+      - POSTGRES_MIN_WAL_SIZE=1GB
+      - POSTGRES_MAX_WAL_SIZE=4GB
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - tigerscan
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tigerscan"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    command: >
+      redis-server
+      --maxmemory 1536mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --appendonly yes
+      --appendfsync everysec
+      --timeout 0
+      --tcp-keepalive 300
+      --activerehashing yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --replica-read-only yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - tigerscan
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Elasticsearch
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.transport.ssl.enabled=true
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g -XX:+UseG1GC -XX:G1ReservePercent=25 -XX:InitiatingHeapOccupancyPercent=30 -XX:MaxGCPauseMillis=500
+      - cluster.routing.allocation.disk.threshold_enabled=true
+      - cluster.routing.allocation.disk.watermark.low=85%
+      - cluster.routing.allocation.disk.watermark.high=90%
+      - indices.memory.index_buffer_size=20%
+      - indices.queries.cache.size=15%
+      - thread_pool.write.queue_size=1000
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - tigerscan
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # =============================================================================
+  # Blockchain Node
+  # =============================================================================
+  
+  node:
+    image: tigerscan/node:latest
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+    environment:
+      - CHAIN_ID=9001
+      - NETWORK_ID=9001
+      - DATA_DIR=/data
+      - HTTP_HOST=0.0.0.0
+      - HTTP_PORT=8545
+      - HTTP_VHOST=0.0.0.0
+      - WS_HOST=0.0.0.0
+      - WS_PORT=8546
+      - WS_VHOST=0.0.0.0
+      - HTTP_API=eth,net,web3,debug,txpool
+      - WS_API=eth,net,web3,debug,txpool
+      - GAS_PRICE=0
+      - GAS_CAP=1000000
+      - MAX_PEERS=50
+      - NODE_KEY=/data/nodekey
+    volumes:
+      - node-data:/data
+    networks:
+      - tigerscan
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =============================================================================
+  # Security Services
+  # =============================================================================
+  
+  # HAProxy (Load Balancer)
+  haproxy:
+    image: haproxy:2.8
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy/errors:/usr/local/etc/haproxy/errors:ro
+      - ./haproxy/whitelist.txt:/etc/haproxy/whitelist.txt:ro
+      - ./haproxy/blacklist.txt:/etc/haproxy/blacklist.txt:ro
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8404:8404"
+    networks:
+      - tigerscan
+    depends_on:
+      - api-server
+
+  # =============================================================================
+  # Monitoring
+  # =============================================================================
+  
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v2.47
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.wal-compression'
+      - '--query.max-concurrency=10'
+      - '--query.timeout=2m'
+    networks:
+      - tigerscan
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:10.1
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_SERVER_ROOT_URL=https://grafana.tigerscan.io
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    volumes:
+      - ./monitoring/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - tigerscan
+
+  # =============================================================================
+  # Logging
+  # =============================================================================
+  
+  # Logstash
+  logstash:
+    image: logstash:8.11
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    volumes:
+      - ./elk/pipelines:/usr/share/logstash/pipeline:ro
+    environment:
+      - LS_JAVA_OPTS=-Xms1g -Xmx1g -XX:+UseG1GC
+    networks:
+      - tigerscan
+    depends_on:
+      - elasticsearch
+
+  # Filebeat
+  filebeat:
+    image: elastic/filebeat:8.11
+    volumes:
+      - ./logging/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/tigerscan:/var/lib/tigerscan:ro
+      - /var/log/tigerscan:/var/log/tigerscan:ro
+    networks:
+      - tigerscan
+
+  # =============================================================================
+  # Backup
+  # =============================================================================
+  
+  backup:
+    image: alpine:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    volumes:
+      - ./backup/backup.sh:/backup.sh:ro
+      - postgres-data:/postgres:ro
+      - redis-data:/redis:ro
+      - elasticsearch-data:/elasticsearch:ro
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_HOST=redis
+      - S3_BACKUP_BUCKET=${S3_BACKUP_BUCKET}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    networks:
+      - tigerscan
+    command: /bin/sh /backup.sh
+
+networks:
+  tigerscan:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: br-tigerscan
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  elasticsearch-data:
+    driver: local
+  node-data:
+    driver: local
+  api-data:
+    driver: local
+  grafana-data:
+    driver: local
+  prometheus-data:
+    driver: local
