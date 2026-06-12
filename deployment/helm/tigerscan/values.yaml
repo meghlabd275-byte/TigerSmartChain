@@ -1,0 +1,190 @@
+# Default values for TigerSmartChain Helm Chart
+
+# Global configuration
+global:
+  imagePullSecrets: []
+  network: mainnet
+  domain: tigerscan.com
+
+# Node configuration
+node:
+  enabled: true
+  replicas: 1
+  image:
+    repository: tigersmartchain/node
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: 2000m
+      memory: 8Gi
+  persistence:
+    enabled: true
+    size: 500Gi
+    storageClass: ssd
+  config:
+    network: mainnet
+    rpcAddr: "0.0.0.0:8545"
+    p2pAddr: "0.0.0.0:30303"
+    logLevel: info
+
+# API configuration
+api:
+  enabled: true
+  replicas: 2
+  image:
+    repository: tigersmartchain/api
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  service:
+    type: ClusterIP
+    port: 4000
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+    - host: api.tigerscan.com
+      paths:
+      - path: /
+        pathType: Prefix
+    tls:
+    - secretName: tigerscan-api-tls
+      hosts:
+      - api.tigerscan.com
+
+# Indexer configuration
+indexer:
+  enabled: true
+  replicas: 1
+  image:
+    repository: tigersmartchain/indexer
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+  config:
+    startBlock: 1
+    batchSize: 100
+    syncInterval: 15s
+
+# Frontend configuration
+frontend:
+  enabled: true
+  replicas: 2
+  image:
+    repository: tigersmartchain/frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 512Mi
+  service:
+    type: LoadBalancer
+    port: 80
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    hosts:
+    - host: tigerscan.com
+      paths:
+      - path: /
+        pathType: Prefix
+    tls:
+    - secretName: tigerscan-frontend-tls
+      hosts:
+      - tigerscan.com
+
+# PostgreSQL configuration
+postgresql:
+  enabled: true
+  auth:
+    username: tigerscan
+    password: changeme
+    database: tigerscan
+  primary:
+    persistence:
+      enabled: true
+      size: 50Gi
+      storageClass: ssd
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# Redis configuration
+redis:
+  enabled: true
+  auth:
+    password: changeme
+  persistence:
+    enabled: true
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 512Mi
+
+# Monitoring
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    retention: 30d
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+  grafana:
+    enabled: true
+    adminPassword: admin123
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+
+# Security
+security:
+  rateLimit:
+    enabled: true
+    requestsPerMinute: 1000
+  ipBlocking:
+    enabled: true
+    maxFailedAttempts: 5
+  tls:
+    enabled: true
+
+# Autoscaling
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70

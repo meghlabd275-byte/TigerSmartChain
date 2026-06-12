@@ -1,0 +1,58 @@
+# Prometheus Configuration for TigerSmartChain
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # TigerSmartChain Node
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node:9090']
+    metrics_path: '/metrics'
+
+  # Explorer API
+  - job_name: 'explorer-api'
+    static_configs:
+      - targets: ['explorer-api:4000']
+    metrics_path: '/metrics'
+
+  # Indexer
+  - job_name: 'indexer'
+    static_configs:
+      - targets: ['indexer:8080']
+    metrics_path: '/metrics'
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # Redis Exporter
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  # Node Exporter (system metrics)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # Blackbox Exporter
+  - job_name: 'blackbox'
+    metrics_path: '/metrics/probe'
+    static_configs:
+      - targets: ['blackbox:9115']
