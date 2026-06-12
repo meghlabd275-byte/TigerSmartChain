@@ -2,6 +2,30 @@
 -- Version: 1.0.0
 
 -- ============================================
+-- ACCOUNTS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS accounts (
+    id BIGSERIAL PRIMARY KEY,
+    address VARCHAR(42) NOT NULL UNIQUE,
+    balance VARCHAR(66) DEFAULT '0',
+    nonce INTEGER DEFAULT 0,
+    code_hash VARCHAR(66),
+    code_length INTEGER DEFAULT 0,
+    is_contract BOOLEAN DEFAULT FALSE,
+    is_verified BOOLEAN DEFAULT FALSE,
+    is_self_destructed BOOLEAN DEFAULT FALSE,
+    first_block_number BIGINT,
+    last_block_number BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_accounts_address ON accounts(address);
+CREATE INDEX idx_accounts_is_contract ON accounts(is_contract);
+CREATE INDEX idx_accounts_is_verified ON accounts(is_verified);
+CREATE INDEX idx_accounts_balance ON accounts(balance DESC);
+
+-- ============================================
 -- BLOCKS TABLE
 -- ============================================
 CREATE TABLE IF NOT EXISTS blocks (
@@ -500,4 +524,367 @@ COMMENT ON TABLE nfts IS 'NFTs table';
 COMMENT ON TABLE contracts IS 'Verified smart contracts table';
 COMMENT ON TABLE validators IS 'Validators table';
 COMMENT ON TABLE proposals IS 'Governance proposals table';
+-- ============================================
+-- CONTRACTS TABLE (Verified Smart Contracts)
+-- ============================================
+CREATE TABLE IF NOT EXISTS contracts (
+    id BIGSERIAL PRIMARY KEY,
+    address VARCHAR(42) NOT NULL UNIQUE,
+    name VARCHAR(255) NOT NULL,
+    compiler VARCHAR(50) NOT NULL,
+    version VARCHAR(50) NOT NULL,
+    optimization_enabled BOOLEAN DEFAULT TRUE,
+    optimization_runs INTEGER DEFAULT 200,
+    source_code TEXT NOT NULL,
+    abi JSONB,
+    bytecode TEXT,
+    constructor_args TEXT,
+    evm_version VARCHAR(50),
+    library_refs JSONB,
+    is_verified BOOLEAN DEFAULT TRUE,
+    verification_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    verified_by VARCHAR(255),
+    is_proxy BOOLEAN DEFAULT FALSE,
+    proxy_implementation VARCHAR(42),
+    is_upgradable BOOLEAN DEFAULT FALSE,
+    license VARCHAR(100),
+    external_libs JSONB,
+    hits_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_contracts_address ON contracts(address);
+CREATE INDEX idx_contracts_name ON contracts(name);
+CREATE INDEX idx_contracts_compiler ON contracts(compiler);
+CREATE INDEX idx_contracts_is_verified ON contracts(is_verified);
+CREATE INDEX idx_contracts_is_proxy ON contracts(is_proxy);
+
+-- ============================================
+-- LOGS TABLE (EVM Event Logs)
+-- ============================================
+CREATE TABLE IF NOT EXISTS logs (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    address VARCHAR(42) NOT NULL,
+    topics JSONB NOT NULL,
+    data TEXT NOT NULL,
+    log_index INTEGER NOT NULL,
+    timestamp BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE,
+    UNIQUE(transaction_hash, log_index)
+);
+
+CREATE INDEX idx_logs_tx ON logs(transaction_hash);
+CREATE INDEX idx_logs_block ON logs(block_number DESC);
+CREATE INDEX idx_logs_address ON logs(address);
+CREATE INDEX idx_logs_timestamp ON logs(timestamp DESC);
+
+-- ============================================
+-- GAS PRICES HISTORY TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS gas_prices (
+    id BIGSERIAL PRIMARY KEY,
+    block_number BIGINT NOT NULL,
+    slow_gas_price BIGINT NOT NULL,
+    avg_gas_price BIGINT NOT NULL,
+    fast_gas_price BIGINT NOT NULL,
+    base_fee_per_gas BIGINT,
+    timestamp BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_gas_prices_block ON gas_prices(block_number);
+CREATE INDEX idx_gas_prices_timestamp ON gas_prices(timestamp DESC);
+
+-- ============================================
+-- API KEYS TABLE (Rate Limiting)
+-- ============================================
+CREATE TABLE IF NOT EXISTS api_keys (
+    id BIGSERIAL PRIMARY KEY,
+    key_hash VARCHAR(255) NOT NULL UNIQUE,
+    key_prefix VARCHAR(20) NOT NULL,
+    user_id VARCHAR(255) NOT NULL,
+    label VARCHAR(255),
+    rate_limit INTEGER DEFAULT 1000,
+    rate_limit_window INTEGER DEFAULT 60,
+    requests_count INTEGER DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    expires_at TIMESTAMP,
+    last_used_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX idx_api_keys_user ON api_keys(user_id);
+CREATE INDEX idx_api_keys_is_active ON api_keys(is_active);
+
+-- ============================================
+-- AUDIT LOGS TABLE (Security)
+-- ============================================
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    user_id VARCHAR(255),
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id VARCHAR(255),
+    ip_address INET,
+    user_agent TEXT,
+    metadata JSONB,
+    success BOOLEAN DEFAULT TRUE,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
+CREATE INDEX idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX idx_audit_logs_created ON audit_logs(created_at DESC);
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
+
+-- ============================================
+-- STAKING TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS stakings (
+    id BIGSERIAL PRIMARY KEY,
+    delegator VARCHAR(42) NOT NULL,
+    validator VARCHAR(42) NOT NULL,
+    amount VARCHAR(66) NOT NULL,
+    rewards VARCHAR(66) DEFAULT '0',
+    lock_start_time BIGINT,
+    lock_end_time BIGINT,
+    is_compound BOOLEAN DEFAULT FALSE,
+    is_withdrawn BOOLEAN DEFAULT FALSE,
+    block_number BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (validator) REFERENCES validators(address) ON DELETE CASCADE,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_stakings_delegator ON stakings(delegator);
+CREATE INDEX idx_stakings_validator ON stakings(validator);
+CREATE INDEX idx_staking_is_withdrawn ON stakings(is_withdrawn);
+
+-- ============================================
+-- BRIDGE TRANSFERS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS bridge_transfers (
+    id BIGSERIAL PRIMARY KEY,
+    transfer_id VARCHAR(100) NOT NULL UNIQUE,
+    source_chain_id BIGINT NOT NULL,
+    dest_chain_id BIGINT NOT NULL,
+    sender VARCHAR(42) NOT NULL,
+    recipient VARCHAR(42) NOT NULL,
+    token_address VARCHAR(42),
+    amount VARCHAR(66),
+    amount_usd VARCHAR(66),
+    status VARCHAR(50) DEFAULT 'pending',
+    direction VARCHAR(10) NOT NULL,
+    fee VARCHAR(66),
+    nonce BIGINT,
+    message_hash VARCHAR(66),
+    confirmation_time BIGINT,
+    completion_time BIGINT,
+    block_number BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_bridge_transfers_id ON bridge_transfers(transfer_id);
+CREATE INDEX idx_bridge_transfers_sender ON bridge_transfers(sender);
+CREATE INDEX idx_bridge_transfers_recipient ON bridge_transfers(recipient);
+CREATE INDEX idx_bridge_transfers_status ON bridge_transfers(status);
+
+-- ============================================
+-- CONTRACT EVENTS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS contract_events (
+    id BIGSERIAL PRIMARY KEY,
+    contract_address VARCHAR(42) NOT NULL,
+    event_name VARCHAR(255) NOT NULL,
+    event_signature VARCHAR(255) NOT NULL,
+    topic0 VARCHAR(66),
+    first_block BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (contract_address) REFERENCES contracts(address) ON DELETE CASCADE,
+    UNIQUE(contract_address, event_signature)
+);
+
+CREATE INDEX idx_contract_events_address ON contract_events(contract_address);
+
+-- ============================================
+-- TOKEN TRANSFERS (ADDITIONAL INDEXES)
+-- ============================================
+CREATE INDEX idx_token_transfers_timestamp ON token_transfers(timestamp DESC);
+CREATE INDEX idx_token_transfers_value ON (value::NUMERIC(78,0));
+
+-- ============================================
+-- NFT TRANSFERS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS nft_transfers (
+    id BIGSERIAL PRIMARY KEY,
+    nft_address VARCHAR(42) NOT NULL,
+    token_id VARCHAR(78) NOT NULL,
+    hash VARCHAR(66) NOT NULL UNIQUE,
+    block_number BIGINT NOT NULL,
+    transaction_hash VARCHAR(66) NOT NULL,
+    from_address VARCHAR(42) NOT NULL,
+    to_address VARCHAR(42) NOT NULL,
+    amount BIGINT DEFAULT 1,
+    log_index INTEGER,
+    timestamp BIGINT NOT NULL,
+    is_mint BOOLEAN DEFAULT FALSE,
+    is_burn BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_nft_transfers_address ON nft_transfers(nft_address);
+CREATE INDEX idx_nft_transfers_token ON nft_transfers(nft_address, token_id);
+CREATE INDEX idx_nft_transfers_from ON nft_transfers(from_address);
+CREATE INDEX idx_nft_transfers_to ON nft_transfers(to_address);
+CREATE INDEX idx_nft_transfers_block ON nft_transfers(block_number DESC);
+CREATE INDEX idx_nft_transfers_timestamp ON nft_transfers(timestamp DESC);
+
+-- ============================================
+-- VIEW: VERIFIED CONTRACTS
+-- ============================================
+CREATE OR REPLACE VIEW v_verified_contracts AS
+SELECT address, name, compiler, version, is_verified, is_proxy, proxy_implementation, hits_count
+FROM contracts
+WHERE is_verified = TRUE
+ORDER BY hits_count DESC;
+
+-- ============================================
+-- VIEW: PENDING TRANSACTIONS
+-- ============================================
+CREATE OR REPLACE VIEW v_pending_transactions AS
+SELECT hash, from_address, to_address, value, gas_price, nonce, created_at
+FROM transactions
+WHERE status = 0
+ORDER BY gas_price DESC, created_at ASC;
+
+-- ============================================
+-- VIEW: LATEST TRANSACTIONS WITH BLOCK INFO
+-- ============================================
+CREATE OR REPLACE VIEW v_transactions_with_blocks AS
+SELECT t.hash, t.from_address, t.to_address, t.value, t.gas_used, t.gas_price, 
+       t.status, t.input_data, b.number as block_number, b.timestamp
+FROM transactions t
+LEFT JOIN blocks b ON t.block_number = b.number
+WHERE t.status != 0
+ORDER BY b.timestamp DESC, t.transaction_index DESC
+LIMIT 100;
+
+-- ============================================
+-- VIEW: TOP TOKEN HOLDERS
+-- ============================================
+CREATE OR REPLACE VIEW v_top_token_holders AS
+SELECT th.token_address, th.address, th.balance, th.percent
+FROM token_holders th
+JOIN tokens t ON t.address = th.token_address
+WHERE th.balance::NUMERIC(78,0) > 0
+ORDER BY th.balance::NUMERIC(78,0) DESC
+LIMIT 100;
+
+-- ============================================
+-- VIEW: NETWORK STATS
+-- ============================================
+CREATE OR REPLACE VIEW v_network_stats AS
+SELECT 
+    (SELECT COUNT(*) FROM blocks) as total_blocks,
+    (SELECT COUNT(*) FROM transactions WHERE status = 1) as total_transactions,
+    (SELECT COUNT(DISTINCT from_address) FROM transactions) as unique_senders,
+    (SELECT COUNT(*) FROM tokens) as total_tokens,
+    (SELECT COUNT(*) FROM collections) as total_collections,
+    (SELECT COUNT(*) FROM nfts) as total_nfts,
+    (SELECT SUM(gas_used::BIGINT) FROM blocks) as total_gas_used,
+    (SELECT AVG(avg_gas_price::BIGINT) FROM gas_prices ORDER BY timestamp DESC LIMIT 1) as current_gas_price;
+
+-- ============================================
+-- FUNCTION: SEARCH EXPLORER
+-- ============================================
+CREATE OR REPLACE FUNCTION search_explorer(query_text TEXT)
+RETURNS TABLE (
+    result_type VARCHAR(50),
+    result_id VARCHAR(255),
+    result_data JSONB,
+    rank_score FLOAT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 'block'::VARCHAR(50), 
+           b.number::VARCHAR(255),
+           jsonb_build_object('hash', b.hash, 'txs', (SELECT COUNT(*) FROM transactions WHERE block_number = b.number), 'gas', b.gas_used)::JSONB,
+           1.0::FLOAT
+    FROM blocks b
+    WHERE b.number = query_text::BIGINT OR b.hash LIKE query_text || '%'
+    UNION ALL
+    SELECT 'transaction'::VARCHAR(50),
+           t.hash::VARCHAR(255),
+           jsonb_build_object('from', t.from_address, 'to', t.to_address, 'value', t.value, 'status', t.status)::JSONB,
+           1.0::FLOAT
+    FROM transactions t
+    WHERE t.hash LIKE query_text || '%'
+    UNION ALL
+    SELECT 'token'::VARCHAR(50),
+           tok.address::VARCHAR(255),
+           jsonb_build_object('name', tok.name, 'symbol', tok.symbol, 'holders', tok.holders_count)::JSONB,
+           1.0::FLOAT
+    FROM tokens tok
+    WHERE tok.symbol ILIKE query_text || '%' OR tok.name ILIKE '%' || query_text || '%'
+    UNION ALL
+    SELECT 'address'::VARCHAR(50),
+           a.address::VARCHAR(255),
+           jsonb_build_object('balance', a.balance)::JSONB,
+           0.5::FLOAT
+    FROM accounts a
+    WHERE a.address LIKE query_text || '%'
+    LIMIT 100;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================
+-- FUNCTION: GET ACCOUNT TOTAL BALANCE
+-- ============================================
+CREATE OR REPLACE FUNCTION get_account_total_balance(addr VARCHAR(42))
+RETURNS NUMERIC(78, 0) AS $$
+DECLARE
+    native_balance NUMERIC(78, 0);
+    token_balance NUMERIC(78, 0);
+BEGIN
+    SELECT COALESCE(a.balance::NUMERIC(78, 0), 0) INTO native_balance 
+    FROM accounts a WHERE a.address = addr;
+    
+    SELECT COALESCE(SUM(th.balance::NUMERIC(78, 0) * COALESCE(t.price::NUMERIC(78, 18)::NUMERIC(78, 0), 0)), 0)
+    INTO token_balance
+    FROM token_holders th
+    JOIN tokens t ON t.address = th.token_address
+    WHERE th.address = addr AND th.balance::NUMERIC(78, 0) > 0;
+    
+    RETURN COALESCE(native_balance, 0) + token_balance;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================
+-- COMMENTS
+-- ============================================
+COMMENT ON TABLE blocks IS 'Blockchain blocks table';
+COMMENT ON TABLE transactions IS 'Blockchain transactions table';
+COMMENT ON TABLE tokens IS 'BEP20 tokens table';
+COMMENT ON TABLE collections IS 'NFT collections table';
+COMMENT ON TABLE nfts IS 'NFTs table';
+COMMENT ON TABLE contracts IS 'Verified smart contracts table';
+COMMENT ON TABLE validators IS 'Validators table';
+COMMENT ON TABLE proposals IS 'Governance proposals table';
 COMMENT ON TABLE daily_stats IS 'Daily network statistics';
+COMMENT ON TABLE logs IS 'EVM event logs';
+COMMENT ON TABLE gas_prices IS 'Historical gas prices';
+COMMENT ON TABLE api_keys IS 'API keys for rate limiting';
+COMMENT ON TABLE audit_logs IS 'Security audit trail';
+COMMENT ON TABLE bridge_transfers IS 'Cross-chain bridge transfers';
