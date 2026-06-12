@@ -1,0 +1,65 @@
+# Logstash Configuration for TigerScan
+# Production-grade log processing pipeline with security
+
+# Node settings
+node.name: tigerscan-logstash
+pipeline.workers: 8
+pipeline.batch.size: 500
+pipeline.batch.delay: 50
+
+# HTTP settings
+http.host: 0.0.0.0
+http.port: 9600
+
+# TLS/SSL configuration
+xpack.security.enabled: true
+xpack.monitoring.enabled: true
+xpack.monitoring.elasticsearch.hosts: ["${ELASTICSEARCH_HOSTS}"]
+
+# TLS settings
+xpack.security.ssl.enabled: true
+xpack.security.ssl.keystore.path: certs/logstash.p12
+xpack.security.ssl.keystore.password: ${LOGSTASH_PASSWORD}
+xpack.security.ssl.truststore.path: certs/logstash.p12
+xpack.security.ssl.truststore.password: ${LOGSTASH_PASSWORD}
+
+# JVM settings
+jvm.options: |
+  -Xms4g
+  -Xmx4g
+  -XX:+UseG1GC
+  -XX:G1ReservePercent=20
+  -XX:MaxGCPauseMillis=200
+  -Djava.io.tmpdir=/tmp/logstash
+  -XX:+HeapDumpOnOutOfMemoryError
+  -XX:HeapDumpPath=/var/log/logstash
+  -Xss512k
+  -XX:ErrorFile=/var/log/logstash/hs_err_pid%p.log
+
+# Logging
+log.level: info
+log.format: json
+
+# Pipeline configurations
+# Main pipeline for explorer logs
+pipeline.id: main
+
+# Input缓冲设置
+queue.type: persisted
+queue.page_capacity: 512mb
+queue.max_bytes: 8gb
+queue.checkpoint.interval: 1000
+
+# Filter workers
+filter workers: 4
+
+# Dead letter queue
+dlq.enabled: true
+dlq.max_size: 1gb
+dlq.path: /var/lib/logstash/dlq
+
+# Path settings
+path.data: /var/lib/logstash
+path.config: /etc/logstash/conf.d
+path.logs: /var/log/logstash
+path.plugins: /usr/share/logstash/plugins

@@ -1,0 +1,110 @@
+# Elasticsearch Configuration for TigerScan
+# Production-grade Elasticsearch cluster configuration with security
+
+cluster.name: tigerscan-elasticsearch
+cluster.routing.allocation.disk.threshold_enabled: true
+cluster.routing.allocation.disk.watermark.low: 85%
+cluster.routing.allocation.disk.watermark.high: 90%
+cluster.routing.allocation.disk.watermark.flood_stage: 95%
+
+# Node roles
+node.name: ${NODE_NAME}
+node.roles: [master, data, ingest]
+node.attr.box_type: hot
+
+# Network
+network.host: 0.0.0.0
+transport.tcp.port: 9300
+http.port: 9200
+
+# HTTP configuration
+http.max_content_length: 500mb
+http.cors.enabled: true
+http.cors.allow-origin: "/.*/"
+http.cors.allow-methods: "OPTIONS, HEAD, GET, POST, PUT, DELETE"
+http.cors.allow-headers: "X-Requested-With, X-Auth-Token, Content-Type, Authorization"
+
+# Security - TLS/SSL configuration
+xpack.security.enabled: true
+xpack.security.enrollment.enabled: true
+
+# Enable SSL/TLS
+xpack.security.transport.ssl.enabled: true
+xpack.security.transport.ssl.verification_mode: certificate
+xpack.security.transport.ssl.client_authentication: optional
+xpack.security.transport.ssl.keystore.path: certs/elastic-certificates.p12
+xpack.security.transport.ssl.keystore.password: ${ELASTIC_PASSWORD}
+xpack.security.transport.ssl.truststore.path: certs/elastic-certificates.p12
+xpack.security.transport.ssl.truststore.password: ${ELASTIC_PASSWORD}
+
+# HTTP SSL
+xpack.security.http.ssl.enabled: true
+xpack.security.http.ssl.keystore.path: certs/elastic-certificates.p12
+xpack.security.http.ssl.keystore.password: ${ELASTIC_PASSWORD}
+
+# Authentication
+xpack.security.authc.enabled: true
+xpack.security.authc.realms:
+  native:
+    native1:
+      order: 1
+
+# Index settings
+indices.memory.index_buffer_size: 30%
+indices.queries.cache.size: 15%
+indices.fielddata.cache.size: 20%
+
+# Thread pools
+thread_pool.write.queue_size: 1000
+thread_pool.search.queue_size: 2000
+
+# JVM settings
+# NOTE: Set heap size to no more than 50% of available RAM
+# Production should be at least 16GB for production
+jvm.options: |
+  -Xms8g
+  -Xmx8g
+  -XX:+UseG1GC
+  -XX:G1ReservePercent=25
+  -XX:InitiatingHeapOccupancyPercent=30
+  -XX:MaxGCPauseMillis=500
+  -Djava.io.tmpdir=${ES_TMPDIR}
+  -XX:+HeapDumpOnOutOfMemoryError
+  -XX:HeapDumpPath=/var/log/elasticsearch
+  -XX:ErrorFile=/var/log/elasticsearch/hs_err_pid%p.log
+  -Xss1m
+  -XX:+AlwaysPreTouch
+  -XX:-UseBiasedLocking
+  -XX:UseAVX=2
+
+# Logging
+logger.level: info
+logger.org.elasticsearch: warn
+logger.org.index.store: INFO
+
+# Network retry
+transport.ping_schedule: 30s
+
+# Discovery
+discovery.seed_hosts: ${ELASTIC_SEED_HOSTS}
+discovery.cluster_formation_warning_threshold: 30s
+
+# Gateway
+gateway.recover_after_time: 5m
+gateway.recover_after_nodes: 2
+
+# Scripts
+script.allowed_types: inline, stored, indexed
+script.max_compilations_rate: 10000/1m
+
+# Repositories
+repositories.url.allowed_urls: ["https://*"]
+
+# Audit
+xpack.security.audit.enabled: true
+xpack.security.audit.logfile.events.include: authentication_success, authentication_failure, access_denied, run_as_denied, run_as_success
+xpack.security.audit.logfile.events.exclude: ""
+xpack.security.audit.logfile.emit_node_host_address: true
+xpack.security.audit.logfile.emit_node_name: true
+xpack.security.audit.logfile.emit_index_name: true
+xpack.security.audit.logfile.emit_username: true

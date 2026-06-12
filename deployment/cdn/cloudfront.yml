@@ -1,0 +1,300 @@
+# CloudFront CDN Configuration for TigerScan
+# Production-grade CDN with security
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFront CDN for TigerScan'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+      - development
+  
+  DomainName:
+    Type: String
+    Default: tigerscan.io
+  
+  AlternativeDomainName:
+    Type: String
+    Default: cdn.tigerscan.io
+
+Resources:
+  # CloudFront Distribution
+  CDNDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'TigerScan CDN - ${Environment}'
+        
+        # Default root object
+        DefaultRootObject: index.html
+        
+        # Price class
+        PriceClass: PriceClass_100
+        
+        # ACM Certificate
+        ViewerCertificate:
+          AcmCertificateArn: !Sub 'arn:aws:acm:us-east-1:${AWS::AccountId}:certificate/${CertificateId}'
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        
+        # Custom error responses
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 403
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 500
+            ResponseCode: 500
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 501
+            ResponseCode: 501
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 502
+            ResponseCode: 502
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 503
+            ResponseCode: 503
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 504
+            ResponseCode: 504
+            ResponsePagePath: /error.html
+            ErrorCachingMinTTL: 60
+        
+        # Default cache behavior
+        DefaultCacheBehavior:
+          TargetOriginId: TigerscanOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          
+          # Cache policy
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          
+          # Origin request policy
+          OriginRequestPolicyId: 216adef3-5f84-4c59-91b5-336a864d9f26
+          
+          # Response headers policy
+          ResponseHeadersPolicyId: 5ea8d5a3-7f7d-4b3d-a5e2-47e2ae2e52e3
+          
+          # Field-level encryption
+          FieldLevelEncryptionId: ''
+          
+          # Function associations
+          FunctionAssociations:
+            - EventType: origin-request
+              FunctionARN: !Sub 'arn:aws:cloudfront:${AWS::AccountId}:function/tigerscan-origin'
+            - EventType: viewer-request
+              FunctionARN: !Sub 'arn:aws:cloudfront:${AWS::AccountId}:function/tigerscan-viewer'
+        
+        # Origin settings
+        Origins:
+          - Id: TigerscanOrigin
+            DomainName: !Sub 'tigerscan-origin.${Environment}.example.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: match-viewer
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginReadTimeout: 10
+              OriginKeepaliveTimeout: 5
+            OriginShield:
+              Enabled: true
+              ShieldRegion: us-east-1
+            # Custom headers
+            CustomHeaders:
+              - HeaderName: X-TigerScan-Environment
+                HeaderValue: !Sub '${Environment}'
+        
+        # Logging
+        Logging:
+          Bucket: !Sub 'logs.tigerscan.io'
+          Prefix: 'cdn/'
+          IncludeCookies: false
+        
+        # Web ACL (WAF)
+        WebACLId: !Sub 'arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:webacl/tigerscan-waf'
+        
+        # Geo restrictions
+        GeoRestrictions:
+          RestrictionType: allow
+          Locations:
+            - US
+            - GB
+            - DE
+            - JP
+            - SG
+            - AU
+        
+        # Cache behaviors for static assets
+        CacheBehaviors:
+          # Images
+          - PathPattern: '/images/*'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            TrustedSigners:
+              - self
+            MinTTL: 86400
+            DefaultTTL: 86400
+            MaxTTL: 2592000
+          
+          # JavaScript
+          - PathPattern: '*.js'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 3600
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+          
+          # CSS
+          - PathPattern: '*.css'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 3600
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+          
+          # Fonts
+          - PathPattern: '*.woff*'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 86400
+            DefaultTTL: 86400
+            MaxTTL: 31536000
+          
+          # Images (extended cache)
+          - PathPattern: '/static/images/*'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 604800
+            DefaultTTL: 604800
+            MaxTTL: 2592000
+          
+          # API (no cache)
+          - PathPattern: '/api/*'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+          
+          # WebSocket (no cache)
+          - PathPattern: '/ws/*'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - POST
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: false
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 0
+            DefaultTTL: 0
+            MaxTTL: 0
+          
+          # Docs (long cache)
+          - PathPattern: '/docs/*'
+            TargetOriginId: TigerscanOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            MinTTL: 3600
+            DefaultTTL: 86400
+            MaxTTL: 2592000
+
+Outputs:
+  DistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CDNDistribution
+    Export: !Sub '${AWS::StackName}-DistributionId'
+  
+  DistributionDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt CDNDistribution.DomainName
+    Export: !Sub '${AWS::StackName}-DomainName'
+  
+  DistributionARN:
+    Description: CloudFront Distribution ARN
+    Value: !GetAtt CDNDistribution.Arn
+    Export: !Sub '${AWS::StackName}-ARN'

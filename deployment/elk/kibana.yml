@@ -1,0 +1,71 @@
+# Kibana Configuration for TigerScan
+# Production-grade Kibana dashboard with security
+
+server.name: tigerscan-kibana
+server.host: "0.0.0.0"
+server.port: 5601
+
+# Server base URL
+server.basePath: ""
+server.maxPayload: 2097152
+
+# ElasticSearch configuration
+elasticsearch.hosts: ["${ELASTICSEARCH_HOSTS}"]
+elasticsearch.requestTimeout: 60000
+elasticsearch.shardTimeout: 30000
+
+# Logging
+logging.dest: /var/log/kibana/kibana.log
+logging.quiet: false
+logging.verbose: false
+logging.max_old_files: 10
+logging.max_file_size: 2048mb
+
+# Security - TLS/SSL
+server.ssl.enabled: true
+server.ssl.key: /etc/kibana/ssl/kibana.key
+server.ssl.certificate: /etc/kibana/ssl/kibana.crt
+
+# Elasticsearch security
+elasticsearch.ssl.verify: true
+elasticsearch.ssl.certificate: /etc/kibana/ssl/elasticsearch.crt
+elasticsearch.ssl.certificateAuthorities: /etc/kibana/ssl/ca.crt
+
+# Authentication
+xpack.security.enabled: true
+xpack.security.encryptionKey: ${KIBANA_ENCRYPTION_KEY}
+
+# Session configuration
+ops.cGroupOverrides.cpuPath: /sys/fs/cgroup/cpu,cpuacct:
+ops.cGroupOverrides.cpuAcctPath: /sys/fs/cgroup/cpu,cpuacct:
+
+# CSP configuration for security
+csp.strict: true
+csp.warnLegacyBrowsers: false
+
+# Monitoring
+ops.interval: 10000
+
+# Elasticsearch tribe nodes
+# elasticsearch.tribe:
+
+# Status allowed domains
+csp.allowOrigins: ["https://tigerscan.io", "https://api.tigerscan.io"]
+csp.allowHeaders: ["SecurityHeadersContent"]
+
+# Saved objects
+savedObjects.maxImportPayloadSize: 33554432
+savedObjects.maxExportPayloadSize: 33554432
+
+# Memory limits
+ops.cGroupOverrides.memoryPath: /sys/fs/cgroup/memory,memory:
+ops.cGroupOverrides.memoryLimit: 4294967296
+
+# Map tiles
+map.tilemap.options.reuseTiles: true
+map.tilemap.options.minZoom: 0
+map.tilemap.options.maxZoom: 19
+map.tilemap.options.subdomains: "a,b,c,d"
+
+# Encryption key
+newsfeed.enabled: false
