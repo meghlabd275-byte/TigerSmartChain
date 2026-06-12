@@ -200,12 +200,15 @@ func (d *Decompiler) extractFunctions(code []byte) []DecompiledFunction {
 	// Try to detect common function selectors
 	knownSelectors := map[string]string{
 		"0xa9059cbb": "transfer",
-		0x23b872dd": "transferFrom",
-		0x095ea7b3": "approve",
-		0x70a08231": "balanceOf",
-		0x18160ddd": "totalSupply",
-		0x40c10f19": "mint",
-		0x42966c68": "burn",
+		"0x23b872dd": "transferFrom",
+		"0x095ea7b3": "approve",
+		"0x70a08231": "balanceOf",
+		"0x18160ddd": "totalSupply",
+		"0x40c10f19": "mint",
+		"0x42966c68": "burn",
+		"0x2e1a7d4d": "delegate",
+		"0x5c60da1b": "implementation",
+		"0x1601c21d": "initialize",
 	}
 	
 	for selector, name := range knownSelectors {
