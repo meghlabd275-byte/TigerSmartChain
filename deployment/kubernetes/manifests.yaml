@@ -1,0 +1,578 @@
+# TigerScan Kubernetes Production Deployment
+# Complete Kubernetes manifests for all services
+
+---
+# PostgreSQL
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tigerscan-postgres-pvc
+  namespace: tigerscan
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tigerscan-postgres
+  namespace: tigerscan
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: tigerscan
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tigerscan-secrets
+                  key: postgres-password
+            - name: POSTGRES_DB
+              value: tigerscan
+          volumeMounts:
+            - name: postgres-storage
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1000m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - tigerscan
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - tigerscan
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: postgres-storage
+          persistentVolumeClaim:
+            claimName: tigerscan-postgres-pvc
+
+---
+# Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-redis
+  namespace: tigerscan
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - redis-server
+            - --appendonly
+            - yes
+            - --maxmemory
+            - "512mb"
+            - --maxmemory-policy
+            - allkeys-lru
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          volumeMounts:
+            - name: redis-storage
+              mountPath: /data
+      volumes:
+        - name: redis-storage
+          emptyDir: {}
+
+---
+# Blockchain Node
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-node
+  namespace: tigerscan
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node
+  template:
+    metadata:
+      labels:
+        app: node
+    spec:
+      containers:
+        - name: node
+          image: ethereum/client-go:stable
+          command:
+            - /bin/sh
+            - -c
+            - >
+              geth 
+              --mainnet 
+              --http 
+              --http.addr=0.0.0.0 
+              --http.port=8545 
+              --http.api=eth,net,web3,debug,txpool 
+              --ws 
+              --ws.addr=0.0.0.0 
+              --ws.port=8546 
+              --ws.api=eth,net,web3,debug,txpool 
+              --http.corsdomain="*" 
+              --ws.origins="*" 
+              --cache=2048 
+              --maxpeers=100
+          ports:
+            - name: http-rpc
+              containerPort: 8545
+            - name: ws-rpc
+              containerPort: 8546
+            - name: p2p
+              containerPort: 30303
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2000m"
+            limits:
+              memory: "8Gi"
+              cpu: "4000m"
+          volumeMounts:
+            - name: node-storage
+              mountPath: /geth
+      volumes:
+        - name: node-storage
+          emptyDir:
+            sizeLimit: 500Gi
+
+---
+# Indexer Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-indexer
+  namespace: tigerscan
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: indexer
+  template:
+    metadata:
+      labels:
+        app: indexer
+    spec:
+      containers:
+        - name: indexer
+          image: tigerscan/indexer:latest
+          env:
+            - name: POSTGRES_HOST
+              value: tigerscan-postgres
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: tigerscan
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tigerscan-secrets
+                  key: postgres-password
+            - name: POSTGRES_DB
+              value: tigerscan
+            - name: INDEXER_RPC_URL
+              value: http://tigerscan-node:8545
+            - name: INDEXER_CHAIN_ID
+              value: "9001"
+            - name: INDEXER_BATCH_SIZE
+              value: "100"
+            - name: INDEXER_WORKERS
+              value: "4"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# API Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-api
+  namespace: tigerscan
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      containers:
+        - name: api
+          image: tigerscan/api:latest
+          env:
+            - name: POSTGRES_HOST
+              value: tigerscan-postgres
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: tigerscan
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tigerscan-secrets
+                  key: postgres-password
+            - name: REDIS_HOST
+              value: tigerscan-redis
+            - name: REDIS_PORT
+              value: "6379"
+            - name: API_PORT
+              value: "8080"
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - api
+                topologyKey: kubernetes.io/hostname
+
+---
+# Frontend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-frontend
+  namespace: tigerscan
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: tigerscan/frontend:latest
+          env:
+            - name: API_URL
+              value: http://tigerscan-api
+            - name: NEXT_PUBLIC_CHAIN_ID
+              value: "9001"
+            - name: NEXT_PUBLIC_CHAIN_NAME
+              value: TigerSmartChain
+            - name: NEXT_PUBLIC_TOKEN_SYMBOL
+              value: TGR
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+---
+# WebSocket Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-websocket
+  namespace: tigerscan
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: websocket
+  template:
+    metadata:
+      labels:
+        app: websocket
+    spec:
+      containers:
+        - name: websocket
+          image: tigerscan/websocket:latest
+          env:
+            - name: REDIS_HOST
+              value: tigerscan-redis
+            - name: REDIS_PORT
+              value: "6379"
+            - name: WS_PORT
+              value: "8081"
+          ports:
+            - containerPort: 8081
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "200m"
+
+---
+# Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-postgres
+  namespace: tigerscan
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: postgres
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-redis
+  namespace: tigerscan
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6379
+      targetPort: 6379
+  selector:
+    app: redis
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-node
+  namespace: tigerscan
+spec:
+  type: ClusterIP
+  ports:
+    - name: http-rpc
+      port: 8545
+      targetPort: 8545
+    - name: ws-rpc
+      port: 8546
+      targetPort: 8546
+  selector:
+    app: node
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-api
+  namespace: tigerscan
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: api
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-frontend
+  namespace: tigerscan
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 3000
+  selector:
+    app: frontend
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tigerscan-ingress
+  namespace: tigerscan
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: tigerscan.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tigerscan-frontend
+                port:
+                  number: 80
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: tigerscan-api
+                port:
+                  number: 8080
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: tigerscan-websocket
+                port:
+                  number: 8081
+  tls:
+    - hosts:
+        - tigerscan.example.com
+      secretName: tigerscan-tls
+
+---
+# Horizontal Pod Autoscaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tigerscan-api-hpa
+  namespace: tigerscan
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tigerscan-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tigerscan-secrets
+  namespace: tigerscan
+type: Opaque
+stringData:
+  postgres-password: changeme
+  api-secret-key: your-secret-key-here
+
+---
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tigerscan-config
+  namespace: tigerscan
+data:
+  CHAIN_ID: "9001"
+  CHAIN_NAME: "TigerSmartChain"
+  TOKEN_SYMBOL: "TGR"
+  TOKEN_NAME: "Tiger Coin"
+  EXPLORER_URL: "https://tigerscan.io"
+  API_URL: "https://api.tigerscan.io"
+  RPC_URL: "https://rpc.tigerscan.io"
