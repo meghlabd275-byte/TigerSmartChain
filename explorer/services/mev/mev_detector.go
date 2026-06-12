@@ -121,10 +121,10 @@ func (d *SandwichAttackDetector) isLargeSwap(tx *Transaction) bool {
 		"0x7ff36ab5", // swapExactETHForTokens
 		"0xb88a802f", // swapETHForExactTokens
 		"0x38ed1739", // swapExactTokensForETH
-		0x3cb4b7a4", // swapTokensForExactETH
-		0x8803dbee", // swapExactTokensForTokens
-		0x4e1cff86", // swapTokensForExactTokens
-		0x5c11d495", // multicall
+		"0x3cb4b7a4", // swapTokensForExactETH
+		"0x8803dbee", // swapExactTokensForTokens
+		"0x4e1cff86", // swapTokensForExactTokens
+		"0x5c11d495", // multicall
 	}
 	
 	for _, sig := range swapSigs {
