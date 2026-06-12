@@ -1,0 +1,16 @@
+[package]
+name = "tiger-mempool-sync"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "Mempool Sync for TigerScan"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
