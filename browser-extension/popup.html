@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TigerScan</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      width: 320px;
+      min-height: 400px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+    }
+    .header {
+      background: #F7931A;
+      color: white;
+      padding: 16px;
+      text-align: center;
+    }
+    .header h1 {
+      font-size: 18px;
+      font-weight: bold;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 12px;
+    }
+    .stat-card {
+      background: white;
+      padding: 12px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .stat-label {
+      font-size: 12px;
+      color: #666;
+    }
+    .stat-value {
+      font-size: 16px;
+      font-weight: bold;
+      color: #F7931A;
+    }
+    .section {
+      padding: 12px;
+    }
+    .section-title {
+      font-size: 14px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+    .search-box {
+      display: flex;
+      gap: 8px;
+    }
+    .search-input {
+      flex: 1;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    .search-btn {
+      background: #F7931A;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .search-btn:hover {
+      background: #e0850d;
+    }
+    .quick-links {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+    .quick-link {
+      background: white;
+      padding: 12px;
+      border-radius: 8px;
+      text-align: center;
+      text-decoration: none;
+      color: #333;
+      font-size: 12px;
+    }
+    .quick-link:hover {
+      background: #f0f0f0;
+    }
+    .quick-link-icon {
+      font-size: 24px;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .gas-section {
+      background: white;
+      margin: 12px;
+      padding: 12px;
+      border-radius: 8px;
+    }
+    .gas-title {
+      font-size: 14px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+    .gas-options {
+      display: flex;
+      gap: 8px;
+    }
+    .gas-option {
+      flex: 1;
+      text-align: center;
+      padding: 8px;
+      background: #f5f5f5;
+      border-radius: 6px;
+    }
+    .gas-option-label {
+      font-size: 10px;
+      color: #666;
+    }
+    .gas-option-value {
+      font-size: 14px;
+      font-weight: bold;
+      color: #F7931A;
+    }
+    .footer {
+      padding: 12px;
+      text-align: center;
+      font-size: 11px;
+      color: #666;
+    }
+    .footer a {
+      color: #F7931A;
+      text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🐯 TigerScan</h1>
+    <p>Blockchain Explorer</p>
+  </div>
+
+  <div class="stats" id="stats">
+    <div class="stat-card">
+      <div class="stat-label">Block</div>
+      <div class="stat-value" id="blockHeight">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">TPS</div>
+      <div class="stat-value" id="tps">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Addresses</div>
+      <div class="stat-value" id="addresses">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Transactions</div>
+      <div class="stat-value" id="transactions">--</div>
+    </div>
+  </div>
+
+  <div class="gas-section">
+    <div class="gas-title">Gas Price</div>
+    <div class="gas-options">
+      <div class="gas-option">
+        <div class="gas-option-label">Slow</div>
+        <div class="gas-option-value" id="gasSlow">--</div>
+      </div>
+      <div class="gas-option">
+        <div class="gas-option-label">Standard</div>
+        <div class="gas-option-value" id="gasStandard">--</div>
+      </div>
+      <div class="gas-option">
+        <div class="gas-option-label">Fast</div>
+        <div class="gas-option-value" id="gasFast">--</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Quick Search</div>
+    <div class="search-box">
+      <input type="text" class="search-input" id="searchInput" placeholder="Address, Tx, Block...">
+      <button class="search-btn" id="searchBtn">Search</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Quick Links</div>
+    <div class="quick-links">
+      <a href="https://tigerscan.io/blocks" target="_blank" class="quick-link">
+        <span class="quick-link-icon">🧱</span>
+        Blocks
+      </a>
+      <a href="https://tigerscan.io/tokens" target="_blank" class="quick-link">
+        <span class="quick-link-icon">💰</span>
+        Tokens
+      </a>
+      <a href="https://tigerscan.io/nfts" target="_blank" class="quick-link">
+        <span class="quick-link-icon">🖼️</span>
+        NFTs
+      </a>
+    </div>
+  </div>
+
+  <div class="footer">
+    <a href="https://tigerscan.io" target="_blank">Open Full Explorer</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
