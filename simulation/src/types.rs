@@ -6,53 +6,51 @@ use serde::{Deserialize, Serialize};
 // SIMULATION
 // =============================================================================
 
-/// Simulation Request
+/// Call request for simulation (read-only)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulationRequest {
-    pub from: String,
+pub struct SimulateCallRequest {
+    /// Contract address to call
     pub to: String,
-    pub value: u64,
-    pub data: Vec<u8>,
-    pub gas: u64,
-    pub block_number: u64,
+    /// Call data (encoded function selector + parameters)
+    pub data: String,
+    /// Block to execute at (default: latest)
+    pub block: Option<String>,
+    /// Gas limit
+    pub gas_limit: Option<u64>,
 }
 
-/// Simulation Result
+/// Transaction request for simulation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulationResult {
-    pub success: bool,
+pub struct SimulateTransactionRequest {
+    /// From address
+    pub from: String,
+    /// To address
+    pub to: String,
+    /// Value in wei
+    pub value: Option<String>,
+    /// Call data
+    pub data: Option<String>,
+    /// Gas limit
+    pub gas_limit: Option<u64>,
+}
+
+/// Simulation response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateResponse {
+    /// Return data from the call
+    pub data: String,
+    /// Gas used
     pub gas_used: u64,
-    pub return_value: Vec<u8>,
-    pub logs: Vec<Log>,
-    pub error: Option<String>,
+    /// Whether the call succeeded
+    pub success: bool,
+    /// Event logs
+    pub logs: Vec<SimulateLog>,
 }
 
-/// Log
+/// Log entry from simulation
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Log {
+pub struct SimulateLog {
     pub address: String,
     pub topics: Vec<String>,
-    pub data: Vec<u8>,
-}
-
-/// Simulator
-pub struct Simulator {
-    block_number: u64,
-}
-
-impl Simulator {
-    pub fn new(block_number: u64) -> Self {
-        Self { block_number }
-    }
-
-    /// Simulate
-    pub fn simulate(&self, _req: &SimulationRequest) -> SimulationResult {
-        SimulationResult {
-            success: true,
-            gas_used: 21000,
-            return_value: vec![],
-            logs: vec![],
-            error: None,
-        }
-    }
+    pub data: String,
 }
