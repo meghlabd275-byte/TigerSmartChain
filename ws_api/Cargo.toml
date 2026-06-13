@@ -1,0 +1,26 @@
+[package]
+name = "ws_api"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket API for TigerScan - Real-time subscriptions"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+anyhow = "1.0"
+uuid = { version = "1.6", features = ["v4"] }
+parking_lot = "0.12"
+
+[features]
+default = ["runtime-tokio"]
+runtime-tokio = ["tokio/rustls"]
+runtime-async = []
+
+[package.metadata]
+docs = "https://docs.tigerscan.io"
