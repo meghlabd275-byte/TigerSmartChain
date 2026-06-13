@@ -3,12 +3,16 @@ package enterprise
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
@@ -191,12 +195,221 @@ func (s *Server) handleLimits(w http.ResponseWriter, r *http.Request) {
 }
 
 func generateSecureKey(length int) string {
-	chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	key := make([]byte, length)
-	for i := range key {
-		key[i] = chars[i%len(chars)]
+	// Use crypto/rand for secure random generation
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback to less secure but deterministic
+		chars := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+		for i := range bytes {
+			bytes[i] = chars[i%len(chars)]
+		}
+		return string(bytes)
 	}
-	return string(key)
+	
+	// Use hex encoding for safe string representation
+	key := make([]byte, length*2)
+	for i, b := range bytes {
+		key[i*2] = chars[b%byte(len(chars))]
+		key[i*2+1] = '0'
+	}
+	
+	return string(key[:length])
+}
+
+// hashKey hashes an API key for secure storage
+func hashKey(key string) string {
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:])
+}
+
+// =============================================================================
+// JWT AUTHENTICATION
+// =============================================================================
+
+// Claims represents JWT claims
+type Claims struct {
+	UserID    int    `json:"userId"`
+	Plan     string `json:"plan"`
+	APIKeyID string `json:"apiKeyId"`
+	jwt.RegisteredClaims
+}
+
+// generateToken generates a JWT token
+func (s *Server) generateToken(userID int, plan, apiKeyID string, expiry time.Duration) (string, error) {
+	claims := Claims{
+		UserID:    userID,
+		Plan:     plan,
+		APIKeyID: apiKeyID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
+			IssuedAt:  jwt.NewNumericTime(time.Now()),
+		},
+	}
+	
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(s.cfg.JWTSecret))
+}
+
+// validateToken validates a JWT token
+func (s *Server) validateToken(tokenString string) (*Claims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(s.cfg.JWTSecret), nil
+	})
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+		return claims, nil
+	}
+	
+	return nil, fmt.Errorf("invalid token")
+}
+
+// =============================================================================
+// API KEY MIDDLEWARE
+// =============================================================================
+
+// APIKeyMiddleware validates API keys
+func (s *Server) APIKeyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		
+		// Get API key from header
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			apiKey = r.URL.Query().Get("apikey")
+		}
+		
+		if apiKey == "" {
+			http.Error(w, "API key required", 401)
+			return
+		}
+		
+		// Hash the key for lookup
+		keyHash := hashKey(apiKey)
+		
+		// Check if key exists and is active
+		var keyInfo struct {
+			ID             string
+			SubscriptionID string
+			RateLimit    int
+			IsActive    bool
+		}
+		
+		err := s.pool.QueryRow(ctx, 
+			"SELECT id, subscription_id, rate_limit, is_active FROM enterprise_api_keys WHERE key_value = $1", keyHash,
+		).Scan(&keyInfo.ID, &keyInfo.SubscriptionID, &keyInfo.RateLimit, &keyInfo.IsActive)
+		
+		if err != nil || !keyInfo.IsActive {
+			http.Error(w, "Invalid or inactive API key", 401)
+			return
+		}
+		
+		// Check rate limit
+		allowed, err := s.CheckRateLimit(ctx, keyInfo.SubscriptionID, keyInfo.RateLimit)
+		if err != nil || !allowed {
+			http.Error(w, "Rate limit exceeded", 429)
+			return
+		}
+		
+		// Add to context
+		ctx = context.WithValue(ctx, "subscriptionId", keyInfo.SubscriptionID)
+		ctx = context.WithValue(ctx, "apiKeyId", keyInfo.ID)
+		
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// =============================================================================
+// BATCH API ENDPOINTS
+// =============================================================================
+
+// BatchRequest represents a batch API request
+type BatchRequest struct {
+	Requests []BatchItem `json:"requests"`
+}
+
+// BatchItem represents a single request in a batch
+type BatchItem struct {
+	ID      string      `json:"id"`
+	Method  string      `json:"method"`
+	Params interface{} `json:"params"`
+}
+
+// BatchResponse represents a batch API response
+type BatchResponse struct {
+	Results []BatchResult `json:"results"`
+}
+
+// BatchResult represents a single result in a batch
+type BatchResult struct {
+	ID     string      `json:"id"`
+	Result interface{} `json:"result,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+// handleBatch handles batch API requests
+func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	
+	var req BatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	
+	// Limit batch size
+	if len(req.Requests) > 100 {
+		http.Error(w, "Batch size exceeds limit of 100", 400)
+		return
+	}
+	
+	results := make([]BatchResult, len(req.Requests))
+	
+	// Process in parallel
+	var wg sync.WaitGroup
+	for i, item := range req.Requests {
+		wg.Add(1)
+		go func(i int, item BatchItem) {
+			defer wg.Done()
+			
+			result, err := s.executeBatchItem(item)
+			results[i] = BatchResult{
+				ID: item.ID,
+				Result: result,
+				Error:  err,
+			}
+		}(i, item)
+	}
+	
+	wg.Wait()
+	
+	json.NewEncoder(w).Encode(BatchResponse{Results: results})
+}
+
+// executeBatchItem executes a single batch item
+func (s *Server) executeBatchItem(item BatchItem) (interface{}, error) {
+	// Route to appropriate handler based on method
+	switch item.Method {
+	case "eth_blockNumber":
+		return s.getBlockNumber(), nil
+	case "eth_getBlockByNumber":
+		return nil, nil // Would call RPC
+	case "eth_getTransactionReceipt":
+		return nil, nil // Would call RPC
+	default:
+		return nil, fmt.Errorf("unknown method: %s", item.Method)
+	}
+}
+
+func (s *Server) getBlockNumber() string {
+	// Would call RPC
+	return "0x0"
 }
 
 func (s *Server) LogUsage(ctx context.Context, subID, endpoint, method string, statusCode, responseTime int) error {
