@@ -184,3 +184,241 @@ pub struct LogFilter {
     #[serde(rename = "blockHash")]
     pub block_hash: Option<String>,
 }
+
+// =============================================================================
+// TRACE TYPES - Internal Transaction Tracking
+// =============================================================================
+
+/// Trace result from trace_block/trace_transaction
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceResult {
+    pub action: Option<TraceAction>,
+    pub result: Option<TraceResultData>,
+    pub tx_hash: Option<String>,
+    pub subtraces: Option<u32>,
+    #[serde(rename = "type")]
+    pub trace_type: Option<String>,
+}
+
+/// Trace action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceAction {
+    #[serde(rename = "callType")]
+    pub call_type: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub value: Option<String>,
+    pub gas: Option<String>,
+    pub input: Option<String>,
+    pub init: Option<String>,
+    #[serde(rename = "address")]
+    pub created_contract: Option<String>,
+    #[serde(rename = "balance")]
+    pub created_balance: Option<String>,
+    #[serde(rename = "refundAddress")]
+    pub refund_address: Option<String>,
+}
+
+/// Trace result data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceResultData {
+    pub gas: Option<String>,
+    pub return_value: Option<String>,
+    pub address: Option<String>,
+}
+
+/// Trace replay result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceReplayResult {
+    #[serde(rename = "txHash")]
+    pub tx_hash: String,
+    pub trace: Option<Vec<TraceResult>>,
+    pub state_diff: Option<StateDiff>,
+    pub vm_trace: Option<VmTrace>,
+}
+
+/// State diff
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateDiff {
+    pub from: String,
+    pub to: String,
+    pub before: String,
+    pub after: String,
+}
+
+// =============================================================================
+// DEBUG TYPES - Block Tracing & Inspection
+// =============================================================================
+
+/// Debug trace options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugTraceOptions {
+    #[serde(rename = "disableStorage")]
+    pub disable_storage: Option<bool>,
+    #[serde(rename = "disableStack")]
+    pub disable_stack: Option<bool>,
+    #[serde(rename = "enableMemory")]
+    pub enable_memory: Option<bool>,
+    #[serde(rename = "enableReturnData")]
+    pub enable_return_data: Option<bool>,
+    pub tracer: Option<String>,
+    #[serde(rename = "tracerConfig")]
+    pub tracer_config: Option<serde_json::Value>,
+}
+
+impl Default for DebugTraceOptions {
+    fn default() -> Self {
+        Self {
+            disable_storage: Some(false),
+            disable_stack: Some(false),
+            enable_memory: Some(false),
+            enable_return_data: Some(false),
+            tracer: Some("callTracer".to_string()),
+            tracer_config: None,
+        }
+    }
+}
+
+/// Debug trace
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugTrace {
+    #[serde(rename = "type")]
+    pub trace_type: String,
+    pub from: String,
+    pub to: String,
+    pub value: String,
+    pub gas: String,
+    pub gas_used: String,
+    pub input: String,
+    pub output: String,
+    pub calls: Vec<DebugCall>,
+}
+
+/// Debug call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugCall {
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub from: String,
+    pub to: String,
+    pub value: String,
+    pub gas: String,
+    pub gas_used: String,
+    pub input: String,
+    pub output: String,
+    pub calls: Vec<DebugCall>,
+}
+
+/// Vm trace
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmTrace {
+    pub code: String,
+    pub ops: Vec<VmOp>,
+}
+
+/// Vm operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmOp {
+    pub pc: u32,
+    pub cost: u32,
+    pub stack: Vec<String>,
+    pub memory: Option<String>,
+    pub return_data: Option<String>,
+    pub op: String,
+}
+
+// =============================================================================
+// PARITY TYPES - OpenEthereum Compatibility
+// =============================================================================
+
+/// Parity trace (OpenEthereum style)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParityTrace {
+    #[serde(rename = "action")]
+    pub action: ParityAction,
+    pub error: Option<String>,
+    #[serde(rename = "result")]
+    pub result: Option<ParityResult>,
+}
+
+/// Parity action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParityAction {
+    #[serde(rename = "callType")]
+    pub call_type: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub value: Option<String>,
+    pub gas: Option<String>,
+    pub input: Option<String>,
+    #[serde(rename = "init")]
+    pub init: Option<String>,
+    #[serde(rename = "address")]
+    pub created_contract: Option<String>,
+    #[serde(rename = "balance")]
+    pub created_balance: Option<String>,
+}
+
+/// Parity result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParityResult {
+    pub gas: Option<String>,
+    #[serde(rename = "returnValue")]
+    pub return_value: Option<String>,
+    pub address: Option<String>,
+}
+
+/// Parity receipt
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParityReceipt {
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: String,
+    pub block_hash: String,
+    pub block_number: u64,
+    #[serde(rename = "contractAddress")]
+    pub contract_address: Option<String>,
+    #[serde(rename = "cumulativeGasUsed")]
+    pub cumulative_gas_used: String,
+    #[serde(rename = "gasUsed")]
+    pub gas_used: String,
+    pub logs: Vec<Log>,
+    #[serde(rename = "logsBloom")]
+    pub logs_bloom: String,
+    #[serde(rename = "status")]
+    pub status: String,
+}
+
+/// Receipt (for eth_getBlockReceipts)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Receipt {
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: String,
+    #[serde(rename = "blockHash")]
+    pub block_hash: String,
+    #[serde(rename = "blockNumber")]
+    pub block_number: u64,
+    #[serde(rename = "contractAddress")]
+    pub contract_address: Option<String>,
+    #[serde(rename = "cumulativeGasUsed")]
+    pub cumulative_gas_used: String,
+    #[serde(rename = "gasUsed")]
+    pub gas_used: String,
+    pub logs: Vec<Log>,
+    #[serde(rename = "logsBloom")]
+    pub logs_bloom: String,
+    pub status: String,
+    #[serde(rename = "type")]
+    pub tx_type: String,
+}
+
+/// Call request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallRequest {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub gas: Option<String>,
+    #[serde(rename = "gasPrice")]
+    pub gas_price: Option<String>,
+    pub value: Option<String>,
+    pub data: Option<String>,
+}

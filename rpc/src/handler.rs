@@ -1,4 +1,12 @@
 //! RPC Handler - Full implementation for connecting to Ethereum nodes
+//! 
+//! This module provides a comprehensive RPC client for connecting to Ethereum nodes
+//! with support for:
+//! - Standard JSON-RPC methods
+//! - Trace methods for internal transaction tracking
+//! - Debug methods for block tracing
+//! - Archive state queries
+//! - Historical state access
 
 use crate::types::*;
 use std::sync::Arc;
@@ -8,6 +16,7 @@ use thiserror::Error;
 use reqwest::{Client, Url};
 use tokio::sync::RwLock;
 use serde_json::{json, Value};
+use serde::Deserialize;
 
 // =============================================================================
 // ERRORS
@@ -411,6 +420,278 @@ impl RPCClient {
         let params = json!([filter]);
         
         let result: Vec<Log> = self.request("eth_getLogs", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    // =============================================================================
+    // TRACE METHODS - Internal Transaction Tracking
+    // =============================================================================
+
+    /// Trace block transactions - returns structured traces for all transactions in a block
+    pub async fn trace_block(&self, block_number: u64) -> Result<Vec<TraceResult>, RPCError> {
+        let params = json!([
+            format!("0x{:x}", block_number),
+            ["trace"]
+        ]);
+        
+        let result: Vec<TraceResult> = self.request("trace_block", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Trace specific transaction - returns full call traces
+    pub async fn trace_transaction(&self, tx_hash: &str) -> Result<Vec<TraceResult>, RPCError> {
+        let params = json!([tx_hash]);
+        
+        let result: Vec<TraceResult> = self.request("trace_transaction", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Replay a transaction for tracing
+    pub async fn trace_replay_transaction(&self, tx_hash: &str, trace_types: &[&str]) -> Result<TraceReplayResult, RPCError> {
+        let params = json!([
+            tx_hash,
+            trace_types
+        ]);
+        
+        let result: TraceReplayResult = self.request("trace_replayTransaction", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Replay multiple transactions
+    pub async fn trace_replay_block_transactions(&self, block_number: u64, trace_types: &[&str]) -> Result<Vec<TraceReplayResult>, RPCError> {
+        let params = json!([
+            format!("0x{:x}", block_number),
+            trace_types
+        ]);
+        
+        let result: Vec<TraceReplayResult> = self.request("trace_replayBlockTransactions", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Get state diffs for a block
+    pub async fn trace_get_state_diffs(&self, block_number: u64) -> Result<Vec<StateDiff>, RPCError> {
+        let params = json!([
+            format!("0x{:x}", block_number),
+            "stateDiff"
+        ]);
+        
+        let result: Vec<StateDiff> = self.request("trace_getStateDiffs", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Filter traces by address
+    pub async fn trace_filter(&self, from_block: u64, to_block: u64, from_address: Option<&str>, to_address: Option<&str>) -> Result<Vec<TraceResult>, RPCError> {
+        #[derive(Serialize)]
+        struct TraceFilter<'a> {
+            from_block: String,
+            to_block: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            from_address: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            to_address: Option<&'a str>,
+        }
+        
+        let filter = TraceFilter {
+            from_block: format!("0x{:x}", from_block),
+            to_block: format!("0x{:x}", to_block),
+            from_address,
+            to_address,
+        };
+        
+        let params = json!([filter]);
+        
+        let result: Vec<TraceResult> = self.request("trace_filter", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    // =============================================================================
+    // DEBUG METHODS - Block Tracing & Inspection
+    // =============================================================================
+
+    /// Debug trace block
+    pub async fn debug_trace_block(&self, block_number: u64, options: &DebugTraceOptions) -> Result<Vec<DebugTrace>, RPCError> {
+        let params = json!([
+            format!("0x{:x}", block_number),
+            options
+        ]);
+        
+        let result: Vec<DebugTrace> = self.request("debug_traceBlock", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Debug trace block by hash
+    pub async fn debug_trace_block_by_hash(&self, block_hash: &str, options: &DebugTraceOptions) -> Result<Vec<DebugTrace>, RPCError> {
+        let params = json!([
+            block_hash,
+            options
+        ]);
+        
+        let result: Vec<DebugTrace> = self.request("debug_traceBlockByHash", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Debug trace transaction
+    pub async fn debug_trace_transaction(&self, tx_hash: &str, options: &DebugTraceOptions) -> Result<DebugTrace, RPCError> {
+        let params = json!([
+            tx_hash,
+            options
+        ]);
+        
+        let result: DebugTrace = self.request("debug_traceTransaction", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Debug trace call
+    pub async fn debug_trace_call(&self, call: &CallRequest, options: &DebugTraceOptions, block: Option<&str>) -> Result<DebugTrace, RPCError> {
+        let block_number = block.unwrap_or("latest");
+        
+        let params = json!([
+            call,
+            block_number,
+            options
+        ]);
+        
+        let result: DebugTrace = self.request("debug_traceCall", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Get block receipts
+    pub async fn eth_get_block_receipts(&self, block_hash: &str) -> Result<Vec<Receipt>, RPCError> {
+        let params = json!([block_hash]);
+        
+        let result: Vec<Receipt> = self.request("eth_getBlockReceipts", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    // =============================================================================
+    // ARCHIVE STATE QUERIES - Historical Data Access
+    // =============================================================================
+
+    /// Get balance at historical block
+    pub async fn eth_get_balance_at(&self, address: &str, block_number: u64) -> Result<String, RPCError> {
+        let params = json!([
+            address,
+            format!("0x{:x}", block_number)
+        ]);
+        
+        let result: String = self.request("eth_getBalance", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Get code at historical block
+    pub async fn eth_get_code_at(&self, address: &str, block_number: u64) -> Result<String, RPCError> {
+        let params = json!([
+            address,
+            format!("0x{:x}", block_number)
+        ]);
+        
+        let result: String = self.request("eth_getCode", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Get storage at historical block
+    pub async fn eth_get_storage_at_block(&self, address: &str, position: &str, block_number: u64) -> Result<String, RPCError> {
+        let params = json!([
+            address,
+            position,
+            format!("0x{:x}", block_number)
+        ]);
+        
+        let result: String = self.request("eth_getStorageAt", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Get transaction count at historical block
+    pub async fn eth_get_transaction_count_at(&self, address: &str, block_number: u64) -> Result<u64, RPCError> {
+        let params = json!([
+            address,
+            format!("0x{:x}", block_number)
+        ]);
+        
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum NonceResult {
+            Nonce(String),
+            NonceHex(String),
+        }
+        
+        let result: NonceResult = self.request("eth_getTransactionCount", Some(params)).await?;
+        
+        let nonce_str = match result {
+            NonceResult::Nonce(n) => n,
+            NonceResult::NonceHex(n) => n,
+        };
+        
+        if nonce_str.starts_with("0x") {
+            u64::from_str_radix(&nonce_str[2..], 16)
+                .map_err(|e| RPCError::ParseError(e.to_string()))?
+        } else {
+            nonce_str.parse()
+                .map_err(|e| RPCError::ParseError(e.to_string()))?
+        }
+    }
+
+    /// Call at historical block (read-only, archive state)
+    pub async fn eth_call_at(&self, to: &str, data: &str, block_number: u64) -> Result<String, RPCError> {
+        #[derive(Serialize)]
+        struct CallRequest<'a> {
+            to: &'a str,
+            data: &'a str,
+        }
+        
+        let call = CallRequest { to, data };
+        let params = json!([
+            call,
+            format!("0x{:x}", block_number)
+        ]);
+        
+        let result: String = self.request("eth_call", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    // =============================================================================
+    // PARITY METHODS - OpenEthereum Compatibility
+    // =============================================================================
+
+    /// Parity trace transaction (OpenEthereum style)
+    pub async fn parity_trace_transaction(&self, tx_hash: &str) -> Result<Vec<ParityTrace>, RPCError> {
+        let params = json!([tx_hash]);
+        
+        let result: Vec<ParityTrace> = self.request("parity_traceTransaction", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Parity trace block
+    pub async fn parity_trace_block(&self, block_number: u64) -> Result<Vec<ParityTrace>, RPCError> {
+        let params = json!([format!("0x{:x}", block_number)]);
+        
+        let result: Vec<ParityTrace> = self.request("parity_traceBlock", Some(params)).await?;
+        
+        Ok(result)
+    }
+
+    /// Parity get block receipts
+    pub async fn parity_get_block_receipts(&self, block_hash: &str) -> Result<Vec<ParityReceipt>, RPCError> {
+        let params = json!([block_hash]);
+        
+        let result: Vec<ParityReceipt> = self.request("parity_getBlockReceipts", Some(params)).await?;
         
         Ok(result)
     }
