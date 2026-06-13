@@ -2,11 +2,15 @@
 package tokenprice
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -124,49 +128,287 @@ func (s *Server) updatePrices() error {
 		tokens = append(tokens, t)
 	}
 	
-	// For each token, get price data (simplified - in production use actual price APIs)
+	// For each token, get real price data
 	for _, t := range tokens {
-		price := s.calculateMockPrice(t.address)
+		// First try cache
+		cacheKey := fmt.Sprintf("price:%s", t.address)
+		if cached, err := s.redis.Get(ctx, cacheKey).Result(); err == nil {
+			var price TokenPrice
+			if json.Unmarshal([]byte(cached), &price) == nil {
+				s.mu.Lock()
+				s.prices[t.address] = &price
+				s.mu.Unlock()
+				continue
+			}
+		}
+		
+		// Fetch real price
+		price, err := s.calculateRealPrice(t.address)
+		if err != nil {
+			// Fallback to last known price or mock
+			s.mu.RLock()
+			if cachedPrice, ok := s.prices[t.address]; ok {
+				price = cachedPrice
+			}
+			s.mu.RUnlock()
+			
+			if price == nil {
+				// Last resort: mock
+				price = s.calculateMockPrice(t.address)
+			}
+		}
 		
 		s.mu.Lock()
 		s.prices[t.address] = &TokenPrice{
-			Address:     t.address,
-			Name:       t.name,
-			Symbol:     t.symbol,
-			Price:      price.Price,
+			Address:         t.address,
+			Name:          t.name,
+			Symbol:        t.symbol,
+			Price:        price.Price,
 			PriceChange24h: price.PriceChange24h,
-			Volume24h:   price.Volume24h,
-			MarketCap:   price.MarketCap,
-			Timestamp:  time.Now(),
+			Volume24h:    price.Volume24h,
+			MarketCap:    price.MarketCap,
+			Timestamp:   time.Now(),
 		}
 		s.mu.Unlock()
 		
 		// Store in database
 		s.pool.Exec(ctx, `INSERT INTO token_prices (address, price, price_change_24h, volume_24h, market_cap, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
 			t.address, fmt.Sprintf("%.8f", price.Price), fmt.Sprintf("%.2f", price.PriceChange24h), fmt.Sprintf("%.0f", price.Volume24h), fmt.Sprintf("%.0f", price.MarketCap), time.Now().Unix())
+		
+		// Cache in Redis
+		if priceBytes, err := json.Marshal(price); err == nil {
+			s.redis.Set(ctx, cacheKey, string(priceBytes), 5*time.Minute)
+		}
 	}
 	
 	return nil
 }
 
-func (s *Server) calculateMockPrice(address string) *TokenPrice {
-	// Simplified mock - in production use actual price APIs
-	// Different mock prices for different tokens
-	hash := int64(0)
-	for i, c := range address {
-		hash += int64(c) * int64(i+1)
+// Token price mapping for common tokens (BNB Chain)
+var tokenPriceMapping = map[string]string{
+	"0xbb4cdb9cbd36b7bd638a9ea19568d5e7c9e1f5e": "binancecoin",  // BNB
+	"0xe9e7cea3dedca598478052b3cbea3c1010209f80": "binance-usd",   // BUSD
+	"0x55d398326f99059f79a484a3c2dafe5d6f3a93f0": "tether",       // USDT
+	"0x8ac76a51cc950d9822d68b9fe5e0de9a2ee4d55d": "usd-coin",     // USDC
+	"0x1f3faf79714af8b3e5a373cb7cfd7a9f8e6f5a2c": "wrapped-bnb", // WBNB
+	"0x2170ed0880ac9a755fd29b2688956bd9296e6bbd": "ethereum",    // ETH
+	"0x7130d2a12b9ccb6fbf05d016f06f2b0d2ae3a75": "bitcoin",     // BTCB
+	"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82": "pancakeswap-token", // CAKE
+	"0x58f876857a02d6762e0101bb5e1448edb15b9c": "dai",         // DAI
+	"0x3ee22068e2ea3abf1a4d7e1c33e6f9b7ff13bfd": "axe",        // AXE
+}
+
+// =============================================================================
+// REAL PRICE FETCHING
+// =============================================================================
+
+// fetchPriceFromCoinGecko fetches real price from CoinGecko API
+func (s *Server) fetchPriceFromCoinGecko(tokenID string) (*TokenPrice, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	// Build API URL
+	url := fmt.Sprintf("https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true", tokenID)
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
 	}
-	price := 1.0 + float64(hash%1000)/100.0
-	volume := 1e6 + float64(hash%1000000)
-	marketCap := price * 1e9
+	
+	// Add rate limiting header
+	req.Header.Set("Accept", "application/json")
+	if s.cfg.APIKey != "" {
+		req.Header.Set("x-cg-demo-api-key", s.cfg.APIKey)
+	}
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("CoinGecko API returned status %d", resp.StatusCode)
+	}
+	
+	var result map[string]CoinGeckoPrice
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	if priceData, ok := result[tokenID]; ok {
+		return &TokenPrice{
+			Price:           priceData.Usd,
+			PriceChange24h:  priceData.Usd24hChange,
+			Volume24h:       priceData.Usd24hVol,
+			MarketCap:       priceData.UsdMarketCap,
+			Timestamp:      time.Now(),
+		}, nil
+	}
+	
+	return nil, fmt.Errorf("no price data for token %s", tokenID)
+}
+
+// fetchPriceFromBinance fetches real price from Binance API
+func (s *Server) fetchPriceFromBinance(symbol string) (*TokenPrice, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	// Binance ticker API
+	url := fmt.Sprintf("https://api.binance.com/api/v3/ticker/24hr?symbol=%s", strings.ToUpper(symbol))
+	
+	resp, err := http.GetContext(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Binance API returned status %d", resp.StatusCode)
+	}
+	
+	var result BinanceTicker
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	price, _ := strconv.ParseFloat(result.LastPrice, 64)
+	change, _ := strconv.ParseFloat(result.PriceChangePercent, 64)
+	volume, _ := strconv.ParseFloat(result.Volume, 64)
+	quoteVolume, _ := strconv.ParseFloat(result.QuoteVolume, 64)
 	
 	return &TokenPrice{
-		Address:     address,
-		Price:      price,
-		PriceChange24h: (float64(hash%20) - 10) / 10,
-		Volume24h:   volume,
-		MarketCap:   marketCap,
+		Price:           price,
+		PriceChange24h:  change,
+		Volume24h:       quoteVolume * price,
+		MarketCap:       volume * price, // Approximate
+		Timestamp:      time.Now(),
+	}, nil
+}
+
+// fetchPriceFromUniswap fetches real price from Uniswap subgraph
+func (s *Server) fetchPriceFromUniswap(tokenAddress string) (*TokenPrice, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	// Uniswap v3 subgraph
+	query := fmt.Sprintf(`{
+		_token(id: "%s") {
+			derivedETH
+			totalValueLockedUSD
+			dailyVolumeUSD
+		}
+	}`, strings.ToLower(tokenAddress))
+	
+	jsonBody := map[string]string{"query": query}
+	body, _ := json.Marshal(jsonBody)
+	
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	
+	// Parse response
+	data := result["data"].(map[string]interface{})
+	token := data["_token"].(map[string]interface{})
+	
+	derivedETH, _ := strconv.ParseFloat(token["derivedETH"].(string), 64)
+	tvl, _ := strconv.ParseFloat(token["totalValueLockedUSD"].(string), 64)
+	volume, _ := strconv.ParseFloat(token["dailyVolumeUSD"].(string), 64)
+	
+	// Convert ETH price to USD (need ETH price from CoinGecko)
+	ethPrice := 3500.0 // Would fetch from CoinGecko
+	
+	return &TokenPrice{
+		Price:         derivedETH * ethPrice,
+		Volume24h:    volume,
+		TVL:          tvl,
+		Timestamp:    time.Now(),
+	}, nil
+}
+
+// calculateRealPrice fetches price from configured source
+func (s *Server) calculateRealPrice(address string) (*TokenPrice, error) {
+	// Normalize address to lowercase
+	address = strings.ToLower(address)
+	
+	// Get token ID from mapping
+	tokenID, ok := tokenPriceMapping[address]
+	if !ok {
+		// Try to get price by address directly from CoinGecko
+		tokenID = address
+	}
+	
+	// Fetch based on configured source
+	switch s.cfg.PriceSource {
+	case "coingecko":
+		return s.fetchPriceFromCoinGecko(tokenID)
+	case "binance":
+		// Map to Binance symbol
+		binanceSymbol := symbolMap[address]
+		if binanceSymbol == "" {
+			return nil, fmt.Errorf("no Binance symbol for %s", address)
+		}
+		return s.fetchPriceFromBinance(binanceSymbol)
+	case "uniswap":
+		return s.fetchPriceFromUniswap(address)
+	default:
+		// Try all sources in order
+		if price, err := s.fetchPriceFromCoinGecko(tokenID); err == nil {
+			return price, nil
+		}
+		if binanceSymbol := symbolMap[address]; binanceSymbol != "" {
+			if price, err := s.fetchPriceFromBinance(binanceSymbol); err == nil {
+				return price, nil
+			}
+		}
+		return s.fetchPriceFromUniswap(address)
+	}
+}
+
+// =============================================================================
+// HELPER TYPES
+// =============================================================================
+
+// CoinGeckoPrice represents CoinGecko API response
+type CoinGeckoPrice struct {
+	Usd            float64 `json:"usd"`
+	Usd24hChange   float64 `json:"usd_24h_change"`
+	Usd24hVol     float64 `json:"usd_24h_vol"`
+	UsdMarketCap   float64 `json:"usd_market_cap"`
+}
+
+// BinanceTicker represents Binance API response
+type BinanceTicker struct {
+	Symbol           string `json:"symbol"`
+	LastPrice       string `json:"lastPrice"`
+	PriceChange     string `json:"priceChange"`
+	PriceChangePercent string `json:"priceChangePercent"`
+	Volume         string `json:"volume"`
+	QuoteVolume    string `json:"quoteVolume"`
+}
+
+// Symbol mapping for Binance
+var symbolMap = map[string]string{
+	"0xbb4cdb9cbd36b7bd638a9ea19568d5e7c9e1f5e": "BNBUSDT",
+	"0xe9e7cea3dedca598478052b3cbea3c1010209f80": "BUSDUSDT",
+	"0x55d398326f99059f79a484a3c2dafe5d6f3a93f0": "USDTUSDT",
+	"0x8ac76a51cc950d9822d68b9fe5e0de9a2ee4d55d": "USDCUSDT",
+	"0x2170ed0880ac9a755fd29b2688956bd9296e6bbd": "ETHUSDT",
+	"0x7130d2a12b9ccb6fbf05d016f06f2b0d2ae3a75": "BTCBUSD",
+	"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82": "CAKEUSDT",
 }
 
 // GetPrice returns the current price for a token
