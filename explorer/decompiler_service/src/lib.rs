@@ -1,10 +1,18 @@
 //! TigerScan Decompiler Service - Bytecode to source analysis
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use tracing::info;
+#![forbid(unsafe_code)]
+
+mod analysis;
+mod opcodes;
+mod patterns;
+mod server;
+mod types;
+
+pub use analysis::*;
+pub use opcodes::*;
+pub use patterns::*;
+pub use server::*;
+pub use types::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecompiledContract {
