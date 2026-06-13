@@ -173,3 +173,14 @@ pub struct Log {
     pub log_index: String,
     pub removed: bool,
 }
+
+/// Log filter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFilter {
+    pub from_block: Option<String>,
+    pub to_block: Option<String>,
+    pub address: Option<serde_json::Value>,
+    pub topics: Option<Vec<serde_json::Value>>,
+    #[serde(rename = "blockHash")]
+    pub block_hash: Option<String>,
+}
