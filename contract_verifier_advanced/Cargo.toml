@@ -1,0 +1,22 @@
+[package]
+name = "contract_verifier_advanced"
+version = "0.1.0"
+edition = "2021"
+description = "Advanced Smart Contract Verifier - Multi-file, Proxy, Libraries"
+
+[dependencies]
+ethers = "2.0"
+solc = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+regex = "1.8"
+sha3 = "0.10"
+walkdir = "2.4"
+log = "0.4"
+env_logger = "0.10"
+
+[lib]
+name = "contract_verifier_advanced"
+path = "src/lib.rs"
