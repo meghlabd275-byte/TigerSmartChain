@@ -1280,3 +1280,174 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     ip_address VARCHAR(45),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- =============================================================================
+-- MISSING TABLES FOR COMPLETE FUNCTIONALITY
+-- =============================================================================
+
+-- Internal Transactions (from trace data)
+CREATE TABLE IF NOT EXISTS internal_transactions (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    trace_index INTEGER NOT NULL,
+    subtrace_index INTEGER DEFAULT 0,
+    call_type VARCHAR(32) NOT NULL,
+    from_address VARCHAR(42) NOT NULL,
+    to_address VARCHAR(42),
+    value NUMERIC(78, 0) DEFAULT 0,
+    gas VARCHAR(32),
+    gas_used VARCHAR(32),
+    input TEXT,
+    output TEXT,
+    error TEXT,
+    depth INTEGER NOT NULL DEFAULT 1,
+    parent_trace_index INTEGER,
+    creates VARCHAR(42),
+    success BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_internal_tx_hash ON internal_transactions(transaction_hash);
+CREATE INDEX idx_internal_tx_block ON internal_transactions(block_number);
+CREATE INDEX idx_internal_tx_from ON internal_transactions(from_address);
+CREATE INDEX idx_internal_tx_to ON internal_transactions(to_address);
+
+-- Token Holders
+CREATE TABLE IF NOT EXISTS token_holders (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(42) NOT NULL,
+    holder_address VARCHAR(42) NOT NULL,
+    balance NUMERIC(78, 0) NOT NULL DEFAULT 0,
+    percent NUMERIC(10, 6) DEFAULT 0,
+    rank INTEGER DEFAULT 0,
+    first_block BIGINT NOT NULL,
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(token_address, holder_address)
+);
+
+CREATE INDEX idx_token_holders_token ON token_holders(token_address);
+CREATE INDEX idx_token_holders_holder ON token_holders(holder_address);
+
+-- Token Holder History
+CREATE TABLE IF NOT EXISTS token_holder_history (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(42) NOT NULL,
+    holder_address VARCHAR(42) NOT NULL,
+    balance NUMERIC(78, 0) NOT NULL,
+    block_number BIGINT NOT NULL,
+    timestamp BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Traces (raw trace data)
+CREATE TABLE IF NOT EXISTS traces (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    trace_address TEXT NOT NULL,
+    trace_type VARCHAR(32) NOT NULL,
+    call_type VARCHAR(32),
+    from_address VARCHAR(42) NOT NULL,
+    to_address VARCHAR(42),
+    value NUMERIC(78, 0) DEFAULT 0,
+    gas VARCHAR(32),
+    gas_used VARCHAR(32),
+    input TEXT,
+    output TEXT,
+    error TEXT,
+    subtraces INTEGER DEFAULT 0,
+    trace_id TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_traces_hash ON traces(transaction_hash);
+CREATE INDEX idx_traces_block ON traces(block_number);
+
+-- State Diffs (balance/storage changes)
+CREATE TABLE IF NOT EXISTS state_diffs (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66),
+    block_number BIGINT NOT NULL,
+    address VARCHAR(42) NOT NULL,
+    storage_key VARCHAR(66),
+    storage_value VARCHAR(66),
+    old_value TEXT,
+    new_value TEXT,
+    diff_type VARCHAR(32) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_state_diffs_block ON state_diffs(block_number);
+CREATE INDEX idx_state_diffs_address ON state_diffs(address);
+
+-- Governance Proposals
+CREATE TABLE IF NOT EXISTS governance_proposals (
+    id BIGSERIAL PRIMARY KEY,
+    proposal_id VARCHAR(64) NOT NULL UNIQUE,
+    contract_address VARCHAR(42) NOT NULL,
+    proposer VARCHAR(42) NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status VARCHAR(32) NOT NULL,
+    for_votes NUMERIC(78, 0) DEFAULT 0,
+    against_votes NUMERIC(78, 0) DEFAULT 0,
+    abstain_votes NUMERIC(78, 0) DEFAULT 0,
+    total_votes NUMERIC(78, 0) DEFAULT 0,
+    start_block BIGINT NOT NULL,
+    end_block BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Governance Votes
+CREATE TABLE IF NOT EXISTS governance_votes (
+    id BIGSERIAL PRIMARY KEY,
+    proposal_id VARCHAR(64) NOT NULL,
+    voter VARCHAR(42) NOT NULL,
+    vote_choice VARCHAR(16) NOT NULL,
+    votes NUMERIC(78, 0) NOT NULL,
+    block_number BIGINT NOT NULL,
+    transaction_hash VARCHAR(66) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- MEV Bundles
+CREATE TABLE IF NOT EXISTS mev_bundles (
+    id BIGSERIAL PRIMARY KEY,
+    bundle_hash VARCHAR(66) NOT NULL UNIQUE,
+    block_number BIGINT NOT NULL,
+    sender VARCHAR(42) NOT NULL,
+    mev_type VARCHAR(32) NOT NULL,
+    tx_hashes TEXT NOT NULL,
+    gas_used BIGINT,
+    profit_eth NUMERIC(78, 0),
+    profit_usd NUMERIC(20, 2),
+    inserted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- NFT Floor Prices
+CREATE TABLE IF NOT EXISTS nft_floor_prices (
+    id BIGSERIAL PRIMARY KEY,
+    collection_address VARCHAR(42) NOT NULL,
+    floor_price NUMERIC(78, 0),
+    floor_price_usd NUMERIC(20, 2),
+    volume_24h NUMERIC(78, 0),
+    volume_24h_usd NUMERIC(20, 2),
+    sales_24h INTEGER DEFAULT 0,
+    holders INTEGER DEFAULT 0,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(collection_address)
+);
+
+-- NFT Rarity
+CREATE TABLE IF NOT EXISTS nft_rarity (
+    id BIGSERIAL PRIMARY KEY,
+    collection_address VARCHAR(42) NOT NULL,
+    token_id VARCHAR(78) NOT NULL,
+    rarity_score NUMERIC(10, 4),
+    rank INTEGER,
+    traits JSONB,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(collection_address, token_id)
+);
