@@ -1,9 +1,13 @@
 //! Cross-chain Service - Bridge Tracking & Multi-chain Portfolio
 
+pub mod bridge_tracker;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+
+pub use bridge_tracker::{BridgeTracker, BridgeTransfer, BridgeStats};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainInfo {
