@@ -1,0 +1,55 @@
+[package]
+name = "tiger-api-gateway"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "TigerScan API Gateway with tiered access control"
+license = "MIT"
+
+[dependencies]
+# Web framework
+actix-web = "4"
+actix-rt = "2"
+actix-cors = "0.7"
+
+# Authentication
+jsonwebtoken = "9"
+bcrypt = "0.15"
+uuid = { version = "1", features = ["v4"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "sqlite", "json"] }
+
+# Rate limiting
+redis = { version = "0.24", features = ["tokio-comp"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Encryption
+aes-gcm = "0.10"
+rand = "0.8"
+
+[features]
+default = []
+test = ["tokio/rt-multi-thread"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

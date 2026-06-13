@@ -1,0 +1,38 @@
+[package]
+name = "tiger-load-balancer"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "High-performance Load Balancer for TigerScan"
+license = "MIT"
+
+[dependencies]
+# Web framework
+actix-web = "4"
+actix-rt = "2"
+actix-cors = "0.7"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Health checks
+http = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
