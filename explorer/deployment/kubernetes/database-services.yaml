@@ -1,0 +1,203 @@
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tigerscan-postgres
+  namespace: tigerscan
+spec:
+  serviceName: tigerscan-postgres
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tigerscan-postgres
+  template:
+    metadata:
+      labels:
+        app: tigerscan-postgres
+    spec:
+      serviceAccountName: tigerscan
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+      containers:
+      - name: postgres
+        image: postgres:15
+        args:
+        - "-c"
+        - "max_connections=200"
+        - "-c"
+        - "shared_buffers=2GB"
+        - "-c"
+        - "effective_cache_size=6GB"
+        - "-c"
+        - "maintenance_work_mem=512MB"
+        - "-c"
+        - "checkpoint_completion_target=0.9"
+        - "-c"
+        - "wal_buffers=16MB"
+        - "-c"
+        - "default_statistics_target=100"
+        - "-c"
+        - "random_page_cost=1.1"
+        - "-c"
+        - "effective_io_concurrency=200"
+        - "-c"
+        - "work_mem=16MB"
+        - "-c"
+        - "min_wal_size=1GB"
+        - "-c"
+        - "max_wal_size=4GB"
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: tigerscan
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: postgres-user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: postgres-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        - name: postgres-config
+          mountPath: /etc/postgresql
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "4Gi"
+          limits:
+            cpu: "4000m"
+            memory: "16Gi"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - "-U"
+            - postgres
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - "-U"
+            - postgres
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+      volumes:
+      - name: postgres-config
+        configMap:
+          name: postgres-config
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 500Gi
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-postgres
+  namespace: tigerscan
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - port: 5432
+    targetPort: 5432
+  selector:
+    app: tigerscan-postgres
+---
+# PostgreSQL ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: tigerscan
+data:
+  postgres.conf: |
+    max_connections = 200
+    shared_buffers = 2GB
+    effective_cache_size = 6GB
+    maintenance_work_mem = 512MB
+    checkpoint_completion_target = 0.9
+    wal_buffers = 16MB
+    default_statistics_target = 100
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    work_mem = 16MB
+    min_wal_size = 1GB
+    max_wal_size = 4GB
+---
+# Redis Cluster
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tigerscan-redis
+  namespace: tigerscan
+spec:
+  serviceName: tigerscan-redis
+  replicas: 6
+  selector:
+    matchLabels:
+      app: tigerscan-redis
+  template:
+    metadata:
+      labels:
+        app: tigerscan-redis
+    spec:
+      serviceAccountName: tigerscan
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command:
+        - redis-server
+        - "--cluster-enabled"
+        - "yes"
+        - "--cluster-config-file"
+        - "/data/nodes.conf"
+        - "--cluster-node-timeout"
+        - "5000"
+        - "--appendonly"
+        - "yes"
+        - "--maxmemory"
+        - "2gb"
+        - "--maxmemory-policy"
+        - "allkeys-lru"
+        ports:
+        - containerPort: 6379
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "1Gi"
+          limits:
+            cpu: "1000m"
+            memory: "4Gi"
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 50Gi

@@ -1,0 +1,163 @@
+# Ingress Controller + Load Balancer
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-nginx
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingress-nginx
+  namespace: ingress-nginx
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ingress-nginx
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "endpoints", "nodes", "pods", "secrets", "namespaces"]
+  verbs: ["list", "watch"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses", "ingressclasses"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses/status"]
+  verbs: ["update"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["list", "watch", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ingress-nginx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ingress-nginx
+subjects:
+- kind: ServiceAccount
+  name: ingress-nginx
+  namespace: ingress-nginx
+---
+# IngressClass
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+---
+# Main Ingress for Tigerscan
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tigerscan-ingress
+  namespace: tigerscan
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1s"
+    nginx.ingress.kubernetes.io/enable-owasp-core-rules: "true"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Frame-Options "SAMEORIGIN" always;
+      add_header X-Content-Type-Options "nosniff" always;
+      add_header X-XSS-Protection "1; mode=block" always;
+      add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+spec:
+  tls:
+  - hosts:
+    - tigerscan.io
+    - www.tigerscan.io
+    - api.tigerscan.io
+    - ws.tigerscan.io
+    - graphql.tigerscan.io
+    secretName: tigerscan-tls
+  rules:
+  - host: tigerscan.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tigerscan-frontend
+            port:
+              number: 80
+  - host: api.tigerscan.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tigerscan-api
+            port:
+              number: 80
+  - host: ws.tigerscan.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tigerscan-websocket
+            port:
+              number: 8546
+  - host: graphql.tigerscan.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tigerscan-graphql
+            port:
+              number: 4000
+
+---
+# Cert Manager ClusterIssuer
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@tigerscan.io
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+---
+# TLS Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tigerscan-tls
+  namespace: tigerscan
+type: kubernetes.io/tls
+data:
+  # Base64 encoded cert and key (replace with real certs in production)
+  # Use cert-manager for automatic cert management

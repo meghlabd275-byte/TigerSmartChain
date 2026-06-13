@@ -1,0 +1,150 @@
+# API Server Kubernetes Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tigerscan-api
+  namespace: tigerscan
+  labels:
+    app: tigerscan-api
+    tier: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tigerscan-api
+  template:
+    metadata:
+      labels:
+        app: tigerscan-api
+        tier: api
+    spec:
+      serviceAccountName: tigerscan
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: api
+        image: tigerscan/api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8443
+          name: https
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: tigerscan-config
+              key: redis-url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: jwt-secret
+        - name: ENCRYPTION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: tigerscan-secrets
+              key: encryption-key
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+# API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerscan-api
+  namespace: tigerscan
+  labels:
+    app: tigerscan-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  - port: 443
+    targetPort: 8443
+    protocol: TCP
+    name: https
+  selector:
+    app: tigerscan-api
+---
+# HPA for API Server
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tigerscan-api-hpa
+  namespace: tigerscan
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tigerscan-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60

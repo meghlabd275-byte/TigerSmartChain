@@ -1,0 +1,47 @@
+# TigerScan Kubernetes Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tigerscan
+  labels:
+    name: tigerscan
+    environment: production
+---
+# Resource Quotas
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tigerscan-quota
+  namespace: tigerscan
+spec:
+  hard:
+    requests.cpu: "32"
+    requests.memory: 64Gi
+    limits.cpu: "64"
+    limits.memory: 128Gi
+    pods: "100"
+    services: "20"
+    secrets: "50"
+    configmaps: "30"
+---
+# Limit Ranges
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: tigerscan-limits
+  namespace: tigerscan
+spec:
+  limits:
+  - max:
+      cpu: "16"
+      memory: 32Gi
+    min:
+      cpu: "100m"
+      memory: 128Mi
+    default:
+      cpu: "500m"
+      memory: 1Gi
+    defaultRequest:
+      cpu: "200m"
+      memory: 512Mi
+    type: Container
