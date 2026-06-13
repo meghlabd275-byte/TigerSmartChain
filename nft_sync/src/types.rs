@@ -45,3 +45,7 @@ impl Default for Sync {
         Self::new()
     }
 }
+
+// Re-export for external use
+pub use crate::metadata::NFTMetadata;
+pub use crate::metadata::NFTAttribute;
