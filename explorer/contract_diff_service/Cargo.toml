@@ -1,0 +1,34 @@
+[package]
+name = "contract_diff_service"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "Contract Diff Viewer and Version Comparison"
+
+[dependencies]
+ethers = { version = "2.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "1.0"
+anyhow = "1.0"
+hex = "0.4"
+reqwest = { version = "0.11", features = ["json"] }
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lib]
+name = "contract_diff_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "contract_diff_service"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
