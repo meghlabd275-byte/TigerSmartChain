@@ -1216,3 +1216,67 @@ COMMENT ON TABLE malicious_contracts IS 'Known malicious contracts';
 COMMENT ON TABLE phishing_urls IS 'Known phishing URLs';
 COMMENT ON TABLE scam_tokens IS 'Known scam tokens';
 COMMENT ON TABLE whale_transactions IS 'Whale transactions (> $10k)';
+
+-- ============================================================================
+-- ADDITIONAL TABLES
+-- ============================================================================
+
+-- DeFi TVL
+CREATE TABLE IF NOT EXISTS defi_tvl (
+    id BIGSERIAL PRIMARY KEY,
+    protocol VARCHAR(128) NOT NULL,
+    tvl NUMERIC(78, 2) NOT NULL DEFAULT 0,
+    tvl_change_24h NUMERIC(10, 2),
+    volume_24h NUMERIC(78, 2),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(protocol)
+);
+
+-- Lending Rates
+CREATE TABLE IF NOT EXISTS lending_rates (
+    id BIGSERIAL PRIMARY KEY,
+    protocol VARCHAR(128) NOT NULL,
+    token VARCHAR(42) NOT NULL,
+    supply_rate NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    borrow_rate NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    utilization NUMERIC(5, 2) NOT NULL DEFAULT 0,
+    total_supply NUMERIC(78, 0),
+    total_borrow NUMERIC(78, 0),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Multi-chain configs
+CREATE TABLE IF NOT EXISTS chain_configs (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id BIGINT NOT NULL UNIQUE,
+    chain_name VARCHAR(128) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+    rpc_url TEXT,
+    explorer_url TEXT,
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+-- API Usage
+CREATE TABLE IF NOT EXISTS api_usage (
+    id BIGSERIAL PRIMARY KEY,
+    api_key_hash VARCHAR(64) NOT NULL,
+    endpoint VARCHAR(128) NOT NULL,
+    method VARCHAR(16) NOT NULL,
+    status_code INTEGER NOT NULL,
+    response_time_ms INTEGER,
+    ip_address VARCHAR(45),
+    user_agent TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Audit Logs
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT,
+    action VARCHAR(128) NOT NULL,
+    resource_type VARCHAR(64),
+    resource_id VARCHAR(128),
+    details JSONB,
+    ip_address VARCHAR(45),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
