@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "TigerSmartChain Explorer",
+  "version": "1.0.0",
+  "description": "Advanced blockchain explorer with real-time data, security alerts, and transaction tracking",
+  "author": "TigerSmartChain",
+  "homepage_url": "https://tigersmartchain.com",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "webNavigation",
+    "webRequest",
+    "alarms",
+    "notifications"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_icon": {
+      "16": "assets/icon16.png",
+      "48": "assets/icon48.png",
+      "128": "assets/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content.js"],
+      "css": ["src/content.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "icons": {
+    "16": "assets/icon16.png",
+    "48": "assets/icon48.png",
+    "128": "assets/icon128.png"
+  },
+  "commands": {
+    "toggle-sidebar": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+T",
+        "mac": "Command+Shift+T"
+      },
+      "description": "Toggle TigerSmartChain sidebar"
+    },
+    "quick-search": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Quick search"
+    }
+  },
+  "alarms": [
+    {
+      "periodInMinutes": 5,
+      "name": "price-check"
+    }
+  ]
+}
