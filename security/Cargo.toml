@@ -3,11 +3,11 @@ name = "tiger-security"
 version = "1.0.0"
 edition = "2021"
 authors = ["TigerScan Team"]
-description = "Advanced security module for TigerScan - AES-256-GCM, CSRF, XSS, Rate Limiting"
+description = "Advanced security module for TigerScan - AES-256-GCM, ChaCha20, Argon2, Rate Limiting, DDoS Protection"
 license = "MIT"
 
 [dependencies]
-# Cryptography
+# Cryptography - AES-256-GCM
 aes-gcm = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
@@ -17,6 +17,18 @@ rsa = "0.8"
 base64 = "0.21"
 hex = "0.4"
 digest = "0.10"
+
+# Argon2 password hashing
+argon2 = "0.5"
+
+# ChaCha20-Poly1305
+chacha20poly1305 = "0.10"
+
+# Ed25519 signatures
+ed25519-dalek = "2"
+
+# GetRandom for secure random
+getrandom = "0.2"
 
 # JWT
 jsonwebtoken = "9"
@@ -56,6 +68,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Constant-time comparison
 subtle = "2"
+
+# Hashing
+blake3 = "1"
+
+# Data structures
+parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] }
