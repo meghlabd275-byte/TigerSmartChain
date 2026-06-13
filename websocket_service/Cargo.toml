@@ -15,6 +15,7 @@ async-trait = "0.1"
 # WebSocket
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
+tungstenite = "0.21"
 
 # HTTP/WebSocket client
 reqwest = { version = "0.11", features = ["json"], default-features = false }
@@ -39,6 +40,17 @@ metrics = "0.21"
 
 # UUID for connection IDs
 uuid = { version = "1.0", features = ["v4"] }
+
+# Parking lot for synchronization
+parking_lot = "0.12"
+
+[lib]
+name = "tiger_websocket_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tiger-websocket-service"
+path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
