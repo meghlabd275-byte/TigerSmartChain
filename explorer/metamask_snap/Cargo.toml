@@ -1,0 +1,20 @@
+[package]
+name = "metamask_snap"
+version = "1.0.0"
+edition = "2021"
+description = "MetaMask Snap for TigerScan"
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[lib]
+name = "metamask_snap"
+path = "src/lib.rs"
+[[bin]]
+name = "metamask_snap"
+path = "src/main.rs"
+[profile.release]
+opt-level = 3

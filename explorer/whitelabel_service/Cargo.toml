@@ -1,0 +1,20 @@
+[package]
+name = "whitelabel_service"
+version = "1.0.0"
+edition = "2021"
+description = "White-label Solution for Custom Branding"
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+parking_lot = "0.12"
+uuid = { version = "1.0", features = ["v4"] }
+
+[lib]
+name = "whitelabel_service"
+path = "src/lib.rs"
+[[bin]]
+name = "whitelabel_service"
+path = "src/main.rs"
+[profile.release]
+opt-level = 3
