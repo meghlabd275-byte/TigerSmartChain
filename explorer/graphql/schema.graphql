@@ -1,0 +1,647 @@
+# TigerScan GraphQL API Schema
+# Production-grade GraphQL API with full blockchain data
+
+type Query {
+  # Blocks
+  blocks(limit: Int, offset: Int, fromBlock: Uint64, toBlock: Uint64, miner: Address): [Block!]!
+  block(numberOrHash: String!): Block
+  latestBlock: Block!
+  
+  # Transactions
+  transactions(limit: Int, offset: Int, from: Address, to: Address, address: Address, status: TxStatus): [Transaction!]!
+  transaction(hash: String!): Transaction
+  transactionReceipt(hash: String!): Receipt
+  internalTransactions(txHash: String!, limit: Int, offset: Int): [InternalTransaction!]!
+  
+  # Tokens
+  tokens(limit: Int, offset: Int, search: String, verified: Boolean): [Token!]!
+  token(address: Address!): Token
+  tokenHolders(address: Address!, limit: Int, offset: Int): [TokenHolder!]!
+  tokenTransfers(address: Address!, limit: Int, offset: Int, fromBlock: Uint64): [TokenTransfer!]!
+  tokenApprovals(address: Address!, owner: Address, spender: Address, limit: Int, offset: Int): [TokenApproval!]!
+  tokenPriceHistory(address: Address!, from: Timestamp!, to: Timestamp!, interval: Interval!): [PricePoint!]!
+  
+  # NFTs
+  nftCollections(limit: Int, offset: Int, search: String): [NFTCollection!]!
+  nftCollection(address: Address!): NFTCollection
+  nft(address: Address!, tokenId: String!): NFT
+  nftOwners(address: Address!, limit: Int, offset: Int): [NFTOwner!]!
+  nftTransfers(address: Address!, limit: Int, offset: Int, fromBlock: Uint64): [NFTTransfer!]!
+  nftRarity(address: Address!, tokenId: String!): NFTRarity
+  nftActivity(address: Address!, limit: Int): [NFTActivity!]!
+  
+  # Accounts
+  account(address: Address!): Account
+  accountTransactions(address: Address!, limit: Int, offset: Int): [Transaction!]!
+  accountTokens(address: Address!, limit: Int, offset: Int): [AccountToken!]!
+  accountNFTs(address: Address!, limit: Int, offset: Int): [AccountNFT!]!
+  
+  # Contracts
+  contract(address: Address!): Contract
+  contractSource(address: Address!): [ContractSource!]!
+  contractABI(address: Address!): String
+  verifiedContracts(limit: Int, offset: Int, search: String, license: String): [VerifiedContract!]!
+  
+  # Validators
+  validators(limit: Int, offset: Int, orderBy: ValidatorOrder): [Validator!]!
+  validator(address: Address!): Validator
+  validatorRewards(address: Address!, fromBlock: Uint64, toBlock: Uint64): [ValidatorReward!]!
+  
+  # DeFi
+  defiProtocols: [DefiProtocol!]!
+  defiProtocol(name: String!): DefiProtocol
+  defiPools(protocol: String, limit: Int, offset: Int): [DefiPool!]!
+  defiTVL: DefiTVL!
+  defiVolumeHistory(from: Timestamp!, to: Timestamp!, interval: Interval!): [DefiVolumePoint!]!
+  
+  # DEX
+  dexPairs(token: Address, dex: String, limit: Int, offset: Int): [DEXPair!]!
+  dexPair(address: Address!): DEXPair
+  dexTokenPairs(address: Address!): [DEXPair!]!
+  
+  # Search
+  search(query: String!): SearchResult!
+  
+  # Stats
+  stats: NetworkStats!
+  gasPrice: GasPrice!
+  gasHistory(from: Timestamp!, to: Timestamp!, interval: Interval!): [GasPricePoint!]!
+  
+  # Pending
+  pendingTransactions(limit: Int, from: Address, to: Address): [PendingTransaction!]!
+}
+
+type Mutation {
+  # Contract Verification
+  verifyContract(input: VerifyContractInput!): VerifyContractResult!
+  verifyProxy(input: VerifyProxyInput!): VerifyProxyResult!
+  
+  # Webhooks
+  createWebhook(input: CreateWebhookInput!): Webhook!
+  updateWebhook(id: ID!, input: UpdateWebhookInput!): Webhook!
+  deleteWebhook(id: ID!): Boolean!
+  
+  # API Keys
+  createAPIKey(input: CreateAPIKeyInput!): APIKey!
+  revokeAPIKey(id: ID!): Boolean!
+}
+
+# Scalar Types
+scalar Address
+scalar Uint64
+scalar Timestamp
+scalar JSON
+
+# Enums
+enum TxStatus {
+  SUCCESS
+  FAILURE
+  PENDING
+}
+
+enum Interval {
+  MINUTE
+  HOUR
+  DAY
+  WEEK
+}
+
+enum ValidatorOrder {
+  DELEGATED
+  BLOCKS
+  REWARD
+  STAKED
+}
+
+# Block Types
+type Block {
+  number: Uint64!
+  hash: String!
+  parentHash: String!
+  nonce: String
+  sha3Uncles: String!
+  logsBloom: String
+  transactionsRoot: String!
+  stateRoot: String!
+  receiptsRoot: String!
+  miner: Address!
+  difficulty: String!
+  totalDifficulty: String
+  size: Uint64!
+  gasLimit: Uint64!
+  gasUsed: Uint64!
+  timestamp: Timestamp!
+  transactions: [Transaction!]!
+  transactionCount: Int!
+  uncles: [Uncle!]!
+}
+
+type Uncle {
+  number: Uint64!
+  hash: String!
+  parentHash: String!
+  miner: Address!
+  difficulty: String!
+  gasLimit: Uint64!
+  gasUsed: Uint64!
+  timestamp: Timestamp!
+  reward: String!
+}
+
+# Transaction Types
+type Transaction {
+  hash: String!
+  blockNumber: Uint64!
+  blockHash: String!
+  transactionIndex: Int!
+  from: Address!
+  to: Address
+  value: String!
+  gasPrice: String!
+  gasUsed: Uint64!
+  nonce: Uint64!
+  input: String
+  v: Int!
+  r: String!
+  s: String!
+  status: TxStatus
+  timestamp: Timestamp!
+  receipt: Receipt
+}
+
+type Receipt {
+  transactionHash: String!
+  blockNumber: Uint64!
+  blockHash: String!
+  contractAddress: Address
+  cumulativeGasUsed: Uint64!
+  gasUsed: Uint64!
+  logs: [Log!]!
+  logsBloom: String!
+  status: Boolean!
+}
+
+type InternalTransaction {
+  type: String!
+  from: Address!
+  to: Address!
+  value: String!
+  input: String
+  callType: String!
+  depth: Int!
+  pc: Uint64!
+  gas: Uint64!
+  gasUsed: Uint64!
+}
+
+type PendingTransaction {
+  hash: String!
+  from: Address!
+  to: Address
+  value: String!
+  gasPrice: String!
+  gasLimit: Uint64!
+  nonce: Uint64!
+  input: String
+  timestamp: Timestamp!
+  size: Uint64!
+}
+
+type Log {
+  address: Address!
+  topics: [String!]!
+  data: String!
+  logIndex: Int!
+  transactionIndex: Int!
+  blockNumber: Uint64!
+}
+
+# Token Types
+type Token {
+  address: Address!
+  name: String!
+  symbol: String!
+  decimals: Int!
+  totalSupply: String!
+  holders: Uint64!
+  transfers24h: Uint64!
+  priceUSD: Float
+  priceChange24h: Float
+  marketCap: Float!
+  volume24h: Float!
+  circulatingSupply: String
+  verified: Boolean!
+  lastUpdated: Timestamp!
+}
+
+type TokenHolder {
+  address: Address!
+  balance: String!
+  balanceUSD: Float!
+  percentage: Float!
+  rank: Int!
+  firstSeen: Timestamp!
+  lastUpdated: Timestamp!
+}
+
+type TokenTransfer {
+  hash: String!
+  blockNumber: Uint64!
+  timestamp: Timestamp!
+  from: Address!
+  to: Address!
+  value: String!
+  valueUSD: Float
+  token: Token!
+}
+
+type TokenApproval {
+  owner: Address!
+  spender: Address!
+  value: String!
+  approved: Boolean!
+  blockNumber: Uint64!
+  transactionHash: String!
+}
+
+type PricePoint {
+  timestamp: Timestamp!
+  price: Float!
+  volume: Float!
+  liquidity: Float
+}
+
+# NFT Types
+type NFTCollection {
+  address: Address!
+  name: String!
+  symbol: String
+  contractType: String!
+  totalSupply: Uint64!
+  holderCount: Uint64!
+  transfers24h: Uint64!
+  volume24h: Float!
+  volume24hUSD: Float!
+  volume7d: Float!
+  volume7dUSD: Float!
+  floorPrice: Float!
+  floorPriceUSD: Float!
+  marketCap: Float!
+  royaltyBps: Int
+  verified: Boolean!
+  category: String
+  description: String
+  imageURL: String
+  bannerURL: String
+}
+
+type NFT {
+  id: String!
+  collection: NFTCollection!
+  owner: Address!
+  currentPrice: Float
+  currentPriceUSD: Float
+  lastSalePrice: Float
+  lastSalePriceUSD: Float
+  lastSaleTimestamp: Timestamp
+  transfersCount: Uint64!
+  metadata: NFTMetadata
+  imageURL: String
+  animationURL: String
+  rarity: NFTRarity
+}
+
+type NFTMetadata {
+  name: String
+  description: String
+  image: String
+  externalUrl: String
+  attributes: [NFTAttribute!]!
+  backgroundColor: String
+  animationUrl: String
+}
+
+type NFTAttribute {
+  traitType: String!
+  value: String!
+  displayType: String
+  rarityScore: Float
+}
+
+type NFTOwner {
+  address: Address!
+  balance: Uint64!
+  percentage: Float!
+}
+
+type NFTTransfer {
+  hash: String!
+  blockNumber: Uint64!
+  timestamp: Timestamp!
+  tokenId: String!
+  from: Address!
+  to: Address!
+  amount: String!
+  price: Float
+  priceUSD: Float
+}
+
+type NFTRarity {
+  tokenId: String!
+  rarityScore: Float!
+  rarityRank: Int!
+  totalMinted: Uint64!
+  traitRarities: [TraitRarity!]!
+}
+
+type TraitRarity {
+  traitType: String!
+  value: String!
+  occurrence: Float!
+  rarityScore: Float!
+}
+
+type NFTActivity {
+  eventType: String!
+  price: Float
+  priceUSD: Float
+  from: Address
+  to: Address
+  tokenId: String
+  timestamp: Timestamp!
+}
+
+# Account Types
+type Account {
+  address: Address!
+  balance: String!
+  balanceUSD: Float
+  nonce: Uint64!
+  code: String
+  codeHash: String
+  isContract: Boolean!
+  tokenCount: Uint64!
+  NFTCount: Uint64!
+  firstSeen: Timestamp!
+  lastUpdated: Timestamp!
+}
+
+type AccountToken {
+  token: Token!
+  balance: String!
+  balanceUSD: Float!
+}
+
+type AccountNFT {
+  collection: NFTCollection!
+  tokenId: String!
+  balance: Uint64!
+}
+
+# Contract Types
+type Contract {
+  address: Address!
+  code: String!
+  codeHash: String!
+  deployedAt: Timestamp!
+  verified: Boolean!
+  verifiedAt: Timestamp
+  source: [ContractSource!]
+  abi: String
+}
+
+type ContractSource {
+  fileName: String!
+  sourceCode: String!
+  language: String!
+  compilerVersion: String
+}
+
+type VerifiedContract {
+  address: Address!
+  contractName: String!
+  compilerVersion: String!
+  optimizer: Boolean!
+  optimizerRuns: Int
+  evmVersion: String
+  license: String
+  verifiedAt: Timestamp!
+  source: [ContractSource!]!
+}
+
+# Validator Types
+type Validator {
+  address: Address!
+  name: String!
+  uptime: Float!
+  delegators: Uint64!
+  totalStaked: String!
+  reward: String!
+  blocksCount: Uint64!
+  commission: Float!
+  selfStaked: String!
+  rank: Int!
+  status: String!
+}
+
+type ValidatorReward {
+  validator: Address!
+  blockNumber: Uint64!
+  reward: String!
+  blockReward: String!
+  txFees: String!
+  timestamp: Timestamp!
+}
+
+# DeFi Types
+type DefiProtocol {
+  name: String!
+  category: String!
+  logo: String
+  description: String
+  website: String
+  tvl: Float!
+  tvlChange24h: Float!
+  volume24h: Float!
+  tokens: [DefiToken!]!
+  pools: [DefiPool!]!
+}
+
+type DefiToken {
+  address: Address!
+  name: String!
+  symbol: String!
+  priceUSD: Float!
+  tvl: Float!
+  volume24h: Float!
+}
+
+type DefiPool {
+  address: Address!
+  protocol: String!
+  tokens: [DefiToken!]!
+  reserves: [String!]!
+  tvl: Float!
+  volume24h: Float!
+  apy: Float!
+}
+
+type DefiTVL {
+  total: Float!
+  change24h: Float!
+  byProtocol: [ProtocolTVL!]!
+  byToken: [TokenTVL!]!
+}
+
+type ProtocolTVL {
+  protocol: String!
+  tvl: Float!
+  change24h: Float!
+}
+
+type TokenTVL {
+  token: Address!
+  tvl: Float!
+  percentage: Float!
+}
+
+type DefiVolumePoint {
+  timestamp: Timestamp!
+  volume: Float!
+  transactions: Uint64!
+}
+
+# DEX Types
+type DEXPair {
+  address: Address!
+  dexName: String!
+  token0: Token!
+  token1: Token!
+  reserve0: String!
+  reserve1: String!
+  totalSupply: String!
+  volume24h: Float!
+  volume7d: Float!
+  fees24h: Float!
+  liquidity: Float!
+  price: Float!
+  priceUSD: Float!
+}
+
+# Search Types
+union SearchResult = Block | Transaction | Token | NFTCollection | Account | Contract
+
+# Stats Types
+type NetworkStats {
+  totalBlocks: Uint64!
+  totalTransactions: Uint64!
+  totalTokens: Uint64!
+  totalAccounts: Uint64!
+  totalContracts: Uint64!
+  tps: Float!
+  avgBlockTime: Float!
+  gasPrice: String!
+  gasPriceUSD: Float!
+}
+
+type GasPrice {
+  low: String!
+  standard: String!
+  fast: String!
+  baseFee: String!
+}
+
+type GasPricePoint {
+  timestamp: Timestamp!
+  avgGasPrice: String!
+  minGasPrice: String!
+  maxGasPrice: String!
+  avgGasPriceUSD: String!
+  transactionsCount: Uint64!
+  blocksCount: Uint64!
+}
+
+# Webhook Types
+type Webhook {
+  id: ID!
+  url: String!
+  events: [String!]!
+  secret: String
+  active: Boolean!
+  createdAt: Timestamp!
+}
+
+# API Key Types
+type APIKey {
+  id: ID!
+  name: String!
+  key: String!
+  scopes: [String!]!
+  rateLimit: Int!
+  requestsCount: Uint64!
+  createdAt: Timestamp!
+  expiresAt: Timestamp
+}
+
+# Input Types
+input VerifyContractInput {
+  address: Address!
+  contractName: String!
+  compilerVersion: String!
+  optimization: Boolean!
+  optimizerRuns: Int
+  evmVersion: String
+  license: String
+  sources: [SourceInput!]!
+  libraryLinks: [LibraryLinkInput!]
+  constructorArgs: String
+}
+
+input SourceInput {
+  fileName: String!
+  content: String!
+}
+
+input LibraryLinkInput {
+  name: String!
+  address: Address!
+}
+
+input VerifyProxyInput {
+  proxyAddress: Address!
+  implementation: Address!
+  compilerVersion: String!
+  proxyType: String!
+}
+
+input CreateWebhookInput {
+  url: String!
+  events: [String!]!
+  secret: String
+}
+
+input UpdateWebhookInput {
+  url: String
+  events: [String!]
+  active: Boolean
+}
+
+input CreateAPIKeyInput {
+  name: String!
+  scopes: [String!]!
+  rateLimit: Int
+  expiresAt: Timestamp
+}
+
+# Response Types
+type VerifyContractResult {
+  success: Boolean!
+  address: Address
+  error: String
+}
+
+type VerifyProxyResult {
+  success: Boolean!
+  address: Address
+  error: String
+}
