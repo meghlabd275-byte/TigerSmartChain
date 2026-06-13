@@ -13,9 +13,21 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.11", features = ["json"] }
 thiserror = "1.0"
 regex = "1.10"
+tiny_http = "0.12"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+
+[lib]
+name = "tigerscan_security"
+path = "src/lib.rs"
+
+[[bin]]
+name = "security_service"
+path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
