@@ -1,0 +1,66 @@
+[package]
+name = "tigerscan_indexer"
+version = "1.0.0"
+edition = "2021"
+description = "Production-grade blockchain indexer for TigerScan Explorer"
+authors = ["TigerSmartChain Team"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate", "json"] }
+postgres = "0.21"
+bb8 = "0.8"
+
+# RPC Client
+ethers = { version = "2.0", features = ["rustls", "abigen"] }
+reqwest = { version = "0.11", features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+bytes = "1.5"
+parking_lot = "0.12"
+once_cell = "1.19"
+regex = "1.10"
+
+# Metrics
+prometheus = "0.13"
+metrics = "0.6"
+
+# Config
+config = "0.13"
+
+# IPFS
+ipfs-api = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+
+[[bin]]
+name = "tigerscan_indexer"
+path = "src/main.rs"
+
+[lib]
+name = "indexer"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

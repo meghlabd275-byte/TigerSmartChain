@@ -1,0 +1,47 @@
+[package]
+name = "tigerscan_simulation"
+version = "1.0.0"
+edition = "2021"
+description = "Transaction simulation service for TigerScan Explorer"
+authors = ["TigerSmartChain Team"]
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+
+# EVM
+ethers = { version = "2.0", features = ["rustls", "abigen"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Config
+config = "0.13"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "tigerscan_simulation"
+path = "src/main.rs"
+
+[lib]
+name = "simulation"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

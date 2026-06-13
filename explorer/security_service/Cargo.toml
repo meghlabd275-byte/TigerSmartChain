@@ -1,0 +1,21 @@
+[package]
+name = "tigerscan_security"
+version = "1.0.0"
+edition = "2021"
+description = "Security service for TigerScan Explorer - honeypot detection, phishing alerts"
+authors = ["TigerSmartChain Team"]
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+ethers = { version = "2.0", features = ["rustls"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+reqwest = { version = "0.11", features = ["json"] }
+thiserror = "1.0"
+regex = "1.10"
+
+[profile.release]
+opt-level = 3
