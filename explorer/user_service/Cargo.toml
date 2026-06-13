@@ -1,0 +1,29 @@
+[package]
+name = "user_service"
+version = "1.0.0"
+edition = "2021"
+description = "User Service: Watchlists, Notes, Alerts, Custom Dashboards"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+thiserror = "1.0"
+anyhow = "1.0"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+base64 = "0.21"
+aes-gcm = "0.10"
+
+[lib]
+name = "user_service"
+path = "src/lib.rs"
+[[bin]]
+name = "user_service"
+path = "src/main.rs"
+[profile.release]
+opt-level = 3
