@@ -2,10 +2,14 @@
 package defi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,9 +111,81 @@ func (s *Server) startUpdater() {
 
 func (s *Server) updateTVL() error {
 	ctx := context.Background()
+	
+	// Try to fetch real TVL from DeFiLlama API
+	tvlData, err := s.fetchTVLFromDeFiLlama()
+	if err != nil {
+		// Fallback to database
+		tvlData = s.fetchTVLFromDB(ctx)
+	}
+	
+	s.mu.Lock()
+	s.tvl = tvlData
+	s.mu.Unlock()
+	
+	// Cache in Redis
+	if tvlData != nil {
+		if data, err := json.Marshal(tvlData); err == nil {
+			s.redis.Set(ctx, "defi:tvl", string(data), time.Hour)
+		}
+	}
+	
+	return nil
+}
+
+// fetchTVLFromDeFiLlama fetches real TVL from DeFiLlama API
+func (s *Server) fetchTVLFromDeFiLlama() (*TVLData, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	// Fetch TVL for BNB Chain (chain id: 56)
+	url := "https://api.llama.fi/v2/chains"
+	
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DeFiLlama API returned status %d", resp.StatusCode)
+	}
+	
+	var chains []DeFiLlamaChain
+	if err := json.NewDecoder(resp.Body).Decode(&chains); err != nil {
+		return nil, err
+	}
+	
+	// Find BNB Chain
+	for _, chain := range chains {
+		if chain.ChainID == 56 || strings.ToLower(chain.Name) == "binance" {
+			byProtocol := make(map[string]float64)
+			byChain := make(map[string]float64)
+			byChain["bsc"] = chain.TVL
+			
+			return &TVLData{
+				TotalTVL:   chain.TVL,
+				ByProtocol: byProtocol,
+				ByChain:    byChain,
+				Change24h:  chain.TVLChange24h,
+				Timestamp:  time.Now(),
+			}, nil
+		}
+	}
+	
+	return &TVLData{TotalTVL: 0, Timestamp: time.Now()}, nil
+}
+
+// fetchTVLFromDB fetches TVL from database as fallback
+func (s *Server) fetchTVLFromDB(ctx context.Context) *TVLData {
 	rows, err := s.pool.Query(ctx, `SELECT address, liquidity FROM dex_pairs UNION ALL SELECT address, liquidity FROM liquidity_pools`)
 	if err != nil {
-		return err
+		return &TVLData{TotalTVL: 0, Timestamp: time.Now()}
 	}
 	defer rows.Close()
 
@@ -126,12 +202,171 @@ func (s *Server) updateTVL() error {
 		totalTVL += liquidity
 	}
 
-	s.mu.Lock()
-	s.tvl = &TVLData{TotalTVL: totalTVL, ByProtocol: byProtocol, ByChain: byChain, Timestamp: time.Now()}
-	s.mu.Unlock()
+	return &TVLData{
+		TotalTVL:   totalTVL,
+		ByProtocol: byProtocol,
+		ByChain:    byChain,
+		Timestamp:  time.Now(),
+	}
+}
 
-	s.redis.Set(ctx, "defi:tvl", fmt.Sprintf("%.2f", totalTVL), time.Hour)
-	return nil
+// GetTopPools returns top liquidity pools
+func (s *Server) GetTopPools(ctx context.Context, limit int) ([]*LiquidityPool, error) {
+	// Try to fetch from DeFiLlama
+	pools, err := s.fetchPoolsFromDeFiLlama(limit)
+	if err == nil && len(pools) > 0 {
+		return pools, nil
+	}
+	
+	// Fallback to database
+	return s.getPoolsFromDB(ctx, limit)
+}
+
+// fetchPoolsFromDeFiLlama fetches pools from DeFiLlama
+func (s *Server) fetchPoolsFromDeFiLlama(limit int) ([]*LiquidityPool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	url := fmt.Sprintf("https://api.llama.fi/pools/chain/BSC?limit=%d", limit)
+	
+	resp, err := http.GetContext(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	var pools []DeFiLlamaPool
+	if err := json.NewDecoder(resp.Body).Decode(&pools); err != nil {
+		return nil, err
+	}
+	
+	result := make([]*LiquidityPool, 0, len(pools))
+	for _, p := range pools {
+		result = append(result, &LiquidityPool{
+			Address:   p.Address,
+			Protocol:  p.Project,
+			Tokens:    []string{p.Token0, p.Token1},
+			Reserves:  []float64{p.TVL, 0},
+			Liquidity: p.TVL,
+			Volume24h: p.Volume24h,
+			APR:       p.APY,
+		})
+	}
+	
+	return result, nil
+}
+
+// getPoolsFromDB gets pools from database
+func (s *Server) getPoolsFromDB(ctx context.Context, limit int) ([]*LiquidityPool, error) {
+	rows, err := s.pool.Query(ctx, `SELECT address, protocol, tokens, reserves, liquidity, apr, volume_24h FROM liquidity_pools ORDER BY liquidity DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pools []*LiquidityPool
+	for rows.Next() {
+		var pool LiquidityPool
+		var tokens, reserves string
+		if err := rows.Scan(&pool.Address, &pool.Protocol, &tokens, &reserves, &pool.Liquidity, &pool.APR, &pool.Volume24h); err != nil {
+			continue
+		}
+		json.Unmarshal([]byte(tokens), &pool.Tokens)
+		json.Unmarshal([]byte(reserves), &pool.Reserves)
+		pools = append(pools, &pool)
+	}
+
+	return pools, nil
+}
+
+// GetDEXPairs returns DEX pairs with real data
+func (s *Server) GetDEXPairs(ctx context.Context, limit int) ([]*DEXPair, error) {
+	// Try to fetch from CoinGecko or DeFiLlama
+	pairs, err := s.fetchDEXPairsFromAPI(limit)
+	if err == nil && len(pairs) > 0 {
+		return pairs, nil
+	}
+	
+	// Fallback to database
+	return s.getDEXPairsFromDB(ctx, limit)
+}
+
+// fetchDEXPairsFromAPI fetches DEX pairs from API
+func (s *Server) fetchDEXPairsFromAPI(limit int) ([]*DEXPair, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	
+	// Get PancakeSwap pairs from DeFiLlama
+	url := "https://api.llama.fi/pools/pancakeswap"
+	
+	resp, err := http.GetContext(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	var pools []DeFiLlamaPool
+	if err := json.NewDecoder(resp.Body).Decode(&pools); err != nil {
+		return nil, err
+	}
+	
+	result := make([]*DEXPair, 0, len(pools))
+	for i, p := range pools {
+		if i >= limit {
+			break
+		}
+		result = append(result, &DEXPair{
+			Address:      p.Address,
+			Token0:       p.Token0,
+			Token1:       p.Token1,
+			Reserve0:     0,
+			Reserve1:     0,
+			Liquidity:    p.TVL,
+			Volume24h:    p.Volume24h,
+			VolumeChange: 0,
+			TxCount24h:   0,
+		})
+	}
+	
+	return result, nil
+}
+
+// getDEXPairsFromDB gets DEX pairs from database
+func (s *Server) getDEXPairsFromDB(ctx context.Context, limit int) ([]*DEXPair, error) {
+	rows, err := s.pool.Query(ctx, `SELECT address, token0, token1, reserve0, reserve1, liquidity, volume_24h FROM dex_pairs ORDER BY liquidity DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pairs []*DEXPair
+	for rows.Next() {
+		var pair DEXPair
+		if err := rows.Scan(&pair.Address, &pair.Token0, &pair.Token1, &pair.Reserve0, &pair.Reserve1, &pair.Liquidity, &pair.Volume24h); err != nil {
+			continue
+		}
+		pairs = append(pairs, &pair)
+	}
+
+	return pairs, nil
+}
+
+// DeFiLlama types
+type DeFiLlamaChain struct {
+	ChainID      int     `json:"chainId"`
+	Name         string  `json:"name"`
+	TVL          float64 `json:"tvl"`
+	TVLChange24h float64 `json:"tvlChange24h"`
+}
+
+type DeFiLlamaPool struct {
+	Address      string  `json:"address"`
+	Project      string  `json:"project"`
+	Token0       string  `json:"token0"`
+	Token1       string  `json:"token1"`
+	TVL          float64 `json:"tvl"`
+	Volume24h    float64 `json:"volume24h"`
+	APY          float64 `json:"apy"`
 }
 
 // GetTVL returns current TVL
