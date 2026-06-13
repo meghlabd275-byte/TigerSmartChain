@@ -1,0 +1,52 @@
+[package]
+name = "tiger-node"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "TigerSmartChain Blockchain Node"
+license = "MIT"
+
+[[bin]]
+name = "tigersmartchaind"
+path = "src/main.rs"
+
+[dependencies]
+# Blockchain core - use existing TigerSmartChain crates
+tiger-blockchain = { path = "../blockchain" }
+tiger-state = { path = "../state" }
+
+# Consensus
+tiger-consensus = { path = "../consensus" }
+
+# Network
+tiger-network = { path = "../network" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+[features]
+default = []
+test = ["tokio/rt-multi-thread"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
