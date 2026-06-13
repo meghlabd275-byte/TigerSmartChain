@@ -1,0 +1,19 @@
+[package]
+name = "slack_integration"
+version = "1.0.0"
+edition = "2021"
+description = "Slack Integration for Notifications"
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+
+[lib]
+name = "slack_integration"
+path = "src/lib.rs"
+[[bin]]
+name = "slack_integration"
+path = "src/main.rs"
+[profile.release]
+opt-level = 3

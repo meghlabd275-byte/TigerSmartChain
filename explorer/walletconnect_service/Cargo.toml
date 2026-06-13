@@ -1,0 +1,21 @@
+[package]
+name = "walletconnect_service"
+version = "1.0.0"
+edition = "2021"
+description = "WalletConnect v2 Integration"
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[lib]
+name = "walletconnect_service"
+path = "src/lib.rs"
+[[bin]]
+name = "walletconnect_service"
+path = "src/main.rs"
+[profile.release]
+opt-level = 3
