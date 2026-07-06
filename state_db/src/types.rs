@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// State Database
 pub struct StateDB {
+    pub db: Option<rocksdb::DB>,
     accounts: std::collections::HashMap<String, Vec<u8>>,
     code: std::collections::HashMap<String, Vec<u8>>,
     storage: std::collections::HashMap<(String, Vec<u8>), Vec<u8>>,
@@ -16,6 +17,7 @@ pub struct StateDB {
 impl StateDB {
     pub fn new() -> Self {
         Self {
+            db: None,
             accounts: std::collections::HashMap::new(),
             code: std::collections::HashMap::new(),
             storage: std::collections::HashMap::new(),

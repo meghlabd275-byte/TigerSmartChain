@@ -6,13 +6,18 @@
 
 /// Pruner
 pub struct Pruner {
-    interval: u64,
-    retain: u64,
+    pub interval: u64,
+    pub retain: u64,
+    pub pruned_count: u64,
 }
 
 impl Pruner {
     pub fn new(interval: u64, retain: u64) -> Self {
-        Self { interval, retain }
+        Self {
+            interval,
+            retain,
+            pruned_count: 0,
+        }
     }
 
     /// Prune
