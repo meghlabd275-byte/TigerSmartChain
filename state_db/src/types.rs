@@ -1,6 +1,7 @@
 //! State DB Types
 
 use serde::{Deserialize, Serialize};
+use rocksdb::DB;
 
 // =============================================================================
 // STATE DATABASE
@@ -8,10 +9,11 @@ use serde::{Deserialize, Serialize};
 
 /// State Database
 pub struct StateDB {
-    pub db: Option<rocksdb::DB>,
-    accounts: std::collections::HashMap<String, Vec<u8>>,
-    code: std::collections::HashMap<String, Vec<u8>>,
-    storage: std::collections::HashMap<(String, Vec<u8>), Vec<u8>>,
+    pub db: Option<DB>,
+    // Memory cache
+    pub(crate) accounts: std::collections::HashMap<String, Vec<u8>>,
+    pub(crate) code: std::collections::HashMap<String, Vec<u8>>,
+    pub(crate) storage: std::collections::HashMap<(String, Vec<u8>), Vec<u8>>,
 }
 
 impl StateDB {
@@ -24,32 +26,32 @@ impl StateDB {
         }
     }
 
-    /// Get account
+    /// Get account from memory
     pub fn get_account(&self, address: &str) -> Option<&Vec<u8>> {
         self.accounts.get(address)
     }
 
-    /// Set account
+    /// Set account in memory
     pub fn set_account(&mut self, address: String, data: Vec<u8>) {
         self.accounts.insert(address, data);
     }
 
-    /// Get code
+    /// Get code from memory
     pub fn get_code(&self, address: &str) -> Option<&Vec<u8>> {
         self.code.get(address)
     }
 
-    /// Set code
+    /// Set code in memory
     pub fn set_code(&mut self, address: String, code: Vec<u8>) {
         self.code.insert(address, code);
     }
 
-    /// Get storage
+    /// Get storage from memory
     pub fn get_storage(&self, address: &str, key: &[u8]) -> Option<&Vec<u8>> {
         self.storage.get(&(address.to_string(), key.to_vec()))
     }
 
-    /// Set storage
+    /// Set storage in memory
     pub fn set_storage(&mut self, address: String, key: Vec<u8>, value: Vec<u8>) {
         self.storage.insert((address, key), value);
     }

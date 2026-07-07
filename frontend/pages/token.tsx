@@ -172,7 +172,7 @@ export default function TokenPage() {
     return (
       <Box sx={{ p: 4 }}>
         <Skeleton variant="rectangular" height={200} sx={{ mb: 2 }} />
-        <Skeleton variant="rectangular" height={400 }} />
+        <Skeleton variant="rectangular" height={400} />
       </Box>
     );
   }

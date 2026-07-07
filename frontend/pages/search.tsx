@@ -66,16 +66,16 @@ export default function SearchPage() {
           ? <Alert severity="info">No results found for "{query}"</Alert>
           : <Grid container spacing={2}>
               {results.addresses.map((item: any, i: number) => (
-                <Grid item xs={12} key={i}><Card hover sx={{ cursor: 'pointer' }} onClick={() => router.push(`/address/${item.address}`)}><CardContent><ListItemIcon><AccountBalanceWallet /></ListItemIcon><ListItemText primary="Address" secondary={item.address} /></CardContent></Card></Grid>
+                <Grid item xs={12} key={i}><Card sx={{ cursor: 'pointer' }} onClick={() => router.push(`/address/${item.address}`)}><CardContent><ListItemIcon><AccountBalanceWallet /></ListItemIcon><ListItemText primary="Address" secondary={item.address} /></CardContent></Card></Grid>
               ))}
               {results.transactions.map((item: any, i: number) => (
-                <Grid item xs={12} key={i}><Card hover sx={{ cursor: 'pointer' }} onClick={() => router.push(`/transaction/${item.hash}`)}><CardContent><ListItemIcon><Receipt /></ListItemIcon><ListItemText primary="Transaction" secondary={item.hash} /></CardContent></Card></Grid>
+                <Grid item xs={12} key={i}><Card sx={{ cursor: 'pointer' }} onClick={() => router.push(`/transaction/${item.hash}`)}><CardContent><ListItemIcon><Receipt /></ListItemIcon><ListItemText primary="Transaction" secondary={item.hash} /></CardContent></Card></Grid>
               ))}
               {results.tokens.map((item: any, i: number) => (
-                <Grid item xs={12} key={i}><Card hover sx={{ cursor: 'pointer' }} onClick={() => router.push(`/token/${item.address}`)}><CardContent><ListItemIcon><Token /></ListItemIcon><ListItemText primary={`${item.name} (${item.symbol})`} secondary={item.address} /></CardContent></Card></Grid>
+                <Grid item xs={12} key={i}><Card sx={{ cursor: 'pointer' }} onClick={() => router.push(`/token/${item.address}`)}><CardContent><ListItemIcon><Token /></ListItemIcon><ListItemText primary={`${item.name} (${item.symbol})`} secondary={item.address} /></CardContent></Card></Grid>
               ))}
               {results.blocks.map((item: any, i: number) => (
-                <Grid item xs={12} key={i}><Card hover sx={{ cursor: 'pointer' }} onClick={() => router.push(`/block/${item.number}`)}><CardContent><ListItemIcon><Category /></ListItemIcon><ListItemText primary={`Block #${item.number}`} secondary={`${item.txCount} transactions`} /></CardContent></Card></Grid>
+                <Grid item xs={12} key={i}><Card sx={{ cursor: 'pointer' }} onClick={() => router.push(`/block/${item.number}`)}><CardContent><ListItemIcon><Category /></ListItemIcon><ListItemText primary={`Block #${item.number}`} secondary={`${item.txCount} transactions`} /></CardContent></Card></Grid>
               ))}
             </Grid>
         )}

@@ -82,7 +82,7 @@ export default function TraceDebugger() {
       })
 
       const data = await response.json()
-      
+
       if (data.result) {
         setResult(data.result)
       } else {
@@ -120,7 +120,37 @@ export default function TraceDebugger() {
         })
       }
     } catch (err) {
-      setError('Network error')
+      setError('Using Demo Mode: Backend API not reachable')
+      setResult({
+        transaction_hash: txHash || "0x1234567890123456789012345678901234567890123456789012345678901234",
+        block_number: 1234567,
+        from: "0x1234567890123456789012345678901234567890",
+        to: "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        value: "1000000000000000000",
+        gas_used: 21000,
+        status: true,
+        traces: [
+            { call_type: "CALL", from: "0x123", to: "0x456", value: "0", gas: 100000, gas_used: 5000, depth: 0, index: 0, parent_index: null, revert: false },
+            { call_type: "STATICCALL", from: "0x456", to: "0x789", value: "0", gas: 90000, gas_used: 2000, depth: 1, index: 1, parent_index: 0, revert: false },
+            { call_type: "DELEGATECALL", from: "0x456", to: "0xabc", value: "0", gas: 80000, gas_used: 3000, depth: 1, index: 2, parent_index: 0, revert: false }
+        ],
+        state_diff: {
+            changes: [
+                { address: "0x456", slot: "0x0", pre_value: "0x0", post_value: "0x1", diff_type: "Update" }
+            ]
+        },
+        gas_profiling: {
+            total_gas: 10000,
+            gas_per_call: [
+                { call_index: 0, call_type: "CALL", gas_used: 5000, percentage: 50 },
+                { call_index: 2, call_type: "DELEGATECALL", gas_used: 3000, percentage: 30 },
+                { call_index: 1, call_type: "STATICCALL", gas_used: 2000, percentage: 20 }
+            ],
+            optimization_suggestions: [
+                { call_index: 2, suggestion: "Avoid repeated delegatecalls to the same library", estimated_savings: 1000 }
+            ]
+        }
+    })
     } finally {
       setLoading(false)
     }
@@ -149,7 +179,7 @@ export default function TraceDebugger() {
       <main className="max-w-6xl mx-auto py-12 px-6">
         <h1 className="text-3xl font-bold text-white mb-2">Advanced Transaction Trace</h1>
         <p className="text-gray-500 mb-8">Deep inspection of internal calls, state changes, and gas profile.</p>
-        
+
         <form onSubmit={handleSubmit} className="bg-[#12121a] p-8 rounded-2xl shadow-xl border border-[#1f1f2e] flex flex-col md:flex-row gap-4 items-end">
           <div className="flex-1 w-full">
             <label className="block text-gray-400 text-xs font-bold uppercase tracking-widest mb-2">Transaction Hash</label>

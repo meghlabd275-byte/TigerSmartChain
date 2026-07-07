@@ -105,7 +105,7 @@ export default function ToolsPage() {
                 <TableHead><TableRow><TableCell>Signature</TableCell><TableCell>Function</TableCell></TableRow></TableHead>
                 <TableBody>
                   {Object.entries(COMMON_SIGNATURES).map(([sig, name]) => (
-                    <TableRow key={sig} hover sx={{ cursor: 'pointer' }} onClick={() => { setSignature(sig); lookupSignature(); }}>
+                    <TableRow key={sig} sx={{ cursor: 'pointer' }} onClick={() => { setSignature(sig); lookupSignature(); }}>
                       <TableCell sx={{ fontFamily: 'monospace' }}>{sig}</TableCell><TableCell>{name}</TableCell>
                     </TableRow>
                   ))}

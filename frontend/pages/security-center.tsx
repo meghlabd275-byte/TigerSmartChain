@@ -9,13 +9,13 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 // Types for security data
 interface SecurityAlert {
   id: string;
-  type: 'honeypot' | 'phishing' | 'rug_pull' | 'exploit' | 'suspicious' | 'verified';
+  type: 'honeypot' | 'phishing' | 'scam' | 'exploit' | 'suspicious' | 'verified';
   severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
   title: string;
   description: string;
   address: string;
   timestamp: number;
-  status: 'active' | 'investigating' | 'resolved' | 'false_positive';
+  status: 'active' | 'active' | 'resolved' | 'false_positive';
   details: Record<string, string | number>;
 }
 
@@ -39,18 +39,18 @@ interface PhishingSite {
   detectedAt: number;
   visits: number;
   reports: number;
-  status: 'active' | 'investigating' | 'taken_down';
+  status: 'active' | 'active' | 'taken_down';
 }
 
 interface ExploitEvent {
   id: string;
   protocol: string;
-  type: 'flash_loan' | 'reentrancy' | 'oracle_manipulation' | 'bridge_exploit' | 'rug_pull';
+  type: 'flash_loan' | 'reentrancy' | 'oracle_manipulation' | 'bridge_exploit' | 'scam';
   amount: number;
   timestamp: number;
   blockNumber: number;
   txHash: string;
-  status: 'confirmed' | 'suspected' | 'investigating';
+  status: 'confirmed' | 'suspected' | 'active';
 }
 
 interface SecurityScore {
@@ -87,13 +87,13 @@ const useSecurityData = () => {
       // Generate security alerts
       const alertData: SecurityAlert[] = [
         { id: '1', type: 'honeypot', severity: 'critical', title: 'Honeypot Detected', description: 'Contract traps users with fake transfer limits', address: '0x1234567890abcdef1234567890abcdef12345678', timestamp: now - 60000, status: 'active', details: { victims: 45, fundsLost: 125000 } },
-        { id: '2', type: 'phishing', severity: 'high', title: 'Phishing Site Active', description: 'Fake airdrop site targeting users', address: '0x2345678901abcdef2345678901abcdef23456789', timestamp: now - 180000, status: 'investigating', details: { targets: 1200 } },
-        { id: '3', type: 'rug_pull', severity: 'critical', title: 'Rug Pull Detected', description: 'Developer drained liquidity pool', address: '0x3456789012abcdef3456789012abcdef34567890', timestamp: now - 3600000, status: 'resolved', details: { fundsLost: 850000 } },
-        { id: '4', type: 'exploit', severity: 'high', title: 'Reentrancy Vulnerability', description: 'Potential reentrancy in contract', address: '0x4567890123abcdef4567890123abcdef45678901', timestamp: now - 7200000, status: 'investigating', details: { tvl: 2500000 } },
+        { id: '2', type: 'phishing', severity: 'high', title: 'Phishing Site Active', description: 'Fake airdrop site targeting users', address: '0x2345678901abcdef2345678901abcdef23456789', timestamp: now - 180000, status: 'active', details: { targets: 1200 } },
+        { id: '3', type: 'scam', severity: 'critical', title: 'Rug Pull Detected', description: 'Developer drained liquidity pool', address: '0x3456789012abcdef3456789012abcdef34567890', timestamp: now - 3600000, status: 'resolved', details: { fundsLost: 850000 } },
+        { id: '4', type: 'exploit', severity: 'high', title: 'Reentrancy Vulnerability', description: 'Potential reentrancy in contract', address: '0x4567890123abcdef4567890123abcdef45678901', timestamp: now - 7200000, status: 'active', details: { tvl: 2500000 } },
         { id: '5', type: 'suspicious', severity: 'medium', title: 'Unusual Activity', description: 'Large token transfers detected', address: '0x5678901234abcdef5678901234abcdef56789012', timestamp: now - 10800000, status: 'resolved', details: { amount: 500000 } },
         { id: '6', type: 'verified', severity: 'info', title: 'Contract Verified', description: 'New verified contract deployed', address: '0x6789012345abcdef6789012345abcdef67890123', timestamp: now - 14400000, status: 'resolved', details: {} },
         { id: '7', type: 'honeypot', severity: 'critical', title: 'Fake NFT Mint', description: 'Contract never reveals winning chance', address: '0x7890123456abcdef7890123456abcdef78901234', timestamp: now - 18000000, status: 'active', details: { victims: 120, fundsLost: 450000 } },
-        { id: '8', type: 'phishing', severity: 'high', title: 'Discord Phishing', description: 'Fake Discord admin posting malicious links', address: '0x8901234567abcdef8901234567abcdef89012345', timestamp: now - 21600000, status: 'investigating', details: { reports: 25 } },
+        { id: '8', type: 'phishing', severity: 'high', title: 'Discord Phishing', description: 'Fake Discord admin posting malicious links', address: '0x8901234567abcdef8901234567abcdef89012345', timestamp: now - 21600000, status: 'active', details: { reports: 25 } },
       ];
       setAlerts(alertData);
       
@@ -102,18 +102,18 @@ const useSecurityData = () => {
         { id: '1', address: '0xHoneypot1', name: 'FakeToken', type: 'honeypot', detectedAt: now - 86400000, victims: 250, fundsLost: 450000, status: 'active', source: 'Honeypot Detector' },
         { id: '2', address: '0xPhish1', name: 'AirdropPro', type: 'phishing', detectedAt: now - 172800000, victims: 1200, fundsLost: 850000, status: 'taken_down', source: 'Community Report' },
         { id: '3', address: '0xScam1', name: 'MoonDAO', type: 'scam', detectedAt: now - 259200000, victims: 850, fundsLost: 2500000, status: 'flagged', source: 'Transaction Analyzer' },
-        { id: '4', address: '0xSus1', name: 'SuspiciousPool', type: 'suspicious', detectedAt: now - 345600000, victims: 45, fundsLost: 125000, status: 'investigating', source: 'Behavior Analysis' },
+        { id: '4', address: '0xSus1', name: 'SuspiciousPool', type: 'suspicious', detectedAt: now - 345600000, victims: 45, fundsLost: 125000, status: 'active', source: 'Behavior Analysis' },
         { id: '5', address: '0xHoneypot2', name: 'WinChance', type: 'honeypot', detectedAt: now - 432000000, victims: 180, fundsLost: 320000, status: 'active', source: 'Honeypot Detector' },
-        { id: '6', address: '0xRug1', name: 'ExitToken', type: 'rug_pull', detectedAt: now - 518400000, victims: 450, fundsLost: 1200000, status: 'taken_down', source: 'Liquidity Scanner' },
+        { id: '6', address: '0xRug1', name: 'ExitToken', type: 'scam', detectedAt: now - 518400000, victims: 450, fundsLost: 1200000, status: 'taken_down', source: 'Liquidity Scanner' },
       ];
       setThreatContracts(threatData);
       
       // Generate phishing sites
       const phishingData: PhishingSite[] = [
-        { id: '1', url: 'etlhereum-prize[.]xyz', target: 'Ethereum Foundation', type: 'fake_airdrops', detectedAt: now - 3600000, visits: 15000, reports: 125, status: 'investigating' },
+        { id: '1', url: 'etlhereum-prize[.]xyz', target: 'Ethereum Foundation', type: 'fake_airdrops', detectedAt: now - 3600000, visits: 15000, reports: 125, status: 'active' },
         { id: '2', url: 'uni-swap[.]net', target: 'Uniswap', type: 'impersonation', detectedAt: now - 7200000, visits: 8500, reports: 85, status: 'taken_down' },
         { id: '3', url: 'eth2-staking[.]info', target: 'Ethereum Foundation', type: 'fake_ico', detectedAt: now - 14400000, visits: 25000, reports: 320, status: 'active' },
-        { id: '4', url: 'opensea-gift[.]com', target: 'OpenSea', type: 'fake_exchange', detectedAt: now - 21600000, visits: 12000, reports: 145, status: 'investigating' },
+        { id: '4', url: 'opensea-gift[.]com', target: 'OpenSea', type: 'fake_exchange', detectedAt: now - 21600000, visits: 12000, reports: 145, status: 'active' },
         { id: '5', url: 'metamask-verify[.]io', target: 'MetaMask', type: 'impersonation', detectedAt: now - 28800000, visits: 35000, reports: 520, status: 'active' },
       ];
       setPhishingSites(phishingData);
@@ -823,7 +823,7 @@ const Filter: React.FC<FilterProps> = ({ filter, setFilter }) => {
     { value: 'all', label: 'All' },
     { value: 'honeypot', label: 'Honeypots' },
     { value: 'phishing', label: 'Phishing' },
-    { value: 'rug_pull', label: 'Rug Pulls' },
+    { value: 'scam', label: 'Rug Pulls' },
     { value: 'exploit', label: 'Exploits' },
     { value: 'suspicious', label: 'Suspicious' },
     { value: 'verified', label: 'Verified' },

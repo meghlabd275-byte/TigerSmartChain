@@ -138,7 +138,7 @@ const simulateTransaction = async (tx: SimulatedTransaction): Promise<Simulation
   
   // Generate mock results
   const gasUsed = Math.floor(21000 + Math.random() * 500000);
-  const gasCost = (gasUsed * parseInt(tx.gasPrice || '20000000000') / 1e18).toFixed(6);
+  const gasCost = (gasUsed * parseInt((tx.gasPrice || '20000000000').toString()) / 1e18).toFixed(6);
   
   // Generate trace
   const trace: TraceEntry[] = [];
@@ -447,7 +447,7 @@ const TransactionSimulation: React.FC = () => {
       value: value || '0',
       data,
       gasLimit: 3000000,
-      gasPrice: (parseFloat(gasPrice) * 1e9).toString(),
+      gasPrice: parseFloat(gasPrice) * 1e9,
     };
     
     // First estimate gas

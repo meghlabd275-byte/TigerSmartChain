@@ -8,21 +8,19 @@ use serde::{Deserialize, Serialize};
 
 /// Private Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrivateKey(pub [u8; 32]);
+pub struct PrivateKey(pub Vec<u8>);
 
 /// Public Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublicKey(pub [u8; 64]);
+pub struct PublicKey(pub Vec<u8>);
 
 /// Address
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Address(pub [u8; 20]);
+pub struct Address(pub Vec<u8>);
 
 impl Address {
     pub fn from_slice(s: &[u8]) -> Self {
-        let mut addr = [0u8; 20];
-        addr.copy_from_slice(s);
-        Self(addr)
+        Self(s.to_vec())
     }
 }
 
@@ -34,6 +32,6 @@ impl Address {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signature {
     pub v: u8,
-    pub r: [u8; 32],
-    pub s: [u8; 32],
+    pub r: Vec<u8>,
+    pub s: Vec<u8>,
 }

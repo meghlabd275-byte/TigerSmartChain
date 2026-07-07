@@ -336,7 +336,7 @@ export default function BlockPage() {
                   {blockData.transactions.map((tx) => (
                     <TableRow 
                       key={tx.hash} 
-                      hover 
+
                       sx={{ cursor: 'pointer' }}
                       onClick={() => router.push(`/transaction/${tx.hash}`)}
                     >

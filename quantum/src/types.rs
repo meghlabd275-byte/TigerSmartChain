@@ -18,3 +18,9 @@ pub struct Key {
 pub struct Signature {
     pub sigma: Vec<u8>,
 }
+
+/// Quantum Engine
+pub struct QuantumEngine {
+    pub enabled: bool,
+    pub algorithm: String,
+}

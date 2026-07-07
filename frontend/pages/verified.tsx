@@ -4,7 +4,7 @@
 
 import { useState, useEffect } from 'react';
 import Head from 'next/head';
-import { Container, Typography, Grid, Card, CardContent, TextField, InputAdornment, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Chip, Avatar, Skeleton } from '@mui/material';
+import { Box, Container, Typography, Grid, Card, CardContent, TextField, InputAdornment, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Chip, Avatar, Skeleton } from '@mui/material';
 import { Search, Code, CheckCircle } from '@mui/icons-material';
 
 interface Contract { address: string; name: string; compiler: string; version: string; verified: number; }

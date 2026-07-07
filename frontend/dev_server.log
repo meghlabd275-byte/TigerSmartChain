@@ -1,0 +1,14 @@
+
+> tigerscan-frontend@2.0.0 dev
+> next dev
+
+   ▲ Next.js 14.0.4
+   - Local:        http://localhost:3000
+
+ ✓ Ready in 2.1s
+ ○ Compiling / ...
+ ✓ Compiled / in 3s (234 modules)
+ ✓ Compiled in 190ms (234 modules)
+ ○ Compiling /_error ...
+ ✓ Compiled /_error in 2.8s (236 modules)
+ ✓ Compiled /trace in 200ms (240 modules)
