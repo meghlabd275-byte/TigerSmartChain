@@ -279,8 +279,8 @@ const ApprovalsTable: React.FC<{
 );
 
 const Filters: React.FC<{
-  filter: typeof import('react').useState<{address?: string; token?: string; risk?: string}>[0];
-  setFilter: typeof import('react').useState<{address?: string; token?: string; risk?: string}>[1];
+  filter: {address?: string; token?: string; risk?: string};
+  setFilter: React.Dispatch<React.SetStateAction<{address?: string; token?: string; risk?: string}>>;
 }> = ({ filter, setFilter }) => (
   <div className="filters">
     <input

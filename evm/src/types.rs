@@ -20,7 +20,59 @@ impl EvmWord {
         bytes[24..].copy_from_slice(&v.to_be_bytes());
         Self(bytes)
     }
+
+    pub fn as_u64(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.0[24..]);
+        u64::from_be_bytes(bytes)
+    }
+
+    pub fn add(&self, other: &Self) -> Self {
+        let a = self.as_u64();
+        let b = other.as_u64();
+        Self::from_u64(a.wrapping_add(b))
+    }
+
+    pub fn mul(&self, other: &Self) -> Self {
+        let a = self.as_u64();
+        let b = other.as_u64();
+        Self::from_u64(a.wrapping_mul(b))
+    }
+
+    pub fn sub(&self, other: &Self) -> Self {
+        let a = self.as_u64();
+        let b = other.as_u64();
+        Self::from_u64(a.wrapping_sub(b))
+    }
+
+    pub fn div(&self, other: &Self) -> Self {
+        let a = self.as_u64();
+        let b = other.as_u64();
+        if b == 0 {
+            Self::zero()
+        } else {
+            Self::from_u64(a / b)
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0.iter().all(|&b| b == 0)
+    }
 }
+
+impl std::hash::Hash for EvmWord {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl PartialEq for EvmWord {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for EvmWord {}
 
 /// Address (160-bit)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +84,7 @@ impl Address {
     }
 
     pub fn from_hex(s: &str) -> Option<Self> {
-        let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
+        let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?;
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&bytes[..20]);
         Some(Self(addr))

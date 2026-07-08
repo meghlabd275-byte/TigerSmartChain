@@ -12,6 +12,9 @@ serde_json = "1.0"
 log = "0.4"
 tiger-state-db = { path = "../state_db" }
 
+[dev-dependencies]
+tempfile = "3.2"
+
 [profile.release]
 opt-level = 3
 lto = true

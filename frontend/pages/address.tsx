@@ -48,7 +48,6 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
-  TabPanel,
   IconButton,
   Tooltip,
   Fade,
@@ -274,7 +273,12 @@ class EncryptionService {
     combined.set(iv, salt.length);
     combined.set(new Uint8Array(encrypted), salt.length + iv.length);
     
-    return btoa(String.fromCharCode(...combined));
+    let binary = '';
+    const bytes = new Uint8Array(combined);
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
   }
   
   static async decrypt(encryptedData: string, key: string): Promise<string> {
@@ -421,7 +425,7 @@ export default function AddressPage() {
   
   // Copy address to clipboard
   const copyAddress = async () => {
-    if (!address) return;
+    if (!address || typeof address !== 'string') return;
     
     try {
       await navigator.clipboard.writeText(address);
@@ -706,7 +710,7 @@ export default function AddressPage() {
                 {transactions.map((tx) => (
                   <TableRow 
                     key={tx.hash}
-                    hover 
+
                     sx={{ cursor: 'pointer' }}
                     onClick={() => router.push(`/transaction/${tx.hash}`)}
                   >
@@ -824,7 +828,7 @@ export default function AddressPage() {
           <Grid container spacing={2}>
             {addressData.tokens?.map((token, i) => (
               <Grid item xs={12} md={6} key={i}>
-                <Card hover>
+                <Card>
                   <CardContent>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                       <Avatar src={token.logoUrl} sx={{ width: 40, height: 40 }}>
@@ -864,7 +868,7 @@ export default function AddressPage() {
           <Grid container spacing={2}>
             {addressData.nfts?.map((nft, i) => (
               <Grid item xs={12} sm={6} md={4} key={i}>
-                <Card hover>
+                <Card>
                   <CardContent>
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                       <Avatar src={nft.logoUrl} sx={{ width: 40, height: 40 }}>

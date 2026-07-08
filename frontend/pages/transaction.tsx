@@ -197,7 +197,7 @@ export default function TransactionPage() {
     return (
       <Box sx={{ p: 4 }}>
         <Skeleton variant="rectangular" height={200} sx={{ mb: 2 }} />
-        <Skeleton variant="rectangular" height={400 }} />
+        <Skeleton variant="rectangular" height={400} />
       </Box>
     );
   }
@@ -244,7 +244,7 @@ export default function TransactionPage() {
                 icon={txData.status === 'success' ? <CheckCircle /> : <ErrorIcon />}
                 label={txData.status.toUpperCase()}
                 color={txData.status === 'success' ? 'success' : 'error'}
-                size="large"
+                size="medium"
               />
             </Box>
           </Box>
@@ -270,7 +270,7 @@ export default function TransactionPage() {
                     <ListItemText 
                       primary="From" 
                       secondary={txData.fromName || txData.from}
-                      secondaryTypographyProps={{ sx: { fontFamily: 'monospace' }}
+                      secondaryTypographyProps={{ sx: { fontFamily: 'monospace' } }}
                     />
                   </ListItem>
                   <ListItem>
@@ -278,7 +278,7 @@ export default function TransactionPage() {
                     <ListItemText 
                       primary="To" 
                       secondary={txData.toName || txData.to}
-                      secondaryTypographyProps={{ sx: { fontFamily: 'monospace' }}
+                      secondaryTypographyProps={{ sx: { fontFamily: 'monospace' } }}
                     />
                   </ListItem>
                 </List>

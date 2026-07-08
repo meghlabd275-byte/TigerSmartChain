@@ -1,0 +1,99 @@
+
+> tigerscan-frontend@2.0.0 start
+> next start
+
+   ▲ Next.js 14.0.4
+   - Local:        http://localhost:3000
+
+ ✓ Ready in 741ms
+Invariant: failed to load static page {
+  "page": "/",
+  "url": "/",
+  "initUrl": "http://localhost:3000/",
+  "didRewrite": false
+}
+ ⨯ MissingStaticPage [Error]: Failed to load static file for page: / ENOENT: no such file or directory, open '/app/frontend/.next/server/pages/index.html'
+    at /app/frontend/node_modules/next/dist/server/require.js:102:19
+    at async loadComponentsImpl (/app/frontend/node_modules/next/dist/server/load-components.js:59:26)
+    at async NextNodeServer.findPageComponentsImpl (/app/frontend/node_modules/next/dist/server/next-server.js:671:36)
+    at async NextNodeServer.renderPageComponent (/app/frontend/node_modules/next/dist/server/base-server.js:1831:24)
+    at async NextNodeServer.renderToResponseImpl (/app/frontend/node_modules/next/dist/server/base-server.js:1881:32)
+    at async NextNodeServer.pipeImpl (/app/frontend/node_modules/next/dist/server/base-server.js:909:25)
+    at async NextNodeServer.handleCatchallRenderRequest (/app/frontend/node_modules/next/dist/server/next-server.js:266:17)
+    at async NextNodeServer.handleRequestImpl (/app/frontend/node_modules/next/dist/server/base-server.js:805:17)
+ ⨯ Error: Cannot find module '/app/frontend/.next/server/pages/_error.js'
+Require stack:
+- /app/frontend/node_modules/next/dist/server/require.js
+- /app/frontend/node_modules/next/dist/server/next-server.js
+- /app/frontend/node_modules/next/dist/server/next.js
+- /app/frontend/node_modules/next/dist/server/lib/start-server.js
+- /app/frontend/node_modules/next/dist/cli/next-start.js
+- /app/frontend/node_modules/next/dist/lib/commands.js
+- /app/frontend/node_modules/next/dist/bin/next
+    at Function.<anonymous> (node:internal/modules/cjs/loader:1383:15)
+    at /app/frontend/node_modules/next/dist/server/require-hook.js:55:36
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1025:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1030:22)
+    at Function._load (node:internal/modules/cjs/loader:1192:37)
+    at TracingChannel.traceSync (node:diagnostics_channel:328:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:237:24)
+    at Module.<anonymous> (node:internal/modules/cjs/loader:1463:12)
+    at mod.require (/app/frontend/node_modules/next/dist/server/require-hook.js:65:28)
+    at require (node:internal/modules/helpers:147:16) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [
+    '/app/frontend/node_modules/next/dist/server/require.js',
+    '/app/frontend/node_modules/next/dist/server/next-server.js',
+    '/app/frontend/node_modules/next/dist/server/next.js',
+    '/app/frontend/node_modules/next/dist/server/lib/start-server.js',
+    '/app/frontend/node_modules/next/dist/cli/next-start.js',
+    '/app/frontend/node_modules/next/dist/lib/commands.js',
+    '/app/frontend/node_modules/next/dist/bin/next'
+  ]
+}
+Invariant: failed to load static page {
+  "page": "/trace",
+  "url": "/trace",
+  "initUrl": "http://localhost:3000/trace",
+  "didRewrite": false
+}
+ ⨯ MissingStaticPage [Error]: Failed to load static file for page: /trace ENOENT: no such file or directory, open '/app/frontend/.next/server/pages/trace.html'
+    at /app/frontend/node_modules/next/dist/server/require.js:102:19
+    at async loadComponentsImpl (/app/frontend/node_modules/next/dist/server/load-components.js:59:26)
+    at async NextNodeServer.findPageComponentsImpl (/app/frontend/node_modules/next/dist/server/next-server.js:671:36)
+    at async NextNodeServer.renderPageComponent (/app/frontend/node_modules/next/dist/server/base-server.js:1831:24)
+    at async NextNodeServer.renderToResponseImpl (/app/frontend/node_modules/next/dist/server/base-server.js:1881:32)
+    at async NextNodeServer.pipeImpl (/app/frontend/node_modules/next/dist/server/base-server.js:909:25)
+    at async NextNodeServer.handleCatchallRenderRequest (/app/frontend/node_modules/next/dist/server/next-server.js:266:17)
+    at async NextNodeServer.handleRequestImpl (/app/frontend/node_modules/next/dist/server/base-server.js:805:17)
+ ⨯ Error: Cannot find module '/app/frontend/.next/server/pages/_error.js'
+Require stack:
+- /app/frontend/node_modules/next/dist/server/require.js
+- /app/frontend/node_modules/next/dist/server/next-server.js
+- /app/frontend/node_modules/next/dist/server/next.js
+- /app/frontend/node_modules/next/dist/server/lib/start-server.js
+- /app/frontend/node_modules/next/dist/cli/next-start.js
+- /app/frontend/node_modules/next/dist/lib/commands.js
+- /app/frontend/node_modules/next/dist/bin/next
+    at Function.<anonymous> (node:internal/modules/cjs/loader:1383:15)
+    at /app/frontend/node_modules/next/dist/server/require-hook.js:55:36
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1025:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1030:22)
+    at Function._load (node:internal/modules/cjs/loader:1192:37)
+    at TracingChannel.traceSync (node:diagnostics_channel:328:14)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:237:24)
+    at Module.<anonymous> (node:internal/modules/cjs/loader:1463:12)
+    at mod.require (/app/frontend/node_modules/next/dist/server/require-hook.js:65:28)
+    at require (node:internal/modules/helpers:147:16) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [
+    '/app/frontend/node_modules/next/dist/server/require.js',
+    '/app/frontend/node_modules/next/dist/server/next-server.js',
+    '/app/frontend/node_modules/next/dist/server/next.js',
+    '/app/frontend/node_modules/next/dist/server/lib/start-server.js',
+    '/app/frontend/node_modules/next/dist/cli/next-start.js',
+    '/app/frontend/node_modules/next/dist/lib/commands.js',
+    '/app/frontend/node_modules/next/dist/bin/next'
+  ]
+}
+Killed
