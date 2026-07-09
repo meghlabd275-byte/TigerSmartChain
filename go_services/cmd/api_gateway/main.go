@@ -88,10 +88,19 @@ func setupRoutes(router *gin.Engine, h *gateway.Handler) {
 		api.GET("/txs/:hash/internal", h.GetInternalTransactions)
 		api.GET("/txs/:hash/trace", h.GetTrace)
 
+		// Internal Transactions (new)
+		api.GET("/internal-txs", h.GetInternalTransactionList)
+		api.GET("/internal-txs/:hash", h.GetInternalTransactions)
+
+		// Traces and State Diffs (new)
+		api.GET("/trace/:hash", h.GetTrace)
+		api.GET("/state-diff/:hash", h.GetStateDiff)
+
 		// Tokens
 		api.GET("/tokens", h.GetTokens)
 		api.GET("/tokens/:address", h.GetToken)
 		api.GET("/tokens/:address/holders", h.GetTokenHolders)
+		api.GET("/tokens/:address/holders/count", h.GetTokenHoldersCount)
 		api.GET("/tokens/:address/transfers", h.GetTokenTransfers)
 		api.GET("/tokens/:address/price-history", h.GetTokenPriceHistory)
 
@@ -101,12 +110,14 @@ func setupRoutes(router *gin.Engine, h *gateway.Handler) {
 		api.GET("/nfts/:address/tokens/:tokenId", h.GetNFTToken)
 		api.GET("/nfts/:address/transfers", h.GetNFTTransfers)
 		api.GET("/nfts/:address/floor", h.GetNFTFloorPrice)
+		api.GET("/nfts/:address/owners", h.GetNFTOwners)
 
 		// Contracts
 		api.GET("/contracts/:address", h.GetContract)
 		api.GET("/contracts/:address/code", h.GetContractCode)
 		api.GET("/contracts/:address/storage/:slot", h.GetStorageAt)
 		api.POST("/contracts/verify", h.VerifyContract)
+		api.GET("/contracts/verified", h.GetVerifiedContracts)
 
 		// Addresses
 		api.GET("/addresses/:address", h.GetAddress)
@@ -118,6 +129,7 @@ func setupRoutes(router *gin.Engine, h *gateway.Handler) {
 		api.GET("/charts/transactions", h.GetTransactionChart)
 		api.GET("/charts/addresses", h.GetAddressChart)
 		api.GET("/gas/oracle", h.GetGasOracle)
+		api.GET("/gas/history", h.GetGasHistory)
 
 		// Search
 		api.GET("/search", h.Search)
@@ -130,10 +142,14 @@ func setupRoutes(router *gin.Engine, h *gateway.Handler) {
 		// DEX
 		api.GET("/dex/pairs", h.GetDexPairs)
 		api.GET("/dex/pairs/:address", h.GetDexPair)
+		api.GET("/dex/pairs/:address/analytics", h.GetDexAnalytics)
 
 		// Governance
 		api.GET("/governance/proposals", h.GetGovernanceProposals)
 		api.GET("/governance/proposals/:id", h.GetGovernanceProposal)
+
+		// MEV (new)
+		api.GET("/mev/bundles", h.GetMEVBundles)
 	}
 
 	// WebSocket
