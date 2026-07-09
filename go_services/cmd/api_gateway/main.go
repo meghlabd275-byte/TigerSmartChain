@@ -78,6 +78,7 @@ func setupRoutes(router *gin.Engine, h *gateway.Handler) {
 		// Blocks
 		api.GET("/blocks/latest", h.GetLatestBlock)
 		api.GET("/blocks/:number", h.GetBlock)
+		api.GET("/blocks/:number/transactions", h.GetBlockTransactions)
 		api.GET("/blocks", h.GetBlocks)
 
 		// Transactions

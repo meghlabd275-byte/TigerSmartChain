@@ -330,6 +330,12 @@ class APIClient {
     const { data } = await this.client.get<string | null>(`/labels/${address}`)
     return data
   }
+
+  // Block Transactions
+  async getBlockTransactions(blockNumber: number): Promise<PaginatedResponse<Transaction>> {
+    const { data } = await this.client.get<PaginatedResponse<Transaction>>(`/blocks/${blockNumber}/transactions`)
+    return data
+  }
 }
 
 export const api = new APIClient()
