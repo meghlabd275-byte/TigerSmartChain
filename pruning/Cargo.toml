@@ -3,17 +3,49 @@ name = "tiger-pruning"
 version = "1.0.0"
 edition = "2021"
 authors = ["TigerScan Team"]
-description = "Pruning for TigerScan"
+description = "High-performance state pruning for TigerScan"
 license = "MIT"
 
 [dependencies]
+# Trie and state
+keccak-hash = "0.10"
+hasher = "0.2"
+
+# Database
+rocksdb = "0.21"
+memmap2 = "0.9"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Logging
 log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Async channels
+crossbeam = "0.8"
+
+# Metrics
+metrics = "0.21"
+
+# State DB
 tiger-state-db = { path = "../state_db" }
 
 [dev-dependencies]
-tempfile = "3.2"
+tempfile = "3.8"
+criterion = "0.5"
+
+[[bench]]
+name = "pruning_bench"
+harness = false
 
 [profile.release]
 opt-level = 3
