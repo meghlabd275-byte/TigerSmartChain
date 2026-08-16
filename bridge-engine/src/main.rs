@@ -101,23 +101,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_fee: "1000000000000000".to_string(),
             max_fee: "100000000000000000".to_string(),
         },
+        database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
     };
 
     // Create bridge engine
-    let bridge = BridgeEngine::new(config);
+    let mut bridge = BridgeEngine::new(config);
+    // Initialize providers (and optional Postgres pool). Failures here are
+    // non-fatal for a dry-run initiate; log and continue.
+    if let Err(e) = bridge.init().await {
+        eprintln!("warn: bridge init: {}", e);
+    }
 
     // Execute transfer
     let source: Chain = cli.from.into();
     let dest: Chain = cli.to.into();
-    
+
     println!("Initiating transfer from {:?} to {:?}", source, dest);
     println!("Token: {}", cli.token);
     println!("Recipient: {}", cli.recipient);
     println!("Amount: {}", cli.amount);
 
-    // Note: This would actually execute the transfer in production
-    // For now, just print the configuration
-    println!("\nBridge configuration loaded successfully");
+    let token_type = tigersmartchain_bridge::TokenType::ERC20;
+    let transfer = bridge
+        .initiate_transfer(
+            source,
+            dest,
+            "0x0000000000000000000000000000000000000000".to_string(),
+            cli.recipient.clone(),
+            cli.token.clone(),
+            token_type,
+            cli.amount.clone(),
+            None,
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+
+    println!("\nTransfer initiated successfully");
+    println!("  Transfer ID : {}", transfer.id);
+    println!("  Source      : {:?}", transfer.source_chain);
+    println!("  Destination : {:?}", transfer.destination_chain);
+    println!("  Status      : {:?}", transfer.status);
+    println!("  Timestamp   : {}", transfer.timestamp);
 
     Ok(())
 }

@@ -30,7 +30,7 @@ pub use message::Message;
 pub use proof::Proof;
 
 /// Chain identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Chain {
     TigerSmartChain,
     Ethereum,
@@ -112,6 +112,8 @@ pub struct BridgeConfig {
     pub signature_threshold: usize,
     pub confirmation_blocks: u64,
     pub fee: FeeConfig,
+    #[serde(default)]
+    pub database_url: String,
 }
 
 /// Chain configuration
