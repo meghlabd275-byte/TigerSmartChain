@@ -34,7 +34,3 @@ tempfile = "3.8"
 [lib]
 name = "indexer_advanced"
 path = "src/lib.rs"
-
-[[bin]]
-name = "indexer"
-path = "src/main.rs"

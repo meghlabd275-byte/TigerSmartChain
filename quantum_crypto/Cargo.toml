@@ -7,11 +7,21 @@ description = "Post-quantum cryptography for blockchain"
 
 [dependencies]
 sha3 = "0.10"
+sha2 = "0.10"
 digest = "0.10"
 rand = "0.8"
+rand_core = "0.6"
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+parking_lot = "0.12"
+tracing = "0.1"
+hex = "0.4"
+# Real post-quantum primitives (NIST PQC finalists):
+#  - pqc_kyber  : ML-KEM (Kyber) key encapsulation
+#  - pqc_dilithium : ML-DSA (Dilithium) signatures
+pqc_kyber = { version = "0.7", features = ["kyber768"] }
+pqc_dilithium = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"

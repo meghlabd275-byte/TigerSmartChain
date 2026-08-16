@@ -104,6 +104,8 @@ pub struct QuantumSignature {
     pub key_type: QuantumKeyType,
     pub signature: Vec<u8>,
     pub message_hash: [u8; 32],
+    /// Original signed message (Dilithium verify requires the message).
+    pub message: Vec<u8>,
 }
 
 /// Quantum-resistant key exchange result
@@ -122,12 +124,14 @@ pub struct QuantumKeyExchange {
 pub struct QuantumCryptoManager {
     /// Active key pairs
     key_pairs: Arc<RwLock<HashMap<String, QuantumKeyPair>>>,
+    /// Live Dilithium (ML-DSA) keypairs, keyed by secret-key bytes.
+    dilithium_keys: Arc<RwLock<HashMap<Vec<u8>, pqc_dilithium::Keypair>>>,
     
     /// Default key type
     default_key_type: QuantumKeyType,
     
-    /// Statistics
-    stats: CryptoStats,
+    /// Statistics (interior-mutable so methods can take &self)
+    stats: Arc<RwLock<CryptoStats>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -153,8 +157,9 @@ impl QuantumCryptoManager {
     pub fn new(default_key_type: QuantumKeyType) -> Self {
         Self {
             key_pairs: Arc::new(RwLock::new(HashMap::new())),
+            dilithium_keys: Arc::new(RwLock::new(HashMap::new())),
             default_key_type,
-            stats: CryptoStats::default(),
+            stats: Arc::new(RwLock::new(CryptoStats::default())),
         }
     }
     
@@ -166,11 +171,11 @@ impl QuantumCryptoManager {
             QuantumKeyType::Kyber512 => self.generate_kyber_key_pair(512)?,
             QuantumKeyType::Kyber768 => self.generate_kyber_key_pair(768)?,
             QuantumKeyType::Kyber1024 => self.generate_kyber_key_pair(1024)?,
-            QuantumKeyType::SPHINCS256s => self.generate_sphincs_key_pair(true)?,
-            QuantumKeyType::SPHINCS256f => self.generate_sphincs_key_pair(false)?,
-            QuantumKeyType::Dilithium2 => self.generate_dilithium_key_pair(2)?,
-            QuantumKeyType::Dilithium3 => self.generate_dilithium_key_pair(3)?,
-            QuantumKeyType::Dilithium5 => self.generate_dilithium_key_pair(5)?,
+            QuantumKeyType::SPHINCS256s => self.generate_sig_key_pair(QuantumKeyType::SPHINCS256s)?,
+            QuantumKeyType::SPHINCS256f => self.generate_sig_key_pair(QuantumKeyType::SPHINCS256f)?,
+            QuantumKeyType::Dilithium2 => self.generate_sig_key_pair(QuantumKeyType::Dilithium2)?,
+            QuantumKeyType::Dilithium3 => self.generate_sig_key_pair(QuantumKeyType::Dilithium3)?,
+            QuantumKeyType::Dilithium5 => self.generate_sig_key_pair(QuantumKeyType::Dilithium5)?,
         };
         
         let key_pair = QuantumKeyPair {
@@ -183,210 +188,109 @@ impl QuantumCryptoManager {
                 .as_secs(),
         };
         
-        self.stats.keys_generated += 1;
+        self.stats.write().keys_generated += 1;
         
         Ok(key_pair)
     }
     
-    /// Generate Kyber key pair
+    /// Generate a real Kyber (ML-KEM) key pair via pqc_kyber.
     fn generate_kyber_key_pair(&self, security_level: usize) -> Result<(QuantumPublicKey, QuantumSecretKey), QuantumCryptoError> {
-        // Simplified Kyber key generation
-        // In production, use actual library like liboqs
-        
-        let key_size = match security_level {
-            512 => 800,
-            768 => 1184,
-            1024 => 1568,
-            _ => return Err(QuantumCryptoError::KeyGenerationFailed("Invalid security level".to_string())),
+        let kem = kyber::KyberKEM::new(security_level);
+        let (pk, sk) = kem.keygen()?;
+        let kt = match security_level {
+            512 => QuantumKeyType::Kyber512,
+            1024 => QuantumKeyType::Kyber1024,
+            _ => QuantumKeyType::Kyber768,
         };
-        
-        let key_data: Vec<u8> = (0..key_size).map(|i| (i as u8) ^ 0xFF).collect();
-        
-        let public_key = QuantumPublicKey {
-            key_type: QuantumKeyType::Kyber768,
-            key_data: key_data.clone(),
-            created_at: 0,
-        };
-        
-        let secret_key = QuantumSecretKey {
-            key_type: QuantumKeyType::Kyber768,
-            key_data: key_data,
-            created_at: 0,
-        };
-        
-        Ok((public_key, secret_key))
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        Ok((
+            QuantumPublicKey { key_type: kt, key_data: pk, created_at: now },
+            QuantumSecretKey { key_type: kt, key_data: sk, created_at: now },
+        ))
     }
-    
-    /// Generate SPHINCS+ key pair
-    fn generate_sphincs_key_pair(&self, _short: bool) -> Result<(QuantumPublicKey, QuantumSecretKey), QuantumCryptoError> {
-        // Simplified SPHINCS+ key generation
-        let key_data: Vec<u8> = (0..64).map(|i| (i as u8) ^ 0xAA).collect();
-        
-        let public_key = QuantumPublicKey {
-            key_type: QuantumKeyType::SPHINCS256s,
-            key_data: key_data.clone(),
-            created_at: 0,
-        };
-        
-        let secret_key = QuantumSecretKey {
-            key_type: QuantumKeyType::SPHINCS256s,
-            key_data: key_data,
-            created_at: 0,
-        };
-        
-        Ok((public_key, secret_key))
+
+    /// Generate a real ML-DSA (Dilithium) key pair. The live Keypair is
+    /// retained in `dilithium_keys` so `sign()` can use it.
+    fn generate_sig_key_pair(&self, key_type: QuantumKeyType) -> Result<(QuantumPublicKey, QuantumSecretKey), QuantumCryptoError> {
+        let kp = pqc_dilithium::Keypair::generate();
+        let secret = kp.expose_secret().to_vec();
+        let public = kp.public.to_vec();
+        self.dilithium_keys.write().insert(secret.clone(), kp);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        Ok((
+            QuantumPublicKey { key_type, key_data: public, created_at: now },
+            QuantumSecretKey { key_type, key_data: secret, created_at: now },
+        ))
     }
-    
-    /// Generate Dilithium key pair
-    fn generate_dilithium_key_pair(&self, variant: u8) -> Result<(QuantumPublicKey, QuantumSecretKey), QuantumCryptoError> {
-        // Simplified Dilithium key generation
-        let key_size = match variant {
-            2 => 2592,
-            3 => 4000,
-            5 => 4864,
-            _ => return Err(QuantumCryptoError::KeyGenerationFailed("Invalid variant".to_string())),
-        };
-        
-        let key_data: Vec<u8> = (0..key_size).map(|i| (i as u8) ^ 0x55).collect();
-        
-        let key_type = match variant {
-            2 => QuantumKeyType::Dilithium2,
-            3 => QuantumKeyType::Dilithium3,
-            5 => QuantumKeyType::Dilithium5,
-            _ => QuantumKeyType::Dilithium2,
-        };
-        
-        let public_key = QuantumPublicKey {
-            key_type,
-            key_data: key_data.clone(),
-            created_at: 0,
-        };
-        
-        let secret_key = QuantumSecretKey {
-            key_type,
-            key_data: key_data,
-            created_at: 0,
-        };
-        
-        Ok((public_key, secret_key))
-    }
-    
-    /// Sign message
+
+    /// Sign a message with the real ML-DSA (Dilithium) keypair.
     pub fn sign(
         &self,
         secret_key: &QuantumSecretKey,
         message: &[u8],
     ) -> Result<QuantumSignature, QuantumCryptoError> {
         debug!("Signing message with {:?}", secret_key.key_type);
-        
+        let is_sig = matches!(
+            secret_key.key_type,
+            QuantumKeyType::SPHINCS256s | QuantumKeyType::SPHINCS256f
+                | QuantumKeyType::Dilithium2 | QuantumKeyType::Dilithium3 | QuantumKeyType::Dilithium5
+        );
+        if !is_sig {
+            return Err(QuantumCryptoError::SigningFailed(format!(
+                "key type {:?} is not a signature scheme", secret_key.key_type)));
+        }
+        let kp = self.dilithium_keys.read().get(&secret_key.key_data).copied().ok_or_else(|| {
+            QuantumCryptoError::InvalidKey("no live Dilithium keypair for this secret key".to_string())
+        })?;
+        let sig = kp.sign(message).to_vec();
         let message_hash = sha3_hash(message);
-        
-        let signature_data = match secret_key.key_type {
-            QuantumKeyType::SPHINCS256s | QuantumKeyType::SPHINCS256f => {
-                self.sign_sphincs(&secret_key.key_data, message)?
-            }
-            QuantumKeyType::Dilithium2 | QuantumKeyType::Dilithium3 | QuantumKeyType::Dilithium5 => {
-                self.sign_dilithium(&secret_key.key_data, message)?
-            }
-            _ => {
-                // Fallback to hash-based for other types
-                self.sign_hash_based(&secret_key.key_data, message)?
-            }
-        };
-        
-        self.stats.signatures_created += 1;
-        
+        self.stats.write().signatures_created += 1;
         Ok(QuantumSignature {
             key_type: secret_key.key_type,
-            signature: signature_data,
+            signature: sig,
             message_hash,
+            message: message.to_vec(),
         })
     }
-    
-    /// Verify signature
+
+    /// Verify a signature using the real ML-DSA (Dilithium) verifier.
     pub fn verify(
         &self,
         public_key: &QuantumPublicKey,
         signature: &QuantumSignature,
     ) -> Result<bool, QuantumCryptoError> {
         debug!("Verifying signature");
-        
-        // Verify message hash matches
-        let computed_hash = sha3_hash(&signature.signature);
-        if computed_hash != signature.message_hash {
-            return Ok(false);
-        }
-        
-        // In production, verify signature using appropriate algorithm
-        self.stats.signatures_verified += 1;
-        
-        Ok(true)
+        let verifier = sphinx::SphinxVerifier::new(public_key.key_data.clone());
+        let valid = verifier.verify(&signature.signature, &signature.message);
+        self.stats.write().signatures_verified += 1;
+        Ok(valid)
     }
-    
-    /// Key exchange (Kyber)
+
+    /// Key exchange (Kyber / ML-KEM): encapsulate a real shared secret.
     pub fn key_exchange(
         &self,
         recipient_public_key: &QuantumPublicKey,
     ) -> Result<QuantumKeyExchange, QuantumCryptoError> {
         debug!("Performing key exchange");
-        
-        // Generate ephemeral key pair
-        let ephemeral = self.generate_kyber_key_pair(768)?;
-        
-        // Compute shared secret (simplified)
-        let shared_secret: Vec<u8> = (0..32).map(|i| i as u8).collect();
-        
-        // Create ciphertext (simplified)
-        let ciphertext: Vec<u8> = (0..1088).map(|i| i as u8).collect();
-        
-        self.stats.key_exchanges_performed += 1;
-        
+        let level = match recipient_public_key.key_type {
+            QuantumKeyType::Kyber512 => 512,
+            QuantumKeyType::Kyber1024 => 1024,
+            _ => 768,
+        };
+        let kem = kyber::KyberKEM::new(level);
+        let (ciphertext, shared_secret) = kem.encapsulate(&recipient_public_key.key_data)?;
+        let (eph_pub, _eph_sec) = kem.keygen()?;
+        self.stats.write().key_exchanges_performed += 1;
         Ok(QuantumKeyExchange {
-            ephemeral_public_key: ephemeral.0.key_data,
+            ephemeral_public_key: eph_pub,
             shared_secret,
             ciphertext,
         })
     }
-    
-    /// Hash-based signature
-    fn sign_hash_based(&self, _key_data: &[u8], message: &[u8]) -> Result<Vec<u8>, QuantumCryptoError> {
-        // Simplified hash-based signature
-        let hash = sha3_hash(message);
-        
-        // Combine with key data (simplified)
-        let mut signature = hash.to_vec();
-        signature.extend_from_slice(&sha3_hash(&signature));
-        
-        Ok(signature)
-    }
-    
-    /// SPHINCS+ signature
-    fn sign_sphincs(&self, key_data: &[u8], message: &[u8]) -> Result<Vec<u8>, QuantumCryptoError> {
-        // Simplified SPHINCS+ signature
-        let hash = sha3_hash(message);
-        
-        // Combine with key data
-        let mut signature = key_data[..64].to_vec();
-        signature.extend_from_slice(&hash);
-        
-        Ok(signature)
-    }
-    
-    /// Dilithium signature
-    fn sign_dilithium(&self, key_data: &[u8], message: &[u8]) -> Result<Vec<u8>, QuantumCryptoError> {
-        // Simplified Dilithium signature
-        let hash = sha3_hash(message);
-        
-        // Combine with key data
-        let mut signature = key_data[..100].to_vec();
-        signature.extend_from_slice(&hash);
-        
-        Ok(signature)
-    }
-    
+
     /// Get statistics
     pub fn get_stats(&self) -> CryptoStats {
-        self.stats.clone()
+        self.stats.read().clone()
     }
 }
 
@@ -435,23 +339,37 @@ mod tests {
     fn test_sign_verify() {
         let manager = QuantumCryptoManager::new(QuantumKeyType::Kyber768);
         let key_pair = manager.generate_key_pair(QuantumKeyType::SPHINCS256s).unwrap();
-        
         let message = b"Test message";
         let signature = manager.sign(&key_pair.secret_key, message).unwrap();
-        
-        let result = manager.verify(&key_pair.public_key, &signature);
-        assert!(result.is_ok());
+        let result = manager.verify(&key_pair.public_key, &signature).unwrap();
+        assert!(result, "valid signature must verify to true");
+    }
+    
+    #[test]
+    fn test_sign_verify_tampered_rejected() {
+        // Security regression: the old fake verifier returned true for any signature.
+        let manager = QuantumCryptoManager::new(QuantumKeyType::Kyber768);
+        let key_pair = manager.generate_key_pair(QuantumKeyType::Dilithium3).unwrap();
+        let message = b"tamper-test-message";
+        let mut signature = manager.sign(&key_pair.secret_key, message).unwrap();
+        assert!(manager.verify(&key_pair.public_key, &signature).unwrap());
+        signature.signature[0] ^= 0xff;
+        assert!(!manager.verify(&key_pair.public_key, &signature).unwrap(),
+                "tampered signature must be rejected");
+        let mut sig2 = manager.sign(&key_pair.secret_key, b"message A").unwrap();
+        sig2.message = b"message B".to_vec();
+        assert!(!manager.verify(&key_pair.public_key, &sig2).unwrap(),
+                "signature for a different message must be rejected");
     }
     
     #[test]
     fn test_key_exchange() {
         let manager = QuantumCryptoManager::new(QuantumKeyType::Kyber768);
         let key_pair = manager.generate_key_pair(QuantumKeyType::Kyber768).unwrap();
-        
         let exchange = manager.key_exchange(&key_pair.public_key).unwrap();
-        
         assert!(!exchange.shared_secret.is_empty());
         assert!(!exchange.ephemeral_public_key.is_empty());
+        assert_eq!(exchange.shared_secret.len(), 32, "Kyber shared secret is 32 bytes");
     }
     
     #[test]

@@ -88,9 +88,9 @@ impl MerkleTree {
             // Determine order
             if current < **sibling {
                 combined.extend_from_slice(&current);
-                combined.extend_from_slice(sibling);
+                combined.extend_from_slice(&**sibling);
             } else {
-                combined.extend_from_slice(sibling);
+                combined.extend_from_slice(&**sibling);
                 combined.extend_from_slice(&current);
             }
             

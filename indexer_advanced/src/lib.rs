@@ -413,7 +413,7 @@ impl Database {
 // ============================================
 
 const ERC20_TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const ERC20_APPROVAL_TOPIC: &str = "0x8c5be1e5ebec7d5bd14f71427d1e84f3b9314c4bde82b4e8e6d2e2e2e2e2e2e2";
+const ERC20_APPROVAL_TOPIC: &str = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const ERC721_TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 pub struct TokenParser;

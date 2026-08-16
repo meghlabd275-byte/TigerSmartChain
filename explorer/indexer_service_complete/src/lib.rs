@@ -616,7 +616,7 @@ impl IndexerService {
         };
 
         // Parse Transfer events (TEP20)
-        let transfer_signature = H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be").unwrap());
+        let transfer_signature = H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap());
         
         for (log_index, log) in receipt.logs.iter().enumerate() {
             if log.topics.len() != 4 {
@@ -679,7 +679,7 @@ impl IndexerService {
         };
 
         // Parse Transfer events (TEP721/TEP1155)
-        let transfer_signature_721 = H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be").unwrap());
+        let transfer_signature_721 = H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap());
         
         for (log_index, log) in receipt.logs.iter().enumerate() {
             if log.topics.len() != 4 {
@@ -743,7 +743,7 @@ impl IndexerService {
         };
 
         // Subscribe to logs
-        let filter = Filter::new().topic0(ethers::types::H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be").unwrap()));
+        let filter = Filter::new().topic0(ethers::types::H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap()));
         
         let mut stream = ws.subscribe_pending_txs().await
             .map_err(|e| IndexerError::Rpc(e.to_string()))?;
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn test_parse_hash() {
-        let hash = "0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be";
+        let hash = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
         let parsed = parse_hash(hash);
         assert!(parsed.is_some());
     }

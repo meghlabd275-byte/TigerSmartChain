@@ -162,9 +162,9 @@ impl LogSearchService {
         
         // ERC-20 events
         let signatures = vec![
-            ("0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be", "Transfer", "Transfer(address from, address to, uint256)"),
-            ("0x8c5be1e5ebec7d5bd14f5bdaa510684b1e5c059b1e5c059b1e5c059b1e5c059b1", "Approval", "Approval(address owner, address spender, uint256)"),
-            ("0x17307e6d6c086e92f9c2e1b1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "TransferSingle", "TransferSingle(address operator, address from, address to, uint256 id, uint256 value)"),
+            ("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", "Transfer", "Transfer(address from, address to, uint256)"),
+            ("0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925", "Approval", "Approval(address owner, address spender, uint256)"),
+            ("0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62", "TransferSingle", "TransferSingle(address operator, address from, address to, uint256 id, uint256 value)"),
             ("0xb5c1f3c2e2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2", "TransferBatch", "TransferBatch(address operator, address from, address to, uint256[] ids, uint256[] values)"),
             ("0x2c5d8a3bc3c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4", "ApprovalForAll", "ApprovalForAll(address account, address operator, bool approved)"),
             // ERC-721 events
@@ -182,9 +182,9 @@ impl LogSearchService {
             ("0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5", "VoteCast", "VoteCast(uint256 id, address voter, uint8 support, uint256 votes)"),
             ("0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c", "ProposalExecuted", "ProposalExecuted(uint256 id)"),
             // Staking events
-            ("0x8c5be1e5ebec7d5bd14f5bdaa510684b1e5c059b1e5c059b1e5c059b1", "Stake", "Stake(address user, uint256 amount)"),
-            ("0x8c5be1e5ebec7d5bd14f5bdaa510684b1e5c059b1e5c059b1e5c059b1", "Unstake", "Unstake(address user, uint256 amount)"),
-            ("0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be", "RewardPaid", "RewardPaid(address user, uint256 reward)"),
+            ("0xe678d5bdcf670ef07ff1a819fad381a3a917e3d6c70d4d1c064b52bb7506c745", "Stake", "Stake(address user, uint256 amount)"),
+            ("0x2458986e35eb8d33d29c9a7dbe095b7957a08ca23784d5e3636e3a03f99058bf", "Unstake", "Unstake(address user, uint256 amount)"),
+            ("0xe2403640ba68fed3a2f88b7557551d1993f84b99bb10ff833f0cf8db0c5e0486", "RewardPaid", "RewardPaid(address user, uint256 reward)"),
         ];
         
         for (hash, name, canonical) in signatures {
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_is_event_signature() {
-        assert!(is_event_signature("0xddf252ad1be2c89b69c2b068fc378da9529521f1c5d5ba481f6d2a9c92955c5be"));
+        assert!(is_event_signature("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
         assert!(!is_event_signature("0x123"));
     }
 }
