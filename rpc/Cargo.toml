@@ -24,7 +24,6 @@ url = "2.4"
 hex = "0.4"
 base64 = "0.21"
 ethabi = "18"
-evm = "6"
 ruint = "1"
 
 [dev-dependencies]

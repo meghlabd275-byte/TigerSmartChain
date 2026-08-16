@@ -23,6 +23,7 @@ pub struct RPCConfig {
     pub port: u16,
     pub cors_enabled: bool,
     pub max_request_size: usize,
+    pub node_url: String,
 }
 
 impl Default for RPCConfig {
@@ -32,15 +33,22 @@ impl Default for RPCConfig {
             port: 8545,
             cors_enabled: true,
             max_request_size: 10 * 1024 * 1024,
+            node_url: "http://localhost:8545".to_string(),
         }
     }
 }
 
 impl RPCServer {
     pub fn new(config: RPCConfig) -> Self {
+        let url = if config.node_url.is_empty() {
+            "http://localhost:8545"
+        } else {
+            &config.node_url
+        };
+        let handler = RPCHandler::new(url).unwrap_or_else(|_| RPCHandler::default());
         Self {
             config,
-            handler: Arc::new(RPCHandler::new()),
+            handler: Arc::new(handler),
         }
     }
 
@@ -68,7 +76,7 @@ impl RPCServer {
         }
     }
 
-    async fn handle_connection(stream: TcpStream, handler: Arc<RPCHandler>) -> Result<(), String> {
+    async fn handle_connection(mut stream: TcpStream, handler: Arc<RPCHandler>) -> Result<(), String> {
         let mut buffer = vec![0u8; 1024 * 1024];
         let n = stream.read(&mut buffer).await.map_err(|e| e.to_string())?;
         buffer.truncate(n);

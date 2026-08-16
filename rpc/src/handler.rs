@@ -16,7 +16,7 @@ use thiserror::Error;
 use reqwest::{Client, Url};
 use tokio::sync::RwLock;
 use serde_json::{json, Value};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // =============================================================================
 // ERRORS
@@ -129,6 +129,43 @@ impl RPCClient {
             .map_err(|e| RPCError::ParseError(e.to_string()))
     }
 
+    /// Send a JSON-RPC request and return the raw result `Value`. This is used
+    /// by the sync `RPCHandler::handle` to proxy arbitrary methods to the
+    /// upstream node without per-method deserialization.
+    pub async fn request_raw(&self, method: &str, params: Option<Value>) -> Result<Value, RPCError> {
+        let request = RPCRequest {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+            id: Some(1),
+        };
+
+        let response = self.client
+            .post(self.url.clone())
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| RPCError::RequestFailed(e.to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(RPCError::RequestFailed(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
+
+        let rpc_response: RPCResponse = response
+            .json()
+            .await
+            .map_err(|e| RPCError::ParseError(e.to_string()))?;
+
+        if let Some(error) = rpc_response.error {
+            return Err(RPCError::RequestFailed(error.message));
+        }
+
+        Ok(rpc_response.result.unwrap_or(Value::Null))
+    }
+
     // =============================================================================
     // CHAIN METHODS
     // =============================================================================
@@ -154,7 +191,7 @@ impl RPCClient {
             u64::from_str_radix(&num_str[2..], 16)
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         } else {
-            num_str.parse()
+            num_str.parse::<u64>()
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         };
         
@@ -189,7 +226,7 @@ impl RPCClient {
             u64::from_str_radix(&id_str[2..], 16)
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         } else {
-            id_str.parse()
+            id_str.parse::<u64>()
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         };
         
@@ -214,13 +251,14 @@ impl RPCClient {
             GasPriceResult::PriceHex(n) => n,
         };
         
-        if price_str.starts_with("0x") {
+        let price = if price_str.starts_with("0x") {
             u128::from_str_radix(&price_str[2..], 16)
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         } else {
-            price_str.parse()
+            price_str.parse::<u128>()
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
-        }
+        };
+        Ok(price)
     }
 
     // =============================================================================
@@ -253,7 +291,7 @@ impl RPCClient {
 
     /// Get latest block
     pub async fn eth_get_latest_block(&self) -> Result<Block, RPCError> {
-        let result: Block = self.request("eth_getBlockByNumber", Some(json!(["latest", false])))?;
+        let result: Block = self.request("eth_getBlockByNumber", Some(json!(["latest", false]))).await?;
         
         Ok(result)
     }
@@ -342,13 +380,14 @@ impl RPCClient {
             NonceResult::NonceHex(n) => n,
         };
         
-        if nonce_str.starts_with("0x") {
+        let nonce = if nonce_str.starts_with("0x") {
             u64::from_str_radix(&nonce_str[2..], 16)
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         } else {
-            nonce_str.parse()
+            nonce_str.parse::<u64>()
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
-        }
+        };
+        Ok(nonce)
     }
 
     // =============================================================================
@@ -402,13 +441,14 @@ impl RPCClient {
             GasResult::GasHex(n) => n,
         };
         
-        if gas_str.starts_with("0x") {
+        let gas = if gas_str.starts_with("0x") {
             u64::from_str_radix(&gas_str[2..], 16)
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         } else {
-            gas_str.parse()
+            gas_str.parse::<u64>()
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
-        }
+        };
+        Ok(gas)
     }
 
     // =============================================================================
@@ -637,13 +677,14 @@ impl RPCClient {
             NonceResult::NonceHex(n) => n,
         };
         
-        if nonce_str.starts_with("0x") {
+        let nonce = if nonce_str.starts_with("0x") {
             u64::from_str_radix(&nonce_str[2..], 16)
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
         } else {
-            nonce_str.parse()
+            nonce_str.parse::<u64>()
                 .map_err(|e| RPCError::ParseError(e.to_string()))?
-        }
+        };
+        Ok(nonce)
     }
 
     /// Call at historical block (read-only, archive state)
@@ -701,29 +742,66 @@ impl RPCClient {
 // RPC HANDLER
 // =============================================================================
 
-/// RPC Handler - wraps client for synchronous access
+/// RPC Handler - wraps client for synchronous access. Every method is proxied
+/// to the configured upstream node; no hardcoded values are returned.
 pub struct RPCHandler {
     client: Arc<RPCClient>,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl RPCHandler {
     /// Create new handler
     pub fn new(url: &str) -> Result<Self, RPCError> {
         let client = Arc::new(RPCClient::new(url)?);
-        Ok(Self { client })
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| RPCError::ConnectionError(format!("tokio runtime: {}", e)))?;
+        Ok(Self { client, runtime })
     }
 
-    /// Handle request
+    /// Handle request by proxying it to the upstream node via request_raw.
+    /// Returns real chain data rather than hardcoded placeholders.
     pub fn handle(&self, request: &RPCRequest) -> RPCResponse {
         let id = request.id.unwrap_or(0);
-        
-        // For sync handlers, we return a basic response
-        // Full async implementation would use the client methods above
-        match request.method.as_str() {
-            "eth_blockNumber" => RPCResponse::success(json!("0x0"), id),
-            "eth_chainId" => RPCResponse::success(json!("0x1"), id),
-            "eth_gasPrice" => RPCResponse::success(json!("0x4"), id),
-            _ => RPCResponse::error(-32601, "Method not found".to_string(), id),
+
+        // Whitelist of proxied methods. Anything not in this set returns the
+        // standard JSON-RPC "method not found" error so we never silently
+        // fabricate a result.
+        const SUPPORTED: &[&str] = &[
+            "eth_blockNumber",
+            "eth_chainId",
+            "eth_gasPrice",
+            "eth_getBalance",
+            "eth_getCode",
+            "eth_getStorageAt",
+            "eth_getTransactionByHash",
+            "eth_getTransactionReceipt",
+            "eth_sendRawTransaction",
+            "eth_estimateGas",
+            "eth_call",
+            "eth_getBlockByNumber",
+            "eth_getBlockByHash",
+            "eth_getTransactionCount",
+            "eth_getBlockTransactionCountByHash",
+            "eth_getBlockTransactionCountByNumber",
+            "eth_getLogs",
+            "eth_accounts",
+            "net_version",
+            "net_listening",
+            "net_peerCount",
+            "web3_clientVersion",
+            "web3_sha3",
+        ];
+
+        if !SUPPORTED.contains(&request.method.as_str()) {
+            return RPCResponse::error(-32601, format!("Method not found: {}", request.method), id);
+        }
+
+        let params = request.params.clone();
+        match self.runtime.block_on(self.client.request_raw(&request.method, params)) {
+            Ok(value) => RPCResponse::success(value, id),
+            Err(e) => RPCResponse::error(-32603, format!("internal error: {}", e), id),
         }
     }
 }
