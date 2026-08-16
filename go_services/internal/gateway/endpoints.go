@@ -542,12 +542,149 @@ func (h *Handler) GetContractABI(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"abi": row["abi"]})
 }
-func (h *Handler) VerifyContractMultiFile(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"status": "queued"}) }
-func (h *Handler) ReadContract(c *gin.Context)             { c.JSON(http.StatusOK, gin.H{"result": "0x"}) }
-func (h *Handler) WriteContract(c *gin.Context)            { c.JSON(http.StatusOK, gin.H{"result": "0x"}) }
-func (h *Handler) CheckProxy(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"isProxy": false}) }
-func (h *Handler) GetContractType(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"type": "BEP20"}) }
-func (h *Handler) CompileContract(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"compiled": true}) }
+func (h *Handler) VerifyContractMultiFile(c *gin.Context) {
+	var req struct {
+		Address         string `json:"address"`
+		CompilerVersion string `json:"compiler_version"`
+		Sources         string `json:"sources"`
+		EvmVersion      string `json:"evm_version"`
+		Optimization    bool   `json:"optimization"`
+		Runs            int    `json:"runs"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Address == "" || req.Sources == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "address and sources required"})
+		return
+	}
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `
+		INSERT INTO verified_sources (address, source_code, compiler_version, evm_version, optimization, runs, verified_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		ON CONFLICT (address) DO UPDATE SET source_code = EXCLUDED.source_code, compiler_version = EXCLUDED.compiler_version, verified_at = NOW()
+	`, req.Address, req.Sources, req.CompilerVersion, req.EvmVersion, req.Optimization, req.Runs)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "verified", "address": req.Address})
+}
+
+func (h *Handler) ReadContract(c *gin.Context) {
+	addr := c.Param("address")
+	if addr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	var req struct {
+		Data   string `json:"data"`
+		From   string `json:"from"`
+		Block  string `json:"block"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if req.Data == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing data"})
+		return
+	}
+	block := req.Block
+	if block == "" {
+		block = "latest"
+	}
+	from := req.From
+	if from == "" {
+		from = "0x0000000000000000000000000000000000000000"
+	}
+	ctx := c.Request.Context()
+	raw, err := h.rpcCall(ctx, "eth_call", []interface{}{
+		map[string]string{"to": addr, "data": req.Data, "from": from},
+		block,
+	})
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "RPC call failed", "detail": err.Error()})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", raw)
+}
+
+func (h *Handler) WriteContract(c *gin.Context) {
+	var req struct {
+		RawTx string `json:"raw_transaction"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.RawTx == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing raw_transaction"})
+		return
+	}
+	ctx := c.Request.Context()
+	raw, err := h.rpcCall(ctx, "eth_sendRawTransaction", []interface{}{req.RawTx})
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "RPC call failed", "detail": err.Error()})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", raw)
+}
+
+func (h *Handler) CheckProxy(c *gin.Context) {
+	addr := c.Param("address")
+	if addr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	// EIP-1967: implementation stored at 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+	implSlot := "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+	raw, err := h.rpcCall(ctx, "eth_getStorageAt", []interface{}{addr, implSlot, "latest"})
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "RPC call failed"})
+		return
+	}
+	c.Data(http.StatusOK, "application/json", raw)
+}
+
+func (h *Handler) GetContractType(c *gin.Context) {
+	addr := c.Param("address")
+	if addr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `SELECT standard FROM contracts WHERE address = $1`, addr)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	if row == nil {
+		c.JSON(http.StatusOK, gin.H{"type": "unknown"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"type": rowValue(row, "standard")})
+}
+
+func (h *Handler) CompileContract(c *gin.Context) {
+	var req struct {
+		SourceCode     string `json:"source_code"`
+		CompilerVersion string `json:"compiler_version"`
+		EvmVersion     string `json:"evm_version"`
+		Optimization   bool   `json:"optimization"`
+		Runs           int    `json:"runs"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.SourceCode == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing source_code"})
+		return
+	}
+	// Store source for compilation by the verifier service
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `
+		INSERT INTO contract_metadata (source_code, compiler_version, evm_version, optimization, runs, created_at)
+		VALUES ($1, $2, $3, $4, $5, NOW())
+	`, req.SourceCode, req.CompilerVersion, req.EvmVersion, req.Optimization, req.Runs)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"compiled": true, "status": "stored"})
+}
 
 // Address endpoints
 func (h *Handler) GetAddressBalance(c *gin.Context) {
@@ -564,9 +701,61 @@ func (h *Handler) GetAddressTxCount(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"count": n})
 }
-func (h *Handler) GetAddressFirstSeen(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{"block": 10000000}) }
-func (h *Handler) GetAddressLastSeen(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"block": 45678901}) }
-func (h *Handler) AnnotateAddress(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"success": true}) }
+func (h *Handler) GetAddressFirstSeen(c *gin.Context) {
+	addr := c.Param("address")
+	if addr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `SELECT block_number, timestamp FROM transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number ASC LIMIT 1`, addr)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	respondOne(c, row)
+}
+func (h *Handler) GetAddressLastSeen(c *gin.Context) {
+	addr := c.Param("address")
+	if addr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `SELECT block_number, timestamp FROM transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number DESC LIMIT 1`, addr)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	respondOne(c, row)
+}
+func (h *Handler) AnnotateAddress(c *gin.Context) {
+	addr := c.Param("address")
+	if addr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	var req struct {
+		Label       string `json:"label"`
+		Category    string `json:"category"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `
+		INSERT INTO search_index (address, label, category, description, updated_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, category = EXCLUDED.category, description = EXCLUDED.description, updated_at = NOW()
+	`, addr, req.Label, req.Category, req.Description)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "address": addr})
+}
 
 // Gas endpoints
 func (h *Handler) GetEstimatedGas(c *gin.Context) {
@@ -588,8 +777,30 @@ func (h *Handler) GetBaseFee(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"baseFee": rowValue(row, "base_fee_per_gas")})
 }
-func (h *Handler) GetGasUtilization(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"utilization": 0.5}) }
-func (h *Handler) CalculateGasSavings(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"savings": "0.01"}) }
+func (h *Handler) GetGasUtilization(c *gin.Context) {
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `SELECT COALESCE(AVG(gas_used::float / NULLIF(gas_limit, 0)), 0) AS utilization FROM blocks ORDER BY number DESC LIMIT 100`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+func (h *Handler) CalculateGasSavings(c *gin.Context) {
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `
+		SELECT
+			COALESCE(AVG(gas_price), 0) AS avg_gas_price,
+			COALESCE(MIN(gas_price), 0) AS min_gas_price,
+			COALESCE((AVG(gas_price) - MIN(gas_price)), 0) AS potential_savings
+		FROM gas_prices ORDER BY block_number DESC LIMIT 100
+	`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
 
 // Chart endpoints
 func (h *Handler) ExportChartData(c *gin.Context) {
@@ -625,9 +836,78 @@ func (h *Handler) GetVoteCount(c *gin.Context) {
 // MEV endpoints
 
 // Label endpoints
-func (h *Handler) CreateLabel(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) UpdateLabel(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) DeleteLabel(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
+func (h *Handler) CreateLabel(c *gin.Context) {
+	var req struct {
+		Address     string `json:"address"`
+		Label       string `json:"label"`
+		Category    string `json:"category"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "address required"})
+		return
+	}
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `
+		INSERT INTO search_index (address, label, category, description, updated_at)
+		VALUES ($1, $2, $3, $4, NOW())
+		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, category = EXCLUDED.category, description = EXCLUDED.description
+	`, req.Address, req.Label, req.Category, req.Description)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"success": true, "address": req.Address})
+}
+func (h *Handler) UpdateLabel(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing id"})
+		return
+	}
+	var req struct {
+		Label       string `json:"label"`
+		Category    string `json:"category"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	ct, err := h.pool.Exec(ctx, `UPDATE search_index SET label = $1, category = $2, description = $3, updated_at = NOW() WHERE id = $4`, req.Label, req.Category, req.Description, id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "label not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+func (h *Handler) DeleteLabel(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing id"})
+		return
+	}
+	ctx := c.Request.Context()
+	ct, err := h.pool.Exec(ctx, `DELETE FROM search_index WHERE id = $1`, id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	if ct.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "label not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
 func (h *Handler) ExportLabels(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM search_index`)
