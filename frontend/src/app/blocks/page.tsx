@@ -20,21 +20,23 @@ import type { BlockListItem } from '@/types'
 export default function BlocksPage() {
   const [blocks, setBlocks] = useState<BlockListItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const limit = 25
 
   const fetchBlocks = async () => {
     setLoading(true)
+    setError(null)
     try {
       const response = await api.getBlocks({ page, limit })
       setBlocks(response.items)
       setTotalPages(Math.ceil(response.total / limit))
     } catch (error) {
       console.error('Error fetching blocks:', error)
-      // Mock data
-      setBlocks(generateMockBlocks())
-      setTotalPages(100)
+      setBlocks([])
+      setTotalPages(1)
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
     }
@@ -104,6 +106,17 @@ export default function BlocksPage() {
                       </td>
                     </tr>
                   ))
+                ) : error ? (
+                  <tr>
+                    <td colSpan={5} className="px-6 py-8 text-center text-red-500">
+                      {error}
+                      <button onClick={fetchBlocks} className="block mx-auto mt-3 px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
+                    </td>
+                  </tr>
+                ) : blocks.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-6 py-8 text-center text-gray-500">No blocks found</td>
+                  </tr>
                 ) : (
                   blocks.map((block) => (
                     <tr key={block.number} className="hover:bg-gray-50 dark:hover:bg-dark-700 transition-colors">
@@ -171,20 +184,4 @@ export default function BlocksPage() {
       </div>
     </div>
   )
-}
-
-function generateMockBlocks(): BlockListItem[] {
-  const blocks = []
-  const now = Math.floor(Date.now() / 1000)
-  for (let i = 0; i < 25; i++) {
-    blocks.push({
-      number: 45678900 - i * 10,
-      hash: `0x${Math.random().toString(16).slice(2, 66).padEnd(64, '0')}`,
-      timestamp: now - i * 30,
-      txCount: Math.floor(Math.random() * 200) + 50,
-      gasUsed: String(Math.floor(Math.random() * 15000000) + 5000000),
-      miner: `0x${Math.random().toString(16).slice(2, 42).padEnd(40, '0')}`
-    })
-  }
-  return blocks
 }

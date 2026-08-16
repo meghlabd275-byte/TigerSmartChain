@@ -18,6 +18,7 @@ import type { Transaction } from '@/types'
 export default function TransactionsPage() {
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [filter, setFilter] = useState<'all' | 'pending'>('all')
@@ -25,6 +26,7 @@ export default function TransactionsPage() {
 
   const fetchTransactions = async () => {
     setLoading(true)
+    setError(null)
     try {
       if (filter === 'pending') {
         const txs = await api.getPendingTransactions()
@@ -37,8 +39,9 @@ export default function TransactionsPage() {
       }
     } catch (error) {
       console.error('Error fetching transactions:', error)
-      setTransactions(generateMockTransactions())
-      setTotalPages(100)
+      setTransactions([])
+      setTotalPages(1)
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
     }
@@ -131,6 +134,17 @@ export default function TransactionsPage() {
                       </td>
                     </tr>
                   ))
+                ) : error ? (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-8 text-center text-red-500">
+                      {error}
+                      <button onClick={fetchTransactions} className="block mx-auto mt-3 px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
+                    </td>
+                  </tr>
+                ) : transactions.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-8 text-center text-gray-500">No transactions found</td>
+                  </tr>
                 ) : (
                   transactions.map((tx) => (
                     <TransactionRow key={tx.hash} tx={tx} />
@@ -242,29 +256,4 @@ function TransactionRow({ tx }: { tx: Transaction }) {
       </td>
     </tr>
   )
-}
-
-function generateMockTransactions(): Transaction[] {
-  const txs = []
-  for (let i = 0; i < 25; i++) {
-    txs.push({
-      hash: `0x${Math.random().toString(16).slice(2, 66).padEnd(64, '0')}`,
-      blockNumber: 45678900 - i,
-      blockHash: `0x${Math.random().toString(16).slice(2, 66).padEnd(64, '0')}`,
-      timestamp: Math.floor(Date.now() / 1000) - i * 30,
-      from: `0x${Math.random().toString(16).slice(2, 42).padEnd(40, '0')}`,
-      to: `0x${Math.random().toString(16).slice(2, 42).padEnd(40, '0')}`,
-      value: String(Math.random() * 1000000000000000000),
-      gasPrice: String(Math.floor(Math.random() * 10 + 3) * 1000000000),
-      gasUsed: '21000',
-      gasLimit: '21000',
-      nonce: i,
-      transactionIndex: i,
-      input: '0x',
-      status: Math.random() > 0.05 ? 'success' : 'failure',
-      logs: [],
-      tokenTransfers: []
-    })
-  }
-  return txs
 }

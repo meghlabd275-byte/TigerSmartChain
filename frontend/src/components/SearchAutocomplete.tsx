@@ -6,7 +6,7 @@ import { Search, FileText, Box, Coins, Image, Hash } from 'lucide-react'
 import { isValidAddress, isValidHash } from '@/lib/utils'
 
 interface SearchResult {
-  type: 'address' | 'transaction' | 'block' | 'token' | 'nft' | 'ens'
+  type: 'address' | 'transaction' | 'block' | 'token' | 'nft' | 'ens' | 'search'
   value: string
   label?: string
 }

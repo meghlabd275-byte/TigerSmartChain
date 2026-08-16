@@ -17,6 +17,7 @@ export default function TokenPage() {
   const [transfers, setTransfers] = useState<any[]>([])
   const [priceHistory, setPriceHistory] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'overview' | 'holders' | 'transfers' | 'price'>('overview')
   const [copied, setCopied] = useState(false)
 
@@ -25,6 +26,8 @@ export default function TokenPage() {
   }, [address])
 
   const fetchData = async () => {
+    setLoading(true)
+    setError(null)
     try {
       const [tokenData, holderList, transferList, priceHist] = await Promise.all([
         api.getToken(address),
@@ -33,26 +36,12 @@ export default function TokenPage() {
         api.getTokenPriceHistory(address)
       ])
       setData(tokenData)
-      setHolders(holderList)
-      setTransfers(transferList)
+      setHolders(holderList.items || [])
+      setTransfers(transferList.items || [])
       setPriceHistory(priceHist)
     } catch (error) {
-      setData({
-        address,
-        name: 'Token',
-        symbol: 'TKN',
-        decimals: 18,
-        totalSupply: '1000000000000000000000',
-        type: 'BEP20',
-        price: 1.00,
-        priceChange24h: 2.5,
-        marketCap: 1000000000,
-        volume24h: 50000000,
-        holdersCount: 10000,
-        transfersCount: 50000,
-        isVerified: true,
-        isSpam: false
-      })
+      setData(null)
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
     }
@@ -68,6 +57,17 @@ export default function TokenPage() {
     return (
       <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-500"></div>
+      </div>
+    )
+  }
+
+  if (error && !data) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center">
+        <div className="text-center">
+          <p className="text-red-500 mb-4">{error}</p>
+          <button onClick={fetchData} className="px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
+        </div>
       </div>
     )
   }
@@ -127,8 +127,9 @@ export default function TokenPage() {
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Price Chart</h2>
           </div>
           <div className="h-80 p-6">
+            {priceHistory.length > 0 ? (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={priceHistory.length > 0 ? priceHistory : generateMockChartData()}>
+              <AreaChart data={priceHistory}>
                 <defs>
                   <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#14b8a6" stopOpacity={0.3} />
@@ -141,6 +142,9 @@ export default function TokenPage() {
                 <Area type="monotone" dataKey="price" stroke="#14b8a6" strokeWidth={2} fillOpacity={1} fill="url(#colorPrice)" />
               </AreaChart>
             </ResponsiveContainer>
+            ) : (
+              <div className="h-full flex items-center justify-center text-gray-500">No price history data available</div>
+            )}
           </div>
         </div>
 
@@ -199,14 +203,3 @@ export default function TokenPage() {
   )
 }
 
-function generateMockChartData() {
-  const data = []
-  const now = Math.floor(Date.now() / 1000)
-  for (let i = 30; i >= 0; i--) {
-    data.push({
-      timestamp: now - i * 86400,
-      price: 0.95 + Math.random() * 0.1
-    })
-  }
-  return data
-}

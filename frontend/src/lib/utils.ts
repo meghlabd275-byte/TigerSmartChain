@@ -95,7 +95,7 @@ export function isValidAddress(address: string): boolean {
 }
 
 export function isValidHash(hash: string): boolean {
-  return /^0x[a-fA-F0-9]{64}$/.test(address)
+  return /^0x[a-fA-F0-9]{64}$/.test(hash)
 }
 
 export function copyToClipboard(text: string): Promise<void> {

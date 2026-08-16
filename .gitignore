@@ -27,3 +27,6 @@ Thumbs.db
 *.o
 *.a
 *.so
+
+# TypeScript build info
+*.tsbuildinfo

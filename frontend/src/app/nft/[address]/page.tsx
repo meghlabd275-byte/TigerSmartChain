@@ -16,6 +16,7 @@ export default function NFTCollectionPage() {
   const [floorHistory, setFloorHistory] = useState<any[]>([])
   const [volumeHistory, setVolumeHistory] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'overview' | 'holders' | 'transfers'>('overview')
   const [copied, setCopied] = useState(false)
 
@@ -24,30 +25,21 @@ export default function NFTCollectionPage() {
   }, [address])
 
   const fetchData = async () => {
+    setLoading(true)
+    setError(null)
     try {
       const [col, floor] = await Promise.all([
         api.getNFTCollection(address),
         api.getNFTFloorPrice(address)
       ])
       setCollection(col)
-      setFloorHistory(generateMockFloorHistory())
-      setVolumeHistory(generateMockVolumeHistory())
+      setFloorHistory([])
+      setVolumeHistory([])
     } catch (error) {
-      setCollection({
-        address,
-        name: 'NFT Collection',
-        symbol: 'NFT',
-        type: 'BEP721',
-        totalSupply: 10000,
-        mintedCount: 5000,
-        ownerCount: 3000,
-        floorPrice: 0.5,
-        averagePrice: 0.8,
-        volume24h: 100000,
-        volume7d: 500000,
-        volume30d: 2000000,
-        imageUrl: ''
-      })
+      setCollection(null)
+      setFloorHistory([])
+      setVolumeHistory([])
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
     }
@@ -63,6 +55,15 @@ export default function NFTCollectionPage() {
     return (
       <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-500"></div>
+      </div>
+    )
+  }
+
+  if (error || !collection) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex flex-col items-center justify-center gap-4">
+        <p className="text-red-500">{error || 'Collection not found'}</p>
+        <button onClick={fetchData} className="px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
       </div>
     )
   }
@@ -132,35 +133,39 @@ export default function NFTCollectionPage() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Floor Price History</h2>
-            <div className="h-64">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={floorHistory}>
-                  <defs>
-                    <linearGradient id="colorFloor" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#14b8a6" stopOpacity={0.3} />
-                      <stop offset="95%" stopColor="#14b8a6" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <XAxis dataKey="date" stroke="#6b7280" fontSize={12} />
-                  <YAxis stroke="#6b7280" fontSize={12} tickFormatter={(v) => `${v} BNB`} />
-                  <Tooltip formatter={(v: number) => [`${v} BNB`, 'Floor']} />
-                  <Area type="monotone" dataKey="floor" stroke="#14b8a6" strokeWidth={2} fillOpacity={1} fill="url(#colorFloor)" />
-                </AreaChart>
-              </ResponsiveContainer>
+            <div className="h-64 flex items-center justify-center text-gray-500 dark:text-gray-400">
+              {floorHistory.length === 0 ? 'No data available' : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={floorHistory}>
+                    <defs>
+                      <linearGradient id="colorFloor" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#14b8a6" stopOpacity={0.3} />
+                        <stop offset="95%" stopColor="#14b8a6" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <XAxis dataKey="date" stroke="#6b7280" fontSize={12} />
+                    <YAxis stroke="#6b7280" fontSize={12} tickFormatter={(v) => `${v} BNB`} />
+                    <Tooltip formatter={(v: number) => [`${v} BNB`, 'Floor']} />
+                    <Area type="monotone" dataKey="floor" stroke="#14b8a6" strokeWidth={2} fillOpacity={1} fill="url(#colorFloor)" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              )}
             </div>
           </div>
 
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Volume History</h2>
-            <div className="h-64">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={volumeHistory}>
-                  <XAxis dataKey="date" stroke="#6b7280" fontSize={12} />
-                  <YAxis stroke="#6b7280" fontSize={12} />
-                  <Tooltip formatter={(v: number) => [`$${formatNumber(v)}`, 'Volume']} />
-                  <Bar dataKey="volume" fill="#14b8a6" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
+            <div className="h-64 flex items-center justify-center text-gray-500 dark:text-gray-400">
+              {volumeHistory.length === 0 ? 'No data available' : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={volumeHistory}>
+                    <XAxis dataKey="date" stroke="#6b7280" fontSize={12} />
+                    <YAxis stroke="#6b7280" fontSize={12} />
+                    <Tooltip formatter={(v: number) => [`$${formatNumber(v)}`, 'Volume']} />
+                    <Bar dataKey="volume" fill="#14b8a6" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
             </div>
           </div>
         </div>
@@ -200,26 +205,4 @@ export default function NFTCollectionPage() {
       </div>
     </div>
   )
-}
-
-function generateMockFloorHistory() {
-  const data = []
-  for (let i = 30; i >= 0; i--) {
-    data.push({
-      date: new Date(Date.now() - i * 86400000).toLocaleDateString(),
-      floor: 0.3 + Math.random() * 0.4
-    })
-  }
-  return data
-}
-
-function generateMockVolumeHistory() {
-  const data = []
-  for (let i = 30; i >= 0; i--) {
-    data.push({
-      date: new Date(Date.now() - i * 86400000).toLocaleDateString(),
-      volume: Math.floor(50000 + Math.random() * 100000)
-    })
-  }
-  return data
 }

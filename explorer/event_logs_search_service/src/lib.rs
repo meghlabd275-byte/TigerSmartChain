@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ethers::core::types::{Address, H256, U256};
 use ethers::providers::{Http, Provider};
+use ethers::providers::Middleware;
 use ethers::types::{Filter, Log, TransactionReceipt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -165,22 +166,22 @@ impl LogSearchService {
             ("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", "Transfer", "Transfer(address from, address to, uint256)"),
             ("0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925", "Approval", "Approval(address owner, address spender, uint256)"),
             ("0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62", "TransferSingle", "TransferSingle(address operator, address from, address to, uint256 id, uint256 value)"),
-            ("0xb5c1f3c2e2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2", "TransferBatch", "TransferBatch(address operator, address from, address to, uint256[] ids, uint256[] values)"),
-            ("0x2c5d8a3bc3c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4", "ApprovalForAll", "ApprovalForAll(address account, address operator, bool approved)"),
+            ("0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb", "TransferBatch", "TransferBatch(address operator, address from, address to, uint256[] ids, uint256[] values)"),
+            ("0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31", "ApprovalForAll", "ApprovalForAll(address account, address operator, bool approved)"),
             // ERC-721 events
-            ("0x8a8c6a3b2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c", "Transfer", "Transfer(address from, address to, uint256 tokenId)"),
-            ("0xa22cb465", "Approval", "Approval(address owner, address approved, uint256 tokenId)"),
-            ("0x5c60da1b", "ApprovalForAll", "ApprovalForAll(address owner, address operator, bool approved)"),
-            ("0x0d053c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", "MetadataUpdate", "MetadataUpdate(uint256 _tokenId)"),
-            ("0xe8c5a3c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c", "BatchMetadataUpdate", "BatchMetadataUpdate(uint256[] _tokenIds)"),
+            ("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", "Transfer", "Transfer(address from, address to, uint256 tokenId)"),
+            ("0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925", "Approval", "Approval(address owner, address approved, uint256 tokenId)"),
+            ("0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31", "ApprovalForAll", "ApprovalForAll(address owner, address operator, bool approved)"),
+            ("0xf8e1a15aba9398e019f0b49df1a4fde98ee17ae345cb5f6b5e2c27f5033e8ce7", "MetadataUpdate", "MetadataUpdate(uint256 _tokenId)"),
+            ("0xf4b8b5c4bf69657a94e5cd0716dd180ff8c7cc9f15a64e3ad256b161f59c14ca", "BatchMetadataUpdate", "BatchMetadataUpdate(uint256[] _tokenIds)"),
             // ERC-1155 events
-            ("0xc3d58168", "TransferSingle", "TransferSingle(address operator, address from, address to, uint256 id, uint256 value)"),
-            ("0x4a4c4d4", "TransferBatch", "TransferBatch(address operator, address from, address to, uint256[] ids, uint256[] values)"),
-            ("0x2c5d8a3bc3c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4", "ApprovalForAll", "ApprovalForAll(address account, address operator, bool approved)"),
+            ("0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62", "TransferSingle", "TransferSingle(address operator, address from, address to, uint256 id, uint256 value)"),
+            ("0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb", "TransferBatch", "TransferBatch(address operator, address from, address to, uint256[] ids, uint256[] values)"),
+            ("0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31", "ApprovalForAll", "ApprovalForAll(address account, address operator, bool approved)"),
             // Governance events
-            ("0x7e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e", "ProposalCreated", "ProposalCreated(uint256 id, address proposer, uint256 startBlock, uint256 endBlock, string description)"),
-            ("0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5", "VoteCast", "VoteCast(uint256 id, address voter, uint8 support, uint256 votes)"),
-            ("0x5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c", "ProposalExecuted", "ProposalExecuted(uint256 id)"),
+            ("0xa00fcf4f5e03cc2f4818b8f380a8f2a06479e49bf0765e5fec09aebdaf922bbc", "ProposalCreated", "ProposalCreated(uint256 id, address proposer, uint256 startBlock, uint256 endBlock, string description)"),
+            ("0xb83d25c6a5d258561330739951487acb4bd09ba5190b5d32c4f261817d906792", "VoteCast", "VoteCast(uint256 id, address voter, uint8 support, uint256 votes)"),
+            ("0x712ae1383f79ac853f8d882153778e0260ef8f03b504e2866e0593e04d2b291f", "ProposalExecuted", "ProposalExecuted(uint256 id)"),
             // Staking events
             ("0xe678d5bdcf670ef07ff1a819fad381a3a917e3d6c70d4d1c064b52bb7506c745", "Stake", "Stake(address user, uint256 amount)"),
             ("0x2458986e35eb8d33d29c9a7dbe095b7957a08ca23784d5e3636e3a03f99058bf", "Unstake", "Unstake(address user, uint256 amount)"),
@@ -242,7 +243,7 @@ impl LogSearchService {
                 data: hex::encode(&log.data),
                 block_number: log.block_number.unwrap_or_default().as_u64(),
                 transaction_hash: format!("{:?}", log.transaction_hash),
-                log_index: log.log_index,
+                log_index: log.log_index.map(|i| i.as_u32()).unwrap_or(0),
                 block_hash: format!("{:?}", log.block_hash.unwrap_or_default()),
                 timestamp: 0,
             });

@@ -1,9 +1,11 @@
 // TigerScan - Top Holders (Rich List) Page with Full Features
 // Complete holder rankings with distribution analysis
 
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import Head from 'next/head'
 import Link from 'next/link'
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:12000'
 
 interface Holder {
   address: string
@@ -40,28 +42,8 @@ interface FilterState {
   sortBy: 'rank' | 'balance' | 'tx_count' | 'last_active'
 }
 
-// Generate sample holders
-const generateSampleHolders = (): Holder[] => {
-  const names = ['BinanceHot', 'BinanceCold', 'Gate.io', 'KuCoin', 'Huobi', 'OKX', 'Bitfinex', 'Coinbase', 'Kraken', 'CryptoCom', 'Genesis', 'ThreeArrows', 'Alameda', 'Polychain', 'Animoca']
-  
-  return Array.from({ length: 100 }, (_, i) => {
-    const balance = Math.random() * 10000000 + 1000 // 1K to 10M TGR
-    return {
-      address: '0x' + Math.random().toString(16).substring(2, 42).padStart(40, '0').substring(0, 40),
-      name: i < 15 ? names[i] : undefined,
-      balance: String(balance * 1e18),
-      balance_usd: balance * 3500, // Assume TGR = $3500
-      percentage: 0, // Will calculate
-      rank: i + 1,
-      first_seen: Date.now() - Math.floor(Math.random() * 365 * 24 * 60 * 60 * 1000),
-      last_active: Date.now() - Math.floor(Math.random() * 30 * 24 * 60 * 60 * 1000),
-      tx_count: Math.floor(Math.random() * 10000) + 100,
-      token_count: Math.floor(Math.random() * 50) + 1,
-    }
-  }).sort((a, b) => parseFloat(b.balance) - parseFloat(a.balance))
-}
-
-const generateStats = (holders: Holder[]): TokenStats => {
+// Compute distribution and percentage stats from real holder data
+const computeStats = (holders: Holder[]): TokenStats => {
   const distribution = {
     '0-1K': 0,
     '1K-10K': 0,
@@ -100,7 +82,7 @@ const generateStats = (holders: Holder[]): TokenStats => {
     circulating_supply: String(totalSupply * 0.85 * 1e18),
     holder_distribution: distribution,
     whale_count: whaleCount,
-    avg_holdings: totalBalance / holders.length,
+    avg_holdings: holders.length ? totalBalance / holders.length : 0,
   }
 }
 
@@ -108,6 +90,7 @@ export default function TopHolders() {
   const [holders, setHolders] = useState<Holder[]>([])
   const [stats, setStats] = useState<TokenStats | null>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<FilterState>({
     search: '',
     minBalance: '',
@@ -117,16 +100,28 @@ export default function TopHolders() {
   const [page, setPage] = useState(1)
   const [selectedToken, setSelectedToken] = useState('TGR')
 
-  useEffect(() => {
-    const sampleHolders = generateSampleHolders()
-    const sampleStats = generateStats(sampleHolders)
-    
-    setTimeout(() => {
-      setHolders(sampleHolders)
-      setStats(sampleStats)
+  const fetchHolders = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/top-holders`)
+      if (!res.ok) throw new Error(`Failed to load top holders (${res.status})`)
+      const data = await res.json()
+      const list: Holder[] = Array.isArray(data) ? data : (data.holders ?? data.data ?? [])
+      setHolders(list)
+      setStats(list.length ? computeStats(list) : null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load top holders')
+      setHolders([])
+      setStats(null)
+    } finally {
       setLoading(false)
-    }, 300)
+    }
   }, [])
+
+  useEffect(() => {
+    fetchHolders()
+  }, [fetchHolders])
 
   // Filter and sort
   const filteredHolders = useMemo(() => {
@@ -210,6 +205,22 @@ export default function TopHolders() {
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-orange-500 mx-auto mb-4"></div>
           <p className="text-gray-400">Loading Top Holders...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
+        <div className="text-center">
+          <p className="text-red-400 mb-4">{error}</p>
+          <button
+            onClick={fetchHolders}
+            className="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg"
+          >
+            Retry
+          </button>
         </div>
       </div>
     )
@@ -345,7 +356,14 @@ export default function TopHolders() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-700">
-                {paginatedHolders.map((holder) => (
+                {paginatedHolders.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-12 text-center text-gray-500">
+                      No data available
+                    </td>
+                  </tr>
+                ) : (
+                paginatedHolders.map((holder) => (
                   <tr key={holder.address} className="hover:bg-gray-750">
                     <td className="px-4 py-3">
                       <span className={`font-bold ${getRankColor(holder.rank)}`}>
@@ -378,7 +396,8 @@ export default function TopHolders() {
                       {formatTime(holder.last_active)}
                     </td>
                   </tr>
-                ))}
+                ))
+                )}
               </tbody>
             </table>
           </div>

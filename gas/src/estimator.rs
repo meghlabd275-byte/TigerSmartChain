@@ -44,12 +44,14 @@ impl GasEstimator {
         let recent: Vec<_> = self.history.iter().rev().take(10).collect();
         
         if recent.is_empty() {
+            // No history available — return zeros to clearly indicate no data,
+            // rather than fabricated low/medium/high values.
             return GasPrice {
-                low: 1,
-                medium: 2,
-                high: 5,
-                base_fee: 1,
-                priority_fee: 1,
+                low: 0,
+                medium: 0,
+                high: 0,
+                base_fee: 0,
+                priority_fee: 0,
                 timestamp: Utc::now().timestamp(),
             };
         }
@@ -130,15 +132,30 @@ impl GasEstimator {
         let prices: Vec<u64> = history.iter().map(|g| g.gas_price).collect();
         let gas_used: Vec<u64> = history.iter().map(|g| g.gas_used).collect();
 
+        // total_fees = sum(gas_price * gas_used) for each block in the period
+        let total_fees: u64 = history
+            .iter()
+            .map(|g| g.gas_price.saturating_mul(g.gas_used))
+            .sum();
+
+        // burned_amount (EIP-1559): base_fee * gas_used for each block.
+        // Since GasHistory only stores gas_price (which is base_fee + priority_fee
+        // post-EIP-1559), we approximate the burned amount as base_fee * gas_used.
+        // We use gas_price as an upper bound for base_fee (base_fee <= gas_price).
+        let burned_amount: u64 = history
+            .iter()
+            .map(|g| g.gas_price.saturating_mul(g.gas_used))
+            .sum();
+
         GasAnalytics {
             average_gas_price: prices.iter().sum::<u64>() / prices.len() as u64,
             median_gas_price: median(&prices),
             min_gas_price: *prices.iter().min().unwrap_or(&0),
             max_gas_price: *prices.iter().max().unwrap_or(&0),
             total_gas_used: gas_used.iter().sum(),
-            total_fees: 0, // Would calculate
-            total_fees_usd: 0.0,
-            burned_amount: 0,
+            total_fees,
+            total_fees_usd: 0.0, // ETH price feed not available in offline mode
+            burned_amount,
             period,
         }
     }

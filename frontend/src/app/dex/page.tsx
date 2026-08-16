@@ -30,7 +30,7 @@ export default function DexPage() {
     setLoading(true)
     try {
       const response = await api.getDexPairs({ page, limit })
-      setPairs(response.items || [])
+      setPairs((response.items || []) as unknown as DexPair[])
       setTotalPages(Math.ceil(response.total / limit))
     } catch (error) {
       // Mock data

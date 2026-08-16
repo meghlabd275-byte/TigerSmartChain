@@ -1,6 +1,7 @@
 //! Uniswap Integration for TigerScan
 
 use crate::client::*;
+use crate::client::UNISWAP_ETH_V3;
 use crate::types::*;
 
 // =============================================================================
@@ -64,6 +65,32 @@ impl UniswapClient {
             return Ok(dex_pair.token0_price);
         }
         Ok(0.0)
+    }
+
+    /// Get pairs by token
+    pub async fn get_pairs_for_token(&self, token: &str) -> DEXResult<Vec<DEXPair>> {
+        let query = r#"
+            query GetPairsByToken($token: String!, $first: Int!) {
+                pools(
+                    first: $first,
+                    orderBy: volumeUSD,
+                    orderDirection: desc,
+                    where: { OR: [{ token0: $token }, { token1: $token }] }
+                ) {
+                    id
+                    token0 { id symbol decimals }
+                    token1 { id symbol decimals }
+                    totalValueLockedToken0
+                    totalValueLockedToken1
+                    volumeUSD
+                    txCount
+                    createdAtTimestamp
+                }
+            }
+        "#;
+        let variables = serde_json::json!({ "token": token.to_lowercase(), "first": 100 });
+        let response = self.client.query_subgraph(UNISWAP_ETH_V3, query, variables).await?;
+        Ok(parse_pairs(&response))
     }
 
     /// Get analytics

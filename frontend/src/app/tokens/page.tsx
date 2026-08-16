@@ -19,6 +19,7 @@ import type { Token } from '@/types'
 export default function TokensPage() {
   const [tokens, setTokens] = useState<Token[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [search, setSearch] = useState('')
@@ -27,14 +28,16 @@ export default function TokensPage() {
 
   const fetchTokens = async () => {
     setLoading(true)
+    setError(null)
     try {
       const response = await api.getTokens({ page, limit })
       setTokens(response.items)
       setTotalPages(Math.ceil(response.total / limit))
     } catch (error) {
       console.error('Error fetching tokens:', error)
-      setTokens(generateMockTokens())
-      setTotalPages(100)
+      setTokens([])
+      setTotalPages(1)
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
     }
@@ -136,6 +139,14 @@ export default function TokensPage() {
                       </td>
                     </tr>
                   ))
+                ) : error ? (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-8 text-center text-red-500">{error}</td>
+                  </tr>
+                ) : filteredTokens.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No tokens found</td>
+                  </tr>
                 ) : (
                   filteredTokens.map((token, index) => (
                     <TokenRow key={token.address} token={token} rank={(page - 1) * limit + index + 1} />
@@ -234,60 +245,4 @@ function TokenRow({ token, rank }: { token: Token; rank: number }) {
       </td>
     </tr>
   )
-}
-
-function generateMockTokens(): Token[] {
-  return [
-    {
-      address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b095c',
-      name: 'Wrapped BNB',
-      symbol: 'WBNB',
-      decimals: 18,
-      totalSupply: '154642888335383047776',
-      type: 'BEP20',
-      price: 587.32,
-      priceChange24h: 2.34,
-      marketCap: 1222770317000,
-      volume24h: 1014061937,
-      holdersCount: 5712837,
-      transfersCount: 45678901,
-      isVerified: true,
-      isSpam: false,
-      logoUrl: 'https://raw.githubusercontent.com/spaceswap/tokenlists/main/assets/WBNB.svg'
-    },
-    {
-      address: '0x55d398326f99059fF775485246999027B3197955',
-      name: 'Tether USD',
-      symbol: 'USDT',
-      decimals: 18,
-      totalSupply: '83028316304124963794203',
-      type: 'BEP20',
-      price: 1.00,
-      priceChange24h: 0.01,
-      marketCap: 83028316304,
-      volume24h: 9176183722,
-      holdersCount: 25847234,
-      transfersCount: 892345678,
-      isVerified: true,
-      isSpam: false,
-      logoUrl: 'https://raw.githubusercontent.com/spaceswap/tokenlists/main/assets/USDT.svg'
-    },
-    {
-      address: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
-      name: 'BUSD Token',
-      symbol: 'BUSD',
-      decimals: 18,
-      totalSupply: '1023456789012345678901',
-      type: 'BEP20',
-      price: 1.00,
-      priceChange24h: -0.01,
-      marketCap: 1023456789,
-      volume24h: 567823456,
-      holdersCount: 8765432,
-      transfersCount: 234567890,
-      isVerified: true,
-      isSpam: false,
-      logoUrl: 'https://raw.githubusercontent.com/spaceswap/tokenlists/main/assets/BUSD.svg'
-    }
-  ]
 }

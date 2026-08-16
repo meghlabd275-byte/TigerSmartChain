@@ -93,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         relayers: vec![],
         validators: vec![],
+        relayers_pubkeys: vec![],
         signature_threshold: 3,
         confirmation_blocks: 15,
         fee: FeeConfig {

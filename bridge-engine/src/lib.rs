@@ -26,6 +26,10 @@ pub mod relayer;
 pub mod engine;
 
 pub use engine::BridgeEngine;
+pub use engine::{
+    BurnEvent, BurnStatus, LockEvent, LockStatus, MintRecord, UnlockRecord,
+    generate_signing_key, sign_event_id, verify_relayer_signature,
+};
 pub use message::Message;
 pub use proof::Proof;
 
@@ -109,6 +113,10 @@ pub struct BridgeConfig {
     pub chains: Vec<ChainConfig>,
     pub relayers: Vec<String>,
     pub validators: Vec<String>,
+    /// Authorized relayer Ed25519 public keys (32-byte, hex-encoded,
+    /// optional 0x-prefix) used to verify lock/burn relayer attestations.
+    #[serde(default)]
+    pub relayers_pubkeys: Vec<String>,
     pub signature_threshold: usize,
     pub confirmation_blocks: u64,
     pub fee: FeeConfig,

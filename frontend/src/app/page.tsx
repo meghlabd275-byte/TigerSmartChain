@@ -27,7 +27,7 @@ import {
   ResponsiveContainer 
 } from 'recharts'
 import api from '@/lib/api'
-import { formatNumber, formatCurrency, formatTimeAgo, formatAddress } from '@/lib/utils'
+import { formatNumber, formatCurrency, formatPercentage, formatTimeAgo, formatAddress } from '@/lib/utils'
 import type { Block, Transaction, Token, NetworkStats, GasOracle, ChartData } from '@/types'
 
 export default function HomePage() {
@@ -39,6 +39,7 @@ export default function HomePage() {
   const [txChartData, setTxChartData] = useState<ChartData[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const fetchData = async () => {
     try {
@@ -50,123 +51,17 @@ export default function HomePage() {
         api.getGasOracle(),
         api.getTransactionHistory({ timeframe: '24h' })
       ])
-      
+
       setLatestBlock(block)
       setRecentTxs(txs.items)
       setTopTokens(tokens.items)
       setNetworkStats(stats)
       setGasOracle(gas)
       setTxChartData(chart)
+      setError(null)
     } catch (error) {
       console.error('Error fetching data:', error)
-      // Use mock data for demo
-      setLatestBlock({
-        number: 45678901,
-        hash: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd',
-        parentHash: '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef123456',
-        timestamp: Math.floor(Date.now() / 1000),
-        transactions: [],
-        gasUsed: '1250000',
-        gasLimit: '30000000',
-        miner: '0x1234567890abcdef1234567890abcdef12345678',
-        difficulty: '0',
-        totalDifficulty: '0',
-        size: 54200,
-        nonce: '0x1234567890abcdef',
-        extraData: '0x',
-        baseFeePerGas: '5000000000',
-        transactionsCount: 156,
-        unclesCount: 0
-      })
-      setRecentTxs([
-        {
-          hash: '0xabc123def456789012345678901234567890abcdef12345678901234567890abcd',
-          blockNumber: 45678900,
-          blockHash: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd',
-          timestamp: Math.floor(Date.now() / 1000) - 60,
-          from: '0x742d35Cc6634C0532925a3b844Bc9e7595f0eB1E',
-          to: '0x8Ba1f109551bD432803012645Ac136ddd64DBA72',
-          value: '1000000000000000000',
-          gasPrice: '5000000000',
-          gasUsed: '21000',
-          gasLimit: '21000',
-          nonce: 12345,
-          transactionIndex: 0,
-          input: '0x',
-          status: 'success',
-          logs: [],
-          tokenTransfers: []
-        }
-      ])
-      setTopTokens([
-        {
-          address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b095c',
-          name: 'Wrapped BNB',
-          symbol: 'WBNB',
-          decimals: 18,
-          totalSupply: '154642888335383047776',
-          type: 'BEP20',
-          price: 587.32,
-          priceChange24h: 2.34,
-          marketCap: 1222770317000,
-          volume24h: 1014061937,
-          holdersCount: 5712837,
-          transfersCount: 45678901,
-          isVerified: true,
-          isSpam: false,
-          logoUrl: 'https://raw.githubusercontent.com/spaceswap/tokenlists/main/assets/WBNB.svg'
-        },
-        {
-          address: '0x55d398326f99059fF775485246999027B3197955',
-          name: 'Tether USD',
-          symbol: 'USDT',
-          decimals: 18,
-          totalSupply: '83028316304124963794203',
-          type: 'BEP20',
-          price: 1.00,
-          priceChange24h: 0.01,
-          marketCap: 83028316304,
-          volume24h: 9176183722,
-          holdersCount: 25847234,
-          transfersCount: 892345678,
-          isVerified: true,
-          isSpam: false,
-          logoUrl: 'https://raw.githubusercontent.com/spaceswap/tokenlists/main/assets/USDT.svg'
-        },
-        {
-          address: '0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56',
-          name: 'BUSD Token',
-          symbol: 'BUSD',
-          decimals: 18,
-          totalSupply: '1023456789012345678901',
-          type: 'BEP20',
-          price: 1.00,
-          priceChange24h: -0.01,
-          marketCap: 1023456789,
-          volume24h: 567823456,
-          holdersCount: 8765432,
-          transfersCount: 234567890,
-          isVerified: true,
-          isSpam: false,
-          logoUrl: 'https://raw.githubusercontent.com/spaceswap/tokenlists/main/assets/BUSD.svg'
-        }
-      ])
-      setNetworkStats({
-        totalBlocks: 45678901,
-        totalTransactions: 2345678901,
-        totalAddresses: 123456789,
-        totalContracts: 5678901,
-        totalTokens: 23456,
-        avgBlockTime: 3.2,
-        avgGasPrice: '5',
-        tps: 125
-      })
-      setGasOracle({
-        slow: '4',
-        standard: '5',
-        fast: '8',
-        baseFee: '5'
-      })
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -188,6 +83,15 @@ export default function HomePage() {
     return (
       <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-500"></div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex flex-col items-center justify-center gap-4">
+        <p className="text-red-500">{error}</p>
+        <button onClick={handleRefresh} className="px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
       </div>
     )
   }
@@ -322,9 +226,12 @@ export default function HomePage() {
               ))}
             </div>
           </div>
-          <div className="h-64">
+          <div className="h-64 flex items-center justify-center">
+            {txChartData.length === 0 ? (
+              <span className="text-gray-500 dark:text-gray-400">No chart data available</span>
+            ) : (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={txChartData.length > 0 ? txChartData : generateMockChartData()}>
+              <AreaChart data={txChartData}>
                 <defs>
                   <linearGradient id="colorTx" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#14b8a6" stopOpacity={0.3} />
@@ -342,6 +249,7 @@ export default function HomePage() {
                 <Area type="monotone" dataKey="value" stroke="#14b8a6" strokeWidth={2} fillOpacity={1} fill="url(#colorTx)" />
               </AreaChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
 
@@ -465,16 +373,4 @@ function QuickLinkCard({ icon, title, description, href }: { icon: React.ReactNo
       <p className="text-sm text-gray-500">{description}</p>
     </Link>
   )
-}
-
-function generateMockChartData() {
-  const data = []
-  const now = Math.floor(Date.now() / 1000)
-  for (let i = 23; i >= 0; i--) {
-    data.push({
-      timestamp: now - i * 3600,
-      value: Math.floor(Math.random() * 500000) + 100000
-    })
-  }
-  return data
 }

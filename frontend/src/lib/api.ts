@@ -272,6 +272,13 @@ class APIClient {
     return data
   }
 
+  async getGasHistory(params?: {
+    timeframe?: '24h' | '7d' | '30d' | '1y'
+  }): Promise<ChartData[]> {
+    const { data } = await this.client.get<ChartData[]>('/charts/gas', { params })
+    return data
+  }
+
   async getGasOracle(): Promise<GasOracle> {
     const { data } = await this.client.get<GasOracle>('/gas/oracle')
     return data

@@ -8,11 +8,12 @@
 - No root Cargo workspace; 147 independent `Cargo.toml` crates (each builds standalone).
 
 ## Verified audit findings (AUDIT_2026.md is ACCURATE — confirmed in source)
-Security CRITICAL (confirmed):
+Security CRITICAL:
 - `precompile/src/ecrecover.rs`: returns `vec![0u8; 32]` (zero address). BREAKS signature recovery.
 - `precompile/src/sha256.rs`: returns `vec![0u8; 32]`. `bn128.rs`/`modexp.rs` return `vec![]`.
-- `quantum_crypto/src/sphinx.rs`: `SphinxVerifier::verify()` returns `true` unconditionally -> universal signature forgery.
-- `quantum_crypto/src/kyber.rs`: keygen is deterministic byte counter; encapsulate/decapsulate ignore keys (fake KEM).
+- `quantum_crypto/src/sphinx.rs` and `kyber.rs`: ALREADY FIXED (commit 67dfc5f). sphinx now uses
+  real ML-DSA/Dilithium-3 via `pqc_dilithium` (verify() returns false for forged/tampered sigs);
+  kyber now uses real ML-KEM via `pqc_kyber` with OsRng. `cargo check` + 17 tests pass.
 - `contract_verifier_advanced/src/lib.rs:~129`: `let matches = true; // Would compare with chain` -> fake verified badge.
 
 HIGH (confirmed):
@@ -59,9 +60,21 @@ Replaced fabricated keccak256 topics with verified real values (computed via pyc
 - RPC handler hardcoded values; missing namespaces.
 - node.rs start() no-op.
 - 116 gateway getMockData handlers.
-- bridge-engine in-memory only.
+- bridge-engine in-memory only. — FIXED 2026-08-16: real lock/mint/burn/unlock flows +
+  real Ed25519 (ed25519-dalek) relayer signature verification, deterministic Keccak256 event
+  ids, sqlx postgres persistence (in-memory fallback), idempotency. 6 integration tests pass.
+  See `bridge-engine/src/engine.rs` + `bridge-engine/tests/bridge_flows.rs`.
 - dex/gas/historical_state/contract_verifier_advanced stubs.
 - committed binaries; SQLite→PostgreSQL+Redis.
+
+## bridge-engine build/test notes (env quirk)
+- `cargo check` passes in `bridge-engine/` without extra setup.
+- `cargo test`/`cargo build` (linking a bin/test) needs OpenSSL dev libs (`-lssl -lcrypto`);
+  the sandbox has only `libssl.so.3`/`libcrypto.so.3`, not the `-lssl`/`-lcrypto` dev symlinks,
+  and no root to install `libssl-dev`. Workaround without root:
+  `mkdir -p /tmp/ossllibs && ln -sf /usr/lib/x86_64-linux-gnu/libssl.so.3 /tmp/ossllibs/libssl.so
+   && ln -sf /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /tmp/ossllibs/libcrypto.so`
+  then `LIBRARY_PATH=/tmp/ossllibs cargo test`.
 
 Committed build artifacts (should be gitignored/removed):
 - `tigersmartchaind` (5MB ELF at repo root), `pruning/target/` (257 files), `crypto_cpp/*.o` + `libtiger_crypto.a`.
@@ -79,6 +92,17 @@ Committed build artifacts (should be gitignored/removed):
 - Rust crates are standalone (no workspace). Each has own Cargo.toml + [profile.release] lto=true.
 - Frontend: Next.js app router under `frontend/src/app/`, theme switching via `frontend/src/app/providers.tsx` + `frontend/src/lib/store.ts`.
 - DB: PostgreSQL schema at `explorer/databases/postgres_schema/schema.sql`. User wants SQLite removed in favor of PostgreSQL + Redis.
+
+## contract_verifier_advanced (already fixed as of commit b79c2ef)
+- `verify()` previously had `let matches = true;` stub (line ~129). Now does REAL comparison:
+  `fetch_onchain_bytecode()` -> `eth_getCode` via `reqwest::blocking` (RPC_HTTP_URL env or `new_with_rpc()`), then `bytecode_matches()` strips trailing CBOR metadata (`0xa1 0x65` prefix) before comparing runtime bytecode. Returns false when RPC unavailable or bytecode differs.
+- `compile_sources()` invokes real `solc --combined-json bin,bin-runtime,abi` (no longer a hardcoded stub). Note: requires solc installed on PATH to actually produce bytecode.
+- Cargo deps include `reqwest` (json+blocking) and `hex`. `cargo check` passes (only unused-variable warnings elsewhere).
+
+## dex + historical_state (already fixed as of commit 6df8deb)
+- `dex/src/client.rs` previously discarded fetched subgraph data with `Ok(vec![])` in `get_pairs`, `search_pairs`, `get_top_tokens`, `get_swaps` (pre-fix lines 180/255/313/353). Now all return real parsed data via `parse_pairs`/`parse_tokens`/`parse_swaps`; `get_analytics` aggregates factory-level stats. No `Ok(vec![])` remains.
+- `historical_state/src/lib.rs` previously returned a zero-balance mock `AccountState` around old line 191 ("// For now, create a mock state", balance "0x0"). `HistoricalIndexer` now uses a real `reqwest::blocking` client + `rpc()` helper issuing `eth_getProof` / `eth_getBalance` / `eth_getStorageAt` / `eth_getCode` / `eth_getBlockByNumber` against `rpc_url` (errors if empty). The remaining `unwrap_or("0x0")`/`"0x000..0"` strings are fallback defaults for missing RPC fields, not mock data.
+- Both crates: `cargo check` passes (only unused-variable/import + non-snake-case warnings).
 
 ## Build/test approach
 - Compile per-crate: `cd <crate> && cargo build` (after `source $HOME/.cargo/env`).

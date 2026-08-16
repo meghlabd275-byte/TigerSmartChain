@@ -29,6 +29,17 @@ export interface BlockListItem {
 }
 
 // Transaction Types
+export interface Log {
+  address: string
+  topics: string[]
+  data: string
+  blockNumber: number
+  transactionHash: string
+  transactionIndex: number
+  logIndex: number
+  removed: boolean
+}
+
 export interface Transaction {
   hash: string
   blockNumber: number

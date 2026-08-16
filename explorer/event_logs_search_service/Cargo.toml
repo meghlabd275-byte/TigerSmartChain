@@ -6,18 +6,19 @@ authors = ["TigerScan Team"]
 description = "Advanced Event Logs Search and Filter Service"
 
 [dependencies]
-ethers = { version = "2.0", features = ["full"] }
+ethers = { version = "2.0", features = ["rustls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 thiserror = "1.0"
 anyhow = "1.0"
 hex = "0.4"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tiny_http = "0.12"
 
 [lib]
 name = "event_logs_search_service"

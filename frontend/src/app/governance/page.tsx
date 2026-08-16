@@ -8,18 +8,28 @@ import api from '@/lib/api'
 export default function GovernancePage() {
   const [proposals, setProposals] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState('all')
 
   useEffect(() => { fetchProposals() }, [filter])
 
   const fetchProposals = async () => {
+    setLoading(true)
+    setError(null)
     try {
       const response = await api.getGovernanceProposals({ status: filter === 'all' ? undefined : filter })
       setProposals(response.items || [])
     } catch (error) {
-      setProposals(generateMockProposals())
+      setProposals([])
+      setError('Failed to load data. Please try again later.')
     } finally { setLoading(false) }
   }
+
+  const totalVoters = proposals.reduce((sum, p) => sum + (p.voteCount || 0), 0)
+  const totalVotes = proposals.reduce(
+    (sum, p) => sum + (Number(p.forVotes) || 0) + (Number(p.againstVotes) || 0),
+    0
+  )
 
   const getStatusColor = (status: string) => {
     switch (status) {
@@ -47,11 +57,11 @@ export default function GovernancePage() {
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2"><Users className="w-4 h-4" /><span className="text-sm">Total Voters</span></div>
-            <p className="text-2xl font-bold">12,345</p>
+            <p className="text-2xl font-bold">{totalVoters.toLocaleString()}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2"><TrendingUp className="w-4 h-4" /><span className="text-sm">Total Votes</span></div>
-            <p className="text-2xl font-bold">1,234,567</p>
+            <p className="text-2xl font-bold">{totalVotes.toLocaleString()}</p>
           </div>
         </div>
 
@@ -67,7 +77,22 @@ export default function GovernancePage() {
         {/* Proposals */}
         <div className="space-y-4">
           {loading ? <div className="animate-pulse space-y-4">{Array.from({length: 5}).map((_,i) => <div key={i} className="h-32 bg-gray-200 rounded-xl"></div>)}</div> : 
-            proposals.map((proposal) => (
+            error ? (
+              <div className="bg-white dark:bg-dark-800 rounded-xl border p-6 text-center text-red-500">
+                {error}
+                <button onClick={fetchProposals} className="block mx-auto mt-3 px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
+              </div>
+            ) :
+            proposals.length === 0 ? (
+              <div className="bg-white dark:bg-dark-800 rounded-xl border p-6 text-center text-gray-500">No proposals found</div>
+            ) :
+            proposals.map((proposal) => {
+              const forVotes = Number(proposal.forVotes) || 0
+              const againstVotes = Number(proposal.againstVotes) || 0
+              const total = forVotes + againstVotes
+              const forPct = total > 0 ? (forVotes / total) * 100 : 0
+              const againstPct = total > 0 ? (againstVotes / total) * 100 : 0
+              return (
               <div key={proposal.id} className="bg-white dark:bg-dark-800 rounded-xl border p-6">
                 <div className="flex items-start justify-between">
                   <div>
@@ -85,28 +110,20 @@ export default function GovernancePage() {
                 </div>
                 <div className="mt-4 flex space-x-4">
                   <div className="flex-1">
-                    <div className="flex justify-between text-sm mb-1"><span className="text-green-500">For</span><span>{((proposal.forVotes || 800000) / ((proposal.forVotes || 800000) + (proposal.againstVotes || 200000)) * 100).toFixed(1)}%</span></div>
-                    <div className="h-2 bg-gray-200 rounded-full"><div className="h-2 bg-green-500 rounded-full" style={{width: `${((proposal.forVotes || 800000) / ((proposal.forVotes || 800000) + (proposal.againstVotes || 200000)) * 100)}%`}}></div></div>
+                    <div className="flex justify-between text-sm mb-1"><span className="text-green-500">For</span><span>{forPct.toFixed(1)}%</span></div>
+                    <div className="h-2 bg-gray-200 rounded-full"><div className="h-2 bg-green-500 rounded-full" style={{width: `${forPct}%`}}></div></div>
                   </div>
                   <div className="flex-1">
-                    <div className="flex justify-between text-sm mb-1"><span className="text-red-500">Against</span><span>{((proposal.againstVotes || 200000) / ((proposal.forVotes || 800000) + (proposal.againstVotes || 200000)) * 100).toFixed(1)}%</span></div>
-                    <div className="h-2 bg-gray-200 rounded-full"><div className="h-2 bg-red-500 rounded-full" style={{width: `${((proposal.againstVotes || 200000) / ((proposal.forVotes || 800000) + (proposal.againstVotes || 200000)) * 100)}%`}}></div></div>
+                    <div className="flex justify-between text-sm mb-1"><span className="text-red-500">Against</span><span>{againstPct.toFixed(1)}%</span></div>
+                    <div className="h-2 bg-gray-200 rounded-full"><div className="h-2 bg-red-500 rounded-full" style={{width: `${againstPct}%`}}></div></div>
                   </div>
                 </div>
               </div>
-            ))
+              )
+            })
           }
         </div>
       </div>
     </div>
   )
-}
-
-function generateMockProposals() {
-  return [
-    { id: 'BEP-1', title: 'Reduce Block Reward to 0.05 BNB', status: 'passed', startBlock: 45670000, endBlock: 45680000, voteCount: 1500000, forVotes: 1200000, againstVotes: 300000 },
-    { id: 'BEP-2', title: 'Increase Validator Set to 41', status: 'active', startBlock: 45690000, endBlock: 45700000, voteCount: 800000, forVotes: 600000, againstVotes: 200000 },
-    { id: 'BEP-3', title: 'Add New Governance Module', status: 'rejected', startBlock: 45650000, endBlock: 45660000, voteCount: 500000, forVotes: 200000, againstVotes: 300000 },
-    { id: 'BEP-4', title: 'Update Gas Parameters', status: 'passed', startBlock: 45630000, endBlock: 45640000, voteCount: 2000000, forVotes: 1800000, againstVotes: 200000 },
-  ]
 }

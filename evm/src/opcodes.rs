@@ -6,7 +6,16 @@ use crate::types::*;
 // OPCODE HELPERS
 // =============================================================================
 
-/// Gas costs
+/// Gas cost charged for an opcode that is invalid, unknown, or unimplemented.
+/// Per the EVM specification 0xfe (INVALID) consumes *all* remaining gas; we
+/// model that with a single prohibitive constant so any transaction reaching
+/// such an opcode can never run for free (free-work DoS surface). The value is
+/// deliberately larger than any realistic per-opcode block gas limit, so a
+/// `checked_add` against the transaction gas budget will always trip an
+/// out-of-gas halt before the opcode can do any work.
+pub const INVALID_OPCODE_GAS: u64 = 1_000_000;
+
+/// Gas costs (Shanghai-era static base costs).
 pub struct GasCost;
 
 impl GasCost {
@@ -65,7 +74,7 @@ impl GasCost {
     pub const MSTORE: u64 = 3;
     pub const MSTORE8: u64 = 3;
     pub const SLOAD: u64 = 100;
-    pub const SSTORE: u64 = 2900;
+    pub const SSTORE: u64 = 20_000;
     pub const JUMP: u64 = 8;
     pub const JUMPI: u64 = 10;
     pub const PC: u64 = 2;
@@ -88,8 +97,14 @@ impl GasCost {
     pub const STATICCALL: u64 = 700;
     pub const RETURN: u64 = 0;
     pub const REVERT: u64 = 0;
-    pub const INVALID: u64 = 0;
-    pub const SELFDESTRUCT: u64 = 0;
+    /// 0xfe INVALID: per spec consumes *all* remaining gas. We model that with
+    /// the prohibitive invalid-opcode cost so a transaction can never execute
+    /// an invalid opcode for free.
+    pub const INVALID: u64 = INVALID_OPCODE_GAS;
+    /// 0xff SELFDESTRUCT: base cost 5000 (EIP-150). An additional 25_000 applies
+    /// when sending to a previously-empty account; that dynamic surcharge is
+    /// not represented by this static base constant.
+    pub const SELFDESTRUCT: u64 = 5_000;
 }
 
 /// Get gas cost for opcode. Every opcode has a real, non-zero cost where the

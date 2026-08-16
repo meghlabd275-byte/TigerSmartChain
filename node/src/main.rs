@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to create node")?;
 
+    let node = Arc::new(node);
     info!("Node initialized successfully");
 
     // Start the node

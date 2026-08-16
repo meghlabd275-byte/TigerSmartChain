@@ -5,6 +5,8 @@ import { useState } from 'react'
 import Head from 'next/head'
 import Link from 'next/link'
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:12000'
+
 interface CallTrace {
   call_type: string
   from: string
@@ -64,66 +66,37 @@ export default function TraceDebugger() {
   const [error, setError] = useState('')
   const [activeTab, setActiveTab] = useState<'calls' | 'state' | 'gas'>('calls')
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const fetchTrace = async () => {
     setLoading(true)
     setError('')
     setResult(null)
 
     try {
-      const response = await fetch('/api/v1/trace', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tx_hash: txHash,
-          enable_state_diff: true,
-          enable_gas_profiling: true
-        })
-      })
+      const response = await fetch(`${API_BASE}/api/v1/trace/${encodeURIComponent(txHash)}`)
+
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => null)
+        throw new Error(errBody?.error || `Trace request failed (${response.status})`)
+      }
 
       const data = await response.json()
-      
-      if (data.result) {
-        setResult(data.result)
+      const result = data.result ?? data
+
+      if (!result || !result.traces) {
+        setError(data.error || 'No trace data available for this transaction.')
       } else {
-        setError(data.error || 'Trace failed. (Demo: Try analyzing any transaction hash)')
-        // Mock data for demo purposes
-        setResult({
-            transaction_hash: txHash,
-            block_number: 1234567,
-            from: "0x1234567890123456789012345678901234567890",
-            to: "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-            value: "1000000000000000000",
-            gas_used: 21000,
-            status: true,
-            traces: [
-                { call_type: "CALL", from: "0x123", to: "0x456", value: "0", gas: 100000, gas_used: 5000, depth: 0, index: 0, parent_index: null, revert: false },
-                { call_type: "STATICCALL", from: "0x456", to: "0x789", value: "0", gas: 90000, gas_used: 2000, depth: 1, index: 1, parent_index: 0, revert: false },
-                { call_type: "DELEGATECALL", from: "0x456", to: "0xabc", value: "0", gas: 80000, gas_used: 3000, depth: 1, index: 2, parent_index: 0, revert: false }
-            ],
-            state_diff: {
-                changes: [
-                    { address: "0x456", slot: "0x0", pre_value: "0x0", post_value: "0x1", diff_type: "Update" }
-                ]
-            },
-            gas_profiling: {
-                total_gas: 10000,
-                gas_per_call: [
-                    { call_index: 0, call_type: "CALL", gas_used: 5000, percentage: 50 },
-                    { call_index: 2, call_type: "DELEGATECALL", gas_used: 3000, percentage: 30 },
-                    { call_index: 1, call_type: "STATICCALL", gas_used: 2000, percentage: 20 }
-                ],
-                optimization_suggestions: [
-                    { call_index: 2, suggestion: "Avoid repeated delegatecalls to the same library", estimated_savings: 1000 }
-                ]
-            }
-        })
+        setResult(result)
       }
     } catch (err) {
-      setError('Network error')
+      setError(err instanceof Error ? err.message : 'Network error')
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    fetchTrace()
   }
 
   const formatAddress = (addr: string) => {
@@ -167,7 +140,29 @@ export default function TraceDebugger() {
           </button>
         </form>
 
-        {error && <div className="mt-6 p-4 bg-red-900/20 border border-red-900/50 text-red-400 rounded-xl text-sm">{error}</div>}
+        {loading && (
+          <div className="mt-6 flex items-center justify-center py-12">
+            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-[#ff6b35]"></div>
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-6 p-4 bg-red-900/20 border border-red-900/50 text-red-400 rounded-xl text-sm flex items-center justify-between">
+            <span>{error}</span>
+            <button
+              onClick={fetchTrace}
+              className="ml-4 px-3 py-1 bg-red-900/40 hover:bg-red-900/60 text-red-300 rounded-lg text-xs"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {!loading && !error && !result && txHash && (
+          <div className="mt-6 p-4 bg-[#12121a] border border-[#1f1f2e] text-gray-500 rounded-xl text-sm text-center">
+            No data available
+          </div>
+        )}
 
         {result && (
           <div className="mt-12 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">

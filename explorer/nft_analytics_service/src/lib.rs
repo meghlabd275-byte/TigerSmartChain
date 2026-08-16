@@ -404,10 +404,18 @@ impl NFTAnalyticsService {
     pub fn calculate_rarity(&self, address: &str, token_id: &str) -> Option<RarityResult> {
         let state = self.state.read();
         
-        let nft = state.nfts.get(address)?
-            .get(token_id)?;
+        let nfts = state.nfts.get(address)?;
+        let target_nft = nfts.get(token_id)?;
         
-        Some(self.rarity_calculator.calculate_rarity(nft))
+        let mut result = self.rarity_calculator.calculate_rarity(target_nft);
+        
+        // Calculate rank: count how many NFTs in this collection have a higher rarity score
+        let rank = nfts.values()
+            .filter(|n| n.rarity_score > result.rarity_score)
+            .count() as u32 + 1;
+        result.rarity_rank = rank;
+        
+        Some(result)
     }
 
     /// Get top NFTs by rarity

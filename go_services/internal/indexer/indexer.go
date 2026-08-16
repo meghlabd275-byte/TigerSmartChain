@@ -1,11 +1,14 @@
 package indexer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -400,10 +403,121 @@ type InternalTxTrace struct {
 	Gas   string `json:"gas"`
 }
 
+// traceCallResult represents a single call within a debug_traceTransaction trace
+type traceCallResult struct {
+	Type    string                 `json:"type"`
+	From    string                 `json:"from"`
+	To      string                 `json:"to"`
+	Value   string                 `json:"value"`
+	Gas     string                 `json:"gas"`
+	GasUsed string                 `json:"gasUsed"`
+	Error   string                 `json:"error"`
+	Calls   []traceCallResult      `json:"calls"`
+	Output  string                 `json:"output"`
+}
+
+// traceResult represents the top-level result of debug_traceTransaction
+type traceResult struct {
+	Type         string            `json:"type"`
+	From         string            `json:"from"`
+	To           string            `json:"to"`
+	Value        string            `json:"value"`
+	Gas          string            `json:"gas"`
+	GasUsed      string            `json:"gasUsed"`
+	Input        string            `json:"input"`
+	Output       string            `json:"output"`
+	Calls        []traceCallResult `json:"calls"`
+}
+
+// rpcRequest is a JSON-RPC 2.0 request envelope
+type rpcRequest struct {
+	Jsonrpc string        `json:"jsonrpc"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+	Id      int           `json:"id"`
+}
+
+// getInternalTransactions calls debug_traceTransaction on the RPC node
+// and extracts all internal calls (CALL, CALLCODE, DELEGATECALL, STATICCALL, CREATE, CREATE2)
 func (i *Indexer) getInternalTransactions(txHash string) ([]InternalTxTrace, error) {
-	// Would call debug_traceTransaction RPC
-	// This is a placeholder
-	return []InternalTxTrace{}, nil
+	reqBody := rpcRequest{
+		Jsonrpc: "2.0",
+		Method:  "debug_traceTransaction",
+		Params:  []interface{}{txHash, map[string]interface{}{"tracer": "callTracer"}},
+		Id:      1,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal trace request: %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", i.config.RPCURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trace request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send trace request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read trace response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("trace request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse JSON-RPC response
+	var rpcResp struct {
+		Result traceResult `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &rpcResp); err != nil {
+		return nil, fmt.Errorf("failed to parse trace response: %w", err)
+	}
+	if rpcResp.Error != nil {
+		// debug_traceTransaction might not be supported by all RPC providers
+		log.Printf("debug_traceTransaction error for %s: code=%d msg=%s", txHash, rpcResp.Error.Code, rpcResp.Error.Message)
+		return nil, fmt.Errorf("trace error: %s", rpcResp.Error.Message)
+	}
+
+	// Extract internal calls recursively
+	var traces []InternalTxTrace
+	collectCalls(rpcResp.Result.Calls, &traces)
+
+	return traces, nil
+}
+
+// collectCalls recursively extracts internal calls from the trace
+func collectCalls(calls []traceCallResult, traces *[]InternalTxTrace) {
+	for _, call := range calls {
+		// Only include actual internal calls (not the top-level transaction)
+		if call.Type == "CALL" || call.Type == "CALLCODE" ||
+			call.Type == "DELEGATECALL" || call.Type == "STATICCALL" ||
+			call.Type == "CREATE" || call.Type == "CREATE2" {
+			*traces = append(*traces, InternalTxTrace{
+				From:  call.From,
+				To:    call.To,
+				Value: call.Value,
+				Call:  strings.ToLower(call.Type),
+				Gas:   call.Gas,
+			})
+		}
+		// Recurse into nested calls
+		if len(call.Calls) > 0 {
+			collectCalls(call.Calls, traces)
+		}
+	}
 }
 
 func (i *Indexer) saveInternalTransaction(txHash string, blockNum uint64, trace InternalTxTrace) {

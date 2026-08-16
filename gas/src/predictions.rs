@@ -32,10 +32,15 @@ impl GasPredictor {
 
     /// Predict next gas price
     pub fn predict(&self, minutes_ahead: u64) -> GasPrediction {
+        // Not enough history for statistical prediction.
+        // Fall back to the most recent observed price (if any) with confidence 0.0
+        // to signal that this is not a real prediction. If there is no history at all,
+        // predicted_price is 0 (clearly invalid) rather than a fabricated value.
         if self.history.len() < 10 {
+            let last_price = self.history.last().map(|h| h.gas_price).unwrap_or(0);
             return GasPrediction {
-                predicted_price: 20,
-                confidence: 50.0,
+                predicted_price: last_price,
+                confidence: 0.0,
                 prediction_time: Utc::now().timestamp(),
                 model: self.model,
             };

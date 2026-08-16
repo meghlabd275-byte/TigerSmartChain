@@ -19,6 +19,7 @@ import type { NFTCollection } from '@/types'
 export default function NFTsPage() {
   const [collections, setCollections] = useState<NFTCollection[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [search, setSearch] = useState('')
@@ -26,14 +27,16 @@ export default function NFTsPage() {
 
   const fetchCollections = async () => {
     setLoading(true)
+    setError(null)
     try {
       const response = await api.getNFTCollections({ page, limit })
       setCollections(response.items)
       setTotalPages(Math.ceil(response.total / limit))
     } catch (error) {
       console.error('Error fetching collections:', error)
-      setCollections(generateMockCollections())
-      setTotalPages(100)
+      setCollections([])
+      setTotalPages(1)
+      setError('Failed to load data. Please try again later.')
     } finally {
       setLoading(false)
     }
@@ -92,6 +95,13 @@ export default function NFTsPage() {
                 <div className="skeleton h-4 w-1/2 rounded"></div>
               </div>
             ))
+          ) : error ? (
+            <div className="col-span-full bg-white dark:bg-dark-800 rounded-xl border border-gray-200 dark:border-dark-700 p-6 text-center text-red-500">
+              {error}
+              <button onClick={fetchCollections} className="block mx-auto mt-3 px-4 py-2 rounded-lg bg-primary-500 text-white hover:bg-primary-600">Retry</button>
+            </div>
+          ) : filteredCollections.length === 0 ? (
+            <div className="col-span-full bg-white dark:bg-dark-800 rounded-xl border border-gray-200 dark:border-dark-700 p-6 text-center text-gray-500">No collections found</div>
           ) : (
             filteredCollections.map((collection) => (
               <CollectionCard key={collection.address} collection={collection} />
@@ -190,37 +200,3 @@ function CollectionCard({ collection }: { collection: NFTCollection }) {
   )
 }
 
-function generateMockCollections(): NFTCollection[] {
-  return [
-    {
-      address: '0x1234567890abcdef1234567890abcdef12345678',
-      name: 'Bored Ape NFT',
-      symbol: 'BAYC',
-      type: 'BEP721',
-      totalSupply: 10000,
-      mintedCount: 10000,
-      ownerCount: 6500,
-      floorPrice: 35.5,
-      averagePrice: 42.3,
-      volume24h: 125000,
-      volume7d: 890000,
-      volume30d: 3200000,
-      imageUrl: 'https://picsum.photos/400/400?random=1'
-    },
-    {
-      address: '0x2345678901abcdef2345678901abcdef23456789',
-      name: 'CryptoPunks Clone',
-      symbol: 'PUNK',
-      type: 'BEP721',
-      totalSupply: 10000,
-      mintedCount: 10000,
-      ownerCount: 4500,
-      floorPrice: 28.9,
-      averagePrice: 35.1,
-      volume24h: 89000,
-      volume7d: 567000,
-      volume30d: 2100000,
-      imageUrl: 'https://picsum.photos/400/400?random=2'
-    }
-  ]
-}

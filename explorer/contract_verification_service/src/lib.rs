@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context as AnyhowContext, Result};
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use encoding_rs::GBK;
@@ -18,6 +18,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha256Digest, Sha256 as Sha256Hasher};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -490,7 +491,7 @@ impl VerificationService {
                 return Err(VerificationError::InvalidInput(format!(
                     "File {} too large: max {} bytes",
                     file.name, self.config.max_file_size
-                ).into());
+                )).into());
             }
         }
         
@@ -540,36 +541,184 @@ impl VerificationService {
         state.compilations_today += 1;
     }
 
-    /// Compile source code
+    /// Compile source code using real solc compiler
     async fn compile(&self, request: &VerificationRequest) -> Result<CompilationOutput> {
         info!("Compiling {} source files", request.source_files.len());
-        
-        // For now, return a simulated output
-        // In production, this would call solc/vyper
-        let output = CompilationOutput {
-            success: true,
-            errors: vec![],
-            warnings: vec![],
-            contracts: vec![
-                CompiledContract {
-                    name: "Contract".to_string(),
-                    abi: "[]".to_string(),
-                    bytecode: "0x".to_string(),
-                    runtime_bytecode: "0x".to_string(),
-                    source_map: "".to_string(),
-                    opcodes: "".to_string(),
+
+        if request.source_files.is_empty() {
+            return Err(anyhow!("No source files provided"));
+        }
+
+        // Build combined Solidity input for solc standard JSON
+        let sources: HashMap<String, String> = request.source_files.iter()
+            .map(|f| (f.name.clone(), f.content.clone()))
+            .collect();
+
+        let solc_input = serde_json::json!({
+            "language": "Solidity",
+            "sources": sources,
+            "settings": {
+                "optimizer": {
+                    "enabled": request.optimization_enabled,
+                    "runs": request.optimization_runs
+                },
+                "evmVersion": request.evm_version,
+                "outputSelection": {
+                    "*": {
+                        "*": ["abi", "evm.bytecode", "evm.deployedBytecode", "evm.sourceMap", "opcodes"]
+                    }
                 }
-            ],
-            sources: HashMap::new(),
-        };
-        
-        Ok(output)
+            }
+        });
+
+        // Try solc via command line
+        let solc_path = std::env::var("SOLC_PATH").unwrap_or_else(|_| "solc".to_string());
+        let output = tokio::process::Command::new(&solc_path)
+            .arg("--standard-json")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        match output {
+            Ok(mut child) => {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let input_str = serde_json::to_string(&solc_input)?;
+                    let _ = stdin.write_all(input_str.as_bytes()).await;
+                }
+
+                let result = child.wait_with_output().await
+                    .context("Failed to wait for solc")?;
+
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                let stderr = String::from_utf8_lossy(&result.stderr);
+
+                let solc_result: serde_json::Value = serde_json::from_str(&stdout)
+                    .map_err(|e| anyhow!("solc output parse error: {} (stderr: {})", e, stderr))?;
+
+                let mut errors = vec![];
+                let mut warnings = vec![];
+                if let Some(errs) = solc_result.get("errors").and_then(|e| e.as_array()) {
+                    for err in errs {
+                        let severity = err.get("severity").and_then(|s| s.as_str()).unwrap_or("error");
+                        let msg = err.get("formattedMessage").and_then(|m| m.as_str()).unwrap_or("unknown error");
+                        let err_type = err.get("type").and_then(|t| t.as_str()).unwrap_or("unknown").to_string();
+                        let source_location = None;
+                        let ce = CompilationError {
+                            source_location,
+                            error_type: err_type,
+                            message: msg.to_string(),
+                            severity: severity.to_string(),
+                        };
+                        if severity == "error" {
+                            errors.push(ce);
+                        } else {
+                            warnings.push(msg.to_string());
+                        }
+                    }
+                }
+
+                if !errors.is_empty() {
+                    return Ok(CompilationOutput {
+                        success: false,
+                        errors,
+                        warnings,
+                        contracts: vec![],
+                        sources: HashMap::new(),
+                    });
+                }
+
+                let mut contracts = vec![];
+                if let Some(contracts_map) = solc_result.get("contracts").and_then(|c| c.as_object()) {
+                    for (_file, file_contracts) in contracts_map {
+                        if let Some(fc) = file_contracts.as_object() {
+                            for (name, contract_data) in fc {
+                                let abi = contract_data.get("abi")
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_else(|| "[]".to_string());
+                                let bytecode = contract_data
+                                    .pointer("/evm/bytecode/object")
+                                    .and_then(|b| b.as_str())
+                                    .unwrap_or("0x")
+                                    .to_string();
+                                let runtime_bytecode = contract_data
+                                    .pointer("/evm/deployedBytecode/object")
+                                    .and_then(|b| b.as_str())
+                                    .unwrap_or("0x")
+                                    .to_string();
+                                let source_map = contract_data
+                                    .pointer("/evm/bytecode/sourceMap")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let opcodes = contract_data
+                                    .pointer("/evm/deployedBytecode/opcodes")
+                                    .and_then(|o| o.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                contracts.push(CompiledContract {
+                                    name: name.to_string(),
+                                    abi,
+                                    bytecode,
+                                    runtime_bytecode,
+                                    source_map,
+                                    opcodes,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if contracts.is_empty() {
+                    return Err(anyhow!("solc produced no contracts"));
+                }
+
+                Ok(CompilationOutput {
+                    success: true,
+                    errors,
+                    warnings,
+                    contracts,
+                    sources: HashMap::new(),
+                })
+            }
+            Err(e) => {
+                warn!("solc not available ({}), falling back to bytecode-only verification", e);
+                Err(anyhow!("solc compiler not available: {}. Install solc or provide pre-compiled bytecode", e))
+            }
+        }
     }
 
-    /// Get on-chain bytecode
+    /// Get on-chain bytecode via real eth_getCode RPC call
     async fn get_on_chain_bytecode(&self, address: &str, _chain_id: u64) -> Result<String> {
-        // In production, this would query the RPC
-        Ok(format!("0x{}", hex::encode(Sha256Hasher::digest(address.as_bytes())))
+        let client = reqwest::Client::new();
+        let rpc_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getCode",
+            "params": [address, "latest"],
+            "id": 1
+        });
+
+        let resp = client.post(self.config.rpc_url.as_str())
+            .json(&rpc_req)
+            .send()
+            .await
+            .context("Failed to send eth_getCode request")?;
+
+        let body: serde_json::Value = resp.json().await
+            .context("Failed to parse eth_getCode response")?;
+
+        let bytecode = body.get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| {
+                if let Some(err) = body.get("error") {
+                    anyhow!("RPC error: {}", err)
+                } else {
+                    anyhow!("No result in eth_getCode response")
+                }
+            })?;
+
+        Ok(bytecode.to_string())
     }
 
     /// Match compiled bytecode with on-chain
@@ -671,7 +820,7 @@ impl VerificationService {
     }
 
     /// Get cached result
-    fn get_cached(&self, address: &str, chain_id: u64) -> Option<VerificationResult> {
+    pub fn get_cached(&self, address: &str, chain_id: u64) -> Option<VerificationResult> {
         let state = self.state.read();
         state.cache.get(&format!("{}-{}", chain_id, address))
             .map(|c| c.result.clone())
@@ -751,7 +900,7 @@ impl SourcifyClient {
 
     /// Fetch source files from Sourcify
     pub async fn get_sources(&self, address: &str, chain_id: u64) -> Result<Option<Vec<SourceFile>>> {
-        let url = format!("{}/files/{}/{}", chain_id, address);
+        let url = format!("{}/files/{}/{}", self.base_url, chain_id, address);
         
         let mut request = self.client.get(&url);
         

@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { Github, Twitter, Discord, Telegram, Mail } from 'lucide-react'
+import { Github, Twitter, MessageCircle, Send, Mail } from 'lucide-react'
 
 const footerLinks = {
   Blockchain: [
@@ -53,10 +53,10 @@ export function Footer() {
                 <Twitter className="w-5 h-5" />
               </a>
               <a href="#" className="text-gray-400 hover:text-primary-500 transition-colors">
-                <Discord className="w-5 h-5" />
+                <MessageCircle className="w-5 h-5" />
               </a>
               <a href="#" className="text-gray-400 hover:text-primary-500 transition-colors">
-                <Telegram className="w-5 h-5" />
+                <Send className="w-5 h-5" />
               </a>
               <a href="#" className="text-gray-400 hover:text-primary-500 transition-colors">
                 <Github className="w-5 h-5" />

@@ -1,9 +1,11 @@
 // TigerScan - Governance DAO Page with Advanced Features
 // Full implementation with proposals, voting, delegates, and real-time updates
 
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import Head from 'next/head'
 import Link from 'next/link'
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:12000'
 
 interface Proposal {
   id: number
@@ -67,76 +69,22 @@ const STATUS_LABELS: Record<string, string> = {
   expired: 'Expired',
 }
 
-// Generate sample proposals with full data
-const generateSampleProposals = (): Proposal[] => {
-  const proposalTitles = [
-    { title: 'Increase Staking Rewards to 15% APY', desc: 'Proposal to increase staking rewards from 12% to 15% APY to incentivize more validators' },
-    { title: 'Add New Treasury Multisig', desc: 'Add a new 5/9 multisig wallet for treasury management' },
-    { title: 'Upgrade Gas Oracle', desc: 'Update the gas oracle to use a more accurate price feed' },
-    { title: 'Enable Cross-Chain Bridge', desc: 'Bridge for multi-chain token transfers' },
-    { title: 'Reduce Block Time', desc: 'Reduce block time from 5s to 3s for faster confirmations' },
-    { title: 'Add NFT Marketplace', desc: 'Integrate marketplace for NFT trading' },
-    { title: 'Update Tokenomics', desc: 'Modify token distribution schedule' },
-    { title: 'Grant for Development', desc: 'Allocate tokens for protocol development' },
-    { title: 'Security Upgrade', desc: 'Implement additional security measures' },
-    { title: 'Partner Integration', desc: 'Integrate with DeFi protocols' },
-  ]
-  
-  const statuses: Proposal['status'][] = ['pending', 'active', 'passed', 'rejected', 'executed', 'expired']
-  const now = Date.now()
-  
-  return proposalTitles.map((p, i) => {
-    const status = statuses[Math.floor(Math.random() * statuses.length)]
-    const forVotes = String(Math.floor(Math.random() * 10000000) + 1000000)
-    const againstVotes = status === 'rejected' ? String(Math.floor(Math.random() * 8000000) + 500000) : String(Math.floor(Math.random() * 2000000))
-    const abstainVotes = String(Math.floor(Math.random() * 500000))
-    const startBlock = 15000000 + (i * 10000)
-    const endBlock = startBlock + 20000
-    
-    const votes: Vote[] = []
-    const types: Vote['support'][] = ['for', 'against', 'abstain']
-    for (let j = 0; j < 15; j++) {
-      votes.push({
-        voter: '0x' + Math.random().toString(16).substring(2, 42).padStart(40, '0').substring(0, 40),
-        support: types[Math.floor(Math.random() * 3)],
-        weight: String(Math.floor(Math.random() * 500000) + 10000),
-        reason: Math.random() > 0.5 ? 'Supporting this proposal for protocol growth' : undefined,
-        timestamp: Date.now() - Math.floor(Math.random() * 7 * 86400000),
-      })
-    }
-    votes.sort((a, b) => parseInt(b.weight) - parseInt(a.weight))
-    
-    return {
-      id: i + 1,
-      title: p.title,
-      description: p.desc,
-      status,
-      for_votes: forVotes,
-      against_votes: againstVotes,
-      abstain_votes: abstainVotes,
-      start_block: startBlock,
-      end_block: endBlock,
-      proposer: '0x' + Math.random().toString(16).substring(2, 42).padStart(40, '0').substring(0, 40),
-      quorum_required: '5000000',
-      created_at: now - (i * 86400000 * 3),
-      votes,
-    }
-  })
-}
-
-// Generate sample delegates
-const generateSampleDelegates = (): Delegate[] => {
-  const names = ['ValidatorDAO', 'DeFi Alliance', 'WhalePool', 'CommunityVault', 'SecurityCouncil', 'YieldFarmer', 'LongHodler', 'ProtocolTeam']
-  
-  return Array.from({ length: 20 }, (_, i) => ({
-    address: '0x' + Math.random().toString(16).substring(2, 42).padStart(40, '0').substring(0, 40),
-    name: names[i % names.length] + (i > 7 ? ` ${Math.floor(i / 8) + 1}` : ''),
-    voting_power: String(Math.floor(Math.random() * 5000000) + 100000),
-    delegated_by: String(Math.floor(Math.random() * 100)),
-    proposals_voted: Math.floor(Math.random() * 50) + 10,
-    last_vote: Date.now() - Math.floor(Math.random() * 30 * 86400000),
-  })).sort((a, b) => parseInt(b.voting_power) - parseInt(a.voting_power))
-}
+// Compute governance stats from real proposal data
+const computeStats = (proposals: Proposal[]): GovernanceStats => ({
+  total_proposals: proposals.length,
+  active_proposals: proposals.filter(p => p.status === 'active').length,
+  passed_proposals: proposals.filter(p => p.status === 'passed' || p.status === 'executed').length,
+  rejected_proposals: proposals.filter(p => p.status === 'rejected' || p.status === 'expired').length,
+  total_voters: proposals.reduce((sum, p) => sum + p.votes.length, 0),
+  total_delegates: new Set(proposals.flatMap(p => p.votes.map(v => v.voter))).size,
+  quorum_percentage: proposals.length ? 5 : 0,
+  avg_participation: proposals.length
+    ? proposals.reduce((sum, p) => {
+        const total = parseInt(p.for_votes) + parseInt(p.against_votes) + parseInt(p.abstain_votes)
+        return sum + (p.quorum_required ? Math.min((total / parseInt(p.quorum_required)) * 100, 100) : 0)
+      }, 0) / proposals.length
+    : 0,
+})
 
 export default function Governance() {
   const [proposals, setProposals] = useState<Proposal[]>([])
@@ -154,26 +102,33 @@ export default function Governance() {
   const [userAddress, setUserAddress] = useState<string>('')
   const [page, setPage] = useState(1)
 
-  useEffect(() => {
-    const sampleProposals = generateSampleProposals()
-    const sampleDelegates = generateSampleDelegates()
-    
-    setTimeout(() => {
-      setProposals(sampleProposals)
-      setDelegates(sampleDelegates)
-      setStats({
-        total_proposals: sampleProposals.length,
-        active_proposals: sampleProposals.filter(p => p.status === 'active').length,
-        passed_proposals: sampleProposals.filter(p => p.status === 'passed' || p.status === 'executed').length,
-        rejected_proposals: sampleProposals.filter(p => p.status === 'rejected' || p.status === 'expired').length,
-        total_voters: 1523,
-        total_delegates: 89,
-        quorum_percentage: 4.2,
-        avg_participation: 67.5,
-      })
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchGovernance = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/governance/proposals`)
+      if (!res.ok) throw new Error(`Failed to load governance data (${res.status})`)
+      const data = await res.json()
+      const list: Proposal[] = Array.isArray(data) ? data : (data.proposals ?? data.data ?? [])
+      const delegateList: Delegate[] = Array.isArray(data) ? [] : (data.delegates ?? [])
+      setProposals(list)
+      setDelegates(delegateList)
+      setStats(computeStats(list))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load governance data')
+      setProposals([])
+      setDelegates([])
+      setStats(null)
+    } finally {
       setLoading(false)
-    }, 300)
+    }
   }, [])
+
+  useEffect(() => {
+    fetchGovernance()
+  }, [fetchGovernance])
 
   // Filter and sort proposals
   const filteredProposals = useMemo(() => {
@@ -263,6 +218,22 @@ export default function Governance() {
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-orange-500 mx-auto mb-4"></div>
           <p className="text-gray-400">Loading Governance...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
+        <div className="text-center">
+          <p className="text-red-400 mb-4">{error}</p>
+          <button
+            onClick={fetchGovernance}
+            className="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg"
+          >
+            Retry
+          </button>
         </div>
       </div>
     )
@@ -368,7 +339,12 @@ export default function Governance() {
         {/* Proposals List */}
         {activeTab === 'proposals' && (
           <div className="space-y-4">
-            {paginatedProposals.map((proposal) => {
+            {paginatedProposals.length === 0 ? (
+              <div className="bg-gray-800 rounded-lg p-12 border border-gray-700 text-center text-gray-500">
+                No data available
+              </div>
+            ) : (
+            paginatedProposals.map((proposal) => {
               const forPercent = parseInt(proposal.for_votes) / (parseInt(proposal.for_votes) + parseInt(proposal.against_votes)) * 100 || 0
               const quorum = calculateQuorum(proposal)
               
@@ -446,9 +422,11 @@ export default function Governance() {
                   </div>
                 </div>
               )
-            })}
-            
+            })
+            )}
+
             {/* Pagination */}
+            {paginatedProposals.length > 0 && (
             <div className="flex justify-between items-center">
               <button
                 onClick={() => setPage(Math.max(1, page - 1))}
@@ -466,6 +444,7 @@ export default function Governance() {
                 Next
               </button>
             </div>
+            )}
           </div>
         )}
 
@@ -484,7 +463,14 @@ export default function Governance() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-700">
-                {delegates.map((delegate, i) => (
+                {delegates.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-12 text-center text-gray-500">
+                      No data available
+                    </td>
+                  </tr>
+                ) : (
+                delegates.map((delegate, i) => (
                   <tr key={i} className="hover:bg-gray-750">
                     <td className="px-4 py-3 text-gray-400">#{i + 1}</td>
                     <td className="px-4 py-3">
@@ -499,7 +485,8 @@ export default function Governance() {
                     <td className="px-4 py-3 text-right text-gray-400">{delegate.proposals_voted}</td>
                     <td className="px-4 py-3 text-right text-gray-400">{formatTime(delegate.last_vote)}</td>
                   </tr>
-                ))}
+                ))
+                )}
               </tbody>
             </table>
           </div>

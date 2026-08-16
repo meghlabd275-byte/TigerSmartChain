@@ -43,8 +43,18 @@ impl DEXAggregator {
             }
         }
 
-        // Get from Uniswap (would be on ETH, so skip for BSC)
-        // In production, would query multiple chains
+        // Get from Uniswap (Ethereum mainnet)
+        if let Ok(pairs) = self.uniswap.get_pairs_for_token(token_in).await {
+            for pair in pairs {
+                if pair.token1.to_lowercase() == token_out.to_lowercase() {
+                    results.push(PriceSource {
+                        protocol: DEXProtocol::UniswapV2,
+                        price: pair.price,
+                        liquidity: pair.liquidity_usd,
+                    });
+                }
+            }
+        }
 
         if results.is_empty() {
             return Err(DEXError::NotFound("No pairs found".to_string()));

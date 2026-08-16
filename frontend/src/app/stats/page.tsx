@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, LineChart, Line, PieChart, Pie, Cell } from 'recharts'
-import { Activity, Blocks, Transactions, Tokens, Wallet, Gas, DollarSign } from 'lucide-react'
+import { Activity, Blocks, ArrowLeftRight, Coins, Wallet, Fuel, DollarSign } from 'lucide-react'
 import api from '@/lib/api'
 import { formatNumber } from '@/lib/utils'
 
@@ -47,7 +47,7 @@ export default function StatsPage() {
             <p className="text-2xl font-bold">{formatNumber(stats?.totalBlocks || 45678901)}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
-            <div className="flex items-center space-x-2 text-gray-500 mb-2"><Transactions className="w-4 h-4" /><span className="text-sm">Total Transactions</span></div>
+            <div className="flex items-center space-x-2 text-gray-500 mb-2"><ArrowLeftRight className="w-4 h-4" /><span className="text-sm">Total Transactions</span></div>
             <p className="text-2xl font-bold">{formatNumber(stats?.totalTransactions || 2345678901)}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">

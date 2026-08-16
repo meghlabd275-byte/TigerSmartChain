@@ -233,7 +233,7 @@ impl Handler {
         }
     }
 
-    pub fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    pub async fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         // Check rate limit
         if let Err(e) = self.rate_limiter.check(ip) {
             let response = ApiResponse {
@@ -273,19 +273,25 @@ impl Handler {
         
         // Handle method
         let result = match request.method.as_str() {
-            "eth_verifyContract" => self.handle_verify(request.params).await,
-            "eth_verifyBatch" => self.handle_batch_verify(request.params).await,
-            "eth_getVerificationStatus" => self.handle_get_status(request.params).await,
-            "eth_getSource" => self.handle_get_source(request.params).await,
+            "eth_verifyContract" => self.handle_verify(request.params).await.map(serde_json::to_value),
+            "eth_verifyBatch" => self.handle_batch_verify(request.params).await.map(serde_json::to_value),
+            "eth_getVerificationStatus" => self.handle_get_status(request.params).await.map(serde_json::to_value),
+            "eth_getSource" => self.handle_get_source(request.params).await.map(serde_json::to_value),
             _ => {
                 Err(format!("Unknown method: {}", request.method))
             }
         };
         
+        let result = match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => Err(format!("Serialization error: {}", e)),
+            Err(e) => Err(e),
+        };
+        
         let response = match result {
             Ok(result) => ApiResponse {
                 jsonrpc: "2.0".to_string(),
-                result: Some(serde_json::to_value(result).unwrap_or_default()),
+                result: Some(result),
                 error: None,
                 id: request.id,
             },
@@ -406,8 +412,11 @@ impl Handler {
         
         // Try Sourcify
         let client = contract_verification_service::SourcifyClient::new(None);
-        client.get_sources(address, chain_id).await?
-            .ok_or("Source not found")
+        client
+            .get_sources(address, chain_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Source not found".to_string())
     }
 }
 
@@ -416,7 +425,7 @@ impl Handler {
 // ============================================================================
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize logging
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
@@ -442,11 +451,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Start HTTP server
     let addr = SocketAddr::from(([0, 0, 0, 0], 8545));
-    let server = Server::http(addr)?;
+    let server = Server::http(addr)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e })?;
     
     info!("Server listening on {}", addr);
     
-    for request in server.incoming_requests() {
+    for mut request in server.incoming_requests() {
         let handler = handler.clone();
         
         tokio::spawn(async move {
@@ -454,11 +464,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|a| a.ip().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             
-            let body = request.as_vec();
+            let mut body = Vec::new();
+            {
+                let mut reader = request.as_reader();
+                if let Err(e) = std::io::Read::read_to_end(&mut reader, &mut body) {
+                    error!("Failed to read request body: {}", e);
+                    return;
+                }
+            }
             
-            let response = handler.handle(&body, &ip);
-            
-            let mut resp = request.respond(response)?;
+            let mut response = handler.handle(&body, &ip).await;
             
             // Add headers
             let headers = vec![
@@ -470,10 +485,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ];
             
             for header in headers {
-                resp.add_header(header);
+                response = response.with_header(header);
             }
             
-            Ok(())
+            if let Err(e) = request.respond(response) {
+                error!("Failed to send response: {}", e);
+            }
         });
     }
     
