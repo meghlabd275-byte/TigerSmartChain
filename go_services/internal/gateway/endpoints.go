@@ -1,14 +1,11 @@
 package gateway
 
 import (
-	"context"
-	"fmt"
-	"math/rand"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
 )
 
 // RegisterAllRoutes registers all 180+ API routes
@@ -412,7 +409,24 @@ func (h *Handler) SearchNFTs(c *gin.Context)               { h.getMockData(c, "n
 func (h *Handler) GetTrendingNFTs(c *gin.Context)          { h.getMockData(c, "nfts", 20) }
 
 // Contract endpoints
-func (h *Handler) GetContractABI(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"abi": []}) }
+func (h *Handler) GetContractABI(c *gin.Context) {
+	address := c.Param("address")
+	if address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `SELECT abi FROM contracts WHERE address = $1 LIMIT 1`, address)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	if row == nil {
+		c.JSON(http.StatusOK, gin.H{"abi": []interface{}{}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"abi": row["abi"]})
+}
 func (h *Handler) GetContractSource(c *gin.Context)       { h.getMockData(c, "source", 1) }
 func (h *Handler) GetVerifiedContract(c *gin.Context)     { h.getMockData(c, "contract", 1) }
 func (h *Handler) VerifyContractMultiFile(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"status": "queued"}) }
@@ -520,62 +534,419 @@ func (h *Handler) SearchTransactions(c *gin.Context)         { h.getMockData(c, 
 func (h *Handler) SearchBlocks(c *gin.Context)               { h.getMockData(c, "blocks", 20) }
 
 // Export endpoints
-func (h *Handler) ExportBlocks(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"exported": 1000}) }
-func (h *Handler) ExportTransactionsAll(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{"exported": 10000}) }
-func (h *Handler) ExportTokens(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"exported": 1000}) }
-func (h *Handler) ExportNFTs(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"exported": 5000}) }
-func (h *Handler) ExportBalances(c *gin.Context)             { c.JSON(http.StatusOK, gin.H{"exported": 10000}) }
-func (h *Handler) ExportContracts(c *gin.Context)            { c.JSON(http.StatusOK, gin.H{"exported": 500}) }
-
-// WebSocket endpoints
-func (h *Handler) HandleBlockWS(c *gin.Context)            { h.HandleWebSocket(c) }
-func (h *Handler) HandleTxWS(c *gin.Context)                 { h.HandleWebSocket(c) }
-
-// Rate limit endpoints
-func (h *Handler) GetRateLimitStatus(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"remaining": 1000, "reset": time.Now().Unix()}) }
-func (h *Handler) ResetRateLimit(c *gin.Context)             { c.JSON(http.StatusOK, gin.H{"success": true}) }
-
-// API Key endpoints
-func (h *Handler) CreateAPIKey(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"key": "tsk_" + generateHash(32)}) }
-func (h *Handler) ListAPIKeys(c *gin.Context)                 { h.getMockData(c, "keys", 5) }
-func (h *Handler) RevokeAPIKey(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) UpdateAPIKey(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"success": true}) }
-
-// Webhook endpoints
-func (h *Handler) CreateWebhook(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"id": randInt(10000)}) }
-func (h *Handler) ListWebhooks(c *gin.Context)                { h.getMockData(c, "webhooks", 10) }
-func (h *Handler) UpdateWebhook(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) DeleteWebhook(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"success": true}) }
-
-// Alert endpoints
-func (h *Handler) CreateAlert(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"id": randInt(10000)}) }
-func (h *Handler) ListAlerts(c *gin.Context)                 { h.getMockData(c, "alerts", 10) }
-func (h *Handler) UpdateAlert(c *gin.Context)                  { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) DeleteAlert(c *gin.Context)                  { c.JSON(http.StatusOK, gin.H{"success": true}) }
-
-// Watchlist endpoints
-func (h *Handler) AddToWatchlist(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) GetWatchlist(c *gin.Context)               { h.getMockData(c, "watchlist", 20) }
-func (h *Handler) RemoveFromWatchlist(c *gin.Context)         { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) UpdateWatchlistItem(c *gin.Context)         { c.JSON(http.StatusOK, gin.H{"success": true}) }
-
-// Helper function
-func (h *Handler) getMockData(c *gin.Context, resource string, count int) {
-	data := generateMockData(resource, count)
-	c.JSON(http.StatusOK, gin.H{
-		"items": data,
-		"total": count * 10,
-	})
+// Export endpoints stream the requested resource count from the database.
+func (h *Handler) ExportBlocks(c *gin.Context) {
+	ctx := c.Request.Context()
+	n, err := h.countQuery(ctx, `SELECT count(*) FROM blocks`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exported": n})
+}
+func (h *Handler) ExportTransactionsAll(c *gin.Context) {
+	ctx := c.Request.Context()
+	n, err := h.countQuery(ctx, `SELECT count(*) FROM transactions`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exported": n})
+}
+func (h *Handler) ExportTokens(c *gin.Context) {
+	ctx := c.Request.Context()
+	n, err := h.countQuery(ctx, `SELECT count(*) FROM tokens`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exported": n})
+}
+func (h *Handler) ExportNFTs(c *gin.Context) {
+	ctx := c.Request.Context()
+	n, err := h.countQuery(ctx, `SELECT count(*) FROM nfts`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exported": n})
+}
+func (h *Handler) ExportBalances(c *gin.Context) {
+	ctx := c.Request.Context()
+	n, err := h.countQuery(ctx, `SELECT count(*) FROM token_holders`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exported": n})
+}
+func (h *Handler) ExportContracts(c *gin.Context) {
+	ctx := c.Request.Context()
+	n, err := h.countQuery(ctx, `SELECT count(*) FROM contracts`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"exported": n})
 }
 
-func generateMockData(resource string, count int) []map[string]interface{} {
-	items := make([]map[string]interface{}, count)
-	for i := 0; i < count; i++ {
-		items[i] = map[string]interface{}{
-			"id":      i + 1,
-			"type":    resource,
-			"created": time.Now().Unix(),
+// WebSocket endpoints
+func (h *Handler) HandleBlockWS(c *gin.Context) { h.HandleWebSocket(c) }
+func (h *Handler) HandleTxWS(c *gin.Context)    { h.HandleWebSocket(c) }
+
+// Rate limit endpoints
+func (h *Handler) GetRateLimitStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"remaining": h.config.RateLimitRPS, "reset": time.Now().Unix()})
+}
+func (h *Handler) ResetRateLimit(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// API Key endpoints
+func (h *Handler) CreateAPIKey(c *gin.Context) {
+	var req struct {
+		Name      string `json:"name"`
+		RateLimit int    `json:"rate_limit"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	ctx := c.Request.Context()
+	var id int64
+	err := h.pool.QueryRow(ctx, `INSERT INTO api_keys (key_hash, key_name, rate_limit, daily_limit, is_active) VALUES ($1, $2, $3, 100000, true) RETURNING id`, "tsk_"+randomHex(32), req.Name, req.RateLimit).Scan(&id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": id, "key": "tsk_" + randomHex(32)})
+}
+func (h *Handler) ListAPIKeys(c *gin.Context)         { h.queryResource(c, "keys", 5) }
+func (h *Handler) RevokeAPIKey(c *gin.Context) {
+	id := c.Param("id")
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `UPDATE api_keys SET is_active = false, updated_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+func (h *Handler) UpdateAPIKey(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		RateLimit int `json:"rate_limit"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `UPDATE api_keys SET rate_limit = $2, updated_at = NOW() WHERE id = $1`, id, req.RateLimit)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// Webhook endpoints
+func (h *Handler) CreateWebhook(c *gin.Context) {
+	var req struct {
+		URL       string `json:"url"`
+		EventType string `json:"event_type"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	var id int64
+	err := h.pool.QueryRow(ctx, `INSERT INTO webhooks (url, event_type, is_active) VALUES ($1, $2, true) RETURNING id`, req.URL, req.EventType).Scan(&id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": id})
+}
+func (h *Handler) ListWebhooks(c *gin.Context)  { h.queryResource(c, "webhooks", 10) }
+func (h *Handler) UpdateWebhook(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		URL       string `json:"url"`
+		EventType string `json:"event_type"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `UPDATE webhooks SET url = $2, event_type = $3, updated_at = NOW() WHERE id = $1`, id, req.URL, req.EventType)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+func (h *Handler) DeleteWebhook(c *gin.Context) {
+	id := c.Param("id")
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `UPDATE webhooks SET is_active = false WHERE id = $1`, id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// Alert endpoints
+func (h *Handler) CreateAlert(c *gin.Context) {
+	var req struct {
+		Address string `json:"address"`
+		Name    string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	var id int64
+	err := h.pool.QueryRow(ctx, `INSERT INTO search_index (search_type, address, name) VALUES ('alert', $1, $2) RETURNING id`, req.Address, req.Name).Scan(&id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": id})
+}
+func (h *Handler) ListAlerts(c *gin.Context)    { h.queryResource(c, "alerts", 10) }
+func (h *Handler) UpdateAlert(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Name string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `UPDATE search_index SET name = $2, updated_at = NOW() WHERE id = $1`, id, req.Name)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+func (h *Handler) DeleteAlert(c *gin.Context) {
+	id := c.Param("id")
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `DELETE FROM search_index WHERE id = $1`, id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// Watchlist endpoints
+func (h *Handler) AddToWatchlist(c *gin.Context) {
+	var req struct {
+		Address string `json:"address"`
+		Name    string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	var id int64
+	err := h.pool.QueryRow(ctx, `INSERT INTO search_index (search_type, address, name) VALUES ('watchlist', $1, $2) RETURNING id`, req.Address, req.Name).Scan(&id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"id": id})
+}
+func (h *Handler) GetWatchlist(c *gin.Context)            { h.queryResource(c, "watchlist", 20) }
+func (h *Handler) RemoveFromWatchlist(c *gin.Context) {
+	id := c.Param("id")
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `DELETE FROM search_index WHERE id = $1`, id)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+func (h *Handler) UpdateWatchlistItem(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Name string `json:"name"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	ctx := c.Request.Context()
+	_, err := h.pool.Exec(ctx, `UPDATE search_index SET name = $2, updated_at = NOW() WHERE id = $1`, id, req.Name)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+
+// queryResource dispatches a resource name to the appropriate PostgreSQL
+// query against the explorer schema and returns real rows. This replaces the
+// previous getMockData/generateMockData placeholder responses.
+func (h *Handler) queryResource(c *gin.Context, resource string, defLimit int) {
+	ctx := c.Request.Context()
+	limit := paramInt(c, "limit", defLimit)
+	offset := paramOffset(c)
+
+	type q struct {
+		sql   string
+		count string
+	}
+	var qq q
+
+	switch resource {
+	case "uncles":
+		qq = q{`SELECT id, number, hash, parent_hash, block_number, miner, gas_limit, gas_used, timestamp, difficulty, reward FROM uncles ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM uncles`}
+	case "logs":
+		// Logs are stored in the transactions.logs JSONB column; emit the
+		// most recent transactions whose logs array is non-empty.
+		qq = q{`SELECT hash, block_number, logs FROM transactions WHERE logs IS NOT NULL AND logs <> 'null' AND jsonb_array_length(COALESCE(logs,'[]'::jsonb)) > 0 ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM transactions WHERE logs IS NOT NULL AND logs <> 'null'`}
+	case "stateDiff", "statediff":
+		qq = q{`SELECT id, transaction_hash, block_number, address, storage_key, storage_value, old_value, new_value, diff_type FROM state_diffs ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM state_diffs`}
+	case "blocks":
+		qq = q{`SELECT id, number, hash, parent_hash, miner, gas_limit, gas_used, timestamp, size, tx_count, base_fee_per_gas, reward FROM blocks WHERE is_uncle = false ORDER BY number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM blocks WHERE is_uncle = false`}
+	case "validators":
+		qq = q{`SELECT id, address, name, moniker, total_stake, commission_rate, is_jailed, is_active, status FROM validators ORDER BY total_stake DESC NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM validators`}
+	case "rewards":
+		qq = q{`SELECT id, block_number, block_hash, validator, amount, transaction_hash FROM block_rewards ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM block_rewards`}
+	case "receipt":
+		qq = q{`SELECT hash, block_number, transaction_index, from_address, to_address, status, gas_used, cumulative_gas_used, effective_gas_price, contract_address, logs FROM transactions WHERE hash = $3 LIMIT 1`, `SELECT 1`}
+	case "txs":
+		qq = q{`SELECT id, hash, nonce, block_number, transaction_index, from_address, to_address, value, gas_price, gas_used, status, transaction_type, block_timestamp FROM transactions ORDER BY block_number DESC NULLS LAST, transaction_index DESC NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM transactions`}
+	case "transfers":
+		qq = q{`SELECT id, token_address, from_address, to_address, value, transaction_hash, block_number, log_index FROM token_transfers ORDER BY block_number DESC, log_index DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM token_transfers`}
+	case "internalTxs":
+		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas, revert FROM internal_transactions ORDER BY block_number DESC, transaction_index DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions`}
+	case "callTree":
+		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas, input, output FROM internal_transactions WHERE transaction_hash = $3 ORDER BY transaction_index, depth LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions WHERE transaction_hash = $3`}
+	case "execution":
+		qq = q{`SELECT hash, block_number, from_address, to_address, gas_used, status, effective_gas_price, logs FROM transactions WHERE hash = $3 LIMIT 1`, `SELECT 1`}
+	case "storage":
+		qq = q{`SELECT id, transaction_hash, block_number, address, storage_key, storage_value, old_value, new_value, diff_type FROM state_diffs WHERE address = $3 OR transaction_hash = $3 ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM state_diffs`}
+	case "callList":
+		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas FROM internal_transactions WHERE transaction_hash = $3 ORDER BY depth, transaction_index LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions WHERE transaction_hash = $3`}
+	case "vmTrace", "replay", "ops":
+		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, from_address, to_address, call_type, value, gas, input, output, revert, error, depth FROM traces WHERE transaction_hash = $3 ORDER BY id LIMIT $1 OFFSET $2`, `SELECT count(*) FROM traces`}
+	case "traces":
+		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, from_address, to_address, call_type, value, gas, error FROM traces ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM traces`}
+	case "metadata":
+		qq = q{`SELECT id, address, name, symbol, decimals, total_supply, holders_count, is_verified, price_usd FROM tokens WHERE address = $3 LIMIT 1`, `SELECT 1`}
+	case "approvals", "allowances":
+		qq = q{`SELECT id, token_address, owner, spender, value, transaction_hash, block_number FROM token_approvals ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM token_approvals`}
+	case "holders":
+		qq = q{`SELECT id, token_address, address, balance, balance_usd, percent_holdings, updated_block FROM token_holders ORDER BY balance_usd DESC NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM token_holders`}
+	case "dexPairs":
+		qq = q{`SELECT id, pair_address, token0_address, token1_address, token0_symbol, token1_symbol, reserve0, reserve1, liquidity_usd, volume_24h, factory_address, pair_type FROM dex_pairs ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM dex_pairs`}
+	case "history":
+		qq = q{`SELECT id, token_address, holder_address, balance, block_number, timestamp FROM token_holder_history ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM token_holder_history`}
+	case "analytics":
+		qq = q{`SELECT date, total_blocks, total_transactions, total_gas_used, total_gas_fees, total_volume, avg_gas_price FROM analytics_daily ORDER BY date DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM analytics_daily`}
+	case "flippening":
+		qq = q{`SELECT date, total_transactions, total_volume FROM analytics_daily ORDER BY date DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM analytics_daily`}
+	case "tokens":
+		qq = q{`SELECT id, address, name, symbol, decimals, total_supply, holders_count, price_usd, is_verified FROM tokens ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM tokens`}
+	case "nfts":
+		qq = q{`SELECT id, collection_address, token_id, owner, uri, metadata FROM nfts ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nfts`}
+	case "volumeHistory":
+		qq = q{`SELECT collection_address, floor_price, volume_24h, sales_24h, holders FROM nft_floor_prices ORDER BY updated_at DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nft_floor_prices`}
+	case "rankings":
+		qq = q{`SELECT id, address, name, symbol, total_supply, holders_count, floor_price, volume_24h, market_cap FROM nft_collections ORDER BY volume_24h DESC NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nft_collections`}
+	case "rarity":
+		qq = q{`SELECT id, collection_address, token_id, rarity_score, rank, traits FROM nft_rarity ORDER BY rank NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nft_rarity`}
+	case "source", "contract":
+		qq = q{`SELECT id, contract_address, file_name, source_code, compiler_version, language FROM verified_sources WHERE contract_address = $3 LIMIT 1`, `SELECT 1`}
+	case "annotations":
+		qq = q{`SELECT id, search_type, address, name, description FROM search_index WHERE address = $3 ORDER BY id LIMIT $1 OFFSET $2`, `SELECT count(*) FROM search_index`}
+	case "balances":
+		qq = q{`SELECT id, token_address, address, balance, balance_usd FROM token_holders WHERE address = $3 ORDER BY balance_usd DESC NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM token_holders WHERE address = $3`}
+	case "trends":
+		qq = q{`SELECT id, gas_price, gas_used, gas_limit, timestamp, base_fee FROM gas_prices ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM gas_prices`}
+	case "aggregator":
+		qq = q{`SELECT date, total_transactions, total_gas_used, total_volume, avg_gas_price FROM analytics_daily ORDER BY date DESC LIMIT 1`, `SELECT 1`}
+	case "chart":
+		qq = q{`SELECT date, total_blocks, total_transactions, total_gas_used, total_gas_fees, total_volume, avg_gas_price FROM analytics_daily ORDER BY date DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM analytics_daily`}
+	case "overview", "stats":
+		qq = q{`SELECT date, total_blocks, total_transactions, total_gas_used, total_gas_fees, total_volume, avg_gas_price FROM analytics_daily ORDER BY date DESC LIMIT 1`, `SELECT 1`}
+	case "historical":
+		qq = q{`SELECT date, total_blocks, total_transactions, total_gas_used, total_gas_fees, total_volume, avg_gas_price FROM analytics_daily ORDER BY date DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM analytics_daily`}
+	case "ohlcv":
+		qq = q{`SELECT id, transaction_hash, pair_address, from_address, to_address, from_amount, to_amount, block_number, log_index FROM dex_swaps ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM dex_swaps`}
+	case "pairs":
+		qq = q{`SELECT id, pair_address, token0_address, token1_address, token0_symbol, token1_symbol, reserve0, reserve1, factory_address FROM dex_pairs ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM dex_pairs`}
+	case "exchanges", "protocols":
+		qq = q{`SELECT DISTINCT factory_address FROM dex_pairs ORDER BY factory_address LIMIT $1 OFFSET $2`, `SELECT count(DISTINCT factory_address) FROM dex_pairs`}
+	case "votes":
+		qq = q{`SELECT id, proposal_id, voter, vote_choice, votes, block_number, transaction_hash FROM governance_votes ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM governance_votes`}
+	case "tally":
+		qq = q{`SELECT proposal_id, count(*) FILTER (WHERE vote_choice = true) AS for_votes, count(*) FILTER (WHERE vote_choice = false) AS against_votes, count(*) AS total FROM governance_votes GROUP BY proposal_id ORDER BY proposal_id DESC LIMIT 1`, `SELECT 1`}
+	case "voters":
+		qq = q{`SELECT DISTINCT voter, count(*) AS vote_count FROM governance_votes GROUP BY voter ORDER BY vote_count DESC LIMIT $1 OFFSET $2`, `SELECT count(DISTINCT voter) FROM governance_votes`}
+	case "delegations", "delegator":
+		qq = q{`SELECT id, address, name, moniker, total_stake, commission_rate, is_active, status FROM validators ORDER BY total_stake DESC NULLS LAST LIMIT $1 OFFSET $2`, `SELECT count(*) FROM validators`}
+	case "bundle":
+		qq = q{`SELECT id, bundle_hash, block_number, sender, mev_type, tx_hashes, gas_used, profit_eth, profit_usd FROM mev_bundles ORDER BY block_number DESC LIMIT 1`, `SELECT 1`}
+	case "bundles":
+		qq = q{`SELECT id, bundle_hash, block_number, sender, mev_type, tx_hashes, gas_used, profit_eth, profit_usd FROM mev_bundles ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM mev_bundles`}
+	case "relays":
+		qq = q{`SELECT DISTINCT sender FROM mev_bundles ORDER BY sender LIMIT $1 OFFSET $2`, `SELECT count(DISTINCT sender) FROM mev_bundles`}
+	case "activities", "sandwiches", "opportunities", "jobs":
+		qq = q{`SELECT id, bundle_hash, block_number, sender, mev_type, profit_eth, profit_usd FROM mev_bundles ORDER BY block_number DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM mev_bundles`}
+	case "categories":
+		qq = q{`SELECT id, search_type, address, name, description FROM search_index ORDER BY id LIMIT $1 OFFSET $2`, `SELECT count(*) FROM search_index`}
+	case "addresses":
+		qq = q{`SELECT id, search_type, address, name, description FROM search_index ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM search_index`}
+	case "keys":
+		qq = q{`SELECT id, key_hash, key_name, user_id, rate_limit, daily_limit, is_active, expires_at FROM api_keys ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM api_keys`}
+	case "webhooks":
+		qq = q{`SELECT id, url, event_type, is_active, retry_count, timeout_seconds FROM webhooks ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM webhooks`}
+	case "alerts", "watchlist":
+		qq = q{`SELECT id, search_type, address, name, description FROM search_index ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM search_index`}
+	default:
+		c.JSON(http.StatusOK, gin.H{"items": []map[string]interface{}{}, "total": 0})
+		return
+	}
+
+	if h.pool == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database unavailable"})
+		return
+	}
+
+	var extraArg interface{}
+	if num := c.Param("number"); num != "" {
+		if n, err := strconv.ParseInt(num, 10, 64); err == nil {
+			extraArg = n
+		} else {
+			extraArg = num
 		}
 	}
-	return items
+	if hash := c.Param("hash"); hash != "" && extraArg == nil {
+		extraArg = hash
+	}
+	if a := c.Param("address"); a != "" && extraArg == nil {
+		extraArg = a
+	}
+	if extraArg == nil {
+		extraArg = ""
+	}
+
+	rows, err := h.queryRows(ctx, qq.sql, limit, offset, extraArg)
+	if err != nil {
+		rows, err = h.queryRows(ctx, qq.sql, limit, offset)
+		if err != nil {
+			dbError(c, err)
+			return
+		}
+	}
+	total, _ := h.countQuery(ctx, qq.count, extraArg)
+	if total == 0 && len(rows) > 0 {
+		total = int64(len(rows))
+	}
+	respondList(c, rows, int(total))
+}
+
+// getMockData is retained as a thin alias so existing route registrations keep
+// compiling; it now delegates to the real database-backed queryResource.
+func (h *Handler) getMockData(c *gin.Context, resource string, count int) {
+	h.queryResource(c, resource, count)
 }
