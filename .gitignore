@@ -22,3 +22,8 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# C/C++ build artifacts
+*.o
+*.a
+*.so
