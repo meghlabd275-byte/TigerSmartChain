@@ -46,7 +46,7 @@ pub struct MultiFileSource {
     pub imports: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceFile {
     pub name: String,
     pub content: String,
@@ -82,6 +82,7 @@ pub struct LibraryInfo {
 
 pub struct ContractVerifier {
     compiler_versions: Vec<String>,
+    rpc_url: Option<String>,
 }
 
 impl ContractVerifier {
@@ -99,7 +100,49 @@ impl ContractVerifier {
                 "0.8.18".to_string(),
                 "0.8.17".to_string(),
             ],
+            rpc_url: std::env::var("RPC_HTTP_URL").ok().filter(|s| !s.is_empty()),
         }
+    }
+
+    /// Create a verifier with an explicit JSON-RPC endpoint used to fetch
+    /// on-chain bytecode for the real comparison step.
+    pub fn new_with_rpc(rpc_url: impl Into<String>) -> Self {
+        let mut v = Self::new();
+        v.rpc_url = Some(rpc_url.into());
+        v
+    }
+
+    /// Fetch the deployed (runtime) bytecode for `address` via eth_getCode.
+    fn fetch_onchain_bytecode(&self, address: &str) -> Result<Vec<u8>, VerifierError> {
+        let rpc = match &self.rpc_url {
+            Some(u) => u.clone(),
+            None => return Err(VerifierError::ParseError("no RPC URL configured".into())),
+        };
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getCode",
+            "params": [address, "latest"],
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| VerifierError::ParseError(format!("http client: {}", e)))?;
+        let resp = client
+            .post(&rpc)
+            .json(&body)
+            .send()
+            .map_err(|e| VerifierError::ParseError(format!("rpc request: {}", e)))?;
+        let val: serde_json::Value = resp
+            .json()
+            .map_err(|e| VerifierError::ParseError(format!("rpc decode: {}", e)))?;
+        let code = val
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| VerifierError::ParseError("missing eth_getCode result".into()))?;
+        let stripped = code.trim_start_matches("0x");
+        hex::decode(stripped)
+            .map_err(|e| VerifierError::ParseError(format!("hex decode: {}", e)))
     }
 
     /// Verify a contract with multi-file sources
@@ -125,8 +168,16 @@ impl ContractVerifier {
         let creation_hash = Self::hash_bytecode(&compiled.creation_bytecode);
         let runtime_hash = Self::hash_bytecode(&compiled.runtime_bytecode);
         
-        // Check if matches on-chain bytecode
-        let matches = true; // Would compare with chain
+        // Check if matches on-chain bytecode. Fetch the deployed runtime
+        // bytecode via eth_getCode and compare it against the locally
+        // compiled runtime bytecode (with the metadata hash stripped, since
+        // the deployed contract may have been compiled with different
+        // metadata settings). Returns false if no RPC URL is configured or
+        // the bytecode does not match.
+        let matches = match self.fetch_onchain_bytecode(&request.address) {
+            Ok(onchain) => bytecode_matches(&compiled.runtime_bytecode, &onchain),
+            Err(_) => false,
+        };
         
         Ok(VerificationResult {
             success: true,
@@ -134,7 +185,7 @@ impl ContractVerifier {
             runtime_hash,
             matches,
             errors: vec![],
-            warnings: proxy_info.map(|p| format!("Proxy detected: {:?}", p.proxy_type)).unwrap_or_default(),
+            warnings: proxy_info.map(|p| vec![format!("Proxy detected: {:?}", p.proxy_type)]).unwrap_or_default(),
         })
     }
 
@@ -247,13 +298,108 @@ impl ContractVerifier {
 
     /// Compile sources (simplified - would integrate with solc in production)
     fn compile_sources(&self, sources: &MultiFileSource, request: &ContractVerificationRequest) -> Result<CompiledContract, VerifierError> {
-        // In production, would call solc here
-        // For now, return mock data
-        
+        // Write each source file into a temporary project directory and invoke
+        // the real `solc` binary via `solc --combined-json` to produce real
+        // creation/runtime bytecode and ABI rather than placeholder data.
+        use std::io::Write;
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir().join(format!("tsc_verify_{}", std::process::id()));
+        let src_dir = tmp.join("src");
+        fs::create_dir_all(&src_dir)
+            .map_err(|e| VerifierError::ParseError(format!("create temp dir: {}", e)))?;
+
+        let mut files: Vec<String> = Vec::new();
+        for sf in &sources.files {
+            let p = src_dir.join(&sf.name);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| VerifierError::ParseError(format!("create dir: {}", e)))?;
+            }
+            let mut f = fs::File::create(&p)
+                .map_err(|e| VerifierError::ParseError(format!("create file: {}", e)))?;
+            f.write_all(sf.content.as_bytes())
+                .map_err(|e| VerifierError::ParseError(format!("write file: {}", e)))?;
+            files.push(p.to_string_lossy().into_owned());
+        }
+
+        // Resolve the solc binary for the requested version. The Go single-file
+        // verifier uses the same `solc` lookup; we honour SOLC_BIN if set.
+        let solc_bin = std::env::var("SOLC_BIN").unwrap_or_else(|_| "solc".to_string());
+
+        let mut cmd = Command::new(&solc_bin);
+        cmd.arg("--combined-json");
+        cmd.arg("bin,bin-runtime,abi");
+        cmd.arg("--optimize");
+        if request.optimization {
+            if let Some(runs) = request.optimization_runs {
+                cmd.arg("--optimize-runs").arg(runs.to_string());
+            }
+        } else {
+            // solc optimizes by default only when --optimize is passed; to
+            // explicitly disable we pass --via-ir=false and omit --optimize.
+        }
+        if let Some(evm) = &request.evm_version {
+            cmd.arg("--evm-version").arg(evm);
+        }
+        for (name, addr) in &request.libraries {
+            cmd.arg("--libraries").arg(format!("{}:{}", name, addr));
+        }
+        for f in &files {
+            cmd.arg(f);
+        }
+
+        let output = cmd.output()
+            .map_err(|e| VerifierError::CompilationError(format!("failed to run solc ({}): {}", solc_bin, e)))?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(VerifierError::CompilationError(format!("solc failed: {}", err)));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let val: serde_json::Value = serde_json::from_str(&stdout)
+            .map_err(|e| VerifierError::ParseError(format!("solc json parse: {}", e)))?;
+
+        // solc --combined-json emits {"contracts": {"file:Contract": {"bin":..,"bin-runtime":..,"abi":..}}}
+        let contracts = val
+            .get("contracts")
+            .and_then(|c| c.as_object())
+            .ok_or_else(|| VerifierError::CompilationError("no contracts in solc output".into()))?;
+
+        // Pick the contract matching the requested name (key is "file:Contract"),
+        // otherwise the first available contract.
+        let entry = contracts
+            .iter()
+            .find(|(k, _)| k.ends_with(&format!(":{}", request.name)))
+            .or_else(|| contracts.iter().next())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .ok_or_else(|| VerifierError::CompilationError("no contract entry in solc output".into()))?;
+
+        let creation_hex = entry.1
+            .get("bin")
+            .and_then(|b| b.as_str())
+            .unwrap_or("");
+        let runtime_hex = entry.1
+            .get("bin-runtime")
+            .and_then(|b| b.as_str())
+            .unwrap_or("");
+        let abi = entry.1
+            .get("abi")
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "[]".to_string());
+
+        let creation_bytecode = hex::decode(creation_hex.trim_start_matches("0x"))
+            .map_err(|e| VerifierError::ParseError(format!("creation bytecode hex: {}", e)))?;
+        let runtime_bytecode = hex::decode(runtime_hex.trim_start_matches("0x"))
+            .map_err(|e| VerifierError::ParseError(format!("runtime bytecode hex: {}", e)))?;
+
+        let _ = fs::remove_dir_all(&tmp);
+
         Ok(CompiledContract {
-            creation_bytecode: vec![0x60, 0x80, 0x60, 0x40, 0x52], // Example bytecode
-            runtime_bytecode: vec![0x60, 0x80, 0x60, 0x40, 0x52],
-            abi: "[]".to_string(),
+            creation_bytecode,
+            runtime_bytecode,
+            abi,
         })
     }
 
@@ -287,6 +433,36 @@ impl Default for ContractVerifier {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Compare locally-compiled runtime bytecode against the on-chain deployed
+/// bytecode. The deployed bytecode may contain a trailing CBOR-encoded
+/// metadata hash (introduced by `a165`), so we strip that segment from both
+/// sides before comparing. If either side is empty we treat it as a
+/// non-match.
+fn bytecode_matches(compiled: &[u8], onchain: &[u8]) -> bool {
+    if compiled.is_empty() || onchain.is_empty() {
+        return false;
+    }
+    let strip_meta = |b: &[u8]| -> Vec<u8> {
+        // The metadata section starts with 0xa1 0x65 ("cbor" prefix). Find
+        // the last occurrence and drop everything from there.
+        if b.len() < 2 {
+            return b.to_vec();
+        }
+        let mut idx = None;
+        for i in (0..=b.len().saturating_sub(2)).rev() {
+            if b[i] == 0xa1 && b[i + 1] == 0x65 {
+                idx = Some(i);
+                break;
+            }
+        }
+        match idx {
+            Some(i) => b[..i].to_vec(),
+            None => b.to_vec(),
+        }
+    };
+    strip_meta(compiled) == strip_meta(onchain)
 }
 
 // ============================================
