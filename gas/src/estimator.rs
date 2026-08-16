@@ -1,6 +1,7 @@
 //! Gas Estimator for TigerScan
 
 use crate::types::*;
+use chrono::Utc;
 use std::collections::VecDeque;
 
 // =============================================================================
@@ -16,9 +17,10 @@ pub struct GasEstimator {
 impl GasEstimator {
     /// Create new estimator
     pub fn new(config: GasConfig) -> Self {
+        let history_size = config.history_size;
         Self {
             config,
-            history: VecDeque::with_capacity(config.history_size),
+            history: VecDeque::with_capacity(history_size),
         }
     }
 

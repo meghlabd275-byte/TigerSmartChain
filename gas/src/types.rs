@@ -48,7 +48,7 @@ pub struct GasPrediction {
 }
 
 /// Prediction Model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum PredictionModel {
     LinearRegression,
     MovingAverage,
@@ -124,6 +124,8 @@ pub struct GasConfig {
     pub fast_confidence: f64,
     pub normal_confidence: f64,
     pub slow_confidence: f64,
+    /// JSON-RPC endpoint used to fetch live gas prices (eth_gasPrice, blocks).
+    pub rpc_url: String,
 }
 
 impl Default for GasConfig {
@@ -136,6 +138,7 @@ impl Default for GasConfig {
             fast_confidence: 95.0,
             normal_confidence: 80.0,
             slow_confidence: 60.0,
+            rpc_url: String::new(),
         }
     }
 }
@@ -189,7 +192,8 @@ mod tests {
 
     #[test]
     fn test_calculate_gas_cost() {
-        assert_eq!(calculate_gas_cost(21000, 1000000000), 21000000000);
+        // 21000 gas * 1 Gwei (1e9 wei) = 2.1e13 wei
+        assert_eq!(calculate_gas_cost(21000, 1_000_000_000), 21_000_000_000_000);
     }
 
     #[test]

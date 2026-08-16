@@ -1,6 +1,7 @@
 //! Gas Price Predictions for TigerScan
 
 use crate::types::*;
+use chrono::Utc;
 
 // =============================================================================
 // PREDICTIONS

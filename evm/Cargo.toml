@@ -12,6 +12,8 @@ serde_json = "1.0"
 log = "0.4"
 thiserror = "1.0"
 hex = "0.4.3"
+ethnum = "1"
+sha3 = "0.10"
 
 [profile.release]
 opt-level = 3
