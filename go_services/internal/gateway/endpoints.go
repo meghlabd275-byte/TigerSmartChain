@@ -326,18 +326,12 @@ func (h *Handler) Ping(c *gin.Context) {
 }
 
 // Block endpoints
-func (h *Handler) GetBlockUncles(c *gin.Context)        { h.getMockData(c, "uncles", 5) }
-func (h *Handler) GetBlockLogs(c *gin.Context)           { h.getMockData(c, "logs", 20) }
-func (h *Handler) GetBlockStateDiff(c *gin.Context)      { h.getMockData(c, "stateDiff", 10) }
 func (h *Handler) GetBlockCount(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM blocks WHERE is_uncle = false`)
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"count": n})
 }
-func (h *Handler) GetBlocksByRange(c *gin.Context)      { h.getMockData(c, "blocks", 25) }
-func (h *Handler) GetBlockValidators(c *gin.Context)    { h.getMockData(c, "validators", 21) }
-func (h *Handler) GetBlockRewards(c *gin.Context)       { h.getMockData(c, "rewards", 1) }
 func (h *Handler) VerifyBlock(c *gin.Context) {
         ctx := c.Request.Context()
         num := c.Param("number")
@@ -378,7 +372,6 @@ func (h *Handler) GetBlockSize(c *gin.Context) {
 }
 
 // Transaction endpoints
-func (h *Handler) GetTransactionReceipt(c *gin.Context)  { h.getMockData(c, "receipt", 1) }
 func (h *Handler) GetTransactionStatus(c *gin.Context) {
         ctx := c.Request.Context()
         hash := c.Param("hash")
@@ -387,7 +380,6 @@ func (h *Handler) GetTransactionStatus(c *gin.Context) {
         if row == nil { c.JSON(http.StatusNotFound, gin.H{"error": "transaction not found"}); return }
         c.JSON(http.StatusOK, gin.H{"status": row["status"], "block_number": row["block_number"]})
 }
-func (h *Handler) GetTransactionLogs(c *gin.Context)   { h.getMockData(c, "logs", 10) }
 func (h *Handler) GetRawTransaction(c *gin.Context) {
         ctx := c.Request.Context()
         hash := c.Param("hash")
@@ -403,54 +395,34 @@ func (h *Handler) IsTransactionConfirmed(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"confirmed": row != nil && row["block_number"] != nil})
 }
-func (h *Handler) GetTransactionsFromAddress(c *gin.Context) { h.getMockData(c, "txs", 20) }
-func (h *Handler) GetTransactionsToAddress(c *gin.Context) { h.getMockData(c, "txs", 20) }
-func (h *Handler) GetTransactionsByAddress(c *gin.Context) { h.getMockData(c, "txs", 25) }
 func (h *Handler) GetTransactionCount(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM transactions`)
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"count": n})
 }
-func (h *Handler) GetLatestTransactions(c *gin.Context)  { h.getMockData(c, "txs", 20) }
-func (h *Handler) GetTokenTransfersByTx(c *gin.Context) { h.getMockData(c, "transfers", 5) }
-func (h *Handler) GetTransactionsBatch(c *gin.Context) { h.getMockData(c, "txs", 50) }
 func (h *Handler) ExportTransactions(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM transactions`)
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"exported": n})
 }
-func (h *Handler) GetExecutionResult(c *gin.Context)  { h.getMockData(c, "execution", 1) }
 
 // Internal transaction endpoints
-func (h *Handler) GetInternalTxsFrom(c *gin.Context)   { h.getMockData(c, "internalTxs", 20) }
-func (h *Handler) GetInternalTxsTo(c *gin.Context)     { h.getMockData(c, "internalTxs", 20) }
-func (h *Handler) GetInternalTxsByAddress(c *gin.Context) { h.getMockData(c, "internalTxs", 25) }
 func (h *Handler) GetInternalTxCount(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM internal_transactions`)
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"count": n})
 }
-func (h *Handler) GetRecentInternalTxs(c *gin.Context) { h.getMockData(c, "internalTxs", 20) }
-func (h *Handler) GetInternalTxsByBlock(c *gin.Context) { h.getMockData(c, "internalTxs", 30) }
 func (h *Handler) ExportInternalTxs(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM internal_transactions`)
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"exported": n})
 }
-func (h *Handler) GetCallTree(c *gin.Context)           { h.getMockData(c, "callTree", 1) }
 
 // Trace endpoints
-func (h *Handler) GetTraceStateDiff(c *gin.Context)      { h.getMockData(c, "statediff", 1) }
-func (h *Handler) GetTraceStorage(c *gin.Context)      { h.getMockData(c, "storage", 5) }
-func (h *Handler) GetTraceCallList(c *gin.Context)     { h.getMockData(c, "callList", 10) }
-func (h *Handler) GetVMTrace(c *gin.Context)             { h.getMockData(c, "vmTrace", 1) }
-func (h *Handler) GetTracesByBlock(c *gin.Context)     { h.getMockData(c, "traces", 50) }
-func (h *Handler) ReplayTransaction(c *gin.Context)     { h.getMockData(c, "replay", 1) }
-func (h *Handler) GetTraceOps(c *gin.Context)           { h.getMockData(c, "ops", 100) }
 
 // Token endpoints
 func (h *Handler) GetTokenTransferCount(c *gin.Context) {
@@ -480,7 +452,6 @@ func (h *Handler) GetTokenSupply(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"supply": rowValue(row, "total_supply")})
 }
-func (h *Handler) GetTokenMetadata(c *gin.Context)          { h.getMockData(c, "metadata", 1) }
 func (h *Handler) GetTokenPrice(c *gin.Context) {
         ctx := c.Request.Context()
         token := c.Param("address")
@@ -521,19 +492,8 @@ func (h *Handler) ExportTokenTransfers(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"exported": n})
 }
-func (h *Handler) GetTokenApprovals(c *gin.Context)         { h.getMockData(c, "approvals", 20) }
-func (h *Handler) GetTokenAllowances(c *gin.Context)        { h.getMockData(c, "allowances", 20) }
-func (h *Handler) GetTopTokenHolders(c *gin.Context)       { h.getMockData(c, "holders", 50) }
-func (h *Handler) GetTokenDexPairs(c *gin.Context)          { h.getMockData(c, "dexPairs", 10) }
-func (h *Handler) GetHolderHistory(c *gin.Context)          { h.getMockData(c, "history", 30) }
-func (h *Handler) GetTokenAnalytics(c *gin.Context)         { h.getMockData(c, "analytics", 1) }
-func (h *Handler) GetTokenFlippening(c *gin.Context)        { h.getMockData(c, "flippening", 1) }
-func (h *Handler) GetTrendingTokens(c *gin.Context)        { h.getMockData(c, "tokens", 20) }
-func (h *Handler) GetNewTokens(c *gin.Context)             { h.getMockData(c, "tokens", 20) }
-func (h *Handler) SearchTokens(c *gin.Context)             { h.getMockData(c, "tokens", 10) }
 
 // NFT endpoints
-func (h *Handler) GetNFTMetadata(c *gin.Context)           { h.getMockData(c, "metadata", 1) }
 func (h *Handler) GetNFTOwnerCount(c *gin.Context) {
         ctx := c.Request.Context()
         collection := c.Param("address")
@@ -547,7 +507,6 @@ func (h *Handler) GetNFTOwnerCount(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"count": n})
 }
-func (h *Handler) GetNFTTokens(c *gin.Context)             { h.getMockData(c, "nfts", 25) }
 func (h *Handler) GetNFTTokenOwner(c *gin.Context) {
         ctx := c.Request.Context()
         collection := c.Param("address")
@@ -556,7 +515,6 @@ func (h *Handler) GetNFTTokenOwner(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"owner": rowValue(row, "owner")})
 }
-func (h *Handler) GetNFTTokenTransfers(c *gin.Context)      { h.getMockData(c, "transfers", 20) }
 func (h *Handler) GetNFTVolume(c *gin.Context) {
         ctx := c.Request.Context()
         collection := c.Param("address")
@@ -564,13 +522,6 @@ func (h *Handler) GetNFTVolume(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"volume": rowValue(row, "volume_24h")})
 }
-func (h *Handler) GetNFTVolumeHistory(c *gin.Context)     { h.getMockData(c, "volumeHistory", 30) }
-func (h *Handler) GetNFTHolders(c *gin.Context)            { h.getMockData(c, "holders", 50) }
-func (h *Handler) GetNFTRankings(c *gin.Context)           { h.getMockData(c, "rankings", 100) }
-func (h *Handler) GetNFTRarity(c *gin.Context)             { h.getMockData(c, "rarity", 1) }
-func (h *Handler) GetNFTAnalytics(c *gin.Context)          { h.getMockData(c, "analytics", 1) }
-func (h *Handler) SearchNFTs(c *gin.Context)               { h.getMockData(c, "nfts", 20) }
-func (h *Handler) GetTrendingNFTs(c *gin.Context)          { h.getMockData(c, "nfts", 20) }
 
 // Contract endpoints
 func (h *Handler) GetContractABI(c *gin.Context) {
@@ -591,8 +542,6 @@ func (h *Handler) GetContractABI(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"abi": row["abi"]})
 }
-func (h *Handler) GetContractSource(c *gin.Context)       { h.getMockData(c, "source", 1) }
-func (h *Handler) GetVerifiedContract(c *gin.Context)     { h.getMockData(c, "contract", 1) }
 func (h *Handler) VerifyContractMultiFile(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"status": "queued"}) }
 func (h *Handler) ReadContract(c *gin.Context)             { c.JSON(http.StatusOK, gin.H{"result": "0x"}) }
 func (h *Handler) WriteContract(c *gin.Context)            { c.JSON(http.StatusOK, gin.H{"result": "0x"}) }
@@ -608,9 +557,6 @@ func (h *Handler) GetAddressBalance(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"balance": rowValue(row, "balance")})
 }
-func (h *Handler) GetAddressTransactions(c *gin.Context)   { h.getMockData(c, "txs", 25) }
-func (h *Handler) GetAddressInternalTxs(c *gin.Context)   { h.getMockData(c, "internalTxs", 20) }
-func (h *Handler) GetAddressBlocksMined(c *gin.Context)   { h.getMockData(c, "blocks", 10) }
 func (h *Handler) GetAddressTxCount(c *gin.Context) {
         ctx := c.Request.Context()
         addr := c.Param("address")
@@ -620,11 +566,7 @@ func (h *Handler) GetAddressTxCount(c *gin.Context) {
 }
 func (h *Handler) GetAddressFirstSeen(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{"block": 10000000}) }
 func (h *Handler) GetAddressLastSeen(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"block": 45678901}) }
-func (h *Handler) GetAddressAnnotations(c *gin.Context)   { h.getMockData(c, "annotations", 5) }
 func (h *Handler) AnnotateAddress(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) GetAllTokenBalances(c *gin.Context)     { h.getMockData(c, "balances", 20) }
-func (h *Handler) GetAllNFTBalances(c *gin.Context)        { h.getMockData(c, "nfts", 10) }
-func (h *Handler) GetAddressAnalytics(c *gin.Context)     { h.getMockData(c, "analytics", 1) }
 
 // Gas endpoints
 func (h *Handler) GetEstimatedGas(c *gin.Context) {
@@ -639,7 +581,6 @@ func (h *Handler) GetGasRecommendation(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"recommended": rowValue(row, "gas_price")})
 }
-func (h *Handler) GetGasTrends(c *gin.Context)             { h.getMockData(c, "trends", 24) }
 func (h *Handler) GetPriorityFees(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"fast": 2, "standard": 1, "slow": 0.5}) }
 func (h *Handler) GetBaseFee(c *gin.Context) {
         ctx := c.Request.Context()
@@ -648,33 +589,15 @@ func (h *Handler) GetBaseFee(c *gin.Context) {
         c.JSON(http.StatusOK, gin.H{"baseFee": rowValue(row, "base_fee_per_gas")})
 }
 func (h *Handler) GetGasUtilization(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"utilization": 0.5}) }
-func (h *Handler) GetGasAggregator(c *gin.Context)         { h.getMockData(c, "aggregator", 1) }
 func (h *Handler) CalculateGasSavings(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"savings": "0.01"}) }
 
 // Chart endpoints
-func (h *Handler) GetDailyTxChart(c *gin.Context)           { h.getMockData(c, "chart", 24) }
-func (h *Handler) GetWeeklyTxChart(c *gin.Context)         { h.getMockData(c, "chart", 7) }
-func (h *Handler) GetMonthlyTxChart(c *gin.Context)         { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetNewAddressesChart(c *gin.Context)      { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetActiveAddressesChart(c *gin.Context)   { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetTokenChart(c *gin.Context)             { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetTokenVolumeChart(c *gin.Context)       { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetNFTChart(c *gin.Context)               { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetNFTVolumeChart(c *gin.Context)         { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetGasChart(c *gin.Context)                { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetGasPriceChart(c *gin.Context)          { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetNetworkChart(c *gin.Context)          { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetTPSChart(c *gin.Context)               { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetDifficultyChart(c *gin.Context)        { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetDexLiquidityChart(c *gin.Context)      { h.getMockData(c, "chart", 30) }
-func (h *Handler) GetDexVolumeChart(c *gin.Context)         { h.getMockData(c, "chart", 30) }
 func (h *Handler) ExportChartData(c *gin.Context) {
         ctx := c.Request.Context()
         n, err := h.countQuery(ctx, `SELECT count(*) FROM analytics_daily`)
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"exported": n})
 }
-func (h *Handler) GetCustomChart(c *gin.Context)            { h.getMockData(c, "chart", 30) }
 
 // DEX endpoints
 func (h *Handler) GetDexLiquidity(c *gin.Context) {
@@ -689,16 +612,8 @@ func (h *Handler) GetDexVolume(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"volume24h": rowValue(row, "volume24h")})
 }
-func (h *Handler) GetDexPairTokens(c *gin.Context)          { h.getMockData(c, "tokens", 2) }
-func (h *Handler) GetDexTransactions(c *gin.Context)        { h.getMockData(c, "txs", 50) }
-func (h *Handler) GetDexOHLCV(c *gin.Context)               { h.getMockData(c, "ohlcv", 100) }
-func (h *Handler) SearchDexPairs(c *gin.Context)            { h.getMockData(c, "pairs", 10) }
-func (h *Handler) GetPopularDexTokens(c *gin.Context)       { h.getMockData(c, "tokens", 20) }
-func (h *Handler) GetDexExchanges(c *gin.Context)           { h.getMockData(c, "exchanges", 10) }
-func (h *Handler) GetDexProtocols(c *gin.Context)           { h.getMockData(c, "protocols", 5) }
 
 // Governance endpoints
-func (h *Handler) GetProposalVotes(c *gin.Context)          { h.getMockData(c, "votes", 100) }
 func (h *Handler) GetVoteCount(c *gin.Context) {
         ctx := c.Request.Context()
         proposalID := c.Param("id")
@@ -706,23 +621,10 @@ func (h *Handler) GetVoteCount(c *gin.Context) {
         if err != nil { dbError(c, err); return }
         c.JSON(http.StatusOK, gin.H{"for": rowValue(row, "for_votes"), "against": rowValue(row, "against_votes")})
 }
-func (h *Handler) GetProposalTally(c *gin.Context)          { h.getMockData(c, "tally", 1) }
-func (h *Handler) GetGovernanceVoters(c *gin.Context)        { h.getMockData(c, "voters", 50) }
-func (h *Handler) GetDelegations(c *gin.Context)            { h.getMockData(c, "delegations", 20) }
-func (h *Handler) GetDelegatorInfo(c *gin.Context)           { h.getMockData(c, "delegator", 1) }
 
 // MEV endpoints
-func (h *Handler) GetMEVBundle(c *gin.Context)              { h.getMockData(c, "bundle", 1) }
-func (h *Handler) GetFlashbotsBundles(c *gin.Context)       { h.getMockData(c, "bundles", 20) }
-func (h *Handler) GetMEVRelays(c *gin.Context)              { h.getMockData(c, "relays", 5) }
-func (h *Handler) GetMEVActivities(c *gin.Context)          { h.getMockData(c, "activities", 50) }
-func (h *Handler) GetSandwichAttacks(c *gin.Context)         { h.getMockData(c, "sandwiches", 20) }
-func (h *Handler) GetArbitrageOpportunities(c *gin.Context)  { h.getMockData(c, "opportunities", 10) }
-func (h *Handler) GetMEVJobs(c *gin.Context)                { h.getMockData(c, "jobs", 20) }
 
 // Label endpoints
-func (h *Handler) GetLabelCategories(c *gin.Context)       { h.getMockData(c, "categories", 10) }
-func (h *Handler) GetAddressesByLabel(c *gin.Context)       { h.getMockData(c, "addresses", 50) }
 func (h *Handler) CreateLabel(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
 func (h *Handler) UpdateLabel(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"success": true}) }
 func (h *Handler) DeleteLabel(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
@@ -734,21 +636,8 @@ func (h *Handler) ExportLabels(c *gin.Context) {
 }
 
 // Stats endpoints
-func (h *Handler) GetBlockStats(c *gin.Context)             { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetTransactionStats(c *gin.Context)       { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetAccountStats(c *gin.Context)            { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetContractStats(c *gin.Context)           { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetTokenStats(c *gin.Context)              { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetNFTStats(c *gin.Context)                { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetDexStats(c *gin.Context)                { h.getMockData(c, "stats", 1) }
-func (h *Handler) GetStatsOverview(c *gin.Context)           { h.getMockData(c, "overview", 1) }
-func (h *Handler) GetHistoricalStats(c *gin.Context)          { h.getMockData(c, "historical", 365) }
 
 // Search endpoints
-func (h *Handler) SearchTokensAdvanced(c *gin.Context)       { h.getMockData(c, "tokens", 20) }
-func (h *Handler) SearchAddresses(c *gin.Context)             { h.getMockData(c, "addresses", 20) }
-func (h *Handler) SearchTransactions(c *gin.Context)         { h.getMockData(c, "txs", 20) }
-func (h *Handler) SearchBlocks(c *gin.Context)               { h.getMockData(c, "blocks", 20) }
 
 // Export endpoints
 // Export endpoints stream the requested resource count from the database.
