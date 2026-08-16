@@ -224,9 +224,9 @@ impl HolderTracker {
     async fn get_holders_from_events(&self, token: &str) -> Result<Vec<TokenHolder>, HolderError> {
         let client = reqwest::Client::new();
         
-        // Get recent Transfer logs
+        // Get recent Transfer logs. keccak256("Transfer(address,address,uint256)")
         let topics = vec![
-            format!("0xddf252ad98be945b9c2ecde21f12c0e2b2ea667aab2d6555d9f6f4c8e3a9c8d9d"),
+            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
         ];
         
         let request = serde_json::json!({
