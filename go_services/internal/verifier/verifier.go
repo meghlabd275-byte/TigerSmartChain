@@ -50,6 +50,7 @@ type VerificationResult struct {
 	ContractName string    `json:"contractName"`
 	Abi          string    `json:"abi"`
 	Bytecode     string    `json:"bytecode"`
+	License      string    `json:"license"`
 	Error        string    `json:"error,omitempty"`
 	VerifiedAt   int64    `json:"verifiedAt"`
 }
@@ -140,7 +141,7 @@ func (v *ContractVerifier) verifyContract(req VerificationRequest) VerificationR
 	}
 
 	// Detect license
-	license := detectLicense(req.SourceCode)
+	result.License = detectLicense(req.SourceCode)
 	result.Status = "success"
 
 	// Generate ABI (simplified - in production would use solc)

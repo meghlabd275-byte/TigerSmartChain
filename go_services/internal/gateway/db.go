@@ -192,6 +192,15 @@ func dbError(c *gin.Context, err error) {
 	})
 }
 
+// rowValue safely extracts a value from a single-row query result. Returns nil
+// when the row is nil so callers can pass it straight to gin.H without panics.
+func rowValue(row map[string]interface{}, key string) interface{} {
+	if row == nil {
+		return nil
+	}
+	return row[key]
+}
+
 // listByBlockNumber returns rows for a given block number using the supplied SQL.
 func (h *Handler) listByBlockNumber(c *gin.Context, sql string) {
 	numStr := c.Param("number")

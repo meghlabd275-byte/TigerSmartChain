@@ -4,11 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/big"
 	"sync"
-	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/tigersmartchain/go_services/internal/rpc"
@@ -16,26 +13,26 @@ import (
 
 // BlockIndexer indexes blockchain blocks and transactions
 type BlockIndexer struct {
-	rpcClient *rpc.BSCClient
-	db        *Database
-	workers   int
+	rpcClient  *rpc.BSCClient
+	db         Database
+	workers    int
 	startBlock uint64
-	endBlock  uint64
-	isRunning bool
-	mu        sync.RWMutex
+	endBlock   uint64
+	isRunning  bool
+	mu         sync.RWMutex
 }
 
 // NewBlockIndexer creates a new block indexer
-func NewBlockIndexer(rpcURL, wsURL string, db *Database, workers int) (*BlockIndexer, error) {
+func NewBlockIndexer(rpcURL, wsURL string, db Database, workers int) (*BlockIndexer, error) {
 	client, err := rpc.NewBSCClient(rpcURL, wsURL)
 	if err != nil {
 		return nil, err
 	}
 
 	return &BlockIndexer{
-		rpcClient: client,
-		db:        db,
-		workers:   workers,
+		rpcClient:  client,
+		db:         db,
+		workers:    workers,
 		startBlock: 0,
 	}, nil
 }
@@ -152,8 +149,8 @@ func (bi *BlockIndexer) processTransaction(ctx context.Context, tx *types.Transa
 	}
 
 	// Save logs
-	for _, log := range receipt.Logs {
-		err = bi.db.SaveLog(ctx, convertLog(log, blockNum))
+	for _, lg := range receipt.Logs {
+		err = bi.db.SaveLog(ctx, convertLog(lg, blockNum))
 		if err != nil {
 			log.Printf("Failed to save log: %v", err)
 		}
@@ -190,34 +187,30 @@ func (bi *BlockIndexer) SubscribeToNewBlocks(ctx context.Context) error {
 // convertBlock converts ETH block to our format
 func convertBlock(block *types.Block) map[string]interface{} {
 	return map[string]interface{}{
-		"number":           block.Number().Uint64(),
-		"hash":             block.Hash().Hex(),
-		"parent_hash":      block.ParentHash().Hex(),
-		"nonce":            block.Nonce(),
-		"sha3_uncles":     block.UncleHash().Hex(),
-		"logs_bloom":      block.Bloom().Bytes(),
+		"number":            block.Number().Uint64(),
+		"hash":              block.Hash().Hex(),
+		"parent_hash":       block.ParentHash().Hex(),
+		"nonce":             block.Nonce(),
+		"sha3_uncles":       block.UncleHash().Hex(),
+		"logs_bloom":        block.Bloom().Bytes(),
 		"transactions_root": block.TxHash().Hex(),
-		"state_root":      block.Root().Hex(),
-		"receipts_root":   block.ReceiptHash().Hex(),
-		"miner":           block.Coinbase().Hex(),
-		"difficulty":      block.Difficulty().String(),
-		"total_difficulty": block.TotalDifficulty().String(),
-		"extra_data":      block.Extra(),
-		"size":            block.Size(),
-		"gas_limit":       block.GasLimit(),
-		"gas_used":        block.GasUsed(),
-		"timestamp":       block.Time(),
-		"transactions":    len(block.Transactions()),
-		"uncles":          len(block.Uncles()),
+		"state_root":        block.Root().Hex(),
+		"receipts_root":     block.ReceiptHash().Hex(),
+		"miner":             block.Coinbase().Hex(),
+		"difficulty":        block.Difficulty().String(),
+		"extra_data":        block.Extra(),
+		"size":              block.Size(),
+		"gas_limit":         block.GasLimit(),
+		"gas_used":          block.GasUsed(),
+		"timestamp":         block.Time(),
+		"transactions":      len(block.Transactions()),
+		"uncles":            len(block.Uncles()),
 	}
 }
 
 // convertTransaction converts ETH transaction to our format
 func convertTransaction(tx *types.Transaction, receipt *types.Receipt, blockNum uint64) map[string]interface{} {
-	var from, to string
-	if tx.From() != nil {
-		from = tx.From().Hex()
-	}
+	to := ""
 	if tx.To() != nil {
 		to = tx.To().Hex()
 	}
@@ -226,8 +219,7 @@ func convertTransaction(tx *types.Transaction, receipt *types.Receipt, blockNum 
 		"hash":              tx.Hash().Hex(),
 		"block_number":      blockNum,
 		"block_hash":        receipt.BlockHash.Hex(),
-		"transaction_index":  receipt.TransactionIndex,
-		"from":              from,
+		"transaction_index": receipt.TransactionIndex,
 		"to":                to,
 		"value":             tx.Value().String(),
 		"gas_price":         tx.GasPrice().String(),
@@ -243,19 +235,19 @@ func convertTransaction(tx *types.Transaction, receipt *types.Receipt, blockNum 
 }
 
 // convertLog converts ETH log to our format
-func convertLog(log *types.Log, blockNum uint64) map[string]interface{} {
-	topics := make([]string, len(log.Topics))
-	for i, topic := range log.Topics {
+func convertLog(lg *types.Log, blockNum uint64) map[string]interface{} {
+	topics := make([]string, len(lg.Topics))
+	for i, topic := range lg.Topics {
 		topics[i] = topic.Hex()
 	}
 
 	return map[string]interface{}{
-		"address":         log.Address.Hex(),
-		"topics":          topics,
-		"data":            common.Bytes2Hex(log.Data),
-		"block_number":    blockNum,
-		"transaction_hash": log.TxHash.Hex(),
-		"log_index":       log.Index,
+		"address":          lg.Address.Hex(),
+		"topics":           topics,
+		"data":             common.Bytes2Hex(lg.Data),
+		"block_number":     blockNum,
+		"transaction_hash": lg.TxHash.Hex(),
+		"log_index":        lg.Index,
 	}
 }
 

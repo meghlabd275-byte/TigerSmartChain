@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -78,6 +79,27 @@ func (b *BSCClient) GetNonce(ctx context.Context, address common.Address) (uint6
 
 func (b *BSCClient) Close() { b.client.Close() }
 
+// SubscribeNewHead subscribes to new block headers via WebSocket.
+func (b *BSCClient) SubscribeNewHead(ctx context.Context, ch chan<- *types.Header) (ethereum.Subscription, error) {
+	if b.wsURL == "" {
+		return nil, fmt.Errorf("WebSocket URL not configured")
+	}
+	wsClient, err := ethclient.DialContext(ctx, b.wsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to WebSocket: %w", err)
+	}
+	sub, err := wsClient.SubscribeNewHead(ctx, ch)
+	if err != nil {
+		wsClient.Close()
+		return nil, err
+	}
+	go func() {
+		<-sub.Err()
+		wsClient.Close()
+	}()
+	return sub, nil
+}
+
 // HTTPClient performs raw JSON-RPC calls
 type HTTPClient struct {
 	url string
@@ -91,13 +113,14 @@ func NewHTTPClient(url string) *HTTPClient {
 func (c *HTTPClient) Call(method string, params ...interface{}) (json.RawMessage, error) {
 	req := map[string]interface{}{"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
 	body, _ := json.Marshal(req)
-	resp, err := c.client.Post(c.url, "application/json", body)
+	resp, err := c.client.Post(c.url, "application/json", bytes.NewReader(body))
 	if err != nil { return nil, err }
 	defer resp.Body.Close()
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 	if errMsg, ok := result["error"]; ok { return nil, fmt.Errorf("%v", errMsg) }
-	return json.RawMessage(result["result"].(string)), nil
+	res, _ := json.Marshal(result["result"])
+	return json.RawMessage(res), nil
 }
 
 func (c *HTTPClient) BlockNumber() (uint64, error) {
@@ -151,7 +174,7 @@ func (c *HTTPClient) GetStorageAt(address, slot string) (string, error) {
 	return value, nil
 }
 
-func (c *HTTPClient) Call(from, to, data string) (string, error) {
+func (c *HTTPClient) EthCall(from, to, data string) (string, error) {
 	result, _ := c.Call("eth_call", map[string]string{"from": from, "to": to, "data": data}, "latest")
 	var value string
 	json.Unmarshal(result, &value)

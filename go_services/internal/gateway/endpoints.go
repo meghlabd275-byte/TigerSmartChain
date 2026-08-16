@@ -329,39 +329,118 @@ func (h *Handler) Ping(c *gin.Context) {
 func (h *Handler) GetBlockUncles(c *gin.Context)        { h.getMockData(c, "uncles", 5) }
 func (h *Handler) GetBlockLogs(c *gin.Context)           { h.getMockData(c, "logs", 20) }
 func (h *Handler) GetBlockStateDiff(c *gin.Context)      { h.getMockData(c, "stateDiff", 10) }
-func (h *Handler) GetBlockCount(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"count": 45678901}) }
+func (h *Handler) GetBlockCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM blocks WHERE is_uncle = false`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"count": n})
+}
 func (h *Handler) GetBlocksByRange(c *gin.Context)      { h.getMockData(c, "blocks", 25) }
 func (h *Handler) GetBlockValidators(c *gin.Context)    { h.getMockData(c, "validators", 21) }
 func (h *Handler) GetBlockRewards(c *gin.Context)       { h.getMockData(c, "rewards", 1) }
-func (h *Handler) VerifyBlock(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"verified": true}) }
-func (h *Handler) GetBlockTxFees(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"fees": "0.05"}) }
-func (h *Handler) GetBlockGasUsed(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{"gasUsed": 15000000}) }
-func (h *Handler) GetBlockSize(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"size": 50000}) }
+func (h *Handler) VerifyBlock(c *gin.Context) {
+        ctx := c.Request.Context()
+        num := c.Param("number")
+        n, err := strconv.ParseInt(num, 10, 64)
+        if err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"}); return }
+        row, err := h.queryOne(ctx, `SELECT hash, number, parent_hash, state_root, tx_count FROM blocks WHERE number = $1`, n)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"verified": row != nil, "block": row})
+}
+func (h *Handler) GetBlockTxFees(c *gin.Context) {
+        ctx := c.Request.Context()
+        num := c.Param("number")
+        n, err := strconv.ParseInt(num, 10, 64)
+        if err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"}); return }
+        row, err := h.queryOne(ctx, `SELECT COALESCE(SUM(gas_used * gas_price), 0) AS fees FROM transactions WHERE block_number = $1`, n)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"fees": row["fees"]})
+}
+func (h *Handler) GetBlockGasUsed(c *gin.Context) {
+        ctx := c.Request.Context()
+        num := c.Param("number")
+        n, err := strconv.ParseInt(num, 10, 64)
+        if err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"}); return }
+        row, err := h.queryOne(ctx, `SELECT gas_used FROM blocks WHERE number = $1`, n)
+        if err != nil { dbError(c, err); return }
+        if row == nil { c.JSON(http.StatusNotFound, gin.H{"error": "block not found"}); return }
+        c.JSON(http.StatusOK, gin.H{"gasUsed": row["gas_used"]})
+}
+func (h *Handler) GetBlockSize(c *gin.Context) {
+        ctx := c.Request.Context()
+        num := c.Param("number")
+        n, err := strconv.ParseInt(num, 10, 64)
+        if err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"}); return }
+        row, err := h.queryOne(ctx, `SELECT size FROM blocks WHERE number = $1`, n)
+        if err != nil { dbError(c, err); return }
+        if row == nil { c.JSON(http.StatusNotFound, gin.H{"error": "block not found"}); return }
+        c.JSON(http.StatusOK, gin.H{"size": row["size"]})
+}
 
 // Transaction endpoints
 func (h *Handler) GetTransactionReceipt(c *gin.Context)  { h.getMockData(c, "receipt", 1) }
-func (h *Handler) GetTransactionStatus(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"status": "success"}) }
+func (h *Handler) GetTransactionStatus(c *gin.Context) {
+        ctx := c.Request.Context()
+        hash := c.Param("hash")
+        row, err := h.queryOne(ctx, `SELECT status, block_number FROM transactions WHERE hash = $1`, hash)
+        if err != nil { dbError(c, err); return }
+        if row == nil { c.JSON(http.StatusNotFound, gin.H{"error": "transaction not found"}); return }
+        c.JSON(http.StatusOK, gin.H{"status": row["status"], "block_number": row["block_number"]})
+}
 func (h *Handler) GetTransactionLogs(c *gin.Context)   { h.getMockData(c, "logs", 10) }
-func (h *Handler) GetRawTransaction(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"raw": "0x..."}) }
-func (h *Handler) IsTransactionConfirmed(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"confirmed": true}) }
+func (h *Handler) GetRawTransaction(c *gin.Context) {
+        ctx := c.Request.Context()
+        hash := c.Param("hash")
+        row, err := h.queryOne(ctx, `SELECT hash, nonce, from_address, to_address, value, gas_price, gas, input, block_number FROM transactions WHERE hash = $1`, hash)
+        if err != nil { dbError(c, err); return }
+        if row == nil { c.JSON(http.StatusNotFound, gin.H{"error": "transaction not found"}); return }
+        c.JSON(http.StatusOK, gin.H{"raw": row})
+}
+func (h *Handler) IsTransactionConfirmed(c *gin.Context) {
+        ctx := c.Request.Context()
+        hash := c.Param("hash")
+        row, err := h.queryOne(ctx, `SELECT block_number FROM transactions WHERE hash = $1`, hash)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"confirmed": row != nil && row["block_number"] != nil})
+}
 func (h *Handler) GetTransactionsFromAddress(c *gin.Context) { h.getMockData(c, "txs", 20) }
 func (h *Handler) GetTransactionsToAddress(c *gin.Context) { h.getMockData(c, "txs", 20) }
 func (h *Handler) GetTransactionsByAddress(c *gin.Context) { h.getMockData(c, "txs", 25) }
-func (h *Handler) GetTransactionCount(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"count": 1000}) }
+func (h *Handler) GetTransactionCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM transactions`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"count": n})
+}
 func (h *Handler) GetLatestTransactions(c *gin.Context)  { h.getMockData(c, "txs", 20) }
 func (h *Handler) GetTokenTransfersByTx(c *gin.Context) { h.getMockData(c, "transfers", 5) }
 func (h *Handler) GetTransactionsBatch(c *gin.Context) { h.getMockData(c, "txs", 50) }
-func (h *Handler) ExportTransactions(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"exported": 1000}) }
+func (h *Handler) ExportTransactions(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM transactions`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"exported": n})
+}
 func (h *Handler) GetExecutionResult(c *gin.Context)  { h.getMockData(c, "execution", 1) }
 
 // Internal transaction endpoints
 func (h *Handler) GetInternalTxsFrom(c *gin.Context)   { h.getMockData(c, "internalTxs", 20) }
 func (h *Handler) GetInternalTxsTo(c *gin.Context)     { h.getMockData(c, "internalTxs", 20) }
 func (h *Handler) GetInternalTxsByAddress(c *gin.Context) { h.getMockData(c, "internalTxs", 25) }
-func (h *Handler) GetInternalTxCount(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"count": 5000}) }
+func (h *Handler) GetInternalTxCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM internal_transactions`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"count": n})
+}
 func (h *Handler) GetRecentInternalTxs(c *gin.Context) { h.getMockData(c, "internalTxs", 20) }
 func (h *Handler) GetInternalTxsByBlock(c *gin.Context) { h.getMockData(c, "internalTxs", 30) }
-func (h *Handler) ExportInternalTxs(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"exported": 500}) }
+func (h *Handler) ExportInternalTxs(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM internal_transactions`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"exported": n})
+}
 func (h *Handler) GetCallTree(c *gin.Context)           { h.getMockData(c, "callTree", 1) }
 
 // Trace endpoints
@@ -374,14 +453,74 @@ func (h *Handler) ReplayTransaction(c *gin.Context)     { h.getMockData(c, "repl
 func (h *Handler) GetTraceOps(c *gin.Context)           { h.getMockData(c, "ops", 100) }
 
 // Token endpoints
-func (h *Handler) GetTokenTransferCount(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"count": 50000}) }
-func (h *Handler) GetTokenBalance(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"balance": "1000000"}) }
-func (h *Handler) GetTokenSupply(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"supply": "1000000000"}) }
+func (h *Handler) GetTokenTransferCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM token_transfers`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"count": n})
+}
+func (h *Handler) GetTokenBalance(c *gin.Context) {
+        ctx := c.Request.Context()
+        token := c.Param("address")
+        holder := c.Query("holder")
+        if holder == "" {
+                row, err := h.queryOne(ctx, `SELECT total_supply FROM tokens WHERE address = $1`, token)
+                if err != nil { dbError(c, err); return }
+                c.JSON(http.StatusOK, gin.H{"balance": rowValue(row, "total_supply")})
+                return
+        }
+        row, err := h.queryOne(ctx, `SELECT balance FROM token_holders WHERE token_address = $1 AND address = $2`, token, holder)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"balance": rowValue(row, "balance")})
+}
+func (h *Handler) GetTokenSupply(c *gin.Context) {
+        ctx := c.Request.Context()
+        token := c.Param("address")
+        row, err := h.queryOne(ctx, `SELECT total_supply FROM tokens WHERE address = $1`, token)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"supply": rowValue(row, "total_supply")})
+}
 func (h *Handler) GetTokenMetadata(c *gin.Context)          { h.getMockData(c, "metadata", 1) }
-func (h *Handler) GetTokenPrice(c *gin.Context)             { c.JSON(http.StatusOK, gin.H{"price": 1.00}) }
-func (h *Handler) GetTokenMarketCap(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"marketCap": 1000000000}) }
-func (h *Handler) ExportTokenHolders(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"exported": 1000}) }
-func (h *Handler) ExportTokenTransfers(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{"exported": 5000}) }
+func (h *Handler) GetTokenPrice(c *gin.Context) {
+        ctx := c.Request.Context()
+        token := c.Param("address")
+        row, err := h.queryOne(ctx, `SELECT price_usd FROM tokens WHERE address = $1`, token)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"price": rowValue(row, "price_usd")})
+}
+func (h *Handler) GetTokenMarketCap(c *gin.Context) {
+        ctx := c.Request.Context()
+        token := c.Param("address")
+        row, err := h.queryOne(ctx, `SELECT price_usd, total_supply FROM tokens WHERE address = $1`, token)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"marketCap": row})
+}
+func (h *Handler) ExportTokenHolders(c *gin.Context) {
+        ctx := c.Request.Context()
+        token := c.Param("address")
+        var n int64
+        var err error
+        if token != "" {
+                n, err = h.countQuery(ctx, `SELECT count(*) FROM token_holders WHERE token_address = $1`, token)
+        } else {
+                n, err = h.countQuery(ctx, `SELECT count(*) FROM token_holders`)
+        }
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"exported": n})
+}
+func (h *Handler) ExportTokenTransfers(c *gin.Context) {
+        ctx := c.Request.Context()
+        token := c.Param("address")
+        var n int64
+        var err error
+        if token != "" {
+                n, err = h.countQuery(ctx, `SELECT count(*) FROM token_transfers WHERE token_address = $1`, token)
+        } else {
+                n, err = h.countQuery(ctx, `SELECT count(*) FROM token_transfers`)
+        }
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"exported": n})
+}
 func (h *Handler) GetTokenApprovals(c *gin.Context)         { h.getMockData(c, "approvals", 20) }
 func (h *Handler) GetTokenAllowances(c *gin.Context)        { h.getMockData(c, "allowances", 20) }
 func (h *Handler) GetTopTokenHolders(c *gin.Context)       { h.getMockData(c, "holders", 50) }
@@ -395,11 +534,36 @@ func (h *Handler) SearchTokens(c *gin.Context)             { h.getMockData(c, "t
 
 // NFT endpoints
 func (h *Handler) GetNFTMetadata(c *gin.Context)           { h.getMockData(c, "metadata", 1) }
-func (h *Handler) GetNFTOwnerCount(c *gin.Context)         { c.JSON(http.StatusOK, gin.H{"count": 5000}) }
+func (h *Handler) GetNFTOwnerCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        collection := c.Param("address")
+        var n int64
+        var err error
+        if collection != "" {
+                n, err = h.countQuery(ctx, `SELECT count(DISTINCT owner) FROM nfts WHERE collection_address = $1`, collection)
+        } else {
+                n, err = h.countQuery(ctx, `SELECT count(DISTINCT owner) FROM nfts`)
+        }
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"count": n})
+}
 func (h *Handler) GetNFTTokens(c *gin.Context)             { h.getMockData(c, "nfts", 25) }
-func (h *Handler) GetNFTTokenOwner(c *gin.Context)         { c.JSON(http.StatusOK, gin.H{"owner": "0x..."}) }
+func (h *Handler) GetNFTTokenOwner(c *gin.Context) {
+        ctx := c.Request.Context()
+        collection := c.Param("address")
+        tokenID := c.Param("token_id")
+        row, err := h.queryOne(ctx, `SELECT owner FROM nfts WHERE collection_address = $1 AND token_id = $2`, collection, tokenID)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"owner": rowValue(row, "owner")})
+}
 func (h *Handler) GetNFTTokenTransfers(c *gin.Context)      { h.getMockData(c, "transfers", 20) }
-func (h *Handler) GetNFTVolume(c *gin.Context)             { c.JSON(http.StatusOK, gin.H{"volume": 100000}) }
+func (h *Handler) GetNFTVolume(c *gin.Context) {
+        ctx := c.Request.Context()
+        collection := c.Param("address")
+        row, err := h.queryOne(ctx, `SELECT volume_24h FROM nft_collections WHERE address = $1`, collection)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"volume": rowValue(row, "volume_24h")})
+}
 func (h *Handler) GetNFTVolumeHistory(c *gin.Context)     { h.getMockData(c, "volumeHistory", 30) }
 func (h *Handler) GetNFTHolders(c *gin.Context)            { h.getMockData(c, "holders", 50) }
 func (h *Handler) GetNFTRankings(c *gin.Context)           { h.getMockData(c, "rankings", 100) }
@@ -437,11 +601,23 @@ func (h *Handler) GetContractType(c *gin.Context)          { c.JSON(http.StatusO
 func (h *Handler) CompileContract(c *gin.Context)          { c.JSON(http.StatusOK, gin.H{"compiled": true}) }
 
 // Address endpoints
-func (h *Handler) GetAddressBalance(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"balance": "1000000000000000000"}) }
+func (h *Handler) GetAddressBalance(c *gin.Context) {
+        ctx := c.Request.Context()
+        addr := c.Param("address")
+        row, err := h.queryOne(ctx, `SELECT COALESCE(SUM(value), 0) AS balance FROM transactions WHERE to_address = $1`, addr)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"balance": rowValue(row, "balance")})
+}
 func (h *Handler) GetAddressTransactions(c *gin.Context)   { h.getMockData(c, "txs", 25) }
 func (h *Handler) GetAddressInternalTxs(c *gin.Context)   { h.getMockData(c, "internalTxs", 20) }
 func (h *Handler) GetAddressBlocksMined(c *gin.Context)   { h.getMockData(c, "blocks", 10) }
-func (h *Handler) GetAddressTxCount(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"count": 500}) }
+func (h *Handler) GetAddressTxCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        addr := c.Param("address")
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM transactions WHERE from_address = $1 OR to_address = $1`, addr)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"count": n})
+}
 func (h *Handler) GetAddressFirstSeen(c *gin.Context)      { c.JSON(http.StatusOK, gin.H{"block": 10000000}) }
 func (h *Handler) GetAddressLastSeen(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"block": 45678901}) }
 func (h *Handler) GetAddressAnnotations(c *gin.Context)   { h.getMockData(c, "annotations", 5) }
@@ -451,11 +627,26 @@ func (h *Handler) GetAllNFTBalances(c *gin.Context)        { h.getMockData(c, "n
 func (h *Handler) GetAddressAnalytics(c *gin.Context)     { h.getMockData(c, "analytics", 1) }
 
 // Gas endpoints
-func (h *Handler) GetEstimatedGas(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"gas": 21000}) }
-func (h *Handler) GetGasRecommendation(c *gin.Context)   { c.JSON(http.StatusOK, gin.H{"recommended": "5"}) }
+func (h *Handler) GetEstimatedGas(c *gin.Context) {
+        ctx := c.Request.Context()
+        row, err := h.queryOne(ctx, `SELECT COALESCE(AVG(gas_used), 21000) AS gas FROM transactions ORDER BY block_number DESC LIMIT 100`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"gas": rowValue(row, "gas")})
+}
+func (h *Handler) GetGasRecommendation(c *gin.Context) {
+        ctx := c.Request.Context()
+        row, err := h.queryOne(ctx, `SELECT gas_price FROM gas_prices ORDER BY id DESC LIMIT 1`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"recommended": rowValue(row, "gas_price")})
+}
 func (h *Handler) GetGasTrends(c *gin.Context)             { h.getMockData(c, "trends", 24) }
 func (h *Handler) GetPriorityFees(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"fast": 2, "standard": 1, "slow": 0.5}) }
-func (h *Handler) GetBaseFee(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"baseFee": 5}) }
+func (h *Handler) GetBaseFee(c *gin.Context) {
+        ctx := c.Request.Context()
+        row, err := h.queryOne(ctx, `SELECT base_fee_per_gas FROM blocks ORDER BY number DESC LIMIT 1`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"baseFee": rowValue(row, "base_fee_per_gas")})
+}
 func (h *Handler) GetGasUtilization(c *gin.Context)        { c.JSON(http.StatusOK, gin.H{"utilization": 0.5}) }
 func (h *Handler) GetGasAggregator(c *gin.Context)         { h.getMockData(c, "aggregator", 1) }
 func (h *Handler) CalculateGasSavings(c *gin.Context)       { c.JSON(http.StatusOK, gin.H{"savings": "0.01"}) }
@@ -477,12 +668,27 @@ func (h *Handler) GetTPSChart(c *gin.Context)               { h.getMockData(c, "
 func (h *Handler) GetDifficultyChart(c *gin.Context)        { h.getMockData(c, "chart", 30) }
 func (h *Handler) GetDexLiquidityChart(c *gin.Context)      { h.getMockData(c, "chart", 30) }
 func (h *Handler) GetDexVolumeChart(c *gin.Context)         { h.getMockData(c, "chart", 30) }
-func (h *Handler) ExportChartData(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"exported": 1000}) }
+func (h *Handler) ExportChartData(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM analytics_daily`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"exported": n})
+}
 func (h *Handler) GetCustomChart(c *gin.Context)            { h.getMockData(c, "chart", 30) }
 
 // DEX endpoints
-func (h *Handler) GetDexLiquidity(c *gin.Context)           { c.JSON(http.StatusOK, gin.H{"liquidity": 50000000}) }
-func (h *Handler) GetDexVolume(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"volume24h": 10000000}) }
+func (h *Handler) GetDexLiquidity(c *gin.Context) {
+        ctx := c.Request.Context()
+        row, err := h.queryOne(ctx, `SELECT COALESCE(SUM(liquidity_usd), 0) AS liquidity FROM dex_pairs`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"liquidity": rowValue(row, "liquidity")})
+}
+func (h *Handler) GetDexVolume(c *gin.Context) {
+        ctx := c.Request.Context()
+        row, err := h.queryOne(ctx, `SELECT COALESCE(SUM(volume_24h), 0) AS volume24h FROM dex_pairs`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"volume24h": rowValue(row, "volume24h")})
+}
 func (h *Handler) GetDexPairTokens(c *gin.Context)          { h.getMockData(c, "tokens", 2) }
 func (h *Handler) GetDexTransactions(c *gin.Context)        { h.getMockData(c, "txs", 50) }
 func (h *Handler) GetDexOHLCV(c *gin.Context)               { h.getMockData(c, "ohlcv", 100) }
@@ -493,7 +699,13 @@ func (h *Handler) GetDexProtocols(c *gin.Context)           { h.getMockData(c, "
 
 // Governance endpoints
 func (h *Handler) GetProposalVotes(c *gin.Context)          { h.getMockData(c, "votes", 100) }
-func (h *Handler) GetVoteCount(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"for": 800000, "against": 200000}) }
+func (h *Handler) GetVoteCount(c *gin.Context) {
+        ctx := c.Request.Context()
+        proposalID := c.Param("id")
+        row, err := h.queryOne(ctx, `SELECT count(*) FILTER (WHERE vote_choice = true) AS for_votes, count(*) FILTER (WHERE vote_choice = false) AS against_votes FROM governance_votes WHERE proposal_id = $1`, proposalID)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"for": rowValue(row, "for_votes"), "against": rowValue(row, "against_votes")})
+}
 func (h *Handler) GetProposalTally(c *gin.Context)          { h.getMockData(c, "tally", 1) }
 func (h *Handler) GetGovernanceVoters(c *gin.Context)        { h.getMockData(c, "voters", 50) }
 func (h *Handler) GetDelegations(c *gin.Context)            { h.getMockData(c, "delegations", 20) }
@@ -514,7 +726,12 @@ func (h *Handler) GetAddressesByLabel(c *gin.Context)       { h.getMockData(c, "
 func (h *Handler) CreateLabel(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
 func (h *Handler) UpdateLabel(c *gin.Context)               { c.JSON(http.StatusOK, gin.H{"success": true}) }
 func (h *Handler) DeleteLabel(c *gin.Context)                { c.JSON(http.StatusOK, gin.H{"success": true}) }
-func (h *Handler) ExportLabels(c *gin.Context)              { c.JSON(http.StatusOK, gin.H{"exported": 1000}) }
+func (h *Handler) ExportLabels(c *gin.Context) {
+        ctx := c.Request.Context()
+        n, err := h.countQuery(ctx, `SELECT count(*) FROM search_index`)
+        if err != nil { dbError(c, err); return }
+        c.JSON(http.StatusOK, gin.H{"exported": n})
+}
 
 // Stats endpoints
 func (h *Handler) GetBlockStats(c *gin.Context)             { h.getMockData(c, "stats", 1) }

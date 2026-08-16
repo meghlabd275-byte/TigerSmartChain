@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -146,12 +147,12 @@ func (i *Indexer) indexBlock(blockNum uint64) error {
 		block.Number().Uint64(),
 		block.Hash().Hex(),
 		block.ParentHash().Hex(),
-		block.Nonce().Hex(),
+		fmt.Sprintf("0x%x", block.Nonce()),
 		block.GasLimit(),
 		block.GasUsed(),
 		block.Time(),
 		block.Coinbase().Hex(),
-		block.Size().Int64(),
+		int64(block.Size()),
 		block.BaseFee(),
 		len(block.Transactions()),
 	)
@@ -170,7 +171,7 @@ func (i *Indexer) indexBlock(blockNum uint64) error {
 	return nil
 }
 
-func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.types.Block) error {
+func (i *Indexer) indexTransaction(tx *types.Transaction, block *types.Block) error {
 	receipt, err := i.ethClient.TransactionReceipt(context.Background(), tx.Hash())
 	if err != nil {
 		return fmt.Errorf("failed to get receipt: %w", err)
@@ -179,6 +180,19 @@ func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.typ
 	var toAddr string
 	if tx.To() != nil {
 		toAddr = tx.To().Hex()
+	}
+
+	// Derive sender address from the transaction signature
+	fromAddr := ""
+	chainID := big.NewInt(56) // BSC chain ID
+	if i.ethClient != nil {
+		if cid, err := i.ethClient.ChainID(context.Background()); err == nil {
+			chainID = cid
+		}
+	}
+	signer := types.NewLondonSigner(chainID)
+	if sender, err := types.Sender(signer, tx); err == nil {
+		fromAddr = sender.Hex()
 	}
 
 	// Determine transaction status
@@ -200,7 +214,7 @@ func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.typ
 		tx.Hash().Hex(),
 		receipt.BlockNumber.Uint64(),
 		receipt.BlockHash.Hex(),
-		tx.From().Hex(),
+		fromAddr,
 		toAddr,
 		tx.Value().String(),
 		tx.GasPrice().String(),
@@ -216,9 +230,9 @@ func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.typ
 	}
 
 	// Insert logs
-	for idx, log := range receipt.Logs {
-		topics := make([]string, len(log.Topics))
-		for j, topic := range log.Topics {
+	for idx, lg := range receipt.Logs {
+		topics := make([]string, len(lg.Topics))
+		for j, topic := range lg.Topics {
 			topics[j] = topic.Hex()
 		}
 
@@ -226,11 +240,11 @@ func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.typ
 			INSERT INTO logs (address, topics, data, block_number, transaction_hash, log_index)
 			VALUES ($1, $2, $3, $4, $5, $6)
 		`,
-			log.Address.Hex(),
+			lg.Address.Hex(),
 			topics,
-			common.Bytes2Hex(log.Data),
-			log.BlockNumber,
-			log.TransactionHash.Hex(),
+			common.Bytes2Hex(lg.Data),
+			lg.BlockNumber,
+			lg.TxHash.Hex(),
 			idx,
 		)
 
@@ -239,14 +253,14 @@ func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.typ
 		}
 
 		// Check for token transfers
-		if len(log.Topics) >= 3 {
+		if len(lg.Topics) >= 3 {
 			// ERC20 Transfer: Transfer(address,address,uint256)
-			if log.Topics[0].Hex() == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" {
-				i.processERC20Transfer(log)
+			if lg.Topics[0].Hex() == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" {
+				i.processERC20Transfer(lg)
 			}
 			// ERC721 Transfer
-			if log.Topics[0].Hex() == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" {
-				i.processERC721Transfer(log)
+			if lg.Topics[0].Hex() == "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" {
+				i.processERC721Transfer(lg)
 			}
 		}
 	}
@@ -254,28 +268,28 @@ func (i *Indexer) indexTransaction(tx *ethereum.Transaction, block *ethereum.typ
 	return nil
 }
 
-func (i *Indexer) processERC20Transfer(log *ethereum.types.Log) {
-	if len(log.Topics) < 3 {
+func (i *Indexer) processERC20Transfer(lg *types.Log) {
+	if len(lg.Topics) < 3 {
 		return
 	}
 
-	from := "0x" + strings.TrimPrefix(log.Topics[1].Hex(), "0x000000000000000000000000")
-	to := "0x" + strings.TrimPrefix(log.Topics[2].Hex(), "0x000000000000000000000000")
+	from := "0x" + strings.TrimPrefix(lg.Topics[1].Hex(), "0x000000000000000000000000")
+	to := "0x" + strings.TrimPrefix(lg.Topics[2].Hex(), "0x000000000000000000000000")
 
-	value := new(big.Int).SetBytes(log.Data).String()
+	value := new(big.Int).SetBytes(lg.Data).String()
 
 	_, err := i.pool.Exec(context.Background(), `
 		INSERT INTO token_transfers (token_address, from_address, to_address, value, transaction_hash, block_number, log_index)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT DO NOTHING
 	`,
-		log.Address.Hex(),
+		lg.Address.Hex(),
 		from,
 		to,
 		value,
-		log.TransactionHash.Hex(),
-		log.BlockNumber,
-		log.Index,
+		lg.TxHash.Hex(),
+		lg.BlockNumber,
+		lg.Index,
 	)
 
 	if err != nil {
@@ -283,27 +297,27 @@ func (i *Indexer) processERC20Transfer(log *ethereum.types.Log) {
 	}
 }
 
-func (i *Indexer) processERC721Transfer(log *ethereum.types.Log) {
-	if len(log.Topics) < 4 {
+func (i *Indexer) processERC721Transfer(lg *types.Log) {
+	if len(lg.Topics) < 4 {
 		return
 	}
 
-	from := "0x" + strings.TrimPrefix(log.Topics[1].Hex(), "0x000000000000000000000000")
-	to := "0x" + strings.TrimPrefix(log.Topics[2].Hex(), "0x000000000000000000000000")
-	tokenId := new(big.Int).SetBytes(log.Data[:32]).String()
+	from := "0x" + strings.TrimPrefix(lg.Topics[1].Hex(), "0x000000000000000000000000")
+	to := "0x" + strings.TrimPrefix(lg.Topics[2].Hex(), "0x000000000000000000000000")
+	tokenId := new(big.Int).SetBytes(lg.Data[:32]).String()
 
 	_, err := i.pool.Exec(context.Background(), `
 		INSERT INTO nft_transfers (collection_address, token_id, from_address, to_address, transaction_hash, block_number, log_index)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT DO NOTHING
 	`,
-		log.Address.Hex(),
+		lg.Address.Hex(),
 		tokenId,
 		from,
 		to,
-		log.TransactionHash.Hex(),
-		log.BlockNumber,
-		log.Index,
+		lg.TxHash.Hex(),
+		lg.BlockNumber,
+		lg.Index,
 	)
 
 	if err != nil {

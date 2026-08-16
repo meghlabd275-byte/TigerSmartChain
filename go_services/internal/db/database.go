@@ -38,48 +38,86 @@ func (d *Database) Close() {
 	d.pool.Close()
 }
 
+// scanBlockCols are the columns returned for a block row.
+type blockRow struct {
+	Number            int64
+	Hash              string
+	ParentHash        string
+	Nonce             string
+	GasLimit          int64
+	GasUsed           int64
+	Timestamp         int64
+	Miner             string
+	Size              int64
+	BaseFeePerGas     *int64
+	TransactionsCount int64
+	UnclesCount       int64
+}
+
+func (b blockRow) toMap() map[string]interface{} {
+	m := map[string]interface{}{
+		"number":             b.Number,
+		"hash":               b.Hash,
+		"parent_hash":        b.ParentHash,
+		"nonce":              b.Nonce,
+		"gas_limit":          b.GasLimit,
+		"gas_used":           b.GasUsed,
+		"timestamp":          b.Timestamp,
+		"miner":              b.Miner,
+		"size":               b.Size,
+		"transactions_count": b.TransactionsCount,
+		"uncles_count":       b.UnclesCount,
+	}
+	if b.BaseFeePerGas != nil {
+		m["base_fee_per_gas"] = *b.BaseFeePerGas
+	}
+	return m
+}
+
 // Block queries
 func (d *Database) GetBlock(ctx context.Context, number uint64) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var b blockRow
 	err := d.pool.QueryRow(ctx, `
-		SELECT number, hash, parent_hash, nonce, gas_limit, gas_used, timestamp, 
+		SELECT number, hash, parent_hash, nonce, gas_limit, gas_used, timestamp,
 		       miner, size, base_fee_per_gas, transactions_count, uncles_count
 		FROM blocks WHERE number = $1
 	`, number).Scan(
-		&result["number"], &result["hash"], &result["parent_hash"], &result["nonce"],
-		&result["gas_limit"], &result["gas_used"], &result["timestamp"], &result["miner"],
-		&result["size"], &result["base_fee_per_gas"], &result["transactions_count"], &result["uncles_count"],
+		&b.Number, &b.Hash, &b.ParentHash, &b.Nonce,
+		&b.GasLimit, &b.GasUsed, &b.Timestamp, &b.Miner,
+		&b.Size, &b.BaseFeePerGas, &b.TransactionsCount, &b.UnclesCount,
 	)
-	
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return b.toMap(), nil
 }
 
 func (d *Database) GetLatestBlock(ctx context.Context) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var b blockRow
 	err := d.pool.QueryRow(ctx, `
-		SELECT number, hash, parent_hash, nonce, gas_limit, gas_used, timestamp, 
+		SELECT number, hash, parent_hash, nonce, gas_limit, gas_used, timestamp,
 		       miner, size, base_fee_per_gas, transactions_count, uncles_count
 		FROM blocks ORDER BY number DESC LIMIT 1
 	`).Scan(
-		&result["number"], &result["hash"], &result["parent_hash"], &result["nonce"],
-		&result["gas_limit"], &result["gas_used"], &result["timestamp"], &result["miner"],
-		&result["size"], &result["base_fee_per_gas"], &result["transactions_count"], &result["uncles_count"],
+		&b.Number, &b.Hash, &b.ParentHash, &b.Nonce,
+		&b.GasLimit, &b.GasUsed, &b.Timestamp, &b.Miner,
+		&b.Size, &b.BaseFeePerGas, &b.TransactionsCount, &b.UnclesCount,
 	)
-	
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return b.toMap(), nil
 }
 
 func (d *Database) GetBlocks(ctx context.Context, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
-	
+
 	var total int
 	err := d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM blocks").Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
-	
+
 	rows, err := d.pool.Query(ctx, `
 		SELECT number, hash, parent_hash, gas_used, gas_limit, timestamp, miner, transactions_count
 		FROM blocks ORDER BY number DESC LIMIT $1 OFFSET $2
@@ -88,55 +126,78 @@ func (d *Database) GetBlocks(ctx context.Context, page, limit int) ([]map[string
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	var blocks []map[string]interface{}
 	for rows.Next() {
-		var b map[string]interface{}
-		if err := rows.Scan(
-			&b["number"], &b["hash"], &b["parent_hash"], &b["gas_used"], 
-			&b["gas_limit"], &b["timestamp"], &b["miner"], &b["transactions_count"],
-		); err != nil {
+		var number, gasUsed, gasLimit, timestamp, txCount int64
+		var hash, parentHash, miner string
+		if err := rows.Scan(&number, &hash, &parentHash, &gasUsed, &gasLimit, &timestamp, &miner, &txCount); err != nil {
 			return nil, 0, err
 		}
-		blocks = append(blocks, b)
+		blocks = append(blocks, map[string]interface{}{
+			"number":             number,
+			"hash":               hash,
+			"parent_hash":        parentHash,
+			"gas_used":           gasUsed,
+			"gas_limit":          gasLimit,
+			"timestamp":          timestamp,
+			"miner":              miner,
+			"transactions_count": txCount,
+		})
 	}
-	
+
 	return blocks, total, nil
 }
 
 // Transaction queries
 func (d *Database) GetTransaction(ctx context.Context, hash string) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var (
+		txHash, blockHash, fromAddr, toAddr, value, gasPrice, nonce, input, txType, status string
+		blockNumber, gas, timestamp                                                       int64
+	)
 	err := d.pool.QueryRow(ctx, `
-		SELECT hash, block_number, block_hash, from_address, to_address, value, 
+		SELECT hash, block_number, block_hash, from_address, to_address, value,
 		       gas_price, gas, nonce, input, tx_type, status, timestamp
 		FROM transactions WHERE hash = $1
 	`, hash).Scan(
-		&result["hash"], &result["block_number"], &result["block_hash"], 
-		&result["from_address"], &result["to_address"], &result["value"],
-		&result["gas_price"], &result["gas"], &result["nonce"], &result["input"],
-		&result["tx_type"], &result["status"], &result["timestamp"],
+		&txHash, &blockNumber, &blockHash, &fromAddr, &toAddr, &value,
+		&gasPrice, &gas, &nonce, &input, &txType, &status, &timestamp,
 	)
-	
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"hash":          txHash,
+		"block_number":  blockNumber,
+		"block_hash":    blockHash,
+		"from_address":  fromAddr,
+		"to_address":    toAddr,
+		"value":         value,
+		"gas_price":     gasPrice,
+		"gas":           gas,
+		"nonce":         nonce,
+		"input":         input,
+		"tx_type":       txType,
+		"status":        status,
+		"timestamp":     timestamp,
+	}, nil
 }
 
 func (d *Database) GetTransactions(ctx context.Context, address string, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
-	
+
 	var total int
 	err := d.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM transactions 
+		SELECT COUNT(*) FROM transactions
 		WHERE from_address = $1 OR to_address = $1
 	`, address).Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
-	
+
 	rows, err := d.pool.Query(ctx, `
 		SELECT hash, block_number, from_address, to_address, value, gas_price, status, timestamp
-		FROM transactions 
+		FROM transactions
 		WHERE from_address = $1 OR to_address = $1
 		ORDER BY block_number DESC LIMIT $2 OFFSET $3
 	`, address, limit, offset)
@@ -144,44 +205,74 @@ func (d *Database) GetTransactions(ctx context.Context, address string, page, li
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	var txs []map[string]interface{}
 	for rows.Next() {
-		var tx map[string]interface{}
-		if err := rows.Scan(
-			&tx["hash"], &tx["block_number"], &tx["from_address"], &tx["to_address"],
-			&tx["value"], &tx["gas_price"], &tx["status"], &tx["timestamp"],
-		); err != nil {
+		var hash, fromAddr, toAddr, value, gasPrice, status string
+		var blockNumber, timestamp int64
+		if err := rows.Scan(&hash, &blockNumber, &fromAddr, &toAddr, &value, &gasPrice, &status, &timestamp); err != nil {
 			return nil, 0, err
 		}
-		txs = append(txs, tx)
+		txs = append(txs, map[string]interface{}{
+			"hash":          hash,
+			"block_number":  blockNumber,
+			"from_address":  fromAddr,
+			"to_address":    toAddr,
+			"value":         value,
+			"gas_price":     gasPrice,
+			"status":        status,
+			"timestamp":     timestamp,
+		})
 	}
-	
+
 	return txs, total, nil
 }
 
 // Token queries
 func (d *Database) GetToken(ctx context.Context, address string) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var (
+		addr, name, symbol, tokenType, logoURL           string
+		decimals                                         int
+		totalSupply                                      string
+		price, priceChange24h, marketCap, volume24h      float64
+		holdersCount, transfersCount                     int64
+		isVerified, isSpam                               bool
+	)
 	err := d.pool.QueryRow(ctx, `
-		SELECT address, name, symbol, decimals, total_supply, type, 
-		       price, price_change_24h, market_cap, volume_24h, 
+		SELECT address, name, symbol, decimals, total_supply, type,
+		       price, price_change_24h, market_cap, volume_24h,
 		       holders_count, transfers_count, is_verified, is_spam, logo_url
 		FROM tokens WHERE address = $1
 	`, address).Scan(
-		&result["address"], &result["name"], &result["symbol"], &result["decimals"],
-		&result["total_supply"], &result["type"], &result["price"], &result["price_change_24h"],
-		&result["market_cap"], &result["volume_24h"], &result["holders_count"], 
-		&result["transfers_count"], &result["is_verified"], &result["is_spam"], &result["logo_url"],
+		&addr, &name, &symbol, &decimals, &totalSupply, &tokenType,
+		&price, &priceChange24h, &marketCap, &volume24h,
+		&holdersCount, &transfersCount, &isVerified, &isSpam, &logoURL,
 	)
-	
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"address":           addr,
+		"name":              name,
+		"symbol":            symbol,
+		"decimals":          decimals,
+		"total_supply":      totalSupply,
+		"type":              tokenType,
+		"price":             price,
+		"price_change_24h":  priceChange24h,
+		"market_cap":        marketCap,
+		"volume_24h":        volume24h,
+		"holders_count":     holdersCount,
+		"transfers_count":   transfersCount,
+		"is_verified":       isVerified,
+		"is_spam":           isSpam,
+		"logo_url":          logoURL,
+	}, nil
 }
 
 func (d *Database) GetTokenHolders(ctx context.Context, address string, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
-	
+
 	var total int
 	err := d.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM token_holders WHERE token_address = $1
@@ -189,10 +280,10 @@ func (d *Database) GetTokenHolders(ctx context.Context, address string, page, li
 	if err != nil {
 		return nil, 0, err
 	}
-	
+
 	rows, err := d.pool.Query(ctx, `
 		SELECT address, balance, percentage
-		FROM token_holders 
+		FROM token_holders
 		WHERE token_address = $1
 		ORDER BY balance DESC LIMIT $2 OFFSET $3
 	`, address, limit, offset)
@@ -200,22 +291,27 @@ func (d *Database) GetTokenHolders(ctx context.Context, address string, page, li
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	var holders []map[string]interface{}
 	for rows.Next() {
-		var h map[string]interface{}
-		if err := rows.Scan(&h["address"], &h["balance"], &h["percentage"]); err != nil {
+		var addr, balance string
+		var percentage float64
+		if err := rows.Scan(&addr, &balance, &percentage); err != nil {
 			return nil, 0, err
 		}
-		holders = append(holders, h)
+		holders = append(holders, map[string]interface{}{
+			"address":    addr,
+			"balance":    balance,
+			"percentage": percentage,
+		})
 	}
-	
+
 	return holders, total, nil
 }
 
 func (d *Database) GetTokenTransfers(ctx context.Context, address string, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
-	
+
 	var total int
 	err := d.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM token_transfers WHERE token_address = $1
@@ -223,10 +319,10 @@ func (d *Database) GetTokenTransfers(ctx context.Context, address string, page, 
 	if err != nil {
 		return nil, 0, err
 	}
-	
+
 	rows, err := d.pool.Query(ctx, `
 		SELECT transaction_hash, from_address, to_address, value, block_number, timestamp
-		FROM token_transfers 
+		FROM token_transfers
 		WHERE token_address = $1
 		ORDER BY block_number DESC LIMIT $2 OFFSET $3
 	`, address, limit, offset)
@@ -234,58 +330,84 @@ func (d *Database) GetTokenTransfers(ctx context.Context, address string, page, 
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	var transfers []map[string]interface{}
 	for rows.Next() {
-		var t map[string]interface{}
-		if err := rows.Scan(
-			&t["transaction_hash"], &t["from_address"], &t["to_address"],
-			&t["value"], &t["block_number"], &t["timestamp"],
-		); err != nil {
+		var txHash, fromAddr, toAddr, value string
+		var blockNumber, timestamp int64
+		if err := rows.Scan(&txHash, &fromAddr, &toAddr, &value, &blockNumber, &timestamp); err != nil {
 			return nil, 0, err
 		}
-		transfers = append(transfers, t)
+		transfers = append(transfers, map[string]interface{}{
+			"transaction_hash": txHash,
+			"from_address":     fromAddr,
+			"to_address":       toAddr,
+			"value":            value,
+			"block_number":     blockNumber,
+			"timestamp":        timestamp,
+		})
 	}
-	
+
 	return transfers, total, nil
 }
 
 // NFT queries
 func (d *Database) GetNFTCollection(ctx context.Context, address string) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var (
+		addr, name, symbol, collectionType, imageURL            string
+		totalSupply, mintedCount, ownerCount                    int64
+		floorPrice, averagePrice, volume24h, volume7d, volume30d float64
+	)
 	err := d.pool.QueryRow(ctx, `
-		SELECT address, name, symbol, type, total_supply, minted_count, 
-		       owner_count, floor_price, average_price, volume_24h, volume_7d, 
+		SELECT address, name, symbol, type, total_supply, minted_count,
+		       owner_count, floor_price, average_price, volume_24h, volume_7d,
 		       volume_30d, image_url
 		FROM nft_collections WHERE address = $1
 	`, address).Scan(
-		&result["address"], &result["name"], &result["symbol"], &result["type"],
-		&result["total_supply"], &result["minted_count"], &result["owner_count"],
-		&result["floor_price"], &result["average_price"], &result["volume_24h"],
-		&result["volume_7d"], &result["volume_30d"], &result["image_url"],
+		&addr, &name, &symbol, &collectionType, &totalSupply, &mintedCount,
+		&ownerCount, &floorPrice, &averagePrice, &volume24h, &volume7d,
+		&volume30d, &imageURL,
 	)
-	
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"address":       addr,
+		"name":          name,
+		"symbol":        symbol,
+		"type":          collectionType,
+		"total_supply":  totalSupply,
+		"minted_count":  mintedCount,
+		"owner_count":   ownerCount,
+		"floor_price":   floorPrice,
+		"average_price": averagePrice,
+		"volume_24h":    volume24h,
+		"volume_7d":     volume7d,
+		"volume_30d":    volume30d,
+		"image_url":     imageURL,
+	}, nil
 }
 
 func (d *Database) GetNFTFloorPrice(ctx context.Context, address string) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var floor, average, volume24h float64
 	err := d.pool.QueryRow(ctx, `
 		SELECT floor_price, average_price, volume_24h
 		FROM nft_collections WHERE address = $1
-	`, address).Scan(
-		&result["floor"], &result["average"], &result["volume_24h"],
-	)
-	
-	return result, err
+	`, address).Scan(&floor, &average, &volume24h)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"floor":      floor,
+		"average":    average,
+		"volume_24h": volume24h,
+	}, nil
 }
 
 // Internal transaction queries
 func (d *Database) GetInternalTransactions(ctx context.Context, txHash string) ([]map[string]interface{}, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT transaction_hash, block_number, from_address, to_address, 
+		SELECT transaction_hash, block_number, from_address, to_address,
 		       value, call_type, gas, input, output
 		FROM traces WHERE transaction_hash = $1
 	`, txHash)
@@ -293,29 +415,38 @@ func (d *Database) GetInternalTransactions(ctx context.Context, txHash string) (
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var traces []map[string]interface{}
 	for rows.Next() {
-		var t map[string]interface{}
-		if err := rows.Scan(
-			&t["transaction_hash"], &t["block_number"], &t["from_address"],
-			&t["to_address"], &t["value"], &t["call_type"], &t["gas"],
-			&t["input"], &t["output"],
-		); err != nil {
+		var txHash, fromAddr, toAddr, value, callType, input, output string
+		var blockNumber, gas int64
+		if err := rows.Scan(&txHash, &blockNumber, &fromAddr, &toAddr, &value, &callType, &gas, &input, &output); err != nil {
 			return nil, err
 		}
-		traces = append(traces, t)
+		traces = append(traces, map[string]interface{}{
+			"transaction_hash": txHash,
+			"block_number":     blockNumber,
+			"from_address":     fromAddr,
+			"to_address":       toAddr,
+			"value":            value,
+			"call_type":        callType,
+			"gas":              gas,
+			"input":            input,
+			"output":           output,
+		})
 	}
-	
+
 	return traces, nil
 }
 
 // Network stats
 func (d *Database) GetNetworkStats(ctx context.Context) (map[string]interface{}, error) {
-	var stats map[string]interface{}
-	
+	var (
+		totalBlocks, totalTxs, totalAddresses, totalContracts, totalTokens, blockHeight int64
+		avgGasUsed                                                                       *float64
+	)
 	err := d.pool.QueryRow(ctx, `
-		SELECT 
+		SELECT
 			(SELECT COUNT(*) FROM blocks) as total_blocks,
 			(SELECT COUNT(*) FROM transactions) as total_transactions,
 			(SELECT COUNT(DISTINCT from_address) FROM transactions) as total_addresses,
@@ -324,23 +455,36 @@ func (d *Database) GetNetworkStats(ctx context.Context) (map[string]interface{},
 			(SELECT AVG(gas_used) FROM blocks WHERE timestamp > NOW() - INTERVAL '24 hours') as avg_gas_used,
 			(SELECT MAX(number) FROM blocks) - (SELECT MIN(number) FROM blocks) as block_height
 	`).Scan(
-		&stats["total_blocks"], &stats["total_transactions"], &stats["total_addresses"],
-		&stats["total_contracts"], &stats["total_tokens"], &stats["avg_gas_used"], &stats["block_height"],
+		&totalBlocks, &totalTxs, &totalAddresses,
+		&totalContracts, &totalTokens, &avgGasUsed, &blockHeight,
 	)
-	
-	return stats, err
+	if err != nil {
+		return nil, err
+	}
+	stats := map[string]interface{}{
+		"total_blocks":        totalBlocks,
+		"total_transactions":  totalTxs,
+		"total_addresses":     totalAddresses,
+		"total_contracts":     totalContracts,
+		"total_tokens":        totalTokens,
+		"block_height":        blockHeight,
+	}
+	if avgGasUsed != nil {
+		stats["avg_gas_used"] = *avgGasUsed
+	}
+	return stats, nil
 }
 
 // DEX queries
 func (d *Database) GetDexPairs(ctx context.Context, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
-	
+
 	var total int
 	err := d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM dex_pairs").Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
-	
+
 	rows, err := d.pool.Query(ctx, `
 		SELECT address, token0_address, token1_address, token0_symbol, token1_symbol,
 		       reserve0, reserve1, liquidity, volume_24h, volume_7d
@@ -350,33 +494,40 @@ func (d *Database) GetDexPairs(ctx context.Context, page, limit int) ([]map[stri
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	var pairs []map[string]interface{}
 	for rows.Next() {
-		var p map[string]interface{}
-		if err := rows.Scan(
-			&p["address"], &p["token0_address"], &p["token1_address"],
-			&p["token0_symbol"], &p["token1_symbol"], &p["reserve0"],
-			&p["reserve1"], &p["liquidity"], &p["volume_24h"], &p["volume_7d"],
-		); err != nil {
+		var addr, t0a, t1a, t0s, t1s, reserve0, reserve1, liquidity, vol24, vol7 string
+		if err := rows.Scan(&addr, &t0a, &t1a, &t0s, &t1s, &reserve0, &reserve1, &liquidity, &vol24, &vol7); err != nil {
 			return nil, 0, err
 		}
-		pairs = append(pairs, p)
+		pairs = append(pairs, map[string]interface{}{
+			"address":          addr,
+			"token0_address":   t0a,
+			"token1_address":   t1a,
+			"token0_symbol":    t0s,
+			"token1_symbol":    t1s,
+			"reserve0":         reserve0,
+			"reserve1":         reserve1,
+			"liquidity":        liquidity,
+			"volume_24h":       vol24,
+			"volume_7d":        vol7,
+		})
 	}
-	
+
 	return pairs, total, nil
 }
 
 // Governance queries
 func (d *Database) GetGovernanceProposals(ctx context.Context, page, limit int) ([]map[string]interface{}, int, error) {
 	offset := (page - 1) * limit
-	
+
 	var total int
 	err := d.pool.QueryRow(ctx, "SELECT COUNT(*) FROM governance_proposals").Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
-	
+
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, title, description, status, vote_count, start_block, end_block, created_at
 		FROM governance_proposals ORDER BY created_at DESC LIMIT $1 OFFSET $2
@@ -385,37 +536,59 @@ func (d *Database) GetGovernanceProposals(ctx context.Context, page, limit int) 
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	var proposals []map[string]interface{}
 	for rows.Next() {
-		var p map[string]interface{}
-		if err := rows.Scan(
-			&p["id"], &p["title"], &p["description"], &p["status"],
-			&p["vote_count"], &p["start_block"], &p["end_block"], &p["created_at"],
-		); err != nil {
+		var id, voteCount, startBlock, endBlock int64
+		var title, description, status string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &title, &description, &status, &voteCount, &startBlock, &endBlock, &createdAt); err != nil {
 			return nil, 0, err
 		}
-		proposals = append(proposals, p)
+		proposals = append(proposals, map[string]interface{}{
+			"id":          id,
+			"title":       title,
+			"description": description,
+			"status":      status,
+			"vote_count":  voteCount,
+			"start_block": startBlock,
+			"end_block":   endBlock,
+			"created_at":  createdAt,
+		})
 	}
-	
+
 	return proposals, total, nil
 }
 
 // Address queries
 func (d *Database) GetAddress(ctx context.Context, address string) (map[string]interface{}, error) {
-	var result map[string]interface{}
-	
+	var (
+		addr, balance                                string
+		isContract                                   bool
+		txCount, firstSeen, lastSeen                 int64
+		totalReceived, totalSent                     string
+	)
 	err := d.pool.QueryRow(ctx, `
-		SELECT address, balance, is_contract, tx_count, first_seen_block, 
+		SELECT address, balance, is_contract, tx_count, first_seen_block,
 		       last_seen_block, total_received, total_sent
 		FROM addresses WHERE address = $1
 	`, address).Scan(
-		&result["address"], &result["balance"], &result["is_contract"],
-		&result["tx_count"], &result["first_seen_block"], &result["last_seen_block"],
-		&result["total_received"], &result["total_sent"],
+		&addr, &balance, &isContract, &txCount, &firstSeen, &lastSeen,
+		&totalReceived, &totalSent,
 	)
-	
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{
+		"address":          addr,
+		"balance":          balance,
+		"is_contract":      isContract,
+		"tx_count":         txCount,
+		"first_seen_block": firstSeen,
+		"last_seen_block":  lastSeen,
+		"total_received":   totalReceived,
+		"total_sent":       totalSent,
+	}, nil
 }
 
 func (d *Database) GetAddressTokens(ctx context.Context, address string) ([]map[string]interface{}, error) {
@@ -430,15 +603,21 @@ func (d *Database) GetAddressTokens(ctx context.Context, address string) ([]map[
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var tokens []map[string]interface{}
 	for rows.Next() {
-		var t map[string]interface{}
-		if err := rows.Scan(&t["address"], &t["name"], &t["symbol"], &t["logo_url"], &t["balance"]); err != nil {
+		var addr, name, symbol, logoURL, balance string
+		if err := rows.Scan(&addr, &name, &symbol, &logoURL, &balance); err != nil {
 			return nil, err
 		}
-		tokens = append(tokens, t)
+		tokens = append(tokens, map[string]interface{}{
+			"address":  addr,
+			"name":     name,
+			"symbol":   symbol,
+			"logo_url": logoURL,
+			"balance":  balance,
+		})
 	}
-	
+
 	return tokens, nil
 }
