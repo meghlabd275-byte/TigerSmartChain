@@ -19,7 +19,7 @@ struct CacheEntry<V> {
     expires: Instant,
 }
 
-impl<K: std::hash::Hash + Eq, V> LRUCache<K, V> {
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> LRUCache<K, V> {
     /// Create new cache
     pub fn new(max_size: usize, ttl: Duration) -> Self {
         Self {

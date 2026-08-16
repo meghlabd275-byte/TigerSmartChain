@@ -60,9 +60,9 @@ pub type DEXResult<T> = std::result::Result<T, DEXError>;
 
 /// DEX Client for querying subgraph APIs
 pub struct DEXClient {
-    http: Client,
+    pub(crate) http: Client,
     cache: Arc<RwLock<Cache>>,
-    config: ClientConfig,
+    pub(crate) config: ClientConfig,
 }
 
 /// Client configuration
@@ -108,7 +108,7 @@ impl<T> CachedItem<T> {
     }
 
     pub fn is_expired(&self) -> bool {
-        Utc::now().timestamp() > self.expires_at
+        Utc::now().timestamp() >= self.expires_at
     }
 }
 
@@ -174,10 +174,17 @@ impl DEXClient {
             "skip": 0
         });
 
-        let _response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
+        let response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
 
-        // Return mock data for now (would parse actual response in production)
-        Ok(vec![])
+        let pairs = parse_pairs(&response);
+        // Cache and return.
+        {
+            let mut cache = self.cache.write().await;
+            for p in &pairs {
+                cache.pairs.insert(p.id.clone(), CachedItem::new(p.clone(), self.config.cache_ttl.as_secs() as i64));
+            }
+        }
+        Ok(pairs)
     }
 
     /// Get pair by ID
@@ -212,10 +219,19 @@ impl DEXClient {
             "id": pair_id
         });
 
-        let _response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
+        let response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
 
-        // Return mock - in production would parse response
-        Err(DEXError::NotFound(format!("Pair not found: {}", pair_id)))
+        let pair = response
+            .pointer("/data/pair")
+            .and_then(|v| if v.is_null() { None } else { Some(parse_pair(v)) })
+            .ok_or_else(|| DEXError::NotFound(format!("Pair not found: {}", pair_id)))?;
+
+        // Cache the result.
+        {
+            let mut cache = self.cache.write().await;
+            cache.pairs.insert(pair_id.to_string(), CachedItem::new(pair.clone(), self.config.cache_ttl.as_secs() as i64));
+        }
+        Ok(pair)
     }
 
     /// Search pairs
@@ -250,9 +266,9 @@ impl DEXClient {
             "first": limit
         });
 
-        let _response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, gql_query, variables).await?;
+        let response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, gql_query, variables).await?;
 
-        Ok(vec![])
+        Ok(parse_pairs(&response))
     }
 
     // =============================================================================
@@ -279,9 +295,18 @@ impl DEXClient {
             "id": token_id
         });
 
-        let _response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
+        let response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
 
-        Err(DEXError::NotFound(format!("Token not found: {}", token_id)))
+        let token = response
+            .pointer("/data/token")
+            .and_then(|v| if v.is_null() { None } else { Some(parse_token(v)) })
+            .ok_or_else(|| DEXError::NotFound(format!("Token not found: {}", token_id)))?;
+
+        {
+            let mut cache = self.cache.write().await;
+            cache.tokens.insert(token_id.to_string(), CachedItem::new(token.clone(), self.config.cache_ttl.as_secs() as i64));
+        }
+        Ok(token)
     }
 
     /// Get top tokens
@@ -308,9 +333,16 @@ impl DEXClient {
             "first": limit
         });
 
-        let _response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
+        let response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
 
-        Ok(vec![])
+        let tokens = parse_tokens(&response);
+        {
+            let mut cache = self.cache.write().await;
+            for t in &tokens {
+                cache.tokens.insert(t.id.clone(), CachedItem::new(t.clone(), self.config.cache_ttl.as_secs() as i64));
+            }
+        }
+        Ok(tokens)
     }
 
     // =============================================================================
@@ -348,9 +380,14 @@ impl DEXClient {
             "first": limit
         });
 
-        let _response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
+        let response: serde_json::Value = self.query_subgraph(PANCAKE_BSC_V2, query, variables).await?;
 
-        Ok(vec![])
+        let swaps = parse_swaps(&response);
+        {
+            let mut cache = self.cache.write().await;
+            cache.swaps.insert(pair_id.to_string(), CachedItem::new(swaps.clone(), self.config.cache_ttl.as_secs() as i64));
+        }
+        Ok(swaps)
     }
 
     // =============================================================================
@@ -382,19 +419,38 @@ impl DEXClient {
             }
         "#;
 
-        let _response: serde_json::Value = self.query_subgraph(endpoint, query, serde_json::json!({})).await?;
+        let response: serde_json::Value = self.query_subgraph(endpoint, query, serde_json::json!({})).await?;
+
+        // Aggregate factory-level stats from the GraphQL response.
+        let factories = response.pointer("/data/factories").and_then(|v| v.as_array());
+        let (total_pairs, total_volume_24h, total_liquidity, total_swaps_24h) = factories
+            .map(|arr| {
+                arr.iter().fold((0u64, 0.0f64, 0.0f64, 0i64), |(p, v, l, s), f| {
+                    (
+                        p + f.get("poolCount").and_then(as_f64).unwrap_or(0.0) as u64,
+                        v + f.get("totalVolumeUSD").and_then(as_f64).unwrap_or(0.0),
+                        l + f.get("totalLiquidityUSD").and_then(as_f64).unwrap_or(0.0),
+                        s + f.get("txCount").and_then(as_f64).unwrap_or(0.0) as i64,
+                    )
+                })
+            })
+            .unwrap_or((0, 0.0, 0.0, 0));
+
+        let top_pairs = parse_pairs(&response);
+        let top_tokens = parse_tokens(&response);
+        let total_tokens = top_tokens.len() as u64;
 
         Ok(DEXAnalytics {
             protocol,
             chain_id: chain,
-            total_pairs: 0,
-            total_tokens: 0,
-            total_volume_24h: 0.0,
-            total_volume_7d: 0.0,
-            total_liquidity: 0.0,
-            total_swaps_24h: 0,
-            top_pairs: vec![],
-            top_tokens: vec![],
+            total_pairs,
+            total_tokens,
+            total_volume_24h,
+            total_volume_7d: total_volume_24h, // 7d not directly available from factories
+            total_liquidity,
+            total_swaps_24h,
+            top_pairs,
+            top_tokens,
         })
     }
 
@@ -403,7 +459,7 @@ impl DEXClient {
     // =============================================================================
 
     /// Query subgraph
-    async fn query_subgraph(
+    pub(crate) async fn query_subgraph(
         &self,
         endpoint: &str,
         query: &str,
@@ -455,12 +511,147 @@ impl DEXClient {
 }
 
 // =============================================================================
+// RESPONSE PARSING
+// =============================================================================
+
+/// Coerce a JSON number/string into f64.
+fn as_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+}
+
+/// Coerce a JSON number/string into i64.
+fn as_i64(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+/// Coerce a JSON number/string into u8.
+fn as_u8(v: &serde_json::Value) -> Option<u8> {
+    v.as_u64()
+        .and_then(|n| u8::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.parse::<u8>().ok()))
+}
+
+fn str_or_empty(v: &serde_json::Value) -> String {
+    v.as_str().unwrap_or("0").to_string()
+}
+
+/// Parse a single pair object from a subgraph response.
+pub(crate) fn parse_pair(v: &serde_json::Value) -> DEXPair {
+    let token0 = v.get("token0").cloned().unwrap_or_default();
+    let token1 = v.get("token1").cloned().unwrap_or_default();
+    let reserve0 = str_or_empty(v.get("reserve0").unwrap_or(&serde_json::Value::Null));
+    let reserve1 = str_or_empty(v.get("reserve1").unwrap_or(&serde_json::Value::Null));
+    let volume_usd = v.get("volumeUSD").and_then(as_f64).unwrap_or(0.0);
+    let reserve0_f = reserve0.parse::<f64>().unwrap_or(0.0);
+    let reserve1_f = reserve1.parse::<f64>().unwrap_or(0.0);
+    DEXPair {
+        id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        token0: token0.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        token1: token1.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        token0_symbol: token0.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        token1_symbol: token1.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        token0_decimals: as_u8(token0.get("decimals").unwrap_or(&serde_json::Value::Null)).unwrap_or(18),
+        token1_decimals: as_u8(token1.get("decimals").unwrap_or(&serde_json::Value::Null)).unwrap_or(18),
+        reserve0,
+        reserve1,
+        liquidity_usd: volume_usd, // approximate
+        volume_24h: volume_usd,
+        volume_7d: v.get("volumeUSD7d").and_then(as_f64).unwrap_or(volume_usd),
+        tx_count_24h: as_i64(v.get("txCount").unwrap_or(&serde_json::Value::Null)).unwrap_or(0),
+        tx_count_7d: as_i64(v.get("txCount").unwrap_or(&serde_json::Value::Null)).unwrap_or(0),
+        price: if reserve1_f > 0.0 { reserve0_f / reserve1_f } else { 0.0 },
+        price_change_24h: 0.0,
+        fees_24h: volume_usd * 0.0025, // 0.25% default fee tier
+        token0_price: if reserve1_f > 0.0 { reserve1_f / reserve0_f } else { 0.0 },
+        token1_price: if reserve0_f > 0.0 { reserve0_f / reserve1_f } else { 0.0 },
+        created_at_block: 0,
+        created_at_timestamp: v
+            .get("createdAtTimestamp")
+            .and_then(as_i64)
+            .unwrap_or(0),
+    }
+}
+
+/// Parse all pairs from `data.pairs`.
+pub(crate) fn parse_pairs(response: &serde_json::Value) -> Vec<DEXPair> {
+    response
+        .pointer("/data/pairs")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_pair).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a single token object.
+fn parse_token(v: &serde_json::Value) -> DEXToken {
+    DEXToken {
+        id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        symbol: v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        decimals: as_u8(v.get("decimals").unwrap_or(&serde_json::Value::Null)).unwrap_or(18),
+        total_supply: str_or_empty(v.get("totalSupply").unwrap_or(&serde_json::Value::Null)),
+        pairs0: vec![],
+        pairs1: vec![],
+        volume_usd_24h: v.get("volumeUSD").and_then(as_f64).unwrap_or(0.0),
+        liquidity_usd: 0.0,
+        tx_count_24h: as_i64(v.get("txCount").unwrap_or(&serde_json::Value::Null)).unwrap_or(0),
+    }
+}
+
+/// Parse all tokens from `data.tokens`.
+fn parse_tokens(response: &serde_json::Value) -> Vec<DEXToken> {
+    response
+        .pointer("/data/tokens")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_token).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a single swap object.
+fn parse_swap(v: &serde_json::Value) -> DEXSwap {
+    let pair_id = v
+        .get("pair")
+        .and_then(|p| p.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tx = v.get("transaction").cloned().unwrap_or_default();
+    DEXSwap {
+        id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        pair_id,
+        timestamp: as_i64(v.get("timestamp").unwrap_or(&serde_json::Value::Null)).unwrap_or(0),
+        token0_in: String::new(),
+        token0_out: String::new(),
+        token1_in: String::new(),
+        token1_out: String::new(),
+        sender: v.get("sender").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        recipient: v.get("to").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        origin: v.get("origin").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        amount0_in: str_or_empty(v.get("amount0In").unwrap_or(&serde_json::Value::Null)),
+        amount1_in: str_or_empty(v.get("amount1In").unwrap_or(&serde_json::Value::Null)),
+        amount0_out: str_or_empty(v.get("amount0Out").unwrap_or(&serde_json::Value::Null)),
+        amount1_out: str_or_empty(v.get("amount1Out").unwrap_or(&serde_json::Value::Null)),
+        transaction_hash: tx.get("hash").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        log_index: 0,
+    }
+}
+
+/// Parse all swaps from `data.swaps`.
+pub(crate) fn parse_swaps(response: &serde_json::Value) -> Vec<DEXSwap> {
+    response
+        .pointer("/data/swaps")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_swap).collect())
+        .unwrap_or_default()
+}
+
+// =============================================================================
 // BUILDER
 // =============================================================================
 
 /// Builder for DEX client
 pub struct DEXClientBuilder {
-    config: ClientConfig,
+    pub(crate) config: ClientConfig,
 }
 
 impl DEXClientBuilder {
@@ -507,7 +698,7 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let client = DEXClient::new();
-        assert!(!client.http.timeout().is_zero());
+        assert!(!client.config.timeout.is_zero());
     }
 
     #[test]

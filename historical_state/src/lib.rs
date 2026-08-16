@@ -128,6 +128,8 @@ pub struct StoredSlot {
 pub struct HistoricalIndexer {
     /// RPC endpoint for state queries
     rpc_url: String,
+    /// Blocking HTTP client for synchronous JSON-RPC calls
+    http: reqwest::blocking::Client,
     /// Cache of recent states
     state_cache: HashMap<String, AccountState>,
     /// Balance history cache
@@ -163,8 +165,13 @@ impl Default for IndexerStats {
 impl HistoricalIndexer {
     /// Create new historical indexer
     pub fn new(rpc_url: String) -> Self {
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
             rpc_url,
+            http,
             state_cache: HashMap::new(),
             balance_cache: HashMap::new(),
             storage_cache: HashMap::new(),
@@ -173,85 +180,138 @@ impl HistoricalIndexer {
         }
     }
 
-    /// Get account state at block
+    /// Issue a synchronous JSON-RPC call and return the `result` field.
+    fn rpc<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T, HistoricalStateError> {
+        if self.rpc_url.is_empty() {
+            return Err(HistoricalStateError::QueryError(
+                "no rpc_url configured".to_string(),
+            ));
+        }
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let resp: serde_json::Value = self
+            .http
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .map_err(|e| HistoricalStateError::QueryError(format!("RPC request failed: {e}")))?
+            .json()
+            .map_err(|e| HistoricalStateError::QueryError(format!("RPC parse failed: {e}")))?;
+        if let Some(err) = resp.get("error") {
+            return Err(HistoricalStateError::QueryError(format!("RPC error: {err}")));
+        }
+        let result = resp
+            .get("result")
+            .ok_or_else(|| HistoricalStateError::QueryError(format!("missing result: {resp}")))?;
+        serde_json::from_value(result.clone())
+            .map_err(|e| HistoricalStateError::QueryError(format!("decode failed: {e}")))
+    }
+
+    /// Get account state at block via eth_getProof + eth_getCode.
     pub fn get_account_at_block(&mut self, address: &str, block_number: u64) -> Result<AccountState, HistoricalStateError> {
         self.stats.total_queries += 1;
-        
+
         let cache_key = format!("{}:{}", address, block_number);
-        
-        // Check cache
+
         if let Some(state) = self.state_cache.get(&cache_key) {
             self.stats.cache_hits += 1;
             return Ok(state.clone());
         }
-        
+
         self.stats.cache_misses += 1;
-        
-        // In production, this would call getProof RPC
-        // For now, create a mock state
+
+        let block_param = serde_json::Value::String(format!("0x{:x}", block_number));
+        let proof: serde_json::Value = self.rpc(
+            "eth_getProof",
+            serde_json::json!([address, [], block_param]),
+        )?;
+        let balance = proof.get("balance").and_then(|v| v.as_str()).unwrap_or("0x0").to_string();
+        let nonce = proof.get("nonce").and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0);
+        let code_hash = proof.get("codeHash").and_then(|v| v.as_str())
+            .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000")
+            .to_string();
+        let storage_root = proof.get("storageHash").and_then(|v| v.as_str())
+            .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000")
+            .to_string();
+
+        let code: Option<String> = self
+            .rpc::<String>("eth_getCode", serde_json::json!([address, block_param]))
+            .ok()
+            .and_then(|c| if c == "0x" || c.is_empty() { None } else { Some(c) });
+
         let state = AccountState {
             address: address.to_string(),
             block_number,
-            nonce: 0,
-            balance: "0x0".to_string(),
-            code_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            storage_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            code: None,
+            nonce,
+            balance,
+            code_hash,
+            storage_root,
+            code,
             timestamp: now_unix(),
         };
-        
-        // Cache it
+
         if self.state_cache.len() >= self.max_cache_size {
-            // Remove oldest
             if let Some(first) = self.state_cache.keys().next().cloned() {
                 self.state_cache.remove(&first);
             }
         }
         self.state_cache.insert(cache_key, state.clone());
-        
+
         Ok(state)
     }
 
-    /// Get historical balance
+    /// Get historical balance via eth_getBalance.
     pub fn get_balance_at_block(&mut self, address: &str, block_number: u64) -> Result<HistoricalBalance, HistoricalStateError> {
         self.stats.total_queries += 1;
-        
+
         let cache_key = format!("{}:{}", address, block_number);
-        
-        // Check balance cache
+
         if let Some(balances) = self.balance_cache.get(&cache_key) {
             if let Some(balance) = balances.last() {
                 self.stats.cache_hits += 1;
                 return Ok(balance.clone());
             }
         }
-        
+
         self.stats.cache_misses += 1;
-        
-        // In production, query from state trie
+
+        let block_param = serde_json::Value::String(format!("0x{:x}", block_number));
+        let balance_hex: String = self.rpc("eth_getBalance", serde_json::json!([address, block_param]))?;
+        let block: serde_json::Value = self.rpc("eth_getBlockByNumber", serde_json::json!([block_param, false]))
+            .unwrap_or(serde_json::Value::Null);
+        let block_hash = block.get("hash").and_then(|v| v.as_str())
+            .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000")
+            .to_string();
+
         let balance = HistoricalBalance {
             address: address.to_string(),
-            balance: "0x0".to_string(),
+            balance: balance_hex,
             block_number,
-            block_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            block_hash,
             timestamp: now_unix(),
         };
-        
-        // Cache it
-        self.balance_cache.entry(cache_key)
-            .or_insert_with(Vec::new)
-            .push(balance.clone());
-        
+
+        self.balance_cache.entry(cache_key).or_insert_with(Vec::new).push(balance.clone());
+
         Ok(balance)
     }
 
-    /// Get storage slot at block
+    /// Get storage slot at block via eth_getStorageAt.
     pub fn get_storage_at_block(&mut self, address: &str, slot: &str, block_number: u64) -> Result<StorageSlot, HistoricalStateError> {
         self.stats.total_queries += 1;
-        
+
         let cache_key = format!("{}:{}:{}", address, slot, block_number);
-        
-        // Check storage cache
+
         if let Some(address_cache) = self.storage_cache.get(address) {
             if let Some(value) = address_cache.get(&format!("{}:{}", slot, block_number)) {
                 self.stats.cache_hits += 1;
@@ -265,43 +325,55 @@ impl HistoricalIndexer {
                 });
             }
         }
-        
+
         self.stats.cache_misses += 1;
-        
+
+        let block_param = serde_json::Value::String(format!("0x{:x}", block_number));
+        let slot_key = normalize_slot_key(slot);
+        let value: String = self.rpc("eth_getStorageAt", serde_json::json!([address, slot_key, block_param]))?;
+        let value = if value.is_empty() {
+            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
+        } else {
+            value
+        };
+
         let slot_data = StorageSlot {
             address: address.to_string(),
             slot: slot.to_string(),
             key: slot.to_string(),
-            value: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            value: value.clone(),
             block_number,
             timestamp: now_unix(),
         };
-        
-        // Cache it
-        self.storage_cache.entry(address.to_string())
+
+        self.storage_cache
+            .entry(address.to_string())
             .or_insert_with(HashMap::new)
-            .insert(format!("{}:{}", slot, block_number), slot_data.value.clone());
-        
+            .insert(format!("{}:{}", slot, block_number), value);
+
         Ok(slot_data)
     }
 
-    /// Generate state proof
+    /// Generate state proof via eth_getProof.
     pub fn get_state_proof(&self, address: &str, block_number: u64, storage_keys: &[String]) -> Result<StateProof, HistoricalStateError> {
-        // Generate account proof
-        let account_proof = vec![
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        ];
-        
-        // Generate storage proofs
-        let storage_proof: Vec<StorageProof> = storage_keys.iter().map(|key| {
-            StorageProof {
-                key: key.clone(),
-                value: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-                proof: vec![],
-            }
-        }).collect();
-        
+        let block_param = serde_json::Value::String(format!("0x{:x}", block_number));
+        let normalized_keys: Vec<String> = storage_keys.iter().map(|k| normalize_slot_key(k)).collect();
+        let proof: serde_json::Value = self.rpc("eth_getProof", serde_json::json!([address, normalized_keys, block_param]))?;
+
+        let account_proof: Vec<String> = proof.get("accountProof").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(|p| p.as_str().unwrap_or("").to_string()).collect())
+            .unwrap_or_default();
+
+        let storage_proof: Vec<StorageProof> = proof.get("storageProof").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(|p| StorageProof {
+                key: p.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                value: p.get("value").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
+                proof: p.get("proof").and_then(|v| v.as_array())
+                    .map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect())
+                    .unwrap_or_default(),
+            }).collect())
+            .unwrap_or_default();
+
         Ok(StateProof {
             address: address.to_string(),
             block_number,
@@ -310,16 +382,22 @@ impl HistoricalIndexer {
         })
     }
 
-    /// Get block state
+    /// Get block state via eth_getBlockByNumber.
     pub fn get_block_state(&self, block_number: u64) -> Result<BlockState, HistoricalStateError> {
+        let block_param = serde_json::Value::String(format!("0x{:x}", block_number));
+        let block: serde_json::Value = self.rpc("eth_getBlockByNumber", serde_json::json!([block_param, false]))?;
+        if block.is_null() {
+            return Err(HistoricalStateError::BlockNotFound(block_number));
+        }
         Ok(BlockState {
             block_number,
-            block_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            state_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            transaction_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            receipts_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            total_difficulty: "0x0".to_string(),
-            timestamp: now_unix(),
+            block_hash: block.get("hash").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
+            state_root: block.get("stateRoot").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
+            transaction_root: block.get("transactionsRoot").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
+            receipts_root: block.get("receiptsRoot").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
+            total_difficulty: block.get("totalDifficulty").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
+            timestamp: block.get("timestamp").and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0),
         })
     }
 
@@ -407,4 +485,69 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// Normalize a storage slot key into a 0x-prefixed 32-byte hex string.
+/// Accepts decimal or hex input and left-pads to 32 bytes for eth_getStorageAt.
+fn normalize_slot_key(slot: &str) -> String {
+    let trimmed = slot.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x") {
+        let clean = hex.trim_start_matches('0');
+        if clean.is_empty() {
+            return "0x0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        }
+        let padded = format!("{:0>64}", clean);
+        if padded.len() == 64 {
+            return format!("0x{padded}");
+        }
+        // too long; keep as-is (already a full hash)
+        return format!("0x{clean}");
+    }
+    // decimal input
+    if let Ok(n) = trimmed.parse::<u128>() {
+        return format!("0x{:064x}", n);
+    }
+    // fall back: pad whatever string we have
+    format!("0x{:0>64}", trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_slot_key_decimal() {
+        assert_eq!(
+            normalize_slot_key("0"),
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(
+            normalize_slot_key("1"),
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+        );
+    }
+
+    #[test]
+    fn test_normalize_slot_key_hex() {
+        assert_eq!(
+            normalize_slot_key("0x1"),
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        // a full 32-byte hash passes through unchanged (0x-prefixed)
+        let hash = "0xa9059cbb2ab094b4c47a900cf8077c98832f4a96b05b06d4ddbc8d2a97dbe3b7";
+        assert_eq!(normalize_slot_key(hash), hash);
+    }
+
+    #[test]
+    fn test_indexer_creation() {
+        let indexer = HistoricalIndexer::new("https://rpc.example.com".to_string());
+        assert_eq!(indexer.stats().total_queries, 0);
+    }
+
+    #[test]
+    fn test_empty_rpc_url_errors() {
+        let mut indexer = HistoricalIndexer::new(String::new());
+        let res = indexer.get_block_state(100);
+        assert!(res.is_err());
+    }
 }

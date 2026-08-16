@@ -2,6 +2,8 @@
 //! Aggregates data from multiple DEXs
 
 use crate::client::*;
+use crate::pancake::PancakeClient;
+use crate::uniswap::UniswapClient;
 use crate::types::*;
 use std::collections::HashMap;
 
