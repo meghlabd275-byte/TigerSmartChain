@@ -6,14 +6,32 @@
   --foreground-rgb: 0, 0, 0;
   --background-start-rgb: 249, 250, 251;
   --background-end-rgb: 249, 250, 251;
+  --card-bg: 255, 255, 255;
+  --card-border: 229, 231, 235;
+  --text-primary: 17, 24, 39;
+  --text-secondary: 107, 114, 128;
+  --accent: 20, 184, 166;
+  --input-bg: 249, 250, 251;
+  --input-border: 209, 213, 219;
+  --navbar-bg: 255, 255, 255;
+  --table-row-hover: 243, 244, 246;
+  --code-bg: 243, 244, 246;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --foreground-rgb: 255, 255, 255;
-    --background-start-rgb: 15, 23, 42;
-    --background-end-rgb: 15, 23, 42;
-  }
+.dark {
+  --foreground-rgb: 255, 255, 255;
+  --background-start-rgb: 15, 23, 42;
+  --background-end-rgb: 15, 23, 42;
+  --card-bg: 30, 41, 59;
+  --card-border: 51, 65, 85;
+  --text-primary: 248, 250, 252;
+  --text-secondary: 148, 163, 184;
+  --accent: 20, 184, 166;
+  --input-bg: 30, 41, 59;
+  --input-border: 51, 65, 85;
+  --navbar-bg: 15, 23, 42;
+  --table-row-hover: 30, 41, 59;
+  --code-bg: 30, 41, 59;
 }
 
 body {
@@ -25,6 +43,7 @@ body {
     )
     rgb(var(--background-start-rgb));
   font-feature-settings: 'rlig' 1, 'calt' 1;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 /* Custom scrollbar */
@@ -33,12 +52,21 @@ body {
   height: 8px;
 }
 
-::-webkit-scrollbar-track {
+.light ::-webkit-scrollbar-track {
   background: #f1f5f9;
 }
 
-::-webkit-scrollbar-thumb {
+.light ::-webkit-scrollbar-thumb {
   background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.dark ::-webkit-scrollbar-track {
+  background: #1e293b;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #475569;
   border-radius: 4px;
 }
 
@@ -56,6 +84,14 @@ body {
 .dark .glass {
   background: rgba(15, 23, 42, 0.7);
   border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Card */
+.card {
+  background: rgb(var(--card-bg));
+  border: 1px solid rgb(var(--card-border));
+  border-radius: 0.75rem;
+  transition: background-color 0.3s ease, border-color 0.3s ease;
 }
 
 /* Gradient text */
@@ -81,11 +117,20 @@ body {
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
 }
 
+.dark .card-hover:hover {
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+}
+
 /* Skeleton loading */
 .skeleton {
   background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
   background-size: 200% 100%;
   animation: skeleton-loading 1.5s infinite;
+}
+
+.dark .skeleton {
+  background: linear-gradient(90deg, #1e293b 25%, #334155 50%, #1e293b 75%);
+  background-size: 200% 100%;
 }
 
 @keyframes skeleton-loading {

@@ -21,6 +21,13 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var t=localStorage.getItem('tigersmartchain-theme');var theme=t?JSON.parse(t).state?.theme:'dark';var root=document.documentElement;root.classList.remove('light','dark');root.classList.add(theme||'dark');}catch(e){document.documentElement.classList.add('dark');}})();`,
+          }}
+        />
+      </head>
       <body className={inter.className}>
         <Providers>
           <div className="min-h-screen flex flex-col bg-gray-50 dark:bg-dark-900">
