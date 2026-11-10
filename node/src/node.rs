@@ -48,6 +48,9 @@ pub struct TigerNode {
     /// Node state
     state: RwLock<NodeState>,
 
+    /// Genesis definition this chain was started from.
+    genesis: Genesis,
+
     /// Chain manager (locked for concurrent access from async tasks)
     chain_manager: tokio::sync::Mutex<ChainManager>,
 
@@ -78,9 +81,38 @@ impl TigerNode {
         // Set initial state
         let state = RwLock::new(NodeState::Starting);
 
-        // Initialize the world state (trie-backed accounts).
-        let world_state = tokio::sync::Mutex::new(WorldState::new());
-        info!("World state initialized");
+        // Initialize the world state (trie-backed accounts) and apply the
+        // genesis allocation. Without this every pre-funded account would
+        // start empty, so no transaction could ever pay for gas.
+        let mut world_state = WorldState::new();
+        let genesis = load_genesis(&config)?;
+        for (address, account) in &genesis.alloc {
+            let parsed = match parse_address(address) {
+                Ok(address) => address,
+                Err(e) => {
+                    warn!("skipping genesis account {address}: {e}");
+                    continue;
+                }
+            };
+            if let Some(balance) = parse_genesis_balance(&account.balance) {
+                world_state.set_balance(&parsed, balance);
+            } else {
+                warn!("skipping genesis balance for {address}: not a valid amount");
+            }
+            if let Some(nonce) = account.nonce {
+                world_state.set_nonce(&parsed, nonce);
+            }
+            if let Some(code) = &account.code {
+                if let Ok(bytes) = hex_decode_checked(code) {
+                    world_state.set_code(&parsed, bytes);
+                }
+            }
+        }
+        let world_state = tokio::sync::Mutex::new(world_state);
+        info!(
+            "World state initialized with {} genesis account(s)",
+            genesis.alloc.len()
+        );
 
         // Initialize blockchain chain manager with config
         let chain_config = ChainConfig {
@@ -94,13 +126,25 @@ impl TigerNode {
         let mempool = Mempool::new();
         info!("Mempool initialized");
 
-        // Initialize PoSA consensus
-        let consensus = PoSA::new(
+        // Initialize PoSA consensus and register the validator set. Without
+        // at least one registered validator the engine has no proposer, so no
+        // block would ever be produced.
+        let mut consensus = PoSA::new(
             config.chain_id,
             config.epoch_length,
             config.slot_duration_secs,
         );
-        info!("Consensus engine initialized");
+        for validator in &config.validators {
+            if !consensus.register_validator(validator.clone(), tiger_consensus::posa::MIN_STAKE) {
+                warn!("ignoring validator {validator}: invalid address or duplicate");
+            }
+        }
+        if config.validators.is_empty() {
+            info!("No validators configured; this node will follow the chain but not propose blocks");
+        } else {
+            info!("Consensus engine initialized with {} validator(s)", config.validators.len());
+        }
+        consensus.update_epoch(0);
 
         // Initialize network sync status
         let sync_status = RwLock::new(SyncStatus::default());
@@ -110,6 +154,7 @@ impl TigerNode {
 
         Ok(Self {
             config,
+            genesis,
             state,
             chain_manager: tokio::sync::Mutex::new(chain_manager),
             world_state,
@@ -159,7 +204,7 @@ impl TigerNode {
             let mut cm = self.chain_manager.lock().await;
             if cm.chain().is_empty() {
                 info!("Chain is empty — installing genesis block");
-                let genesis_config = create_genesis_block(self.config.chain_id);
+                let genesis_config = self.genesis.clone();
                 cm.chain_mut().set_genesis(genesis_config.clone());
 
                 let genesis_block = genesis_block_from(&genesis_config);
@@ -180,6 +225,20 @@ impl TigerNode {
 
         // Spawn sync status monitor
         self.spawn_sync_monitor();
+
+        // Start the JSON-RPC server so wallets and the explorer can reach the
+        // chain. Without it the node has no client interface at all.
+        if self.config.rpc_enabled {
+            let node = Arc::clone(self);
+            let addr = self.config.rpc_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::rpc_server::serve(Arc::clone(&node), addr.clone()).await {
+                    error!("JSON-RPC server on {addr} stopped: {e}");
+                }
+            });
+        } else {
+            info!("RPC is disabled by configuration; no client interface will be served");
+        }
 
         info!("All node components started successfully");
         Ok(())
@@ -352,7 +411,6 @@ impl TigerNode {
         self.chain_manager.lock().await
     }
 
-    /// Get the state trie instance.
     /// Access the world state.
     pub fn world_state(&self) -> &tokio::sync::Mutex<WorldState> {
         &self.world_state
@@ -413,6 +471,88 @@ fn create_genesis_block(chain_id: u64) -> Genesis {
         coinbase: "0x0000000000000000000000000000000000000000".to_string(),
         alloc: HashMap::new(),
     }
+}
+
+/// Load the genesis definition.
+///
+/// When `--genesis-file` is set the file is read and parsed; a missing or
+/// malformed file is a fatal error rather than a silent fall back to the
+/// built-in genesis, because starting a chain with the wrong genesis would
+/// fork it from every other node.
+fn load_genesis(config: &Config) -> Result<Genesis> {
+    let Some(path) = &config.genesis_file else {
+        return Ok(create_genesis_block(config.chain_id));
+    };
+
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read genesis file {path}"))?;
+    let genesis: Genesis = serde_json::from_str(&contents)
+        .with_context(|| format!("cannot parse genesis file {path}"))?;
+
+    if genesis.config.chain_id != config.chain_id {
+        anyhow::bail!(
+            "genesis file {path} declares chain id {}, but the node is configured for {}",
+            genesis.config.chain_id,
+            config.chain_id
+        );
+    }
+    info!("Loaded genesis from {path}");
+    Ok(genesis)
+}
+
+/// Parse a genesis balance, accepting both decimal and `0x`-prefixed hex.
+fn parse_genesis_balance(value: &str) -> Option<[u8; 32]> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        // A balance is an integer, so an odd digit count is legitimate and
+        // must be left-padded: 1 TGR is `0xde0b6b3a7640000`, which has 15
+        // digits. Only code (a byte string) requires an even count.
+        let padded = if hex.len() % 2 != 0 {
+            format!("0{hex}")
+        } else {
+            hex.to_string()
+        };
+        let bytes = hex_decode_checked(&padded).ok()?;
+        if bytes.len() > 32 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        out[32 - bytes.len()..].copy_from_slice(&bytes);
+        return Some(out);
+    }
+    // Decimal: accumulate into a 256-bit big-endian value.
+    let mut out = [0u8; 32];
+    for digit in value.bytes() {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        // out = out * 10 + digit
+        let mut carry = (digit - b'0') as u32;
+        for byte in out.iter_mut().rev() {
+            let product = (*byte as u32) * 10 + carry;
+            *byte = (product & 0xff) as u8;
+            carry = product >> 8;
+        }
+        if carry != 0 {
+            return None; // overflowed 256 bits
+        }
+    }
+    Some(out)
+}
+
+/// Decode hex strictly, rejecting a missing `0x` prefix and odd lengths.
+fn hex_decode_checked(value: &str) -> Result<Vec<u8>, String> {
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    if trimmed.len() % 2 != 0 {
+        return Err("odd number of hex digits".to_string());
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let bytes = trimmed.as_bytes();
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16).ok_or("invalid hex digit")?;
+        let lo = (pair[1] as char).to_digit(16).ok_or("invalid hex digit")?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
 }
 
 /// Build the genesis block from its configuration.
@@ -677,6 +817,7 @@ mod tests {
     use super::*;
     use tiger_blockchain::types::Transaction;
     use tiger_blockchain::{block_hash, sign_transaction, transactions_root};
+    use tiger_consensus::posa::MIN_STAKE;
     use tiger_state::account::{u256_from_u64, WorldState};
 
     #[tokio::test]
@@ -684,6 +825,49 @@ mod tests {
         let config = Config::default_mainnet();
         let node = TigerNode::new(config).await.expect("node must initialize");
         assert!(!node.is_running().await, "a new node is not running");
+    }
+
+    #[test]
+    fn genesis_balances_parse_in_decimal_and_hex() {
+        // 1 TGR = 10^18.
+        assert_eq!(
+            parse_genesis_balance("1000000000000000000"),
+            Some(u256_from_u64(1_000_000_000_000_000_000))
+        );
+        assert_eq!(parse_genesis_balance("0xde0b6b3a7640000"), Some({
+            let mut v = [0u8; 32];
+            v[24..].copy_from_slice(&0x0de0b6b3a7640000u64.to_be_bytes());
+            v
+        }));
+        assert_eq!(parse_genesis_balance("0"), Some([0u8; 32]));
+        // Rejected inputs.
+        assert_eq!(parse_genesis_balance("12x4"), None);
+        assert_eq!(parse_genesis_balance("-5"), None);
+        // A value wider than 256 bits must not silently truncate.
+        assert_eq!(parse_genesis_balance(&"9".repeat(100)), None);
+    }
+
+    #[test]
+    fn hex_decoding_is_strict_about_odd_lengths() {
+        assert_eq!(hex_decode_checked("0x1234").unwrap(), vec![0x12, 0x34]);
+        assert!(hex_decode_checked("0x123").is_err());
+        assert!(hex_decode_checked("0xzz").is_err());
+    }
+
+    #[test]
+    fn a_configured_validator_set_produces_blocks() {
+        // With a validator registered, the engine names a proposer for every
+        // height; with none it never does, which is why no block would be
+        // produced.
+        let mut consensus = PoSA::new(6666, 200, 3);
+        assert_eq!(consensus.get_proposer(1), None);
+
+        consensus.register_validator("0x1111111111111111111111111111111111111111".to_string(), MIN_STAKE);
+        consensus.update_epoch(0);
+        assert_eq!(
+            consensus.get_proposer(1),
+            Some("0x1111111111111111111111111111111111111111".to_string())
+        );
     }
 
     #[test]

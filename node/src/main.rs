@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 
 mod config;
 mod node;
+mod rpc_server;
 
 pub use config::Config;
 pub use node::TigerNode;
@@ -87,6 +88,11 @@ struct Args {
     /// Validator address
     #[arg(long)]
     validator_addr: Option<String>,
+
+    /// Comma-separated validator addresses that may propose blocks. Without
+    /// any, this node follows the chain but never produces a block.
+    #[arg(long, value_delimiter = ',')]
+    validators: Vec<String>,
 
     /// Validator private key (hex)
     #[arg(long)]
@@ -166,6 +172,7 @@ async fn main() -> Result<()> {
         args.cache_size,
         args.validator_addr,
         args.validator_key,
+        args.validators,
         args.epoch_length,
         args.slot_duration_secs,
         args.metrics_enabled,

@@ -5,7 +5,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Reward paid to the proposer of each block, in wei: 2 TGR.
-pub const DEFAULT_BLOCK_REWARD: u64 = 2_000_000_000_000_000_000;
+pub const DEFAULT_BLOCK_REWARD: u128 = 2_000_000_000_000_000_000;
+/// Floor gas price reported on an empty chain, in wei: 1 Gwei.
+pub const DEFAULT_MIN_GAS_PRICE: u64 = 1_000_000_000;
+/// Gas ceiling for read-only calls: 50 million.
+pub const DEFAULT_CALL_GAS_LIMIT: u64 = 50_000_000;
 
 /// Node configuration holding all settings for the TigerSmartChain node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +39,15 @@ pub struct Config {
     pub epoch_length: u64,
     pub slot_duration_secs: u64,
     /// Reward paid to the proposer of each block, in wei.
-    pub block_reward: u64,
+    pub block_reward: u128,
+    /// Addresses that may propose blocks, each staked at the consensus
+    /// minimum. An empty list means this node is not a validator and will
+    /// follow the chain without producing blocks.
+    pub validators: Vec<String>,
+    /// Floor reported by `eth_gasPrice` on an empty chain, in wei.
+    pub min_gas_price: u64,
+    /// Gas ceiling for `eth_call` and `eth_estimateGas`.
+    pub call_gas_limit: u64,
 
     /// Metrics settings
     pub metrics_enabled: bool,
@@ -62,6 +74,7 @@ impl Config {
         cache_size: usize,
         validator_addr: Option<String>,
         validator_key: Option<String>,
+        validators: Vec<String>,
         epoch_length: u64,
         slot_duration_secs: u64,
         metrics_enabled: bool,
@@ -82,9 +95,14 @@ impl Config {
             cache_size,
             validator_addr,
             validator_key,
+            validators,
             epoch_length,
             slot_duration_secs,
             block_reward: DEFAULT_BLOCK_REWARD,
+            min_gas_price: DEFAULT_MIN_GAS_PRICE,
+            call_gas_limit: DEFAULT_CALL_GAS_LIMIT,
+            
+            
             metrics_enabled,
             metrics_addr,
             genesis_file,
@@ -110,6 +128,11 @@ impl Config {
             epoch_length: 200,
             slot_duration_secs: 3,
             block_reward: DEFAULT_BLOCK_REWARD,
+            validators: Vec::new(),
+            min_gas_price: DEFAULT_MIN_GAS_PRICE,
+            call_gas_limit: DEFAULT_CALL_GAS_LIMIT,
+            
+            
             metrics_enabled: false,
             metrics_addr: ":9090".to_string(),
             genesis_file: None,
@@ -135,6 +158,11 @@ impl Config {
             epoch_length: 200,
             slot_duration_secs: 3,
             block_reward: DEFAULT_BLOCK_REWARD,
+            validators: Vec::new(),
+            min_gas_price: DEFAULT_MIN_GAS_PRICE,
+            call_gas_limit: DEFAULT_CALL_GAS_LIMIT,
+            
+            
             metrics_enabled: false,
             metrics_addr: ":9090".to_string(),
             genesis_file: None,

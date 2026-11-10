@@ -25,8 +25,11 @@ pub struct PoSA {
     validator_registry: HashMap<String, Validator>,
     /// Last epoch updated
     last_epoch: u64,
-    /// Block rewards for current epoch
-    pending_rewards: HashMap<String, u64>,
+    /// Block rewards accrued in the current epoch, in wei.
+    ///
+    /// Held as `u128`: a wei-denominated reward overflows `u64` after only a
+    /// handful of blocks, which would panic the block producer.
+    pending_rewards: HashMap<String, u128>,
 }
 
 impl PoSA {
@@ -73,7 +76,7 @@ impl PoSA {
     /// Returns the rewards accrued during the epoch that just ended, so the
     /// caller can credit them to the real world state. The map is empty when
     /// no new epoch began.
-    pub fn update_epoch(&mut self, block_number: u64) -> HashMap<String, u64> {
+    pub fn update_epoch(&mut self, block_number: u64) -> HashMap<String, u128> {
         let current_epoch = block_number / self.epoch_length;
         if current_epoch <= self.last_epoch && !self.validators.is_empty() {
             return HashMap::new();
@@ -118,9 +121,14 @@ impl PoSA {
         Some(self.validators[index].clone())
     }
 
-    /// Process block reward for the proposer
-    pub fn record_block_reward(&mut self, proposer: String, reward: u64) {
-        *self.pending_rewards.entry(proposer).or_insert(0) += reward;
+    /// Record a block reward for the proposer.
+    ///
+    /// Accumulation saturates rather than overflowing: a wei total can
+    /// realistically approach the ceiling, and a panic here would stop block
+    /// production entirely.
+    pub fn record_block_reward(&mut self, proposer: String, reward: u128) {
+        let entry = self.pending_rewards.entry(proposer).or_insert(0);
+        *entry = entry.saturating_add(reward);
     }
 
     /// Take the rewards accrued since the last epoch, leaving the ledger empty.
@@ -129,12 +137,12 @@ impl PoSA {
     /// the rewards itself. Returning them lets the caller credit the real
     /// world state; discarding them (as an earlier version did by clearing the
     /// map) would silently destroy every block reward ever earned.
-    pub fn take_pending_rewards(&mut self) -> HashMap<String, u64> {
+    pub fn take_pending_rewards(&mut self) -> HashMap<String, u128> {
         std::mem::take(&mut self.pending_rewards)
     }
 
     /// The rewards currently owed, without clearing them.
-    pub fn pending_rewards(&self) -> &HashMap<String, u64> {
+    pub fn pending_rewards(&self) -> &HashMap<String, u128> {
         &self.pending_rewards
     }
 
@@ -143,7 +151,7 @@ impl PoSA {
     /// The rewards are handed to the caller through
     /// [`PoSA::take_pending_rewards`]; this method is called at an epoch
     /// boundary so the caller can settle them before the new epoch begins.
-    fn distribute_rewards(&mut self) -> HashMap<String, u64> {
+    fn distribute_rewards(&mut self) -> HashMap<String, u128> {
         self.take_pending_rewards()
     }
 
@@ -231,6 +239,24 @@ mod tests {
         // Still in the same epoch: nothing is settled.
         assert!(posa.update_epoch(5).is_empty());
         assert_eq!(posa.pending_rewards().get("0x1"), Some(&7));
+    }
+
+    #[test]
+    fn a_wei_reward_does_not_overflow_the_ledger() {
+        // 2 TGR per block in wei; a u64 ledger overflowed after ~9 blocks and
+        // panicked the block producer.
+        const TWO_TGR: u128 = 2_000_000_000_000_000_000;
+        let mut posa = PoSA::new(1, 1000, 3);
+        posa.register_validator("0x1".to_string(), MIN_STAKE);
+        posa.update_epoch(0);
+        for _ in 0..1000 {
+            posa.record_block_reward("0x1".to_string(), TWO_TGR);
+        }
+        assert_eq!(posa.pending_rewards().get("0x1"), Some(&(TWO_TGR * 1000)));
+        // Even past the u64 ceiling the total is exact, and saturation keeps
+        // it from wrapping.
+        posa.record_block_reward("0x1".to_string(), u128::MAX);
+        assert_eq!(posa.pending_rewards().get("0x1"), Some(&u128::MAX));
     }
 
     #[test]
