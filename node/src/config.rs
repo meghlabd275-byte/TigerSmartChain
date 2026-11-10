@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Reward paid to the proposer of each block, in wei: 2 TGR.
+pub const DEFAULT_BLOCK_REWARD: u64 = 2_000_000_000_000_000_000;
+
 /// Node configuration holding all settings for the TigerSmartChain node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -31,6 +34,8 @@ pub struct Config {
     pub validator_key: Option<String>,
     pub epoch_length: u64,
     pub slot_duration_secs: u64,
+    /// Reward paid to the proposer of each block, in wei.
+    pub block_reward: u64,
 
     /// Metrics settings
     pub metrics_enabled: bool,
@@ -79,6 +84,7 @@ impl Config {
             validator_key,
             epoch_length,
             slot_duration_secs,
+            block_reward: DEFAULT_BLOCK_REWARD,
             metrics_enabled,
             metrics_addr,
             genesis_file,
@@ -103,6 +109,7 @@ impl Config {
             validator_key: None,
             epoch_length: 200,
             slot_duration_secs: 3,
+            block_reward: DEFAULT_BLOCK_REWARD,
             metrics_enabled: false,
             metrics_addr: ":9090".to_string(),
             genesis_file: None,
@@ -127,6 +134,7 @@ impl Config {
             validator_key: None,
             epoch_length: 200,
             slot_duration_secs: 3,
+            block_reward: DEFAULT_BLOCK_REWARD,
             metrics_enabled: false,
             metrics_addr: ":9090".to_string(),
             genesis_file: None,

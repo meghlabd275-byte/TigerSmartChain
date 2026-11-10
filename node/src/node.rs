@@ -214,12 +214,32 @@ impl TigerNode {
                     cm.chain().height() + 1
                 };
 
-                // Update consensus epoch and get proposer
-                let proposer = {
+                // Update the consensus epoch and get the proposer. When the
+                // call crosses an epoch boundary it returns the rewards earned
+                // during the epoch that just ended; those are credited to the
+                // real world state, since the consensus engine holds no
+                // balances of its own.
+                let (proposer, settled_rewards) = {
                     let mut consensus = node.consensus.lock().await;
-                    consensus.update_epoch(next_block);
-                    consensus.get_proposer(next_block)
+                    let settled = consensus.update_epoch(next_block);
+                    (consensus.get_proposer(next_block), settled)
                 };
+
+                if !settled_rewards.is_empty() {
+                    let mut world = node.world_state.lock().await;
+                    for (validator, reward) in &settled_rewards {
+                        if let Ok(address) = parse_address(validator) {
+                            world.credit(&address, &parse_u256(&format!("0x{reward:x}")));
+                        } else {
+                            warn!("cannot pay reward to unparseable validator {validator}");
+                        }
+                    }
+                    info!(
+                        "settled {} validator reward entries at block {}",
+                        settled_rewards.len(),
+                        next_block
+                    );
+                }
 
                 if let Some(proposer) = proposer {
                     if let Some(ref my_addr) = node.config.validator_addr {
@@ -247,6 +267,14 @@ impl TigerNode {
                             match result {
                                 Ok(block_hash) => {
                                     info!("Successfully produced block #{} (hash: {})", next_block, block_hash);
+                                    // Credit the proposer's pending reward.
+                                    {
+                                        let mut consensus = node.consensus.lock().await;
+                                        consensus.record_block_reward(
+                                            proposer.clone(),
+                                            node.config.block_reward,
+                                        );
+                                    }
                                     // Remove included txs from mempool
                                     let mut mempool = node.mempool.lock().await;
                                     for tx in &pending_txs {

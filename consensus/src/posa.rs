@@ -43,9 +43,16 @@ impl PoSA {
         }
     }
 
-    /// Register a new validator
+    /// Register a new validator.
+    ///
+    /// Returns false when the stake is below the minimum, or when the address
+    /// is already registered: overwriting an existing validator would silently
+    /// discard its accumulated delegated stake.
     pub fn register_validator(&mut self, address: String, stake: u64) -> bool {
         if stake < MIN_STAKE {
+            return false;
+        }
+        if self.validator_registry.contains_key(&address) {
             return false;
         }
 
@@ -61,15 +68,19 @@ impl PoSA {
         true
     }
 
-    /// Update validator set for a new epoch
-    pub fn update_epoch(&mut self, block_number: u64) {
+    /// Update the validator set for a new epoch.
+    ///
+    /// Returns the rewards accrued during the epoch that just ended, so the
+    /// caller can credit them to the real world state. The map is empty when
+    /// no new epoch began.
+    pub fn update_epoch(&mut self, block_number: u64) -> HashMap<String, u64> {
         let current_epoch = block_number / self.epoch_length;
         if current_epoch <= self.last_epoch && !self.validators.is_empty() {
-            return;
+            return HashMap::new();
         }
 
-        // Distribute pending rewards from previous epoch
-        self.distribute_rewards();
+        // Settle the rewards accrued during the epoch that just ended.
+        let settled = self.distribute_rewards();
 
         // Elect new validators based on total stake (stake + delegated)
         let mut candidates: Vec<_> = self.validator_registry.values()
@@ -95,6 +106,7 @@ impl PoSA {
         }
 
         self.last_epoch = current_epoch;
+        settled
     }
 
     /// Get the proposer for a given block number and timestamp
@@ -111,11 +123,28 @@ impl PoSA {
         *self.pending_rewards.entry(proposer).or_insert(0) += reward;
     }
 
-    /// Distribute rewards to validators
-    fn distribute_rewards(&mut self) {
-        // In a real implementation, this would update balances in the state DB
-        // For now, we clear the pending rewards
-        self.pending_rewards.clear();
+    /// Take the rewards accrued since the last epoch, leaving the ledger empty.
+    ///
+    /// The consensus engine does not hold account balances, so it cannot pay
+    /// the rewards itself. Returning them lets the caller credit the real
+    /// world state; discarding them (as an earlier version did by clearing the
+    /// map) would silently destroy every block reward ever earned.
+    pub fn take_pending_rewards(&mut self) -> HashMap<String, u64> {
+        std::mem::take(&mut self.pending_rewards)
+    }
+
+    /// The rewards currently owed, without clearing them.
+    pub fn pending_rewards(&self) -> &HashMap<String, u64> {
+        &self.pending_rewards
+    }
+
+    /// Distribute rewards to validators.
+    ///
+    /// The rewards are handed to the caller through
+    /// [`PoSA::take_pending_rewards`]; this method is called at an epoch
+    /// boundary so the caller can settle them before the new epoch begins.
+    fn distribute_rewards(&mut self) -> HashMap<String, u64> {
+        self.take_pending_rewards()
     }
 
     /// Get current active validators
@@ -174,6 +203,100 @@ mod tests {
         assert_eq!(posa.get_proposer(0).unwrap(), "0x1");
         assert_eq!(posa.get_proposer(1).unwrap(), "0x2");
         assert_eq!(posa.get_proposer(2).unwrap(), "0x1");
+    }
+
+    #[test]
+    fn epoch_change_settles_rewards_instead_of_discarding_them() {
+        let mut posa = PoSA::new(1, 10, 3);
+        posa.register_validator("0x1".to_string(), MIN_STAKE);
+        posa.update_epoch(0);
+
+        posa.record_block_reward("0x1".to_string(), 100);
+        posa.record_block_reward("0x1".to_string(), 50);
+        assert_eq!(posa.pending_rewards().get("0x1"), Some(&150));
+
+        // Crossing into a new epoch must hand the rewards back, not drop them.
+        let settled = posa.update_epoch(10);
+        assert_eq!(settled.get("0x1"), Some(&150));
+        // The ledger is empty afterwards.
+        assert!(posa.pending_rewards().is_empty());
+    }
+
+    #[test]
+    fn rewards_accumulate_within_an_epoch() {
+        let mut posa = PoSA::new(1, 10, 3);
+        posa.register_validator("0x1".to_string(), MIN_STAKE);
+        posa.update_epoch(0);
+        posa.record_block_reward("0x1".to_string(), 7);
+        // Still in the same epoch: nothing is settled.
+        assert!(posa.update_epoch(5).is_empty());
+        assert_eq!(posa.pending_rewards().get("0x1"), Some(&7));
+    }
+
+    #[test]
+    fn duplicate_registration_is_refused() {
+        let mut posa = PoSA::new(1, 10, 3);
+        assert!(posa.register_validator("0x1".to_string(), MIN_STAKE));
+        assert!(!posa.register_validator("0x1".to_string(), MIN_STAKE * 10));
+    }
+
+    #[test]
+    fn below_minimum_stake_is_refused() {
+        let mut posa = PoSA::new(1, 10, 3);
+        assert!(!posa.register_validator("0x1".to_string(), MIN_STAKE - 1));
+    }
+
+    #[test]
+    fn only_the_top_staked_validators_are_elected() {
+        let mut posa = PoSA::new(1, 10, 3);
+        // Register 25 validators with increasing stake. Stakes stay well
+        // below u64::MAX / 25 so the multiplication cannot overflow.
+        for i in 0..25u64 {
+            posa.register_validator(format!("0x{i}"), MIN_STAKE + i * 1_000_000);
+        }
+        posa.update_epoch(0);
+        // The cap is 21, so the four lowest-staked are left out.
+        assert_eq!(posa.active_validators().len(), 21);
+        assert!(!posa.is_validator("0x0"));
+        assert!(posa.is_validator("0x24"));
+    }
+
+    #[test]
+    fn slashing_below_the_minimum_deactivates_the_validator() {
+        let mut posa = PoSA::new(1, 10, 3);
+        // Register with headroom above the minimum so a small penalty does
+        // not immediately drop the validator below it.
+        posa.register_validator("0x1".to_string(), MIN_STAKE * 2);
+        posa.update_epoch(0);
+        assert!(posa.is_validator("0x1"));
+
+        // A penalty smaller than the headroom leaves the stake above the
+        // minimum, so the validator stays active.
+        posa.slash_validator("0x1", MIN_STAKE / 2);
+        assert_eq!(posa.active_validators().len(), 1, "still above the minimum");
+        assert!(posa.is_validator("0x1"));
+
+        // Slashing past the minimum deactivates and removes it.
+        posa.slash_validator("0x1", MIN_STAKE);
+        assert!(!posa.is_validator("0x1"), "now below the minimum");
+        assert!(posa.active_validators().is_empty());
+    }
+
+    #[test]
+    fn a_validator_at_exactly_the_minimum_is_deactivated_by_any_penalty() {
+        let mut posa = PoSA::new(1, 10, 3);
+        posa.register_validator("0x1".to_string(), MIN_STAKE);
+        posa.update_epoch(0);
+        // The stake sits exactly on the threshold, so the smallest slash takes
+        // it below and the validator must be removed.
+        posa.slash_validator("0x1", 1);
+        assert!(!posa.is_validator("0x1"));
+    }
+
+    #[test]
+    fn an_empty_validator_set_has_no_proposer() {
+        let posa = PoSA::new(1, 10, 3);
+        assert_eq!(posa.get_proposer(0), None);
     }
 
     #[test]
