@@ -107,3 +107,74 @@ Committed build artifacts (should be gitignored/removed):
 ## Build/test approach
 - Compile per-crate: `cd <crate> && cargo build` (after `source $HOME/.cargo/env`).
 - For real crypto, add crates: sha2, sha3, secp256k1, ark-bn254/ark-ec, num-bigint, etc.
+
+## Session 2026-11-10 — foundational chain primitives (VERIFIED, tests pass)
+
+### Correction to earlier notes in this file
+Earlier entries claimed `evm/src/executor.rs` had "only ~14 opcodes" and that
+everything else silently no-opped. That was wrong. The executor had 78+ real
+opcode arms. The actual defects were narrower and are now fixed:
+
+1. **No world-state interface at all.** There was no way for the interpreter to
+   read balances, code or storage. Consequences:
+   - `BALANCE`/`EXTCODESIZE`/`EXTCODEHASH`/`BLOCKHASH` popped an argument and
+     pushed hardcoded zero.
+   - `CALL`/`CALLCODE`/`DELEGATECALL`/`STATICCALL` popped the arguments and
+     pushed 1 ("success") without executing any callee code.
+   - `LOG*` wrote to a local Vec that was returned but never tied to state.
+   Fixed by `evm/src/host.rs` (`Host` trait + `MemoryHost`) and
+   `Executor::execute_with_host`.
+
+2. **Opcode 0x39 (CODECOPY) was missing from `Opcode::from_u8`.** Any contract
+   that copies its own code (most constructor patterns, and every proxy)
+   halted on the first CODECOPY. This was a real, chain-breaking bug.
+
+3. **Cancun opcodes were absent:** TLOAD 0x5c, TSTORE 0x5d, MCOPY 0x5e,
+   PUSH0 0x5f. Solidity >= 0.8.20 emits PUSH0 by default, so contracts built
+   with current compilers could not run at all. Now implemented.
+
+4. **`continue` instead of falling through in the CALL path** skipped `pc += 1`,
+   re-executing the CALL opcode forever.
+
+5. `gas_cost()` was already exhaustive (no `_ => 0`). The `_ => 0` arms earlier
+   notes flagged are in `push_size`/`dup_index`/`swap_index`, where returning 0
+   is correct behaviour, not a bug.
+
+### blockchain crate (did not compile before)
+- `Genesis: Option<Genesis>` — invalid field name; `block.header.hash` — no
+  such field. Both fixed.
+- `validate_block` returned `Ok(())` unconditionally. Now `blockchain/src/block.rs`
+  enforces: field well-formedness, gas_used <= gas_limit, transactions root vs
+  transactions, tx hash vs contents, sequential numbers, parent hash linkage,
+  strictly increasing timestamps, bounded gas-limit drift, EIP-1559 base fee.
+
+### Reference values for future verification (all externally cross-checked)
+Python reference: `pip install trie rlp` + pycryptodome keccak.
+- Empty MPT root: `56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`
+- Trie wiki example (do/dog/doge/horse):
+  `5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84`
+- 256-key keyset root: `5643a50bb43d87e2552644da07ccf5f8f63b657eb244f7a94f67cfde62771fb3`
+- Two-account state root: `6779436c64ba6aca6d5776eb5c6292437577bf0e7e02928ba13035642b2da6cd`
+- Header RLP len 518 -> block hash
+  `b94619d59f53841ab9231c1f0fe7c3d69fa2afccdb670d11bceba840d51025ee`
+- Single legacy tx hash `c62b26ea23a81032c361c445c8c76ad8169b1b7faa3fe4f7f73e91d386b02551`
+  and single-tx root `17c4c383428af70a00b993bfde4577db206fb686f31836edc701e11a783018d1`
+
+### Ethereum JSON hex rule (easy to get wrong)
+Fixed-width fields (hashes, addresses, bloom) are strict: odd length rejected.
+JSON-RPC *quantities* have no leading zeros, so `0x100` is valid and must be
+left-padded. `blockchain/src/block.rs` has separate `decode_hex_field` and
+`decode_hex_quantity` for this.
+
+### Test counts (all passing)
+- crypto_cpp C++ KATs: 16/16 (`cd crypto_cpp && make test`)
+- crypto (Rust): 5
+- state (Rust): 21
+- evm (Rust): 32
+- blockchain (Rust): 21
+
+### Commands
+- Rust: `source $HOME/.cargo/env && cd <crate> && cargo test`
+- C++: `cd crypto_cpp && make test`
+- Crates are standalone (no workspace). `state` depends on `crypto`; `evm`
+  depends on `crypto` + `state`; `blockchain` depends on `crypto` + `state`.
