@@ -7,7 +7,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Treasury
 /// @dev Multi-sig treasury for managing protocol funds
@@ -102,6 +102,8 @@ contract Treasury is AccessControl, ReentrancyGuard {
         bytes calldata data
     ) external nonReentrant returns (uint256) {
         require(isSigner[msg.sender], "Not a signer");
+        require(to != address(0), "Invalid transaction");
+        require(value > 0 || data.length > 0, "Invalid transaction");
 
         uint256 txIndex = nonce;
         transactions[txIndex] = Transaction({

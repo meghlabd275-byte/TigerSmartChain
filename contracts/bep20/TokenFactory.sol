@@ -23,6 +23,10 @@ contract TokenFactory {
     // Token template count
     uint256 public templateCount;
 
+    // Monotonic counter used to derive unique create2 salts. Without it every
+    // clone shares salt 0 and the second deployment collides with the first.
+    uint256 public creationNonce;
+
     // Events
     event TokenCreated(
         address indexed token,
@@ -156,25 +160,51 @@ contract TokenFactory {
      * @param template Template address
      * @return cloned address
      */
-    function _cloneTemplate(address template) internal returns (address) {
-        // Minimal proxy clone
-        bytes32 salt = keccak256(abi.encodePacked(template, block.timestamp));
-        
-        address cloned;
+    function _cloneTemplate(address template) internal returns (address cloned) {
+        bytes32 salt = keccak256(abi.encodePacked(msg.sender, creationNonce++));
+
+        // EIP-1167 minimal proxy. The init code is 0x14 bytes, followed by the
+        // 0x14-byte implementation address, then 0x0f bytes of runtime: 0x37
+        // bytes in total.
         assembly {
             let ptr := mload(0x40)
-            
-            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d602d80600a3d3981f3363d3d373d3d3d5af43d82803e903d91602a57fd5bf3)
-            mstore(add(ptr, 0x0d), shl(0x68, template))
-            mstore(add(ptr, 0x0d), shl(0x80, salt))
-            
-            cloned := create2(0, ptr, 0x13, salt)
+            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)
+            mstore(add(ptr, 0x14), shl(0x60, template))
+            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)
+            cloned := create2(0, ptr, 0x37, salt)
+            mstore(0x40, add(ptr, 0x60))
         }
-        
+
         if (cloned == address(0)) revert DeploymentFailed();
-        return cloned;
     }
 
+    /// @notice Predicts the address of the next clone created by `creator`
+    function predictNextTokenAddress(address creator) external view returns (address) {
+        bytes32 salt = keccak256(abi.encodePacked(creator, creationNonce));
+        address template = tokenTemplates[0];
+        return address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(bytes1(0xff), address(this), salt, _proxyCodeHash(template))
+                    )
+                )
+            )
+        );
+    }
+
+    function _proxyCodeHash(address template) internal pure returns (bytes32) {
+        bytes20 target = bytes20(template);
+        return keccak256(
+            abi.encodePacked(
+                hex"3d602d80600a3d3981f3",
+                hex"363d3d373d3d3d363d73",
+                target,
+                hex"5af43d82803e903d91602b57fd5bf3"
+            )
+        );
+    }
+        
     // =============================================================================
     // QUERY FUNCTIONS
     // =============================================================================
@@ -191,7 +221,7 @@ contract TokenFactory {
      * @notice Get created tokens
      * @param start Start index
      * @param count Number of tokens
-     * @return Array of token addresses
+     * @return tokens Token addresses in creation order
      */
     function getTokens(uint256 start, uint256 count)
         external
@@ -252,7 +282,7 @@ contract TokenV1 {
         uint256 _initialSupply,
         address _owner
     ) external {
-        require(name.length == 0, "already initialized");
+        require(bytes(name).length == 0, "already initialized");
         
         name = _name;
         symbol = _symbol;
@@ -269,7 +299,7 @@ contract TokenV1 {
      * @param data Custom data
      */
     function initializeCustom(address _owner, bytes calldata data) external {
-        require(name.length == 0, "already initialized");
+        require(bytes(name).length == 0, "already initialized");
         
         // Decode custom data
         (name, symbol, decimals, totalSupply) = abi.decode(

@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 /**
  * @title LockManager
  * @dev Token lock manager for staking and vesting
  * @notice Manages locked tokens for validators and delegators
  */
 contract LockManager {
+    using SafeERC20 for IERC20;
+
     // =============================================================================
     // DATA STRUCTURES
     // =============================================================================
@@ -90,7 +95,7 @@ contract LockManager {
     error InvalidDuration();
     error InvalidBeneficiary();
     error LockNotFound();
-    error LockRevoked();
+    error LockAlreadyRevoked();
     error LockNotRevocable();
     error StillLocked();
     error ZeroAddress();
@@ -140,7 +145,7 @@ contract LockManager {
         uint256 amount,
         uint256 duration,
         LockType lockType
-    ) external onlyOwner notStopped returns (bytes32 lockId) {
+    ) public onlyOwner notStopped returns (bytes32 lockId) {
         if (beneficiary == address(0)) revert InvalidBeneficiary();
         if (amount < minLockAmount) revert InvalidAmount();
         if (duration < 1 days || duration > maxLockDuration) revert InvalidDuration();
@@ -155,7 +160,8 @@ contract LockManager {
 
         // Generate lock ID
         lockId = keccak256(
-            abi.encodePacked(beneficiary, amount, block.timestamp, lockCount);
+            abi.encodePacked(beneficiary, amount, block.timestamp, lockCount)
+        );
         lockCount++;
 
         // Create lock
@@ -173,6 +179,10 @@ contract LockManager {
         // Add to beneficiary locks
         beneficiaryLocks[beneficiary].push(lockId);
 
+        // Pull the tokens into escrow; without this the lock is only an
+        // accounting entry and every release would fail on an empty balance.
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+
         // Update total locked
         totalLocked += amount;
 
@@ -184,7 +194,7 @@ contract LockManager {
      * @param beneficiaries Array of beneficiary addresses
      * @param amounts Array of lock amounts
      * @param durations Array of lock durations
-     * @return Array of lock IDs
+     * @return lockIds IDs of the created locks
      */
     function createMultipleLocks(
         address[] calldata beneficiaries,
@@ -221,7 +231,7 @@ contract LockManager {
     function release(bytes32 lockId) external notStopped returns (uint256 released) {
         Lock storage lock = locks[lockId];
         if (lock.amount == 0) revert LockNotFound();
-        if (lock.revoked) revert LockRevoked();
+        if (lock.revoked) revert LockAlreadyRevoked();
 
         // Calculate releasable amount
         released = _calculateReleasable(lock);
@@ -232,6 +242,8 @@ contract LockManager {
         totalReleased += released;
         totalLocked -= released;
 
+        IERC20(token).safeTransfer(lock.beneficiary, released);
+
         emit LockReleased(lockId, lock.beneficiary, released);
     }
 
@@ -240,6 +252,7 @@ contract LockManager {
      */
     function _calculateReleasable(Lock storage lock)
         internal
+        view
         returns (uint256 releasable)
     {
         // Check cliff
@@ -290,18 +303,25 @@ contract LockManager {
         Lock storage lock = locks[lockId];
         if (lock.amount == 0) revert LockNotFound();
         if (!lock.revocable) revert LockNotRevocable();
-        if (lock.revoked) revert LockRevoked();
+        if (lock.revoked) revert LockAlreadyRevoked();
 
-        // Calculate releasable amount
+        // Split the lock: the vested part belongs to the beneficiary and the
+        // rest returns to the owner. Both legs settle the lock in full.
         uint256 releasable = _calculateReleasable(lock);
+        uint256 remainder = lock.amount - lock.released - releasable;
 
-        // Mark as revoked
         lock.revoked = true;
-        lock.released += releasable;
+        lock.released = lock.amount;
 
-        // Update totals
         totalReleased += releasable;
-        totalLocked -= (lock.amount - lock.released);
+        totalLocked -= lock.amount;
+
+        if (releasable > 0) {
+            IERC20(token).safeTransfer(lock.beneficiary, releasable);
+        }
+        if (remainder > 0) {
+            IERC20(token).safeTransfer(owner, remainder);
+        }
 
         emit LockRevoked(lockId);
     }
@@ -418,8 +438,4 @@ contract LockManager {
     // INIT
     // =============================================================================
 
-    // Avoid unused warnings
-    function init() external pure {
-        require(maxLockDuration > 0, "duration check");
-    }
 }

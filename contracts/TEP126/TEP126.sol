@@ -70,7 +70,6 @@ contract TEP126 is ERC20, ERC20Burnable, ERC20Permit, AccessControl, Pausable, I
 
     // Chain info
     uint256 public chainId;
-    bytes32 public domainSeparator;
 
     /// @notice Constructor for TEP126 token
     /// @param name_ Token name
@@ -97,24 +96,6 @@ contract TEP126 is ERC20, ERC20Burnable, ERC20Permit, AccessControl, Pausable, I
         _version = version_;
         _mintingEnabled = true;
 
-        // Set chain ID
-        uint256 chainId;
-        assembly {
-            chainId := chainchainid
-        }
-        chainId = block.chainid;
-        domainSeparator = keccak256(
-            abi.encode(
-                keccak256(
-                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
-                ),
-                keccak256(bytes(name_)),
-                keccak256(bytes(version_)),
-                chainId,
-                address(this)
-            )
-        );
-
         // Grant roles
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(MINTER_ROLE, msg.sender);
@@ -132,22 +113,22 @@ contract TEP126 is ERC20, ERC20Burnable, ERC20Permit, AccessControl, Pausable, I
     }
 
     /// @notice Returns the token decimals
-    function decimals() public view override returns (uint8) {
+    function decimals() public view override(ERC20, ITEP126) returns (uint8) {
         return _decimals;
     }
 
     /// @notice Returns the token name
-    function name() public view override(ERC20, IERC20) returns (string memory) {
+    function name() public view override(ERC20) returns (string memory) {
         return _name;
     }
 
     /// @notice Returns the token symbol
-    function symbol() public view override(ERC20, IERC20) returns (string memory) {
+    function symbol() public view override(ERC20) returns (string memory) {
         return _symbol;
     }
 
     /// @notice Returns the cap on total supply
-    function cap() external view override returns (uint256) {
+    function cap() external view override(ITEP126) returns (uint256) {
         return _cap;
     }
 
@@ -223,10 +204,12 @@ contract TEP126 is ERC20, ERC20Burnable, ERC20Permit, AccessControl, Pausable, I
         bytes32 r,
         bytes32 s
     ) external {
-        // Use permit
-        _permit(_owner, spender, value, deadline, v, r, s);
-        _spendAllowance(_owner, spender, value);
-        _transfer(_owner, to, value);
+        // Validate the owner's permit signature, then transfer on their
+        // behalf. `permit` grants this contract the allowance; it is consumed
+        // immediately so no residual allowance is left behind.
+        permit(from, address(this), amount, deadline, v, r, s);
+        _spendAllowance(from, address(this), amount);
+        _transfer(from, to, amount);
     }
 
     /// @notice Pauses all token transfers
@@ -255,21 +238,12 @@ contract TEP126 is ERC20, ERC20Burnable, ERC20Permit, AccessControl, Pausable, I
         emit MintingEnabled(enabled);
     }
 
-    /// @notice Returns the domain separator for permit
-    function DOMAIN_SEPARATOR() external view returns (bytes32) {
-        return domainSeparator;
-    }
-
-    /// @notice Returns the nonces for permit
-    function nonces(address owner) external view returns (uint256) {
-        return super.nonces(owner);
-    }
 
     /// @notice Returns if the contract supports the given interface
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(AccessControl, IERC165)
+        override(AccessControl)
         returns (bool)
     {
         return
@@ -283,7 +257,7 @@ contract TEP126 is ERC20, ERC20Burnable, ERC20Permit, AccessControl, Pausable, I
         address from,
         address to,
         uint256 value
-    ) internal override(ERC20, Pausable) whenNotPaused {
+    ) internal override(ERC20) whenNotPaused {
         super._update(from, to, value);
     }
 }

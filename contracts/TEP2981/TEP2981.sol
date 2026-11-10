@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
 /// @title TEP2981 NFT Royalty Standard
 /// @notice Standard for NFT royalty information
 /// @dev Based on EIP-2981
@@ -54,8 +57,9 @@ contract RoyaltyCollector is ITEP2981 {
 
     /// @notice See ITEP2981.royaltyInfo
     function royaltyInfo(uint256 tokenId, uint256 salePrice)
-        external
+        public
         view
+        virtual
         override
         returns (address receiver, uint256 royaltyAmount)
     {
@@ -83,12 +87,7 @@ contract RoyaltyCollector is ITEP2981 {
         require(feeBasisPoints <= MAX_FEE_BASIS_POINTS, "TEP2981: fee too high");
         require(recipient != address(0), "TEP2981: zero address");
 
-        _royaltyInfo[tokenId] = RoyaltyInfo({
-            recipient: recipient,
-            feeBasisPoints: feeBasisPoints
-        });
-
-        emit RoyaltyUpdated(tokenId, recipient, feeBasisPoints);
+        _setTokenRoyalty(tokenId, recipient, feeBasisPoints);
     }
 
     /// @notice Sets default royalty for collection
@@ -102,9 +101,22 @@ contract RoyaltyCollector is ITEP2981 {
         _defaultFeeBasisPoints = feeBasisPoints;
     }
 
+    /// @notice Sets royalty for a token, for use by derived contracts.
+    function _setTokenRoyalty(
+        uint256 tokenId,
+        address recipient,
+        uint256 feeBasisPoints
+    ) internal {
+        _royaltyInfo[tokenId] = RoyaltyInfo({
+            recipient: recipient,
+            feeBasisPoints: feeBasisPoints
+        });
+        emit RoyaltyUpdated(tokenId, recipient, feeBasisPoints);
+    }
+
     /// @notice Returns royalty info for a token
     function getRoyaltyInfo(uint256 tokenId)
-        external
+        public
         view
         returns (address recipient, uint256 feeBasisPoints)
     {
@@ -118,8 +130,12 @@ contract RoyaltyCollector is ITEP2981 {
 
 /// @title NFT with Royalty
 /// @dev NFT contract with built-in royalty support
-contract NFTWithRoyalty is RoyaltyCollector {
+contract NFTWithRoyalty is ERC721, RoyaltyCollector, Ownable {
     mapping(uint256 => address) private _creators;
+
+    // Metadata URI per token; ERC721 keeps its own private map that cannot be
+    // written to from a derived contract.
+    mapping(uint256 => string) private _tokenURIs;
 
     /// @notice Constructor
     /// @param name Token name
@@ -131,7 +147,7 @@ contract NFTWithRoyalty is RoyaltyCollector {
         string memory symbol,
         address defaultRecipient,
         uint256 defaultFeeBasisPoints
-    ) RoyaltyCollector(defaultRecipient, defaultFeeBasisPoints) {}
+    ) ERC721(name, symbol) RoyaltyCollector(defaultRecipient, defaultFeeBasisPoints) Ownable(msg.sender) {}
 
     /// @notice Mint with creator
     /// @param to Mint to address
@@ -141,8 +157,16 @@ contract NFTWithRoyalty is RoyaltyCollector {
         address to,
         uint256 tokenId,
         address creator
-    ) external {
+    ) external onlyOwner {
+        _mint(to, tokenId);
         _creators[tokenId] = creator;
+
+        // A minted token earns the collection default until the creator or
+        // owner overrides it.
+        (, uint256 defaultFee) = getRoyaltyInfo(tokenId);
+        if (defaultFee != 0) {
+            _setTokenRoyalty(tokenId, creator, defaultFee);
+        }
     }
 
     /// @notice Get creator of token
@@ -162,4 +186,27 @@ contract NFTWithRoyalty is RoyaltyCollector {
         (, uint256 amount) = royaltyInfo(tokenId, salePrice);
         return amount;
     }
+
+    /// @inheritdoc ERC721
+    function tokenURI(uint256 tokenId)
+        public
+        view
+        override
+        returns (string memory)
+    {
+        _requireOwned(tokenId);
+        return _tokenURIs[tokenId];
+    }
+
+    /// @notice Sets the metadata URI for a token.
+    function setTokenURI(uint256 tokenId, string memory uri) external {
+        require(
+            _ownerOf(tokenId) == msg.sender || getApproved(tokenId) == msg.sender,
+            "NFTWithRoyalty: not authorised"
+        );
+        _tokenURIs[tokenId] = uri;
+        emit MetadataUpdate(tokenId);
+    }
+
+    event MetadataUpdate(uint256 indexed tokenId);
 }

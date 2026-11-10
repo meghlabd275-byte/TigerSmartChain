@@ -8,7 +8,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Governor
 /// @dev Governance contract with proposal, voting, and execution
@@ -139,6 +139,10 @@ contract Governor is AccessControl, ReentrancyGuard {
         votingPeriod = _votingPeriod;
         proposalThreshold = _proposalThreshold;
         quorumVotes = _quorumVotes;
+
+        // Without a default the queue step would delay nothing, since
+        // `queueTime` is derived from this value.
+        timelockDelay = 2 days;
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
@@ -338,26 +342,30 @@ contract Governor is AccessControl, ReentrancyGuard {
     function state(uint256 proposalId) public view returns (ProposalState) {
         Proposal storage proposal = proposals[proposalId];
 
+        // Terminal states win over the voting timeline, otherwise an executed
+        // proposal would keep reporting Succeeded while it is still queued.
         if (proposal.canceled) {
             return ProposalState.Canceled;
-        } else if (block.number <= proposal.startBlock) {
+        }
+        if (proposal.executed) {
+            return ProposalState.Executed;
+        }
+        if (block.number <= proposal.startBlock) {
             return ProposalState.Pending;
-        } else if (block.number <= proposal.endBlock) {
+        }
+        if (block.number <= proposal.endBlock) {
             return ProposalState.Active;
-        } else if (
+        }
+        if (
             proposal.forVotes <= proposal.againstVotes ||
             proposal.forVotes < quorumVotes
         ) {
             return ProposalState.Defeated;
-        } else if (proposal.queued && block.timestamp < proposal.queueTime) {
-            return ProposalState.Queued;
-        } else if (proposal.queued && block.timestamp >= proposal.queueTime) {
-            return ProposalState.Succeeded;
-        } else if (proposal.executed) {
-            return ProposalState.Executed;
-        } else {
-            return ProposalState.Succeeded;
         }
+        if (proposal.queued && block.timestamp < proposal.queueTime) {
+            return ProposalState.Queued;
+        }
+        return ProposalState.Succeeded;
     }
 
     /// @notice Set voting delay
@@ -412,6 +420,9 @@ contract Timelock is AccessControl {
     /// @notice Pending calls
     mapping(bytes32 => bool) public queuedTransactions;
 
+    /// @notice Earliest execution time per queued call
+    mapping(bytes32 => uint256) public queuedEta;
+
     /// @notice Call scheduled event
     event CallScheduled(
         bytes32 indexed txHash,
@@ -451,7 +462,9 @@ contract Timelock is AccessControl {
         bytes32 txHash = keccak256(
             abi.encode(target, value, data, eta)
         );
+        require(!queuedTransactions[txHash], "Already queued");
         queuedTransactions[txHash] = true;
+        queuedEta[txHash] = eta;
 
         emit CallScheduled(txHash, target, value, data, eta);
     }
@@ -467,6 +480,9 @@ contract Timelock is AccessControl {
             abi.encode(target, value, data, eta)
         );
         require(queuedTransactions[txHash], "Not queued");
+        // The delay has to be enforced here as well; checking it only at
+        // schedule time would let a queued call run immediately.
+        require(block.timestamp >= queuedEta[txHash], "Transaction locked");
 
         queuedTransactions[txHash] = false;
 
@@ -480,6 +496,7 @@ contract Timelock is AccessControl {
     function cancel(bytes32 txHash) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(queuedTransactions[txHash], "Not queued");
         queuedTransactions[txHash] = false;
+        queuedEta[txHash] = 0;
 
         emit CallCanceled(txHash);
     }

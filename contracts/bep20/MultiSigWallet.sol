@@ -28,6 +28,9 @@ contract MultiSigWallet {
     // Owners
     mapping(address => bool) public owners;
 
+    // Owner list, kept in sync with the mapping
+    address[] internal ownerList;
+
     // Required confirmations
     uint256 public required;
 
@@ -67,6 +70,12 @@ contract MultiSigWallet {
         _;
     }
 
+    /// @dev Allows a confirmed transaction to reconfigure the wallet.
+    modifier onlyOwnerOrSelf() {
+        if (msg.sender != address(this) && !owners[msg.sender]) revert NotOwner();
+        _;
+    }
+
     // =============================================================================
     // CONSTRUCTOR
     // =============================================================================
@@ -84,7 +93,9 @@ contract MultiSigWallet {
         // Set owners
         for (uint256 i = 0; i < _owners.length; i++) {
             if (_owners[i] == address(0)) revert ZeroAddress();
+            if (owners[_owners[i]]) revert InvalidOwner();
             owners[_owners[i]] = true;
+            ownerList.push(_owners[i]);
         }
 
         required = _required;
@@ -207,7 +218,12 @@ contract MultiSigWallet {
     /**
      * @notice Get transaction details
      * @param txId Transaction ID
-     * @return Transaction struct
+     * @return to Recipient address
+     * @return value Value in wei
+     * @return data Call data
+     * @return confirmations Number of confirmations
+     * @return executed Whether the transaction was executed
+     * @return cancelled Whether the transaction was cancelled
      */
     function getTransaction(uint256 txId)
         external
@@ -264,19 +280,20 @@ contract MultiSigWallet {
      * @return count Number of owners
      */
     function getOwnerCount() external view returns (uint256 count) {
-        // Note: This is inefficient but works for now
-        // In production, would maintain a separate count
-        count = 0;
-        for (uint256 i = 0; i < 1000; i++) {
-            if (owners[address(uint160(i))]) {
-                count++;
-            }
-        }
+        return ownerList.length;
+    }
+
+    /**
+     * @notice Get the list of owners
+     * @return list Current owner addresses
+     */
+    function getOwners() external view returns (address[] memory list) {
+        return ownerList;
     }
 
     /**
      * @notice Get pending transactions
-     * @return Array of transaction IDs
+     * @return txIds Pending transaction IDs
      */
     function getPendingTransactions()
         external
@@ -288,7 +305,7 @@ contract MultiSigWallet {
         // Count pending
         for (uint256 i = 0; i < transactionCount; i++) {
             Transaction storage tx = transactions[i];
-            if (!tx.executed && !tx.cancelled && tx.confirmations >= required) {
+            if (!tx.executed && !tx.cancelled) {
                 count++;
             }
         }
@@ -299,7 +316,7 @@ contract MultiSigWallet {
         
         for (uint256 i = 0; i < transactionCount; i++) {
             Transaction storage tx = transactions[i];
-            if (!tx.executed && !tx.cancelled && tx.confirmations >= required) {
+            if (!tx.executed && !tx.cancelled) {
                 txIds[index++] = i;
             }
         }
@@ -313,25 +330,43 @@ contract MultiSigWallet {
      * @notice Add owner
      * @param newOwner New owner address
      */
-    function addOwner(address newOwner) external onlyOwner {
+    function addOwner(address newOwner) external onlyOwnerOrSelf {
         if (newOwner == address(0)) revert ZeroAddress();
+        if (owners[newOwner]) revert InvalidOwner();
         owners[newOwner] = true;
+        ownerList.push(newOwner);
     }
 
     /**
      * @notice Remove owner
+     * @dev The requirement drops with the owner count, otherwise the remaining
+     *      owners could never reach a threshold that outnumbers them.
      * @param oldOwner Owner address to remove
      */
-    function removeOwner(address oldOwner) external onlyOwner {
+    function removeOwner(address oldOwner) external onlyOwnerOrSelf {
+        if (!owners[oldOwner]) revert NotOwner();
         owners[oldOwner] = false;
+
+        for (uint256 i = 0; i < ownerList.length; i++) {
+            if (ownerList[i] == oldOwner) {
+                ownerList[i] = ownerList[ownerList.length - 1];
+                ownerList.pop();
+                break;
+            }
+        }
+
+        if (required > ownerList.length) {
+            required = ownerList.length;
+        }
     }
 
     /**
      * @notice Change requirement
      * @param _required New required confirmations
      */
-    function changeRequirement(uint256 _required) external onlyOwner {
+    function changeRequirement(uint256 _required) external onlyOwnerOrSelf {
         require(_required > 0, "required > 0");
+        require(_required <= ownerList.length, "required > owners");
         required = _required;
     }
 }

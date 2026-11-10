@@ -6,7 +6,7 @@ pragma solidity ^0.8.20;
 /// @dev Enables validators to relay messages between chains
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Relayer Interface
 interface IRelayer {
@@ -41,13 +41,6 @@ contract Relayer is IRelayer, AccessControl, ReentrancyGuard {
 
     // Supported chains
     mapping(uint256 => bool) public supportedChains;
-
-    // Event
-    event MessageRelayed(
-        uint256 indexed chainId,
-        bytes32 indexed messageId,
-        address indexed relayer
-    );
 
     constructor() {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
@@ -147,7 +140,7 @@ contract PriceOracle is Ownable {
         uint256 blockNumber;
     }
 
-    constructor() Ownable() {}
+    constructor() Ownable(msg.sender) {}
 
     /// @notice Updates a price
     function updatePrice(string memory symbol, uint256 price) external onlyOwner {
@@ -189,7 +182,7 @@ contract PriceOracle is Ownable {
 /// @dev Enables anyone to challenge invalid states
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Challenge Contract
 contract ChallengeSystem is Ownable, ReentrancyGuard {
@@ -233,7 +226,7 @@ contract ChallengeSystem is Ownable, ReentrancyGuard {
         bool indexed success
     );
 
-    constructor() Ownable() {
+    constructor() Ownable(msg.sender) {
         slashAmount = 1 ether;
         rewardPercentage = 5000;
     }
@@ -294,7 +287,8 @@ contract ChallengeSystem is Ownable, ReentrancyGuard {
 
             // Reward challenger
             uint256 reward = (challenge.deposit * rewardPercentage) / 10000;
-            payable(challenge.challenger).transfer(reward);
+            (bool paid, ) = payable(challenge.challenger).call{value: reward}("");
+            require(paid, "Reward transfer failed");
         } else {
             // Challenge dismissed - challenger loses deposit
             challenge.status = ChallengeStatus.Dismissed;
@@ -332,7 +326,7 @@ contract WrappedBNB is ERC20, Ownable {
     // Withdrawal event
     event Withdrawal(address indexed user, uint256 amount);
 
-    constructor() ERC20("Wrapped BNB", "WBNB") Ownable() {}
+    constructor() ERC20("Wrapped BNB", "WBNB") Ownable(msg.sender) {}
 
     /// @notice Deposits BNB and mints WBNB
     function deposit() external payable {
@@ -345,13 +339,15 @@ contract WrappedBNB is ERC20, Ownable {
     function withdraw(uint256 amount) external {
         require(balanceOf(msg.sender) >= amount, "Insufficient balance");
         _burn(msg.sender, amount);
-        payable(msg.sender).transfer(amount);
+        (bool withdrawn, ) = payable(msg.sender).call{value: amount}("");
+        require(withdrawn, "Withdrawal failed");
         emit Withdrawal(msg.sender, amount);
     }
 
     /// @notice Emergency withdraw by owner
     function emergencyWithdraw() external onlyOwner {
-        payable(owner()).transfer(address(this).balance);
+        (bool swept, ) = payable(owner()).call{value: address(this).balance}("");
+        require(swept, "Sweep failed");
     }
 
     // Required for receiving BNB
@@ -373,9 +369,9 @@ contract BNBConverter is Ownable {
         bool toNative
     );
 
-    constructor(address _wbnb) Ownable() {
+    constructor(address _wbnb) Ownable(msg.sender) {
         require(_wbnb != address(0), "Invalid WBNB");
-        wbnb = WrappedBNB(_wbnb);
+        wbnb = WrappedBNB(payable(_wbnb));
     }
 
     /// @notice Convert BNB to WBNB
@@ -391,7 +387,8 @@ contract BNBConverter is Ownable {
         require(amount > 0, "Cannot convert 0");
         require(wbnb.transferFrom(msg.sender, address(this), amount), "Transfer failed");
         wbnb.withdraw(amount);
-        payable(msg.sender).transfer(amount);
+        (bool withdrawn, ) = payable(msg.sender).call{value: amount}("");
+        require(withdrawn, "Withdrawal failed");
         emit Converted(msg.sender, amount, true);
     }
 }

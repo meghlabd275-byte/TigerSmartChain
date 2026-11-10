@@ -434,8 +434,4 @@ contract ParameterGovernor {
     // INIT
     // =============================================================================
 
-    // Avoid unused warnings
-    function init() external pure {
-        require(votingPeriod > 0, "period check");
-    }
 }

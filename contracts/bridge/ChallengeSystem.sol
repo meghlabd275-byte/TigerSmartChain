@@ -83,7 +83,8 @@ contract ChallengeSystem {
 
         if (success) {
             // Return bond to challenger
-            payable(challenge.challenger).transfer(challengerBonds[challenge.challenger]);
+            (bool refunded, ) = payable(challenge.challenger).call{value: challengerBonds[challenge.challenger]}("");
+            require(refunded, "Bond refund failed");
             challengerBonds[challenge.challenger] = 0;
         }
 

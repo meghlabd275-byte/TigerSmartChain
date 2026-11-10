@@ -7,7 +7,9 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// @title TokenHub
 /// @notice Token Hub for cross-chain transfers
@@ -16,6 +18,9 @@ contract TokenHub is AccessControl, ReentrancyGuard {
 
     /// @notice Relayer role
     bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
+
+    /// @notice Signing keys allowed to authorise an inbound transfer
+    mapping(address => bool) public relayers;
 
     /// @notice Chain ID
     uint16 public chainId;
@@ -153,7 +158,9 @@ contract TokenHub is AccessControl, ReentrancyGuard {
         require(!transferRecords[transferId], "Already relayed");
         require(recipient != address(0), "Invalid recipient");
 
-        // Verify signature
+        // The transfer is only accepted if an authorised relayer signed these
+        // exact parameters. Binding the local chain id stops a signature from
+        // being replayed against a different deployment.
         bytes32 message = keccak256(
             abi.encodePacked(
                 token,
@@ -162,13 +169,16 @@ contract TokenHub is AccessControl, ReentrancyGuard {
                 amount,
                 fromChain,
                 nonce,
-                transferId
+                transferId,
+                block.chainid
             )
         );
-        
-        // Verify relayer signature
-        // In production, use proper signature verification
-        
+        address signer = ECDSA.recover(
+            MessageHashUtils.toEthSignedMessageHash(message),
+            signature
+        );
+        require(relayers[signer], "Invalid relayer signature");
+
         // Mark as relayed
         transferRecords[transferId] = true;
 
@@ -195,7 +205,7 @@ contract TokenHub is AccessControl, ReentrancyGuard {
         uint256 amount,
         uint16 toChain,
         uint64 nonce
-    ) public pure returns (bytes32) {
+    ) public view returns (bytes32) {
         return keccak256(
             abi.encodePacked(
                 token,
@@ -243,11 +253,13 @@ contract TokenHub is AccessControl, ReentrancyGuard {
     /// @notice Add relayer
     function addRelayer(address relayer) external onlyRole(DEFAULT_ADMIN_ROLE) {
         grantRole(RELAYER_ROLE, relayer);
+        relayers[relayer] = true;
     }
 
     /// @notice Remove relayer
     function removeRelayer(address relayer) external onlyRole(DEFAULT_ADMIN_ROLE) {
         revokeRole(RELAYER_ROLE, relayer);
+        relayers[relayer] = false;
     }
 
     /// @notice Get nonce for address
@@ -335,7 +347,7 @@ contract Relay is AccessControl {
     event RelayExecuted(bytes32 indexed transferId, bool success);
     
     constructor(address _tokenHub, address _lightClient) {
-        tokenHub = TokenHub(_tokenHub);
+        tokenHub = TokenHub(payable(_tokenHub));
         lightClient = LightClient(_lightClient);
         
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);

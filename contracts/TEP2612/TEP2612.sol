@@ -6,7 +6,6 @@ pragma solidity ^0.8.20;
 /// @dev Based on EIP-2612
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/utils/cryptography/SignatureVerification.sol";
 
 /// @notice TEP2612 permit interface
 interface ITEP2612 {
@@ -34,9 +33,9 @@ contract TEP2612Token is ERC20, ITEP2612 {
             "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
         );
 
-    mapping(address => uint256) public nonces;
+    mapping(address => uint256) private _nonces;
 
-    bytes32 public override(DOMAIN_SEPARATOR) domainSeparator;
+    bytes32 public domainSeparator;
 
     constructor(
         string memory name,
@@ -82,7 +81,7 @@ contract TEP2612Token is ERC20, ITEP2612 {
                 owner,
                 spender,
                 value,
-                nonces[owner],
+                _nonces[owner],
                 deadline
             )
         );
@@ -96,12 +95,12 @@ contract TEP2612Token is ERC20, ITEP2612 {
         require(signer == owner, "TEP2612: invalid signature");
 
         // Update nonce
-        nonces[owner]++;
+        _nonces[owner]++;
 
         // Approve
         _approve(owner, spender, value);
 
-        emit ApprovalUsed(owner, spender, value, nonces[owner], hash);
+        emit ApprovalUsed(owner, spender, value, _nonces[owner], hash);
     }
 
     /// @notice Returns the domain separator
@@ -111,7 +110,7 @@ contract TEP2612Token is ERC20, ITEP2612 {
 
     /// @notice Returns the current nonce for an owner
     function nonces(address owner) external view returns (uint256) {
-        return nonces[owner];
+        return _nonces[owner];
     }
 
     // Optional: Add permitTransfer for gasless transfers
@@ -143,7 +142,7 @@ contract TEP2612Token is ERC20, ITEP2612 {
                 from,
                 to,
                 amount,
-                nonces[from],
+                _nonces[from],
                 deadline
             )
         );
@@ -157,7 +156,7 @@ contract TEP2612Token is ERC20, ITEP2612 {
         require(signer == from, "TEP2612: invalid signature");
 
         // Update nonce
-        nonces[from]++;
+        _nonces[from]++;
 
         // Transfer
         _transfer(from, to, amount);

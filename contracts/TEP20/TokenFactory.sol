@@ -25,7 +25,7 @@ interface ITokenFactory {
         uint256 initialSupply,
         uint256 cap,
         address owner
-    ) external returns (address tokenAddress);
+    ) external payable returns (address tokenAddress);
 
     /// @notice Event when token is created
     event TokenCreated(
@@ -43,19 +43,42 @@ interface ITokenFactory {
 contract BasicToken is ERC20 {
     uint8 private _decimals;
 
+    /// Supply ceiling in base units; 0 means uncapped.
+    uint256 public immutable cap;
+
+    /// Account permitted to mint, if the token is not capped.
+    address public immutable minter;
+
+    error CapExceeded(uint256 requested, uint256 cap);
+
     constructor(
         string memory name,
         string memory symbol,
         uint8 decimals_,
         uint256 initialSupply,
+        uint256 cap_,
         address initialHolder
     ) ERC20(name, symbol) {
+        if (cap_ != 0 && initialSupply > cap_) {
+            revert CapExceeded(initialSupply, cap_);
+        }
         _decimals = decimals_;
+        cap = cap_;
+        minter = initialHolder;
         _mint(initialHolder, initialSupply);
     }
 
     function decimals() public view override returns (uint8) {
         return _decimals;
+    }
+
+    /// @notice Mints new supply, enforcing the cap when one is set.
+    function mint(address to, uint256 amount) external {
+        require(msg.sender == minter, "BasicToken: not minter");
+        if (cap != 0 && totalSupply() + amount > cap) {
+            revert CapExceeded(totalSupply() + amount, cap);
+        }
+        _mint(to, amount);
     }
 }
 
@@ -63,6 +86,9 @@ contract BasicToken is ERC20 {
 contract TokenFactory is ITokenFactory, Ownable {
     // Mapping from token address to creator
     mapping(address => address) public tokenCreators;
+
+    // Every token created by each address, in creation order.
+    mapping(address => address[]) internal tokensByCreator;
 
     // Counter for deterministic addresses
     uint256 public tokenCount;
@@ -76,7 +102,7 @@ contract TokenFactory is ITokenFactory, Ownable {
     // Allowed token implementations
     mapping(address => bool) public allowedImplementations;
 
-    constructor() Ownable() {
+    constructor() Ownable(msg.sender) {
         creationFee = 0.01 ether;
         feeRecipient = msg.sender;
     }
@@ -89,7 +115,7 @@ contract TokenFactory is ITokenFactory, Ownable {
         uint256 initialSupply,
         uint256 cap,
         address owner
-    ) external payable override returns (address tokenAddress) {
+    ) public payable override returns (address tokenAddress) {
         // Check fee
         require(msg.value >= creationFee, "Insufficient creation fee");
 
@@ -103,11 +129,13 @@ contract TokenFactory is ITokenFactory, Ownable {
             symbol,
             decimals,
             initialSupply,
+            cap,
             owner == address(0) ? msg.sender : owner
         );
 
         tokenAddress = address(token);
         tokenCreators[tokenAddress] = msg.sender;
+        tokensByCreator[msg.sender].push(tokenAddress);
 
         emit TokenCreated(
             tokenAddress,
@@ -141,8 +169,7 @@ contract TokenFactory is ITokenFactory, Ownable {
         view
         returns (address[] memory)
     {
-        // In production, use indexed mapping
-        return new address[](0);
+        return tokensByCreator[creator];
     }
 }
 

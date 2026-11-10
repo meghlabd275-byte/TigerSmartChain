@@ -29,6 +29,8 @@ struct VestingSchedule {
 contract TokenVesting is Ownable {
     using SafeERC20 for IERC20;
 
+    constructor() Ownable(msg.sender) {}
+
     // Duration unit in seconds
     uint256 public constant DURATION_UNIT = 1 seconds;
 
@@ -222,7 +224,7 @@ contract TokenTimelock is Ownable {
     // Event
     event Released(uint256 amount);
 
-    constructor(address _token, uint256 _releaseTime) {
+    constructor(address _token, uint256 _releaseTime) Ownable(msg.sender) {
         require(_token != address(0), "Invalid token");
         require(_releaseTime > block.timestamp, "Invalid release time");
 
@@ -283,7 +285,7 @@ contract MultiStageVesting is Ownable {
     // Stage release events
     event StageReleased(uint256 stageIndex, uint256 amount);
 
-    constructor(address _token, address _beneficiary) {
+    constructor(address _token, address _beneficiary) Ownable(msg.sender) {
         require(_token != address(0), "Invalid token");
         require(_beneficiary != address(0), "Invalid beneficiary");
 

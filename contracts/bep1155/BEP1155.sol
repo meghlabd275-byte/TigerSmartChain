@@ -98,6 +98,9 @@ interface IBEP1155 {
      */
     function safeBatchTransferFrom(address from, address to, uint256[] calldata ids, uint256[] calldata amounts, bytes calldata data) external;
 }
+interface IERC165 {
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
 
 interface IBEP1155Receiver is IERC165 {
     /**
@@ -134,9 +137,6 @@ interface IBEP1155Receiver is IERC165 {
     ) external returns (bytes4);
 }
 
-interface IERC165 {
-    function supportsInterface(bytes4 interfaceId) external view returns (bool);
-}
 
 /**
  * @dev Implementation of the {IBEP1155} multi-token standard.
@@ -162,7 +162,7 @@ contract BEP1155 is Context, ERC165, IBEP1155 {
     /**
      * @dev See {IERC165-supportsInterface}.
      */
-    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165, IERC165) returns (bool) {
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC165) returns (bool) {
         return interfaceId == type(IBEP1155).interfaceId || super.supportsInterface(interfaceId);
     }
 
@@ -364,7 +364,7 @@ contract BEP1155 is Context, ERC165, IBEP1155 {
         address to,
         uint256 id,
         uint256 amount,
-        bytes calldata data
+        bytes memory data
     ) private returns (bool) {
         bytes4 retval = IBEP1155Receiver(to).onBEP1155Received(operator, from, id, amount, data);
         return (retval == _BEP1155_RECEIVED);
@@ -377,9 +377,9 @@ contract BEP1155 is Context, ERC165, IBEP1155 {
         address operator,
         address from,
         address to,
-        uint256[] calldata ids,
-        uint256[] calldata amounts,
-        bytes calldata data
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
     ) private returns (bool) {
         bytes4 retval = IBEP1155Receiver(to).onBEP1155BatchReceived(operator, from, ids, amounts, data);
         return (retval == _BEP1155_BATCH_RECEIVED);
@@ -476,6 +476,11 @@ contract BEP1155 is Context, ERC165, IBEP1155 {
  * there is an account (an owner) that can be granted exclusive access to
  * specific functions.
  */
+
+/**
+ * @title BEP1155URIStorage
+ * @dev BEP1155 token with storage based token URI management
+ */
 abstract contract Ownable is Context {
     address private _owner;
 
@@ -522,11 +527,9 @@ abstract contract Ownable is Context {
     }
 }
 
-/**
- * @title BEP1155URIStorage
- * @dev BEP1155 token with storage based token URI management
- */
-abstract contract BEP1155URIStorage is BEP1155 {
+abstract contract BEP1155URIStorage is BEP1155, Ownable {
+    // Highest token id handed out by `create`; ids are never reused.
+    uint256 internal _nextTokenId;
     using Strings for uint256;
 
     // Optional mapping for token URIs under the base URI
@@ -610,12 +613,12 @@ library Address {
 /**
  * BEP1155 Token with minting and burning capabilities.
  */
-contract BEP1155Token is BEP1155URIStorage, Ownable {
+contract BEP1155Token is BEP1155URIStorage {
     /**
      * @dev Creates a new token type and assigns the initial supply to the caller.
      */
     function create(uint256 initialSupply, string memory _tokenURI) external onlyOwner returns (uint256 id) {
-        id = 1; // Simplified - in production would use next token ID
+        id = ++_nextTokenId;
         _mint(_msgSender(), id, initialSupply, "");
         _setURI(id, _tokenURI);
     }

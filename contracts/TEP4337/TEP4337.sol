@@ -13,7 +13,7 @@ interface IEntryPoint {
         uint256
     ) external;
 
-    function getUserOpHash(UserOperation calldata) external view returns (bytes32);
+    function getUserOpHash(UserOperation memory) external view returns (bytes32);
 
     function getDeposit(address) external view returns (uint256);
 
@@ -186,7 +186,8 @@ contract SimpleWallet is IWallet {
         require(available >= amount, "insufficient deposit");
 
         entryPoint.addDepositTo{value: 0}(address(0)); // Reduce deposit
-        recipient.transfer(amount);
+        (bool sent, ) = recipient.call{value: amount}("");
+        require(sent, "ETH transfer failed");
     }
 
     /// @notice Transfer ownership
@@ -229,8 +230,8 @@ contract EntryPoint is IEntryPoint {
     }
 
     /// @notice Get user operation hash
-    function getUserOpHash(UserOperation calldata op)
-        external
+    function getUserOpHash(UserOperation memory op)
+        public
         view
         override
         returns (bytes32)
@@ -273,16 +274,19 @@ contract EntryPoint is IEntryPoint {
         // Check init code
         if (op.initCode.length > 0) {
             // Deploy wallet via init code
+            bytes memory initCode = op.initCode;
+            uint256 nonce = op.nonce;
             address wallet;
             assembly {
                 wallet := create2(
                     0,
-                    add(op.initCode, 0x20),
-                    mload(op.initCode),
-                    op.nonce
+                    add(initCode, 0x20),
+                    mload(initCode),
+                    nonce
                 )
             }
             require(wallet != address(0), "init failed");
+            require(wallet == op.sender, "wallet address mismatch");
         }
 
         // Require sufficient gas

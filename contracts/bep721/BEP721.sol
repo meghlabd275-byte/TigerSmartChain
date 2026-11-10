@@ -8,6 +8,8 @@ import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Burnable.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /// @title BEP721Token
 /// @notice BEP721 NFT with metadata, burning, and access control
@@ -32,6 +34,18 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
 
     // Token ID counter
     uint256 private _currentTokenId;
+
+    // Addresses authorised to sign lazy-mint vouchers.
+    mapping(address => bool) private _lazyMintSigners;
+
+    // Voucher hashes already redeemed, so a signature cannot be replayed.
+    mapping(bytes32 => bool) private _redeemedVouchers;
+
+    /// @notice Emitted when a lazy-mint signer is added or removed
+    event LazyMintSignerUpdated(address indexed signer, bool allowed);
+
+    /// @notice Emitted when a lazy-minted token is created
+    event LazyMinted(address indexed to, uint256 indexed tokenId, string uri);
 
     /// @notice Emitted when creator is queried
     event CreatorQueried(address indexed creator, uint256 tokenId);
@@ -61,7 +75,7 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
 
     /// @notice Returns the creator of tokenId
     function creatorOf(uint256 tokenId) public view returns (address) {
-        require(_exists(tokenId), "BEP721: nonexistent token");
+        require(_ownerOf(tokenId) != address(0), "BEP721: nonexistent token");
         return _tokenCreators[tokenId];
     }
 
@@ -78,7 +92,6 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
         _setTokenURI(newTokenId, uri);
         _tokenCreators[newTokenId] = msg.sender;
         _creatorTokenCount[msg.sender]++;
-        _totalSupply++;
 
         return newTokenId;
     }
@@ -100,7 +113,6 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
             _setTokenURI(newTokenId, uris[i]);
             _tokenCreators[newTokenId] = msg.sender;
             _creatorTokenCount[msg.sender]++;
-            _totalSupply++;
 
             tokenIds[i] = newTokenId;
         }
@@ -110,32 +122,72 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
         return tokenIds;
     }
 
-    /// @notice Lazy mint with signature
-    /// @param to Address to mint to
-    /// @param uri Token URI
-    /// @param signature Creator's signature
-    function lazyMint(
-        address to,
-        string memory uri,
-        bytes memory signature
-    ) public returns (uint256) {
-        // Verify signature
-        bytes32 message = keccak256(abi.encodePacked(to, uri, block.chainid));
-        bytes32 ethSignedMessage = keccak256(
-            bytes(string(abi.encodePacked("\x19Ethereum Signed Message:\n32", message)))
+    /// @notice Authorises an address to sign lazy-mint vouchers
+    function setLazyMintSigner(address signer, bool allowed)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        require(signer != address(0), "BEP721: zero signer");
+        _lazyMintSigners[signer] = allowed;
+        emit LazyMintSignerUpdated(signer, allowed);
+    }
+
+    /// @notice Returns whether an address may sign lazy-mint vouchers
+    function isLazyMintSigner(address signer) external view returns (bool) {
+        return _lazyMintSigners[signer];
+    }
+
+    /// @notice Hash that a lazy-mint voucher signature must commit to
+    function lazyMintHash(address to, string memory uri, uint256 tokenId, uint256 deadline)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encodePacked(
+                address(this),
+                block.chainid,
+                to,
+                tokenId,
+                keccak256(bytes(uri)),
+                deadline
+            )
         );
+    }
 
-        // This would normally verify against a creator
-        _currentTokenId++;
-        uint256 newTokenId = _currentTokenId;
+    /// @notice Mints a token against a voucher signed by an authorised signer
+    /// @dev The caller must be the voucher's `to` address, the token id is
+    ///      fixed by the signer, and each voucher can be redeemed only once.
+    function lazyMint(
+        string memory uri,
+        uint256 tokenId,
+        uint256 deadline,
+        bytes memory signature
+    ) external returns (uint256) {
+        require(block.timestamp <= deadline, "BEP721: voucher expired");
+        require(_tokenCreators[tokenId] == address(0), "BEP721: voucher redeemed");
+        require(bytes(signature).length == 65, "BEP721: bad signature length");
 
-        _safeMint(to, newTokenId);
-        _setTokenURI(newTokenId, uri);
-        _tokenCreators[newTokenId] = to;
-        _creatorTokenCount[to]++;
-        _totalSupply++;
+        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(
+            lazyMintHash(msg.sender, uri, tokenId, deadline)
+        );
+        address signer = ECDSA.recover(digest, signature);
+        require(_lazyMintSigners[signer], "BEP721: unauthorised signer");
 
-        return newTokenId;
+        _redeemedVouchers[digest] = true;
+
+        _safeMint(msg.sender, tokenId);
+        _setTokenURI(tokenId, uri);
+        _tokenCreators[tokenId] = msg.sender;
+        _creatorTokenCount[msg.sender]++;
+
+        emit LazyMinted(msg.sender, tokenId, uri);
+        return tokenId;
+    }
+
+    /// @notice Returns whether a voucher digest has already been redeemed
+    function voucherRedeemed(bytes32 digest) external view returns (bool) {
+        return _redeemedVouchers[digest];
     }
 
     /// @notice Set base URI
@@ -191,11 +243,6 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
         return result;
     }
 
-    /// @dev Override to support ERC721A-style token ID enumeration
-    function _exists(uint256 tokenId) internal view virtual override returns (bool) {
-        return tokenId > 0 && tokenId <= _currentTokenId;
-    }
-
     /// @dev Override tokenURI to support ERC721A
     function tokenURI(uint256 tokenId)
         public
@@ -204,7 +251,7 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
         override(ERC721, ERC721URIStorage)
         returns (string memory)
     {
-        require(_exists(tokenId), "BEP721: nonexistent token");
+        require(_ownerOf(tokenId) != address(0), "BEP721: nonexistent token");
         return super.tokenURI(tokenId);
     }
 
@@ -217,25 +264,32 @@ contract BEP721Token is ERC721, ERC721URIStorage, ERC721Burnable, AccessControl 
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(ERC721, AccessControl)
+        override(ERC721, ERC721URIStorage, AccessControl)
         returns (bool)
     {
         return super.supportsInterface(interfaceId);
     }
 
-    /// @dev Override burn to update tracking
-    function _burn(uint256 tokenId)
-        internal
-        virtual
-        override(ERC721, ERC721URIStorage)
-    {
-        address creator = _tokenCreators[tokenId];
-        if (creator != address(0)) {
-            _creatorTokenCount[creator]--;
-        }
-        _totalSupply--;
+    /// @dev Tracks supply on burn. `_update` is the only virtual hook that
+    ///      fires for every token movement in OpenZeppelin v5.
+    function _update(
+        address to,
+        uint256 tokenId,
+        address auth
+    ) internal virtual override returns (address) {
+        address from = super._update(to, tokenId, auth);
 
-        super._burn(tokenId);
+        if (from == address(0)) {
+            _totalSupply++;
+        } else if (to == address(0)) {
+            _totalSupply--;
+            address creator = _tokenCreators[tokenId];
+            if (creator != address(0)) {
+                _creatorTokenCount[creator]--;
+            }
+        }
+
+        return from;
     }
 }
 

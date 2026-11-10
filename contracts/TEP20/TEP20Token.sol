@@ -141,40 +141,33 @@ contract TEP20 is ERC20, ERC20Burnable, ERC20Pausable, AccessControl {
         emit CooldownUpdated(account, cooldown);
     }
     
-    /// @notice Hook before transfer
-    function _beforeTokenTransfer(
+    /// @notice Applies blacklist, anti-bot, tax and pause rules to every
+    ///         supply movement. OpenZeppelin v5 removed `_beforeTokenTransfer`,
+    ///         so all hooks live in `_update`.
+    function _update(
         address from,
         address to,
         uint256 amount
-    ) internal override(ERC20, ERC20Pausable) {
-        // Check blacklist
+    ) internal override(ERC20, ERC20Pausable) whenNotPaused {
         require(!blacklist[from], "TEP20: sender blacklisted");
         require(!blacklist[to], "TEP20: recipient blacklisted");
-        
-        // Check anti-bot
+
         if (antiBotEnabled && from != address(0) && to != address(0)) {
             require(
                 block.timestamp >= transferCooldown[from],
                 "TEP20: cooldown active"
             );
+            transferCooldown[from] = block.timestamp + 1;
         }
-        
-        super._beforeTokenTransfer(from, to, amount);
-    }
-    
-    /// @notice Override transfer with tax
-    function _update(address from, address to, uint256 amount) 
-        internal override(ERC20) returns (uint256) {
-        
+
         if (taxRate > 0 && taxRecipient != address(0) && from != address(0) && to != address(0)) {
             uint256 tax = (amount * taxRate) / 10000;
-            
             if (tax > 0) {
                 super._update(from, taxRecipient, tax);
                 amount -= tax;
             }
         }
-        
-        return super._update(from, to, amount);
+
+        super._update(from, to, amount);
     }
 }

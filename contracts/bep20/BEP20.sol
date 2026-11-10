@@ -41,9 +41,9 @@ abstract contract BEP20 is IBEP20 {
     mapping(address => mapping(address => uint256)) private _allowances;
     uint256 private _totalSupply;
 
-    string private _name;
-    string private _symbol;
-    uint8 private _decimals;
+    string internal _name;
+    string internal _symbol;
+    uint8 internal _decimals;
 
     /// @notice Emitted when tokens are burned
     event Burn(address indexed from, uint256 value);
@@ -273,6 +273,8 @@ library SafeMath {
 /// @title BEP20Token
 /// @notice Full-featured BEP20 token with additional features
 contract BEP20Token is BEP20 {
+    using SafeMath for uint256;
+
     mapping(address => bool) private _isExcludedFromFee;
     mapping(address => bool) private _blacklist;
     
@@ -349,7 +351,7 @@ contract BEP20Token is BEP20 {
         return _blacklist[account];
     }
 
-    /// @dev Override transfer to include tax and blacklist
+    /// @dev Applies blacklist and transfer tax to every balance movement.
     function _transfer(address from, address to, uint256 amount) internal virtual override {
         require(!blacklistEnabled || !_blacklist[from], "Blacklisted");
         require(!blacklistEnabled || !_blacklist[to], "Blacklisted");
@@ -359,8 +361,12 @@ contract BEP20Token is BEP20 {
             uint256 burnAmount = tax.mul(burnRate).div(100);
             uint256 transferAmount = amount.sub(tax);
 
-            super._transfer(from, treasury, tax.sub(burnAmount));
-            super._transfer(from, address(0), burnAmount);
+            if (tax > 0) {
+                super._transfer(from, treasury, tax.sub(burnAmount));
+                if (burnAmount > 0) {
+                    _burn(from, burnAmount);
+                }
+            }
             super._transfer(from, to, transferAmount);
         } else {
             super._transfer(from, to, amount);

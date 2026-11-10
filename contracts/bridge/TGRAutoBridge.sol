@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
 /**
  * @title TGRAutoBridge
  * @dev Automatic bridge for TSC (TigerSmartChain) between networks.
  * Implements automated token bridging with liquidity pools.
  * TGRAutoBridge = TigerSmartChain Auto Bridge
  */
-contract TGRAutoBridge {
+contract TGRAutoBridge is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     // Events
-    event BridgeInitialized(address indexed token, uint256 amount, address indexed sender);
+    event BridgeInitialized(
+        bytes32 indexed transferId,
+        address indexed token,
+        uint256 amount,
+        address indexed sender
+    );
     event BridgeCompleted(bytes32 indexed transferId, address indexed recipient, uint256 amount);
     event BridgeCancelled(bytes32 indexed transferId, address indexed sender);
     event LiquidityAdded(address indexed provider, uint256 amount);
@@ -31,6 +44,9 @@ contract TGRAutoBridge {
     mapping(address => uint256) public liquidityProviders;
     address[] public liquidityProviderList;
     uint256 public totalLiquidity;
+    /// @notice Native value locked against pending transfers. Excluded from
+    ///         liquidity withdrawals so a provider cannot drain escrowed funds.
+    uint256 public reservedLiquidity;
     uint256 public transferCount;
     address public governance;
     address public oracle;
@@ -80,11 +96,19 @@ contract TGRAutoBridge {
         require(amount >= MIN_BRIDGE_AMOUNT, "Amount too small");
         require(amount <= MAX_BRIDGE_AMOUNT, "Amount too large");
         
+        require(recipient != address(0), "Invalid recipient");
+        require(token == address(0) || supportedTokens[token], "Token not supported");
+
         uint256 fee = (amount * BRIDGE_FEE) / 1000;
-        uint256 totalRequired = token == address(0) ? amount + fee : amount;
 
         if (token == address(0)) {
-            require(msg.value >= totalRequired, "Insufficient BNB");
+            require(msg.value >= amount + fee, "Insufficient BNB");
+            // The bridged amount is held in escrow until the transfer settles.
+            reservedLiquidity += amount;
+        } else {
+            // Pull the tokens into escrow; without this the bridge would mint
+            // the recipient a claim it cannot honour.
+            IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         }
 
         transferId = keccak256(abi.encodePacked(
@@ -108,7 +132,7 @@ contract TGRAutoBridge {
             destinationChain: destinationChain
         });
 
-        emit BridgeInitialized(token, amount, msg.sender);
+        emit BridgeInitialized(transferId, token, amount, msg.sender);
     }
 
     /**
@@ -116,16 +140,28 @@ contract TGRAutoBridge {
      * @param transferId Transfer ID
      * @param recipient Recipient on destination chain
      */
-    function completeBridge(bytes32 transferId, address recipient) 
-        external 
-        onlyGovernance 
+    function completeBridge(bytes32 transferId, address recipient)
+        external
+        nonReentrant
     {
         BridgeTransfer storage transfer = transfers[transferId];
         require(transfer.status == Status.Pending, "Not pending");
         require(block.timestamp <= transfer.confirmDeadline, "Expired");
+        require(recipient != address(0), "Invalid recipient");
+        require(msg.sender == oracle || msg.sender == governance, "Not authorized");
 
         transfer.status = Status.Completed;
-        
+
+        // Release the escrowed amount to the recipient. The fee stays with the
+        // bridge as revenue.
+        if (transfer.token == address(0)) {
+            reservedLiquidity -= transfer.amount;
+            (bool paid, ) = payable(recipient).call{value: transfer.amount}("");
+            require(paid, "Payout failed");
+        } else {
+            IERC20(transfer.token).safeTransfer(recipient, transfer.amount);
+        }
+
         emit BridgeCompleted(transferId, recipient, transfer.amount);
     }
 
@@ -133,7 +169,7 @@ contract TGRAutoBridge {
      * @dev Cancel a bridge transfer
      * @param transferId Transfer ID
      */
-    function cancelBridge(bytes32 transferId) external {
+    function cancelBridge(bytes32 transferId) external nonReentrant {
         BridgeTransfer storage transfer = transfers[transferId];
         require(transfer.sender == msg.sender, "Not sender");
         require(transfer.status == Status.Pending, "Not pending");
@@ -141,9 +177,13 @@ contract TGRAutoBridge {
 
         transfer.status = Status.Cancelled;
 
-        // Refund
+        // Refund the escrowed amount and the fee.
         if (transfer.token == address(0)) {
-            payable(msg.sender).transfer(transfer.amount + transfer.fee);
+            reservedLiquidity -= transfer.amount;
+            (bool refunded, ) = payable(msg.sender).call{value: transfer.amount + transfer.fee}("");
+            require(refunded, "Refund failed");
+        } else {
+            IERC20(transfer.token).safeTransfer(msg.sender, transfer.amount);
         }
 
         emit BridgeCancelled(transferId, msg.sender);
@@ -176,7 +216,8 @@ contract TGRAutoBridge {
         liquidityProviders[msg.sender] -= amount;
         totalLiquidity -= amount;
         
-        payable(msg.sender).transfer(amount);
+        (bool paid, ) = payable(msg.sender).call{value: amount}("");
+        require(paid, "Withdrawal failed");
 
         emit LiquidityRemoved(msg.sender, amount);
     }
@@ -185,9 +226,7 @@ contract TGRAutoBridge {
      * @dev Get reserved liquidity for pending transfers
      */
     function getReservedLiquidity() public view returns (uint256) {
-        uint256 reserved = 0;
-        // This would iterate over pending transfers
-        return reserved;
+        return reservedLiquidity;
     }
 
     /**
@@ -196,6 +235,13 @@ contract TGRAutoBridge {
      */
     function setOracle(address _oracle) external onlyGovernance {
         oracle = _oracle;
+    }
+
+    /**
+     * @dev Enable or disable an ERC20 token for bridging
+     */
+    function setTokenSupported(address token, bool supported) external onlyGovernance {
+        supportedTokens[token] = supported;
     }
 
     /**

@@ -99,7 +99,7 @@ contract TokenTimelock {
         address beneficiary,
         uint256 amount,
         uint256 releaseTime
-    ) external onlyOwner returns (bytes32 timelockId) {
+    ) public onlyOwner returns (bytes32 timelockId) {
         if (beneficiary == address(0)) revert ZeroAddress();
         if (amount == 0) revert InvalidAmount();
         if (releaseTime <= block.timestamp) revert InvalidTime();
@@ -133,7 +133,7 @@ contract TokenTimelock {
      * @param beneficiaries Array of beneficiary addresses
      * @param amounts Array of amounts
      * @param releaseTime Release timestamp
-     * @return Array of timelock IDs
+     * @return timelockIds IDs of the created timelocks
      */
     function lockMultiple(
         address[] calldata beneficiaries,
@@ -387,8 +387,4 @@ contract TokenTimelock {
     // INIT
     // =============================================================================
 
-    // Avoid unused warnings
-    function init() external pure {
-        require(totalLocked == 0, "init check");
-    }
 }
