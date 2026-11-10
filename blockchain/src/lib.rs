@@ -6,8 +6,9 @@ pub mod mempool;
 pub mod types;
 
 pub use block::{
-    block_hash, encode_header, hex_encode, transaction_hash, transactions_root, validate_block,
-    ValidationError, EMPTY_TRIE_ROOT,
+    block_hash, encode_header, encode_legacy_transaction, hex_encode, quantity_item,
+    recover_transaction_sender, sign_transaction, signing_hash, transaction_hash,
+    transactions_root, validate_block, ValidationError, EMPTY_TRIE_ROOT,
 };
 pub use chain::*;
 pub use mempool::*;

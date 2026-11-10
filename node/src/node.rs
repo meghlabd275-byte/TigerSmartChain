@@ -12,9 +12,12 @@ use tokio::task::JoinSet;
 
 // Import from existing TigerSmartChain Rust crates
 use tiger_blockchain::{ChainConfig, ChainManager, Genesis, Mempool, Transaction};
+
+/// Gas limit for produced blocks.
+const BLOCK_GAS_LIMIT: u64 = 30_000_000;
 use tiger_consensus::PoSA;
 use tiger_network::SyncStatus;
-use tiger_state::Trie;
+use tiger_state::account::WorldState;
 
 /// Node state
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +51,8 @@ pub struct TigerNode {
     /// Chain manager (locked for concurrent access from async tasks)
     chain_manager: tokio::sync::Mutex<ChainManager>,
 
-    /// State trie
-    state_trie: RwLock<Trie>,
+    /// World state: accounts, balances, code and storage.
+    world_state: tokio::sync::Mutex<WorldState>,
 
     /// Transaction pool (mempool)
     mempool: tokio::sync::Mutex<Mempool>,
@@ -75,9 +78,9 @@ impl TigerNode {
         // Set initial state
         let state = RwLock::new(NodeState::Starting);
 
-        // Initialize state trie (Merkle Patricia Trie)
-        let state_trie = RwLock::new(Trie::new());
-        info!("State trie initialized");
+        // Initialize the world state (trie-backed accounts).
+        let world_state = tokio::sync::Mutex::new(WorldState::new());
+        info!("World state initialized");
 
         // Initialize blockchain chain manager with config
         let chain_config = ChainConfig {
@@ -109,7 +112,7 @@ impl TigerNode {
             config,
             state,
             chain_manager: tokio::sync::Mutex::new(chain_manager),
-            state_trie,
+            world_state,
             mempool: tokio::sync::Mutex::new(mempool),
             consensus: tokio::sync::Mutex::new(consensus),
             sync_status,
@@ -146,15 +149,25 @@ impl TigerNode {
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         info!("Starting node components...");
 
-        // Validate that we have a genesis block; if not, create one
+        // Install the genesis block if the chain is empty.
+        //
+        // `height()` returns 0 both for an empty chain and for a chain whose
+        // only block is genesis, so `is_empty()` is what distinguishes them.
+        // The genesis block must be a real block at number 0: without it the
+        // first produced block has no parent to link to and validation fails.
         {
             let mut cm = self.chain_manager.lock().await;
-            let chain = cm.chain_mut();
-            if chain.height() == 0 {
-                info!("No genesis block found — initializing genesis");
-                let genesis = create_genesis_block(self.config.chain_id);
-                chain.set_genesis(genesis);
-                info!("Genesis block initialized at height 0");
+            if cm.chain().is_empty() {
+                info!("Chain is empty — installing genesis block");
+                let genesis_config = create_genesis_block(self.config.chain_id);
+                cm.chain_mut().set_genesis(genesis_config.clone());
+
+                let genesis_block = genesis_block_from(&genesis_config);
+                let hash = tiger_blockchain::block_hash(&genesis_block.header)
+                    .map_err(|e| anyhow::anyhow!("failed to hash genesis block: {e}"))?;
+                cm.process_block(genesis_block)
+                    .map_err(|e| anyhow::anyhow!("failed to insert genesis block: {e}"))?;
+                info!("Genesis block installed at height 0 (hash: {})", hash);
             }
         }
 
@@ -220,7 +233,15 @@ impl TigerNode {
 
                             let result = {
                                 let mut cm = node.chain_manager.lock().await;
-                                produce_block(&mut cm, &pending_txs, next_block, &proposer, node.config.chain_id)
+                                let mut world = node.world_state.lock().await;
+                                produce_block(
+                                    &mut cm,
+                                    &mut world,
+                                    &pending_txs,
+                                    next_block,
+                                    &proposer,
+                                    node.config.chain_id,
+                                )
                             };
 
                             match result {
@@ -304,8 +325,9 @@ impl TigerNode {
     }
 
     /// Get the state trie instance.
-    pub fn get_state_trie(&self) -> &RwLock<Trie> {
-        &self.state_trie
+    /// Access the world state.
+    pub fn world_state(&self) -> &tokio::sync::Mutex<WorldState> {
+        &self.world_state
     }
 
     /// Get the mempool instance (locked).
@@ -365,105 +387,250 @@ fn create_genesis_block(chain_id: u64) -> Genesis {
     }
 }
 
+/// Build the genesis block from its configuration.
+///
+/// The genesis header is a real header: its transactions root is the empty
+/// trie root and its state root is the root of the (empty) world state, so it
+/// hashes consistently with every other client.
+fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
+    use tiger_blockchain::types::{Block, BlockHeader};
+    use tiger_blockchain::EMPTY_TRIE_ROOT;
+
+    let state_root = WorldState::new().state_root();
+
+    Block {
+        header: BlockHeader {
+            parent_hash: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
+            sha3_uncles: format!(
+                "0x{}",
+                tiger_blockchain::hex_encode(&tiger_crypto::keccak256(&[]))
+            ),
+            miner: genesis.coinbase.clone(),
+            state_root: format!("0x{}", tiger_blockchain::hex_encode(&state_root)),
+            transactions_root: format!("0x{}", tiger_blockchain::hex_encode(&EMPTY_TRIE_ROOT)),
+            receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&EMPTY_TRIE_ROOT)),
+            logs_bloom: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 256])),
+            difficulty: "0x0".to_string(),
+            number: 0,
+            gas_limit: genesis.gas_limit.parse().unwrap_or(BLOCK_GAS_LIMIT),
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: format!("0x{}", tiger_blockchain::hex_encode(genesis.extra_data.as_bytes())),
+            mix_hash: genesis.mix_hash.clone(),
+            nonce: "0x0000000000000000".to_string(),
+            base_fee_per_gas: Some(0),
+            withdrawals_root: None,
+        },
+        transactions: Vec::new(),
+        uncles: Vec::new(),
+    }
+}
+
 /// Produce (seal) a new block from a set of pending transactions.
-/// This creates a BlockHeader with the correct parent hash, inserts the block
-/// into the chain, and returns the block hash.
+///
+/// The header carries real roots: the transactions root is computed from the
+/// transactions and the state root from the world state after applying them.
+/// The block hash is the keccak256 of the RLP-encoded header, so it agrees
+/// with what any other client computes for the same header.
+///
+/// Transactions that fail validation or revert are still included (they paid
+/// for their gas) but do not change state beyond the gas charge.
 fn produce_block(
     chain_manager: &mut ChainManager,
+    world_state: &mut WorldState,
     transactions: &[Transaction],
     block_number: u64,
     miner: &str,
-    _chain_id: u64,
+    chain_id: u64,
 ) -> Result<String, String> {
     use tiger_blockchain::types::{Block, BlockHeader};
+    use tiger_blockchain::{block_hash, transactions_root, EMPTY_TRIE_ROOT};
+    use tiger_evm::transition::{
+        apply_transaction, BlockContext, TransactionRequest,
+    };
 
     let parent_block = chain_manager
         .chain()
         .get_block(block_number.saturating_sub(1));
 
-    let parent_hash = parent_block
-        .map(|b| {
-            // Hash the parent block header
-            let header_json = serde_json::to_string(&b.header)
-                .unwrap_or_default();
-            simple_hash(&header_json)
-        })
-        .unwrap_or_else(|| "0x0000000000000000000000000000000000000000000000000000000000000000".to_string());
+    let parent_hash = match parent_block {
+        Some(block) => block_hash(&block.header)
+            .map_err(|e| format!("failed to hash parent header: {e}"))?,
+        None => format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
+    };
 
     let timestamp = chrono::Utc::now().timestamp() as u64;
+    let mut coinbase = [0u8; 20];
+    if let Ok(addr) = parse_address(miner) {
+        coinbase = addr;
+    }
 
-    let gas_used: u64 = transactions.iter().map(|tx| tx.gas).sum();
+    let block_ctx = BlockContext {
+        chain_id,
+        number: block_number,
+        timestamp,
+        gas_limit: BLOCK_GAS_LIMIT,
+        coinbase,
+        base_fee: 0,
+    };
+
+    // Select the transactions that can legitimately be included.
+    //
+    // A producer must never emit a block its own validator would reject, so a
+    // transaction whose declared hash does not match its contents or whose
+    // signature cannot be recovered is dropped before the block is built. It
+    // is not enough to skip applying it: it would still be part of the block
+    // and fail block validation.
+    let mut included: Vec<Transaction> = Vec::with_capacity(transactions.len());
+    let mut requests: Vec<tiger_evm::transition::TransactionRequest> =
+        Vec::with_capacity(transactions.len());
+    for tx in transactions {
+        match transaction_to_request(tx, chain_id) {
+            Some(request) => {
+                included.push(tx.clone());
+                requests.push(request);
+            }
+            None => {
+                warn!(
+                    "dropping transaction {}: signature cannot be recovered",
+                    tx.hash
+                );
+            }
+        }
+    }
+
+    // Apply each transaction to the world state. Gas actually consumed is
+    // summed, not the gas limits the transactions declared.
+    let mut gas_used: u64 = 0;
+    for (tx, request) in included.iter().zip(requests.iter()) {
+        match apply_transaction(world_state, request, &block_ctx) {
+            Ok(outcome) => {
+                gas_used = gas_used.saturating_add(outcome.gas_used);
+                if !outcome.success {
+                    info!("transaction {} reverted, gas used {}", tx.hash, outcome.gas_used);
+                }
+            }
+            Err(e) => {
+                warn!("transaction {} rejected: {}", tx.hash, e);
+            }
+        }
+    }
+
+    // The transactions root is computed over the transactions as included.
+    let tx_root = transactions_root(&included)
+        .map_err(|e| format!("failed to compute transactions root: {e}"))?;
+
+    // The state root reflects the world state after applying the block.
+    let state_root = world_state.state_root();
 
     let header = BlockHeader {
         parent_hash,
-        sha3_uncles: "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".to_string(),
+        sha3_uncles: format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(&tiger_crypto::keccak256(&[]))
+        ),
         miner: miner.to_string(),
-        state_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        transactions_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        receipts_root: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        logs_bloom: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        state_root: format!("0x{}", tiger_blockchain::hex_encode(&state_root)),
+        transactions_root: format!("0x{}", tiger_blockchain::hex_encode(&tx_root)),
+        // Receipts are not produced by this node yet, so the root of the empty
+        // trie is used rather than a zero placeholder.
+        receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&EMPTY_TRIE_ROOT)),
+        logs_bloom: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 256])),
         difficulty: "0".to_string(),
         number: block_number,
-        gas_limit: 30000000,
+        gas_limit: BLOCK_GAS_LIMIT,
         gas_used,
         timestamp,
-        extra_data: format!("TigerSmartChain block #{}", block_number),
-        mix_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        extra_data: format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                format!("TigerSmartChain block #{block_number}").as_bytes()
+            )
+        ),
+        mix_hash: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
         nonce: "0x0000000000000000".to_string(),
         base_fee_per_gas: Some(0),
         withdrawals_root: None,
     };
 
-    // Compute block hash from header
-    let header_json = serde_json::to_string(&header)
-        .map_err(|e| format!("Failed to serialize header: {}", e))?;
-    let block_hash = format!("0x{}", simple_hash(&header_json));
+    // The block hash is keccak256(RLP(header)), identical to every other
+    // Ethereum-compatible client.
+    let block_hash =
+        block_hash(&header).map_err(|e| format!("failed to hash block header: {e}"))?;
 
     let block = Block {
         header,
-        transactions: transactions.to_vec(),
+        transactions: included,
         uncles: vec![],
     };
 
-    // Validate and insert the block
     chain_manager
         .process_block(block)
-        .map_err(|e| format!("Failed to process block: {}", e))?;
+        .map_err(|e| format!("failed to process block: {e}"))?;
 
     Ok(block_hash)
 }
 
-/// Simple SHA-256 hash for block/header identification.
-/// Uses a basic hash implementation (not Keccak/Eth hash, but deterministic and sufficient
-/// for block identification within this node).
-fn simple_hash(input: &str) -> String {
-    // Use a simple but deterministic hash: FNV-1a 256-bit equivalent
-    // For production, this should use Keccak-256, but for node-internal block
-    // identification this provides a unique deterministic hash.
-    let bytes = input.as_bytes();
-    let mut hash: [u64; 4] = [
-        0xcbf29ce484222325,
-        0xcbf29ce484222325,
-        0xcbf29ce484222325,
-        0xcbf29ce484222325,
-    ];
-    let primes: [u64; 4] = [
-        0x100000001b3,
-        0x100000001b5,
-        0x100000001b7,
-        0x100000001bb,
-    ];
+/// Convert a node transaction into the form the transition function needs.
+///
+/// Returns `None` when the sender cannot be recovered, which means the
+/// transaction is not authorised and must not be applied.
+fn transaction_to_request(tx: &Transaction, chain_id: u64) -> Option<tiger_evm::transition::TransactionRequest> {
+    use tiger_blockchain::recover_transaction_sender;
 
-    for (i, &byte) in bytes.iter().enumerate() {
-        let slot = i % 4;
-        hash[slot] ^= byte as u64;
-        hash[slot] = hash[slot].wrapping_mul(primes[slot]);
+    let sender = recover_transaction_sender(tx, chain_id).ok()?;
+    let to = match &tx.to {
+        Some(address) => Some(parse_address(address).ok()?),
+        None => None,
+    };
+
+    Some(tiger_evm::transition::TransactionRequest {
+        nonce: tx.nonce,
+        gas_price: parse_u256(&format!("0x{:x}", tx.gas_price)),
+        gas_limit: tx.gas,
+        to,
+        value: parse_u256(&tx.value),
+        data: hex_decode(&tx.input),
+        sender,
+    })
+}
+
+/// Parse a `0x`-prefixed 20-byte address.
+fn parse_address(value: &str) -> Result<[u8; 20], String> {
+    let bytes = hex_decode(value);
+    if bytes.len() != 20 {
+        return Err(format!("expected a 20-byte address, got {} bytes", bytes.len()));
     }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
 
-    format!(
-        "{:016x}{:016x}{:016x}{:016x}",
-        hash[0], hash[1], hash[2], hash[3]
-    )
+/// Parse a `0x`-prefixed hex quantity into a 32-byte big-endian value.
+fn parse_u256(value: &str) -> [u8; 32] {
+    let bytes = hex_decode(value);
+    let mut out = [0u8; 32];
+    if bytes.len() <= 32 {
+        out[32 - bytes.len()..].copy_from_slice(&bytes);
+    } else {
+        // A value wider than 256 bits is not representable; clamp to the
+        // maximum rather than truncating silently.
+        out = [0xffu8; 32];
+    }
+    out
+}
+
+/// Decode hex, tolerating a missing `0x` prefix and an odd digit count.
+fn hex_decode(value: &str) -> Vec<u8> {
+    let trimmed = value.strip_prefix("0x").unwrap_or(value);
+    let padded = if trimmed.len() % 2 != 0 {
+        format!("0{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+    (0..padded.len() / 2)
+        .map(|i| u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16).unwrap_or(0))
+        .collect()
 }
 
 impl Drop for TigerNode {
@@ -480,23 +647,150 @@ impl Drop for TigerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tiger_blockchain::types::Transaction;
+    use tiger_blockchain::{block_hash, sign_transaction, transactions_root};
+    use tiger_state::account::{u256_from_u64, WorldState};
 
     #[tokio::test]
     async fn test_node_creation() {
         let config = Config::default_mainnet();
-        let node = TigerNode::new(config).await;
-        
-        // This will fail because we don't have actual implementations
-        // but it tests the structure
-        assert!(node.is_err() || node.is_ok());
+        let node = TigerNode::new(config).await.expect("node must initialize");
+        assert!(!node.is_running().await, "a new node is not running");
     }
 
     #[test]
     fn test_config_validation() {
         let mut config = Config::default_mainnet();
         config.network_id = 0;
-        
-        let result = TigerNode::validate_config(&config);
-        assert!(result.is_err());
+        assert!(TigerNode::validate_config(&config).is_err());
+    }
+
+    fn chain_manager() -> ChainManager {
+        ChainManager::new(ChainConfig {
+            chain_id: 6666,
+            london_block: Some(0),
+            ..Default::default()
+        })
+    }
+
+    fn signed_transfer(key: [u8; 32], nonce: u64, to: [u8; 20], value: u64) -> Transaction {
+        let mut tx = Transaction {
+            hash: String::new(),
+            nonce,
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            from: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 20])),
+            to: Some(format!("0x{}", tiger_blockchain::hex_encode(&to))),
+            value: format!("0x{value:x}"),
+            gas_price: 1,
+            gas: 21_000,
+            input: "0x".to_string(),
+            v: "0x0".to_string(),
+            r: "0x0".to_string(),
+            s: "0x0".to_string(),
+        };
+        sign_transaction(&mut tx, 6666, &key).unwrap();
+        tx
+    }
+
+    fn hex32(bytes: &[u8; 32]) -> String {
+        format!("0x{}", tiger_blockchain::hex_encode(bytes))
+    }
+
+    #[test]
+    fn produced_block_carries_real_roots_and_links_to_its_parent() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+
+        let genesis = genesis_block_from(&create_genesis_block(6666));
+        let genesis_hash = block_hash(&genesis.header).unwrap();
+        cm.process_block(genesis).unwrap();
+
+        let hash = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666).unwrap();
+        let block = cm.chain().get_block(1).expect("block 1 must exist");
+
+        assert_eq!(block.header.parent_hash, genesis_hash);
+        assert_eq!(
+            block.header.transactions_root.to_lowercase(),
+            hex32(&tiger_blockchain::EMPTY_TRIE_ROOT)
+        );
+        assert_eq!(
+            block.header.state_root.to_lowercase(),
+            hex32(&world.state_root())
+        );
+        assert_eq!(hash, block_hash(&block.header).unwrap());
+        assert_eq!(cm.chain().height(), 1);
+    }
+
+    #[test]
+    fn produced_block_applies_a_signed_transfer_to_state() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+
+        let key = [0x46u8; 32];
+        let sender = tiger_crypto::private_key_to_address(&key).unwrap();
+        let recipient = [0x22u8; 20];
+        world.set_balance(&sender, u256_from_u64(10_000_000));
+
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        let txs = vec![signed_transfer(key, 0, recipient, 1234)];
+        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666).unwrap();
+
+        assert_eq!(world.balance(&recipient), u256_from_u64(1234));
+        assert_eq!(
+            world.balance(&sender),
+            u256_from_u64(10_000_000 - 1234 - 21_000)
+        );
+        assert_eq!(world.nonce(&sender), 1);
+
+        let block = cm.chain().get_block(1).unwrap();
+        assert_eq!(
+            block.header.transactions_root.to_lowercase(),
+            hex32(&transactions_root(&txs).unwrap())
+        );
+        assert_eq!(block.header.gas_used, 21_000);
+    }
+
+    #[test]
+    fn a_transaction_with_an_unrecoverable_signature_is_not_applied() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        // A zero signature cannot be recovered, so the transaction must be
+        // skipped rather than applied.
+        let tx = Transaction {
+            hash: format!("0x{}", tiger_blockchain::hex_encode(&[0x01; 32])),
+            nonce: 0,
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            from: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 20])),
+            to: Some(format!("0x{}", tiger_blockchain::hex_encode(&[0x22u8; 20]))),
+            value: "0x1".to_string(),
+            gas_price: 1,
+            gas: 21_000,
+            input: "0x".to_string(),
+            v: "0x0".to_string(),
+            r: "0x0".to_string(),
+            s: "0x0".to_string(),
+        };
+
+        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666).unwrap();
+
+        let block = cm.chain().get_block(1).unwrap();
+        // The invalid transaction is excluded from the block, not merely
+        // skipped during execution: including it would make the block itself
+        // fail validation.
+        assert!(block.transactions.is_empty());
+        assert_eq!(block.header.gas_used, 0);
+        assert_eq!(world.balance(&[0x22u8; 20]), [0u8; 32]);
     }
 }

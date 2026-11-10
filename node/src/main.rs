@@ -146,7 +146,12 @@ async fn main() -> Result<()> {
     // Build RPC CORS host
     let rpc_cors_host = args.rpc_cors_host.unwrap_or_default();
 
-    // Create node configuration
+    // Create node configuration. Clone the fields that are logged after the
+    // config takes ownership of them.
+    let listen_addr = args.listen_addr.clone();
+    let rpc_addr = args.rpc_addr.clone();
+    let metrics_addr = args.metrics_addr.clone();
+
     let config = Config::new(
         args.network_id,
         args.chain_id,
@@ -180,24 +185,38 @@ async fn main() -> Result<()> {
     node.start().await.context("Failed to start node")?;
 
     info!("TigerSmartChain node started successfully");
-    info!("P2P listening on: {}", args.listen_addr);
+    info!("P2P listening on: {}", listen_addr);
     
     if args.rpc_enabled {
-        info!("RPC server listening on: {}", args.rpc_addr);
+        info!("RPC server listening on: {}", rpc_addr);
     }
     
     if args.metrics_enabled {
-        info!("Metrics server listening on: {}", args.metrics_addr);
+        info!("Metrics server listening on: {}", metrics_addr);
     }
 
-    // Wait for shutdown signal
-    tokio::select! {
-        _ = signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
+    // Wait for a shutdown signal. SIGTERM is only available on Unix; on other
+    // platforms the Ctrl+C branch alone terminates the select.
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                result.context("failed to listen for Ctrl+C")?;
+                info!("Received Ctrl+C, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down...");
+            }
         }
-        _ = tokio::signal::signal(tokio::signal::SignalKind::terminate()) => {
-            info!("Received SIGTERM, shutting down...");
-        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await.context("failed to listen for Ctrl+C")?;
+        info!("Received Ctrl+C, shutting down...");
     }
 
     // Stop the node gracefully
