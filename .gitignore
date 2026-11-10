@@ -30,3 +30,6 @@ Thumbs.db
 
 # TypeScript build info
 *.tsbuildinfo
+
+# C++ test binaries
+crypto_cpp/crypto_test
