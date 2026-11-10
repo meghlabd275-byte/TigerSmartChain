@@ -222,6 +222,76 @@ impl WorldState {
         self.account_mut(address).nonce = nonce;
     }
 
+    /// Whether an account is "dead" for EIP-161 purposes: either it does not
+    /// exist or it is empty (zero nonce, zero balance, no code).
+    ///
+    /// This is what decides whether a value transfer to the account incurs the
+    /// new-account gas surcharge.
+    pub fn is_dead(&self, address: &Address) -> bool {
+        match self.accounts.get(address) {
+            Some(account) => is_empty_account(account),
+            None => true,
+        }
+    }
+
+    /// Credit `amount` to `address`, creating the account if needed.
+    pub fn credit(&mut self, address: &Address, amount: &[u8; 32]) {
+        let account = self.account_mut(address);
+        let (sum, overflow) = u256_add(&account.balance, amount);
+        // A balance overflow would be a consensus failure; saturating at the
+        // maximum keeps the total supply finite rather than wrapping.
+        if !overflow {
+            account.balance = sum;
+        } else {
+            account.balance = [0xffu8; 32];
+        }
+    }
+
+    /// Debit `amount` from `address`, returning false if the balance is
+    /// insufficient. On failure nothing is modified.
+    pub fn debit(&mut self, address: &Address, amount: &[u8; 32]) -> bool {
+        let current = self.balance(address);
+        match u256_sub(&current, amount) {
+            Some(remaining) => {
+                self.account_mut(address).balance = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move `amount` from `from` to `to`.
+    ///
+    /// Returns false and leaves both balances untouched when `from` cannot
+    /// cover the amount.
+    pub fn transfer(&mut self, from: &Address, to: &Address, amount: &[u8; 32]) -> bool {
+        if !self.debit(from, amount) {
+            return false;
+        }
+        self.credit(to, amount);
+        true
+    }
+
+    /// Capture the current state so it can be restored if execution fails.
+    ///
+    /// A reverted call frame must leave no trace, but the gas charge and the
+    /// nonce increment are applied at the transaction level and must survive.
+    /// Taking the snapshot before any of the transaction's own writes and
+    /// restoring it on failure gives exactly that separation.
+    ///
+    /// The snapshot clones the account map. That is O(state size) per
+    /// transaction, which is acceptable for correctness and for test and
+    /// single-block use; a production node would journal individual writes
+    /// instead. The clone keeps this simple enough to be obviously correct.
+    pub fn snapshot(&self) -> WorldState {
+        self.clone()
+    }
+
+    /// Restore a previously captured snapshot.
+    pub fn restore(&mut self, snapshot: WorldState) {
+        self.accounts = snapshot.accounts;
+    }
+
     /// Insert a fully formed account.
     pub fn insert_account(&mut self, address: Address, account: Account) {
         self.accounts.insert(address, account);
@@ -266,6 +336,76 @@ impl WorldState {
         }
         trie.root_hash()
     }
+}
+
+// =============================================================================
+// 256-BIT BIG-ENDIAN ARITHMETIC
+// =============================================================================
+//
+// Balances are 256-bit values, so a u64 is not enough. These helpers operate
+// on the canonical big-endian 32-byte representation and report overflow
+// explicitly rather than silently wrapping, which matters because a wrapping
+// balance operation would mint or destroy funds.
+
+/// A 256-bit value from a u64.
+pub fn u256_from_u64(value: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[24..].copy_from_slice(&value.to_be_bytes());
+    out
+}
+
+/// Add two 256-bit values, returning the sum and whether it overflowed.
+pub fn u256_add(a: &[u8; 32], b: &[u8; 32]) -> ([u8; 32], bool) {
+    let mut out = [0u8; 32];
+    let mut carry = 0u16;
+    for i in (0..32).rev() {
+        let sum = a[i] as u16 + b[i] as u16 + carry;
+        out[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    (out, carry != 0)
+}
+
+/// Subtract `b` from `a`, returning `None` on underflow.
+pub fn u256_sub(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let diff = a[i] as i16 - b[i] as i16 - borrow;
+        if diff < 0 {
+            out[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            out[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+    if borrow != 0 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Multiply a 256-bit value by a u64, returning `None` on overflow.
+pub fn u256_mul_u64(a: &[u8; 32], b: u64) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let mut carry = 0u128;
+    for i in (0..32).rev() {
+        let product = a[i] as u128 * b as u128 + carry;
+        out[i] = (product & 0xff) as u8;
+        carry = product >> 8;
+    }
+    if carry != 0 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Compare two 256-bit values.
+pub fn u256_cmp(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+    a.cmp(b)
 }
 
 /// EIP-161 emptiness: zero nonce, zero balance and no code.
