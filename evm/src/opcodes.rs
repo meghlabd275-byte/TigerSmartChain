@@ -105,6 +105,14 @@ impl GasCost {
     /// when sending to a previously-empty account; that dynamic surcharge is
     /// not represented by this static base constant.
     pub const SELFDESTRUCT: u64 = 5_000;
+    /// 0x5c TLOAD: warm storage read (EIP-1153).
+    pub const TLOAD: u64 = 100;
+    /// 0x5d TSTORE: warm storage write (EIP-1153).
+    pub const TSTORE: u64 = 100;
+    /// 0x5e MCOPY: base cost plus a per-word copy fee, charged dynamically.
+    pub const MCOPY: u64 = 3;
+    /// 0x5f PUSH0: as cheap as a PUSH1 with no immediate.
+    pub const PUSH0: u64 = 2;
 }
 
 /// Get gas cost for opcode. Every opcode has a real, non-zero cost where the
@@ -175,6 +183,10 @@ pub fn gas_cost(opcode: Opcode) -> u64 {
         MSIZE => GasCost::MSIZE,
         GAS => GasCost::GAS,
         JUMPDEST => GasCost::JUMPDEST,
+        TLOAD => GasCost::TLOAD,
+        TSTORE => GasCost::TSTORE,
+        MCOPY => GasCost::MCOPY,
+        PUSH0 => GasCost::PUSH0,
         // PUSH1..PUSH32 all cost 3
         PUSH1 | PUSH2 | PUSH3 | PUSH4 | PUSH5 | PUSH6 | PUSH7 | PUSH8
         | PUSH9 | PUSH10 | PUSH11 | PUSH12 | PUSH13 | PUSH14 | PUSH15 | PUSH16
@@ -208,6 +220,7 @@ pub fn gas_cost(opcode: Opcode) -> u64 {
 pub fn push_size(opcode: Opcode) -> usize {
     use Opcode::*;
     match opcode {
+        PUSH0 => 0,
         PUSH1 => 1, PUSH2 => 2, PUSH3 => 3, PUSH4 => 4, PUSH5 => 5, PUSH6 => 6,
         PUSH7 => 7, PUSH8 => 8, PUSH9 => 9, PUSH10 => 10, PUSH11 => 11, PUSH12 => 12,
         PUSH13 => 13, PUSH14 => 14, PUSH15 => 15, PUSH16 => 16, PUSH17 => 17, PUSH18 => 18,

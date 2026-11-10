@@ -1,12 +1,17 @@
 //! TigerSmartChain state primitives.
 //!
-//! Provides RLP serialisation and the Merkle Patricia Trie that underpin
-//! state roots, transaction roots and receipt roots.
+//! Provides RLP serialisation, the Merkle Patricia Trie, and the account/world
+//! state layer that computes real Ethereum state roots.
 
+pub mod account;
 pub mod rlp;
 pub mod trie;
 pub mod types;
 
+pub use account::{
+    account_hash, encode_account, is_empty_account, storage_root, Account as StateAccount,
+    Address as StateAddress, WorldState, EMPTY_CODE_HASH, EMPTY_STATE_ROOT,
+};
 pub use rlp::{RlpError, RlpItem};
 pub use trie::{Node, Trie};
 pub use types::*;

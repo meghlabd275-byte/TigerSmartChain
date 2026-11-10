@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// EVM Word (256-bit) backed by ethnum::U256 for correct modular arithmetic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EvmWord(pub [u8; 32]);
 
 impl EvmWord {
@@ -284,7 +284,7 @@ impl PartialEq for EvmWord {
 impl Eq for EvmWord {}
 
 /// Address (160-bit)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Address(pub [u8; 20]);
 
 impl Address {
@@ -324,6 +324,16 @@ impl Stack {
             let val = self.data[self.data.len() - n].clone();
             self.data.push(val);
         }
+    }
+
+    /// Snapshot of the stack, bottom first. Used by tests and debuggers.
+    pub fn entries(&self) -> Vec<EvmWord> {
+        self.data.clone()
+    }
+
+    /// Current stack depth.
+    pub fn depth(&self) -> usize {
+        self.data.len()
     }
 
     pub fn swap(&mut self, n: usize) {
@@ -399,6 +409,21 @@ impl Storage {
     pub fn load(&self, key: &EvmWord) -> EvmWord {
         self.data.get(key).cloned().unwrap_or(EvmWord::zero())
     }
+
+    /// Snapshot of every stored slot.
+    pub fn entries(&self) -> Vec<(EvmWord, EvmWord)> {
+        self.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// Number of stored slots.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether no slots are stored.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 // =============================================================================
@@ -418,6 +443,8 @@ pub struct ExecutionContext {
     pub stack: Stack,
     pub memory: Memory,
     pub storage: Storage,
+    /// Transient storage (EIP-1153): cleared after each transaction.
+    pub transient: Storage,
     /// Chain/environment block info for BLOCKHASH/NUMBER/TIMESTAMP/etc.
     pub block_number: u64,
     pub block_timestamp: u64,
@@ -441,6 +468,7 @@ impl ExecutionContext {
             stack: Stack::new(),
             memory: Memory::new(),
             storage: Storage::new(),
+            transient: Storage::new(),
             block_number: 0,
             block_timestamp: 0,
             block_gas_limit: 30_000_000,
@@ -538,6 +566,14 @@ pub enum Opcode {
     MSIZE,
     GAS,
     JUMPDEST,
+    /// 0x5c: load from transient storage (EIP-1153).
+    TLOAD,
+    /// 0x5d: store to transient storage (EIP-1153).
+    TSTORE,
+    /// 0x5e: copy a memory region (EIP-5656).
+    MCOPY,
+    /// 0x5f: push the constant zero (EIP-3855).
+    PUSH0,
     PUSH1,
     PUSH2,
     PUSH3,
@@ -659,6 +695,7 @@ impl Opcode {
             0x36 => CALLDATACOPY,
             0x37 => CODESIZE,
             0x38 => CODECOPY,
+            0x39 => CODECOPY,
             0x3a => GASPRICE,
             0x3b => EXTCODESIZE,
             0x3c => EXTCODECOPY,
@@ -685,6 +722,10 @@ impl Opcode {
             0x59 => MSIZE,
             0x5a => GAS,
             0x5b => JUMPDEST,
+            0x5c => TLOAD,
+            0x5d => TSTORE,
+            0x5e => MCOPY,
+            0x5f => PUSH0,
             0x60 => PUSH1,
             0x61 => PUSH2,
             0x62 => PUSH3,

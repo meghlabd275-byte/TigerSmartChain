@@ -1,8 +1,19 @@
-//! TigerScan EVM Module
+//! TigerSmartChain EVM interpreter.
+//!
+//! Executes EVM bytecode with gas metering and real world-state access via the
+//! [`Host`] trait, so balances, code, storage and block hashes come from the
+//! node's actual state rather than from placeholders.
 
-pub mod types;
 pub mod executor;
+pub mod host;
 pub mod opcodes;
+pub mod types;
 
+pub use executor::Executor;
+pub use host::{Host, MemoryHost};
+pub use opcodes::*;
 pub use types::*;
-pub use executor::*;
+
+// Re-exported so the interpreter can build CREATE addresses without depending
+// on the state crate directly.
+pub use tiger_state::rlp::RlpItem;
