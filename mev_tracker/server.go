@@ -1,15 +1,13 @@
 // Package mevtracker provides MEV and whale transaction tracking
 // Built with Rust for high performance and security
-package mevtracker
+package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
-	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,29 +16,33 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Config holds MEV tracker configuration
-type Config struct {
+// TrackerConfig holds MEV tracker configuration
+type TrackerConfig struct {
 	DBURL          string
 	RedisURL       string
 	UpdateInterval time.Duration
 	WhaleThreshold float64 // USD threshold for whale transactions
+	// NativeToken is the wrapped-native token address whose USD price is read
+	// from the token_prices table. Without it, values cannot be denominated in
+	// USD and whale detection is skipped rather than guessing a price.
+	NativeToken string
 }
 
 // MEVTransaction represents an MEV transaction
 type MEVTransaction struct {
-	Hash          string    `json:"hash"`
-	Type          string    `json:"type"` // flash_loan, sandwich, arbitrage, liquidate
-	Profit        float64   `json:"profit"`
-	BlockNumber  int64     `json:"blockNumber"`
-	Timestamp    time.Time `json:"timestamp"`
-	GasUsed      uint64    `json:"gasUsed"`
-	GasPrice     uint64    `json:"gasPrice"`
-	Contracts    []string  `json:"contracts"`
+	Hash        string    `json:"hash"`
+	Type        string    `json:"type"` // flash_loan, sandwich, arbitrage, liquidate
+	Profit      float64   `json:"profit"`
+	BlockNumber int64     `json:"blockNumber"`
+	Timestamp   time.Time `json:"timestamp"`
+	GasUsed     uint64    `json:"gasUsed"`
+	GasPrice    uint64    `json:"gasPrice"`
+	Contracts   []string  `json:"contracts"`
 }
 
 // WhaleTransaction represents a whale transaction
 type WhaleTransaction struct {
-	Hash         string    `json:"hash"`
+	Hash        string    `json:"hash"`
 	From        string    `json:"from"`
 	To          string    `json:"to"`
 	Value       float64   `json:"value"` // in USD
@@ -54,29 +56,28 @@ type WhaleTransaction struct {
 
 // LargeTrade represents a large trade alert
 type LargeTrade struct {
-	Hash         string    `json:"hash"`
-	Protocol     string    `json:"protocol"`
-	FromToken    string    `json:"fromToken"`
-	ToToken      string    `json:"toToken"`
-	FromAmount   float64   `json:"fromAmount"`
-	ToAmount     float64   `json:"toAmount"`
-	USDValue     float64   `json:"usdValue"`
-	BlockNumber  int64     `json:"blockNumber"`
-	Timestamp    time.Time `json:"timestamp"`
+	Hash        string    `json:"hash"`
+	Protocol    string    `json:"protocol"`
+	FromToken   string    `json:"fromToken"`
+	ToToken     string    `json:"toToken"`
+	FromAmount  float64   `json:"fromAmount"`
+	ToAmount    float64   `json:"toAmount"`
+	USDValue    float64   `json:"usdValue"`
+	BlockNumber int64     `json:"blockNumber"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 // Server represents the MEV tracker server
 type Server struct {
-	cfg   *Config
-	pool  *pgxpool.Pool
-	redis *redis.Client
-	mu    sync.RWMutex
-	whaleThreshold uint64
-	knownWhales   map[string]bool
+	cfg         *TrackerConfig
+	pool        *pgxpool.Pool
+	redis       *redis.Client
+	mu          sync.RWMutex
+	knownWhales map[string]bool
 }
 
 // NewServer creates a new MEV tracker server
-func NewServer(cfg *Config) (*Server, error) {
+func NewServer(cfg *TrackerConfig) (*Server, error) {
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, cfg.DBURL)
 	if err != nil {
@@ -90,10 +91,9 @@ func NewServer(cfg *Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create tables: %w", err)
 	}
 	srv := &Server{
-		cfg: cfg,
-		pool: pool,
-		redis: rdb,
-		whaleThreshold: uint64(cfg.WhaleThreshold),
+		cfg:         cfg,
+		pool:        pool,
+		redis:       rdb,
 		knownWhales: make(map[string]bool),
 	}
 	go srv.startTracker()
@@ -130,163 +130,249 @@ func (s *Server) startTracker() {
 	}
 }
 
+// chainTx is the subset of an indexed transaction needed for MEV and whale
+// analysis.
+type chainTx struct {
+	hash      string
+	from      string
+	to        string
+	value     string
+	input     string
+	gasPrice  uint64
+	gasUsed   uint64
+	blockNum  int64
+	txIndex   int
+	timestamp int64
+}
+
 // scanTransactions scans recent transactions for MEV and whale activity
 func (s *Server) scanTransactions() error {
 	ctx := context.Background()
-	
-	// Get recent transactions
-	rows, err := s.pool.Query(ctx, `SELECT hash, from_address, to_address, value, gas_price, gas_used, block_number, timestamp FROM transactions WHERE timestamp > $1 ORDER BY timestamp DESC LIMIT 1000`, time.Now().Unix()-3600)
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT hash, from_address, COALESCE(to_address, ''), value, gas_price,
+		       COALESCE(gas_used, 0), block_number,
+		       COALESCE(transaction_index, 0),
+		       COALESCE(EXTRACT(EPOCH FROM block_timestamp)::bigint, 0),
+		       COALESCE(input, '')
+		FROM transactions
+		WHERE block_timestamp > NOW() - INTERVAL '1 hour'
+		ORDER BY block_number DESC, transaction_index ASC
+		LIMIT 1000`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	
-	type tx struct {
-		hash       string
-		from       string
-		to         string
-		value      string
-		gasPrice   uint64
-		gasUsed    uint64
-		blockNum   int64
-		timestamp  int64
-	}
-	
-	var txs []tx
+
+	var txs []chainTx
 	for rows.Next() {
-		var t tx
-		if err := rows.Scan(&t.hash, &t.from, &t.to, &t.value, &t.gasPrice, &t.gasUsed, &t.blockNum, &t.timestamp); err != nil {
+		var t chainTx
+		if err := rows.Scan(&t.hash, &t.from, &t.to, &t.value, &t.gasPrice, &t.gasUsed,
+			&t.blockNum, &t.txIndex, &t.timestamp, &t.input); err != nil {
 			continue
 		}
 		txs = append(txs, t)
 	}
-	
-	// Analyze each transaction
+
 	for _, t := range txs {
-		// Check for whale transaction
 		s.checkWhaleTransaction(ctx, t)
-		
-		// Check for MEV
-		s.checkMEVTransaction(ctx, t)
+		s.checkMEVTransaction(ctx, t, txs)
 	}
-	
+
 	return nil
 }
 
-// checkWhaleTransaction checks if a transaction is a whale transaction
-func (s *Server) checkWhaleTransaction(ctx context.Context, t tx) {
-	// Parse value
-	valueWei := new(big.Int)
-	valueWei, ok := valueWei.SetString(t.value, 10)
+// checkWhaleTransaction records a transaction whose native value exceeds the
+// configured USD threshold. The USD value uses the indexed native token price;
+// when no price is available the transaction is skipped instead of being
+// assigned an invented value.
+func (s *Server) checkWhaleTransaction(ctx context.Context, t chainTx) {
+	valueWei, ok := new(big.Int).SetString(t.value, 10)
 	if !ok {
 		return
 	}
-	
-	// Convert to ETH (assuming 18 decimals)
-	valueEth := new(big.Float).SetInt(valueWei)
-	valueEth.Mul(valueEth, big.NewFloat(1e-18))
-	
-	// Get ETH price (simplified - use price oracle in production)
-	ethPrice := 3000.0 // Mock price
-	valueUSD, _ := valueEth.Float64()
-	valueUSD *= ethPrice
-	
-	// Check if it's a whale transaction
-	if valueUSD >= s.cfg.WhaleThreshold {
-		// Determine whale type
-		whaleType := s.determineWhaleType(t.from)
-		
-		// Save to database
-		s.pool.Exec(ctx, `INSERT INTO whale_transactions (hash, tx_from, tx_to, value_wei, value_usd, block_number, timestamp, whale_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (hash) DO NOTHING`,
-			t.hash, t.from, t.to, t.value, valueUSD, t.blockNum, t.timestamp, whaleType)
-		
-		// Publish to Redis for real-time alerts
-		whaleTx := WhaleTransaction{
-			Hash:         t.hash,
-			From:        t.from,
-			To:          t.to,
-			Value:       valueUSD,
-			ValueNative: valueEth.String(),
-			BlockNumber: t.blockNum,
-			Timestamp:   time.Unix(t.timestamp, 0),
-			IsLarge:     true,
-			WhaleType:   whaleType,
-		}
-		data, _ := json.Marshal(whaleTx)
-		s.redis.Publish(ctx, "whale_alerts", string(data))
+
+	price, err := s.nativePriceUSD(ctx)
+	if err != nil || price <= 0 {
+		return
 	}
+
+	valueNative := new(big.Float).Quo(new(big.Float).SetInt(valueWei), big.NewFloat(1e18))
+	valueFloat, _ := valueNative.Float64()
+	valueUSD := valueFloat * price
+
+	if valueUSD < s.cfg.WhaleThreshold {
+		return
+	}
+
+	whaleType := s.determineWhaleType(ctx, t.from)
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO whale_transactions (hash, tx_from, tx_to, value_wei, value_usd, block_number, timestamp, whale_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (hash) DO NOTHING`,
+		t.hash, t.from, t.to, t.value, valueUSD, t.blockNum, t.timestamp, whaleType); err != nil {
+		return
+	}
+
+	whaleTx := WhaleTransaction{
+		Hash:        t.hash,
+		From:        t.from,
+		To:          t.to,
+		Value:       valueUSD,
+		ValueNative: valueNative.String(),
+		BlockNumber: t.blockNum,
+		Timestamp:   time.Unix(t.timestamp, 0),
+		IsLarge:     true,
+		WhaleType:   whaleType,
+	}
+	data, _ := json.Marshal(whaleTx)
+	s.redis.Publish(ctx, "whale_alerts", string(data))
 }
 
-// determineWhaleType determines the type of whale
-func (s *Server) determineWhaleType(address string) string {
-	// Check if known whale
-	if s.knownWhales[address] {
+// nativePriceUSD returns the most recent indexed USD price of the configured
+// native token.
+func (s *Server) nativePriceUSD(ctx context.Context) (float64, error) {
+	if s.cfg.NativeToken == "" {
+		return 0, fmt.Errorf("native token address not configured")
+	}
+	var price float64
+	err := s.pool.QueryRow(ctx, `
+		SELECT price_usd::float8 FROM token_prices
+		WHERE token_address = $1
+		ORDER BY timestamp DESC
+		LIMIT 1`, s.cfg.NativeToken).Scan(&price)
+	if err != nil {
+		return 0, fmt.Errorf("no indexed price for native token %s: %w", s.cfg.NativeToken, err)
+	}
+	return price, nil
+}
+
+// determineWhaleType classifies an address using the operator-maintained
+// known_whales table.
+func (s *Server) determineWhaleType(ctx context.Context, address string) string {
+	s.mu.RLock()
+	known := s.knownWhales[address]
+	s.mu.RUnlock()
+	if known {
 		return "known_whale"
 	}
-	
-	// Check address pattern (simplified)
-	hash := sha256.Sum256([]byte(address))
-	hashStr := hex.EncodeToString(hash[:])
-	
-	if strings.HasPrefix(hashStr, "0000") {
-		return "institutional"
+
+	var whaleType string
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(whale_type, '') FROM known_whales WHERE address = $1`, address).Scan(&whaleType); err == nil && whaleType != "" {
+		return whaleType
 	}
-	
-	return "defi_trader"
+	return "unclassified"
 }
 
-// checkMEVTransaction checks if a transaction is an MEV transaction
-func (s *Server) checkMEVTransaction(ctx context.Context, t tx) {
-	mevType := s.detectMEVType(t)
-	
-	if mevType != "" {
-		// Calculate profit (simplified)
-		profit := float64(t.gasUsed*t.gasPrice) / 1e18 * 3000 // ETH price
-		
-		s.pool.Exec(ctx, `INSERT INTO mev_transactions (hash, tx_type, profit, block_number, timestamp, gas_used, gas_price) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (hash) DO NOTHING`,
-			t.hash, mevType, fmt.Sprintf("%.2f", profit), t.blockNum, t.timestamp, t.gasUsed, t.gasPrice)
-		
-		// Publish to Redis
-		mevTx := MEVTransaction{
-			Hash:         t.hash,
-			Type:         mevType,
-			Profit:       profit,
-			BlockNumber:  t.blockNum,
-			Timestamp:    time.Unix(t.timestamp, 0),
-			GasUsed:      t.gasUsed,
-			GasPrice:     t.gasPrice,
-		}
-		data, _ := json.Marshal(mevTx)
-		s.redis.Publish(ctx, "mev_alerts", string(data))
-	}
+// mevSelectors maps the leading four bytes of a transaction's calldata to the
+// class of activity that entry point performs.
+var mevSelectors = map[string]string{
+	"0xab9c4b5d": "flash_loan", // Aave flashLoan(address,address[],uint256[],uint256[],address,bytes,uint16)
+	"0x5c38449e": "flash_loan", // Balancer flashLoan(address,address[],uint256[],bytes)
+	"0x00a718a9": "liquidate",  // Aave liquidationCall(address,address,address,uint256,bool)
+	"0x414bf389": "arbitrage",  // Uniswap V3 exactInputSingle
+	"0xc04b8d59": "arbitrage",  // Uniswap V3 exactInput
+	"0x38ed1739": "swap",       // Uniswap V2 swapExactTokensForTokens
+	"0x7ff36ab5": "swap",       // Uniswap V2 swapExactETHForTokens
+	"0x18cbafe5": "swap",       // Uniswap V2 swapExactTokensForETH
+	"0xfb3bdb41": "swap",       // Uniswap V2 swapETHForExactTokens
+	"0x8803dbee": "swap",       // Uniswap V2 swapTokensForExactTokens
+	"0x5ae401dc": "swap",       // Uniswap V3 multicall
 }
 
-// detectMEVType detects the type of MEV transaction
-func (s *Server) detectMEVType(t tx) string {
-	// Check input data for MEV patterns
-	inputData := "" // Would get from transaction input in production
-	
-	// Flash loan pattern: multiple token transfers in same block
-	if strings.Contains(inputData, "flashLoan") || strings.Contains(inputData, "flashSwap") {
-		return "flash_loan"
+// selector returns the leading four bytes of hex-encoded calldata.
+func selector(input string) string {
+	hexData := strings.TrimPrefix(input, "0x")
+	if len(hexData) < 8 {
+		return ""
 	}
-	
-	// Sandwich pattern: large gas price, between two other txs
-	if t.gasPrice > 100000000000 { // > 100 Gwei
+	return "0x" + strings.ToLower(hexData[:8])
+}
+
+// checkMEVTransaction classifies a transaction and records it when it performs
+// MEV-generating activity.
+func (s *Server) checkMEVTransaction(ctx context.Context, t chainTx, all []chainTx) {
+	mevType := s.detectMEVType(t, all)
+	if mevType == "" {
+		return
+	}
+
+	price, err := s.nativePriceUSD(ctx)
+	if err != nil {
+		return
+	}
+
+	// The minimum extractable value is the priority fee the searcher actually
+	// paid; a precise profit figure requires trace-level accounting.
+	profitWei := new(big.Int).Mul(new(big.Int).SetUint64(t.gasUsed), new(big.Int).SetUint64(t.gasPrice))
+	profitNative, _ := new(big.Float).Quo(new(big.Float).SetInt(profitWei), big.NewFloat(1e18)).Float64()
+	profit := profitNative * price
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO mev_transactions (hash, tx_type, profit, block_number, timestamp, gas_used, gas_price)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (hash) DO NOTHING`,
+		t.hash, mevType, strconv.FormatFloat(profit, 'f', 18, 64), t.blockNum, t.timestamp, t.gasUsed, t.gasPrice); err != nil {
+		return
+	}
+
+	mevTx := MEVTransaction{
+		Hash:        t.hash,
+		Type:        mevType,
+		Profit:      profit,
+		BlockNumber: t.blockNum,
+		Timestamp:   time.Unix(t.timestamp, 0),
+		GasUsed:     t.gasUsed,
+		GasPrice:    t.gasPrice,
+	}
+	data, _ := json.Marshal(mevTx)
+	s.redis.Publish(ctx, "mev_alerts", string(data))
+}
+
+// detectMEVType classifies a transaction from its calldata selector. A swap is
+// reported as a sandwich only when it is bracketed by two other swaps in the
+// same block and pays a strictly higher gas price than both, which is the
+// on-chain signature of a sandwich attack.
+func (s *Server) detectMEVType(t chainTx, all []chainTx) string {
+	kind, ok := mevSelectors[selector(t.input)]
+	if !ok {
+		return ""
+	}
+	if kind != "swap" {
+		return kind
+	}
+
+	prev, next := neighboursInBlock(t, all)
+	if prev != nil && next != nil &&
+		mevSelectors[selector(prev.input)] == "swap" &&
+		mevSelectors[selector(next.input)] == "swap" &&
+		t.gasPrice > prev.gasPrice && t.gasPrice > next.gasPrice {
 		return "sandwich"
 	}
-	
-	// Arbitrage: multiple token swaps
-	if strings.Contains(inputData, "swap") && strings.Contains(inputData, "exactInput") {
-		return "arbitrage"
-	}
-	
-	// Liquidation: liquidation function calls
-	if strings.Contains(inputData, "liquidate") || strings.Contains(inputData, "liquidateBorrow") {
-		return "liquidate"
-	}
-	
 	return ""
+}
+
+// neighboursInBlock returns the transactions immediately preceding and
+// following t in its block, or nil at a block boundary.
+func neighboursInBlock(t chainTx, all []chainTx) (prev, next *chainTx) {
+	for i := range all {
+		cand := &all[i]
+		if cand.blockNum != t.blockNum {
+			continue
+		}
+		switch {
+		case cand.txIndex < t.txIndex:
+			if prev == nil || cand.txIndex > prev.txIndex {
+				prev = cand
+			}
+		case cand.txIndex > t.txIndex:
+			if next == nil || cand.txIndex < next.txIndex {
+				next = cand
+			}
+		}
+	}
+	return prev, next
 }
 
 // GetWhaleTransactions returns recent whale transactions
@@ -296,17 +382,18 @@ func (s *Server) GetWhaleTransactions(ctx context.Context, limit int) ([]WhaleTr
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var txs []WhaleTransaction
 	for rows.Next() {
 		var t WhaleTransaction
-		if err := rows.Scan(&t.Hash, &t.From, &t.To, &t.ValueNative, &t.Value, &t.Token, &t.BlockNumber, &t.Timestamp, &t.WhaleType); err != nil {
+		var timestamp int64
+		if err := rows.Scan(&t.Hash, &t.From, &t.To, &t.ValueNative, &t.Value, &t.Token, &t.BlockNumber, &timestamp, &t.WhaleType); err != nil {
 			continue
 		}
-		t.Timestamp = time.Unix(t.Timestamp, 0)
+		t.Timestamp = time.Unix(timestamp, 0)
 		txs = append(txs, t)
 	}
-	
+
 	return txs, nil
 }
 
@@ -317,7 +404,7 @@ func (s *Server) GetMEVTransactions(ctx context.Context, limit int) ([]MEVTransa
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var txs []MEVTransaction
 	for rows.Next() {
 		var t MEVTransaction
@@ -330,7 +417,7 @@ func (s *Server) GetMEVTransactions(ctx context.Context, limit int) ([]MEVTransa
 		t.Timestamp = time.Unix(timestamp, 0)
 		txs = append(txs, t)
 	}
-	
+
 	return txs, nil
 }
 
@@ -341,7 +428,7 @@ func (s *Server) GetLargeTrades(ctx context.Context, limit int) ([]LargeTrade, e
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var trades []LargeTrade
 	for rows.Next() {
 		var t LargeTrade
@@ -352,7 +439,7 @@ func (s *Server) GetLargeTrades(ctx context.Context, limit int) ([]LargeTrade, e
 		t.Timestamp = time.Unix(timestamp, 0)
 		trades = append(trades, t)
 	}
-	
+
 	return trades, nil
 }
 
@@ -360,7 +447,7 @@ func (s *Server) GetLargeTrades(ctx context.Context, limit int) ([]LargeTrade, e
 func (s *Server) SubscribeWhaleAlerts(ctx context.Context) <-chan *WhaleTransaction {
 	pubsub := s.redis.Subscribe(ctx, "whale_alerts")
 	ch := make(chan *WhaleTransaction, 10)
-	
+
 	go func() {
 		for msg := range pubsub.Channel() {
 			var wt WhaleTransaction
@@ -369,7 +456,7 @@ func (s *Server) SubscribeWhaleAlerts(ctx context.Context) <-chan *WhaleTransact
 			}
 		}
 	}()
-	
+
 	return ch
 }
 
@@ -377,7 +464,7 @@ func (s *Server) SubscribeWhaleAlerts(ctx context.Context) <-chan *WhaleTransact
 func (s *Server) SubscribeMEVAlerts(ctx context.Context) <-chan *MEVTransaction {
 	pubsub := s.redis.Subscribe(ctx, "mev_alerts")
 	ch := make(chan *MEVTransaction, 10)
-	
+
 	go func() {
 		for msg := range pubsub.Channel() {
 			var mt MEVTransaction
@@ -386,7 +473,7 @@ func (s *Server) SubscribeMEVAlerts(ctx context.Context) <-chan *MEVTransaction 
 			}
 		}
 	}()
-	
+
 	return ch
 }
 
@@ -403,13 +490,20 @@ func FormatWhaleValue(usdValue float64) string {
 
 // IsKnownWhale checks if an address is a known whale
 func (s *Server) IsKnownWhale(address string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.knownWhales[address]
 }
 
 // AddKnownWhale adds a known whale address
 func (s *Server) AddKnownWhale(address, whaleType, label string) error {
-	s.knownWhales[address] = true
 	_, err := s.pool.Exec(context.Background(), `INSERT INTO known_whales (address, whale_type, label) VALUES ($1, $2, $3) ON CONFLICT (address) DO UPDATE SET whale_type = $2, label = $3`,
 		address, whaleType, label)
-	return err
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.knownWhales[address] = true
+	s.mu.Unlock()
+	return nil
 }

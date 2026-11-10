@@ -3,7 +3,7 @@ package nftfloor
 
 import (
 	"context"
-	"encoding/json"
+
 	"fmt"
 	"math"
 	"sort"
@@ -23,53 +23,53 @@ type Config struct {
 
 // NFTCollection represents NFT collection data
 type NFTCollection struct {
-	Address          string  `json:"address"`
-	Name            string  `json:"name"`
-	Symbol          string  `json:"symbol"`
-	FloorPrice      float64 `json:"floorPrice"`
-	FloorPriceChange float64 `json:"floorPriceChange24h"`
-	Volume24h       float64 `json:"volume24h"`
-	VolumeChange24h float64 `json:"volumeChange24h"`
-	TotalSupply    int     `json:"totalSupply"`
-	NumOwners      int     `json:"numOwners"`
-	AvgPrice       float64 `json:"avgPrice"`
-	Timestamp      time.Time `json:"timestamp"`
+	Address          string    `json:"address"`
+	Name             string    `json:"name"`
+	Symbol           string    `json:"symbol"`
+	FloorPrice       float64   `json:"floorPrice"`
+	FloorPriceChange float64   `json:"floorPriceChange24h"`
+	Volume24h        float64   `json:"volume24h"`
+	VolumeChange24h  float64   `json:"volumeChange24h"`
+	TotalSupply      int       `json:"totalSupply"`
+	NumOwners        int       `json:"numOwners"`
+	AvgPrice         float64   `json:"avgPrice"`
+	Timestamp        time.Time `json:"timestamp"`
 }
 
 // NFTTrait represents NFT trait
 type NFTTrait struct {
-	TraitType   string  `json:"traitType"`
-	TraitValue  string  `json:"traitValue"`
+	TraitType  string  `json:"traitType"`
+	TraitValue string  `json:"traitValue"`
 	Rarity     float64 `json:"rarity"`
 	NumNFTs    int     `json:"numNfts"`
 }
 
 // NFT represents an NFT
 type NFT struct {
-	Address       string          `json:"address"`
-	TokenID       string          `json:"tokenId"`
-	Name         string          `json:"name"`
-	Owner        string          `json:"owner"`
-	ImageURL     string          `json:"imageUrl"`
-	Price        float64        `json:"price"`
-	Traits       []NFTTrait     `json:"traits"`
-	IsForSale    bool           `json:"isForSale"`
-	LastSalePrice float64       `json:"lastSalePrice"`
+	Address       string     `json:"address"`
+	TokenID       string     `json:"tokenId"`
+	Name          string     `json:"name"`
+	Owner         string     `json:"owner"`
+	ImageURL      string     `json:"imageUrl"`
+	Price         float64    `json:"price"`
+	Traits        []NFTTrait `json:"traits"`
+	IsForSale     bool       `json:"isForSale"`
+	LastSalePrice float64    `json:"lastSalePrice"`
 }
 
 // FloorPriceHistory represents historical floor price
 type FloorPriceHistory struct {
-	Timestamp    time.Time
-	FloorPrice  float64
+	Timestamp  time.Time
+	FloorPrice float64
 	Volume     float64
 }
 
 // Server represents the NFT floor price server
 type Server struct {
-	cfg   *Config
-	pool  *pgxpool.Pool
-	redis *redis.Client
-	mu    sync.RWMutex
+	cfg         *Config
+	pool        *pgxpool.Pool
+	redis       *redis.Client
+	mu          sync.RWMutex
 	collections map[string]*NFTCollection
 }
 
@@ -118,22 +118,24 @@ func (s *Server) startUpdater() {
 	}
 }
 
-// updateFloorPrices updates floor prices for all collections
+// updateFloorPrices recomputes floor price, 24h volume, supply and holder count
+// for every tracked collection from the indexed on-chain data. Collections with
+// no observed trades yet report zero rather than an invented value.
 func (s *Server) updateFloorPrices() error {
 	ctx := context.Background()
-	
+
 	rows, err := s.pool.Query(ctx, `SELECT address, name, symbol FROM collections WHERE is_active = true`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	
+
 	type collectionInfo struct {
 		address string
 		name    string
 		symbol  string
 	}
-	
+
 	var collections []collectionInfo
 	for rows.Next() {
 		var c collectionInfo
@@ -142,50 +144,67 @@ func (s *Server) updateFloorPrices() error {
 		}
 		collections = append(collections, c)
 	}
-	
+
 	for _, c := range collections {
-		floorPrice := s.calculateMockFloorPrice(c.address)
-		
+		floor, volume, supply, owners, err := s.computeCollectionStats(ctx, c.address)
+		if err != nil {
+			return fmt.Errorf("compute stats for %s: %w", c.address, err)
+		}
+
 		s.mu.Lock()
 		s.collections[c.address] = &NFTCollection{
-			Address:          c.address,
-			Name:            c.name,
-			Symbol:          c.symbol,
-			FloorPrice:      floorPrice.FloorPrice,
-			FloorPriceChange: floorPrice.FloorPriceChange,
-			Volume24h:       floorPrice.Volume24h,
-			TotalSupply:     floorPrice.TotalSupply,
-			NumOwners:       floorPrice.NumOwners,
-			Timestamp:       time.Now(),
+			Address:     c.address,
+			Name:        c.name,
+			Symbol:      c.symbol,
+			FloorPrice:  floor,
+			Volume24h:   volume,
+			TotalSupply: supply,
+			NumOwners:   owners,
+			Timestamp:   time.Now(),
 		}
 		s.mu.Unlock()
-		
-		// Store in database
-		s.pool.Exec(ctx, `INSERT INTO nft_floor_prices (collection_address, floor_price, volume_24h, total_supply, num_owners, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`,
-			c.address, fmt.Sprintf("%.8f", floorPrice.FloorPrice), fmt.Sprintf("%.0f", floorPrice.Volume24h), floorPrice.TotalSupply, floorPrice.NumOwners, time.Now().Unix())
+
+		if _, err := s.pool.Exec(ctx, `
+			INSERT INTO nft_floor_prices (collection_address, floor_price, volume_24h, total_supply, num_owners, timestamp)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (collection_address, timestamp) DO UPDATE
+			SET floor_price = EXCLUDED.floor_price, volume_24h = EXCLUDED.volume_24h,
+			    total_supply = EXCLUDED.total_supply, num_owners = EXCLUDED.num_owners`,
+			c.address, fmt.Sprintf("%.8f", floor), fmt.Sprintf("%.0f", volume), supply, owners, time.Now().Unix(),
+		); err != nil {
+			return fmt.Errorf("persist floor price for %s: %w", c.address, err)
+		}
 	}
-	
+
 	return nil
 }
 
-func (s *Server) calculateMockFloorPrice(address string) *NFTCollection {
-	hash := int64(0)
-	for i, c := range address {
-		hash += int64(c) * int64(i+1)
+// computeCollectionStats derives floor price, 24h volume, traded token count and
+// distinct holder count for a collection from the indexed transfer and
+// ownership tables. A collection with no observed transfers reports zero.
+func (s *Server) computeCollectionStats(ctx context.Context, address string) (floor, volume float64, supply, owners int, err error) {
+	err = s.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE(MIN(value), 0),
+			COALESCE(SUM(value), 0),
+			COUNT(DISTINCT token_id)
+		FROM nft_transfers
+		WHERE token_address = $1 AND from_address <> '0x0000000000000000000000000000000000000000'`,
+		address,
+	).Scan(&floor, &volume, &supply)
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
-	floorPrice := 0.1 + float64(hash%100)/10
-	volume := 1e5 + float64(hash%100000)
-	supply := 1000 + (hash % 10000)
-	owners := supply / 2
-	
-	return &NFTCollection{
-		Address:        address,
-		FloorPrice:    floorPrice,
-		FloorPriceChange: (float64(hash%20) - 10) / 10,
-		Volume24h:     volume,
-		TotalSupply:   supply,
-		NumOwners:     owners,
+
+	err = s.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT owner) FROM nft_owners WHERE token_address = $1`,
+		address,
+	).Scan(&owners)
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
+
+	return floor, volume, supply, owners, nil
 }
 
 // GetFloorPrice returns floor price for a collection
@@ -193,21 +212,35 @@ func (s *Server) GetFloorPrice(ctx context.Context, address string) (*NFTCollect
 	s.mu.RLock()
 	collection, ok := s.collections[address]
 	s.mu.RUnlock()
-	
+
 	if ok {
 		return collection, nil
 	}
-	
-	// Try database
+
+	// Fall back to the most recently persisted snapshot for this collection.
 	var nc NFTCollection
 	var floorPriceStr, volumeStr string
-	err := s.pool.QueryRow(ctx, `SELECT address, name, symbol, floor_price, volume_24h, total_supply, num_owners FROM collections WHERE address = $1`, address).Scan(&nc.Address, &nc.Name, &nc.Symbol, &floorPriceStr, &volumeStr, &nc.TotalSupply, &nc.NumOwners)
+	err := s.pool.QueryRow(ctx, `
+		SELECT p.collection_address, COALESCE(c.name, ''), COALESCE(c.symbol, ''),
+		       p.floor_price, p.volume_24h, p.total_supply, p.num_owners
+		FROM nft_floor_prices p
+		LEFT JOIN collections c ON c.address = p.collection_address
+		WHERE p.collection_address = $1
+		ORDER BY p.timestamp DESC
+		LIMIT 1`, address).Scan(
+		&nc.Address, &nc.Name, &nc.Symbol, &floorPriceStr, &volumeStr, &nc.TotalSupply, &nc.NumOwners,
+	)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Sscanf(floorPriceStr, "%f", &nc.FloorPrice)
-	fmt.Sscanf(volumeStr, "%f", &nc.Volume24h)
-	
+	if _, err := fmt.Sscanf(floorPriceStr, "%f", &nc.FloorPrice); err != nil {
+		return nil, fmt.Errorf("parse floor price %q: %w", floorPriceStr, err)
+	}
+	if _, err := fmt.Sscanf(volumeStr, "%f", &nc.Volume24h); err != nil {
+		return nil, fmt.Errorf("parse volume %q: %w", volumeStr, err)
+	}
+	nc.Timestamp = time.Now()
+
 	return &nc, nil
 }
 
@@ -215,27 +248,27 @@ func (s *Server) GetFloorPrice(ctx context.Context, address string) (*NFTCollect
 func (s *Server) GetTopCollections(ctx context.Context, limit int) ([]*NFTCollection, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	type collectionWithVolume struct {
 		collection *NFTCollection
 		volume     float64
 	}
-	
+
 	var collections []collectionWithVolume
 	for _, c := range s.collections {
 		collections = append(collections, collectionWithVolume{collection: c, volume: c.Volume24h})
 	}
-	
+
 	// Sort by volume
 	sort.Slice(collections, func(i, j int) bool {
 		return collections[i].volume > collections[j].volume
 	})
-	
+
 	var result []*NFTCollection
 	for i := 0; i < limit && i < len(collections); i++ {
 		result = append(result, collections[i].collection)
 	}
-	
+
 	return result, nil
 }
 
@@ -246,7 +279,7 @@ func (s *Server) GetTraitRarity(ctx context.Context, address string) ([]NFTTrait
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var traits []NFTTrait
 	for rows.Next() {
 		var t NFTTrait
@@ -255,7 +288,7 @@ func (s *Server) GetTraitRarity(ctx context.Context, address string) ([]NFTTrait
 		}
 		traits = append(traits, t)
 	}
-	
+
 	return traits, nil
 }
 
@@ -266,7 +299,7 @@ func (s *Server) GetFloorPriceHistory(ctx context.Context, address string, days 
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var history []FloorPriceHistory
 	for rows.Next() {
 		var h FloorPriceHistory
@@ -278,7 +311,7 @@ func (s *Server) GetFloorPriceHistory(ctx context.Context, address string, days 
 		fmt.Sscanf(volumeStr, "%f", &h.Volume)
 		history = append(history, h)
 	}
-	
+
 	return history, nil
 }
 

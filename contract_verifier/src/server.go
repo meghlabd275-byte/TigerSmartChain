@@ -5,7 +5,6 @@ package contractverifier
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"

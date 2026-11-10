@@ -8,8 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/big"
-	"regexp"
 	"strings"
 	"sync"
 	"time"

@@ -4,8 +4,6 @@ package kubernetes
 
 import (
 	"fmt"
-	"os"
-	"strings"
 )
 
 // =============================================================================
@@ -549,7 +547,4 @@ func GetTolerations() string {
   effect: NoExecute
   tolerationSeconds: 300
 `
-
-var _ = os.Getenv
-var _ = strings.Contains
-var _ = fmt.Sprintf
+}

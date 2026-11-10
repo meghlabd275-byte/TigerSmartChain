@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,11 +20,11 @@ import (
 
 // Client represents a TigerSmartChain JSON-RPC client.
 type Client struct {
-	rpcURL  string
+	rpcURL     string
 	httpClient *http.Client
 
-	mu     sync.RWMutex
-	nonce  map[string]uint64
+	mu    sync.RWMutex
+	nonce map[string]uint64
 
 	chainID uint64
 }
@@ -35,7 +36,7 @@ func NewClient(rpcURL string) (*Client, error) {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		nonce: make(map[string]uint64),
+		nonce:   make(map[string]uint64),
 		chainID: 9001,
 	}
 
@@ -309,7 +310,7 @@ func (c *Client) call(ctx context.Context, method string, params interface{}, re
 	req := &RPCRequest{
 		JSONRPC: "2.0",
 		Method:  method,
-		ID:     1,
+		ID:      1,
 	}
 
 	if params != nil {
@@ -357,62 +358,62 @@ type Transaction struct {
 
 // CallRequest represents a call request.
 type CallRequest struct {
-	From  string  `json:"from,omitempty"`
-	To    string  `json:"to"`
-	Value string  `json:"value,omitempty"`
-	Data  string  `json:"data,omitempty"`
+	From  string `json:"from,omitempty"`
+	To    string `json:"to"`
+	Value string `json:"value,omitempty"`
+	Data  string `json:"data,omitempty"`
 }
 
 // FilterRequest represents a filter request.
 type FilterRequest struct {
 	FromBlock string   `json:"fromBlock,omitempty"`
-	ToBlock  string   `json:"toBlock,omitempty"`
-	Address  string   `json:"address,omitempty"`
-	Topics   []string `json:"topics,omitempty"`
+	ToBlock   string   `json:"toBlock,omitempty"`
+	Address   string   `json:"address,omitempty"`
+	Topics    []string `json:"topics,omitempty"`
 }
 
 // Block represents a block.
 type Block struct {
-	Number       string   `json:"number"`
-	Hash         string   `json:"hash"`
-	ParentHash   string   `json:"parentHash"`
-	Nonce       string   `json:"nonce"`
-	Timestamp   string   `json:"timestamp"`
+	Number       string        `json:"number"`
+	Hash         string        `json:"hash"`
+	ParentHash   string        `json:"parentHash"`
+	Nonce        string        `json:"nonce"`
+	Timestamp    string        `json:"timestamp"`
 	Transactions []Transaction `json:"transactions"`
 }
 
 // TransactionReceipt represents a transaction receipt.
 type TransactionReceipt struct {
-	TransactionHash  string `json:"transactionHash"`
-	BlockNumber    string `json:"blockNumber"`
-	BlockHash     string `json:"blockHash"`
+	TransactionHash   string `json:"transactionHash"`
+	BlockNumber       string `json:"blockNumber"`
+	BlockHash         string `json:"blockHash"`
 	CumulativeGasUsed string `json:"cumulativeGasUsed"`
-	GasUsed      string `json:"gasUsed"`
-	Status       string `json:"status"`
+	GasUsed           string `json:"gasUsed"`
+	Status            string `json:"status"`
 }
 
 // Log represents an event log.
 type Log struct {
-	Address string   `json:"address"`
-	Topics  []string `json:"topics"`
-	Data    string   `json:"data"`
-	BlockNumber string `json:"blockNumber"`
+	Address     string   `json:"address"`
+	Topics      []string `json:"topics"`
+	Data        string   `json:"data"`
+	BlockNumber string   `json:"blockNumber"`
 }
 
 // RPCRequest represents an RPC request.
 type RPCRequest struct {
 	JSONRPC string      `json:"jsonrpc"`
-	Method string      `json:"method"`
-	Params interface{} `json:"params,omitempty"`
-	ID     int         `json:"id"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"`
+	ID      int         `json:"id"`
 }
 
 // RPCResponse represents an RPC response.
 type RPCResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	Result interface{}     `json:"result,omitempty"`
-	Error  RPCError        `json:"error,omitempty"`
-	ID     int             `json:"id"`
+	JSONRPC string      `json:"jsonrpc"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   RPCError    `json:"error,omitempty"`
+	ID      int         `json:"id"`
 }
 
 // RPCError represents an RPC error.
@@ -475,7 +476,11 @@ func parseUint64(s string) (uint64, error) {
 	if s == "" {
 		return 0, nil
 	}
-	return fmt.Sscanf(s, "%x", new(uint64))
+	v, err := strconv.ParseUint(s, 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse uint64 %q: %w", s, err)
+	}
+	return v, nil
 }
 
 func parseBigInt(s string) (*big.Int, error) {

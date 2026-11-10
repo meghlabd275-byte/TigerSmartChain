@@ -2,13 +2,11 @@
 package defi
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"

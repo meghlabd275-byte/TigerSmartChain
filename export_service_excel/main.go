@@ -7,8 +7,6 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math"
 	"math/big"
 	"net/http"
 	"os"
@@ -18,8 +16,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lib/pq"
-	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/time/rate"
 )
 

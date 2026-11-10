@@ -4,8 +4,6 @@ package vyperverifier
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"

@@ -4,8 +4,6 @@ package gasoracle
 import (
 	"context"
 	"fmt"
-	"math"
-	"math/big"
 	"sync"
 	"time"
 

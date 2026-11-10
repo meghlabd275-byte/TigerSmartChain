@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -729,7 +730,3 @@ func sendError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
-// Atomic operations for metrics
-import (
-	"sync/atomic"
-)

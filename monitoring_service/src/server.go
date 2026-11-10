@@ -3,6 +3,7 @@ package monitoring
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"runtime"
@@ -102,7 +103,7 @@ func (s *Server) checkComponents() {
 		case "database":
 			start := time.Now()
 			err := s.pool.QueryRow(ctx, "SELECT 1").Scan()
-			status.Latency = time.Since(start).Milliseconds()
+			status.Latency = float64(time.Since(start).Microseconds()) / 1000.0
 			if err != nil {
 				status.Status = "down"
 				status.Error = err.Error()
@@ -117,7 +118,7 @@ func (s *Server) checkComponents() {
 		case "redis":
 			start := time.Now()
 			err := s.redis.Ping(ctx).Err()
-			status.Latency = time.Since(start).Milliseconds()
+			status.Latency = float64(time.Since(start).Microseconds()) / 1000.0
 			if err != nil {
 				status.Status = "down"
 				status.Error = err.Error()

@@ -1,6 +1,6 @@
 /**
  * TigerScan Price Alerts Service
- * 
+ *
  * Complete implementation of token price notifications:
  * - Price threshold alerts
  * - Percentage change alerts
@@ -76,25 +76,25 @@ func getEnv(key, defaultValue string) string {
 // =============================================================================
 
 type PriceAlert struct {
-	ID            int64     `json:"id"`
-	UserID        int64     `json:"user_id"`
-	TokenAddress  string    `json:"token_address"`
-	TokenSymbol   string    `json:"token_symbol"`
-	AlertType     string    `json:"alert_type"`  // above, below, change_up, change_down, volume
-	Threshold     float64   `json:"threshold"`
-	Enabled       bool      `json:"enabled"`
+	ID            int64      `json:"id"`
+	UserID        int64      `json:"user_id"`
+	TokenAddress  string     `json:"token_address"`
+	TokenSymbol   string     `json:"token_symbol"`
+	AlertType     string     `json:"alert_type"` // above, below, change_up, change_down, volume
+	Threshold     float64    `json:"threshold"`
+	Enabled       bool       `json:"enabled"`
 	LastTriggered *time.Time `json:"last_triggered,omitempty"`
-	TriggerCount  int64     `json:"trigger_count"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	TriggerCount  int64      `json:"trigger_count"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 type NotificationChannel struct {
-	ID           int64  `json:"id"`
-	UserID       int64  `json:"user_id"`
-	ChannelType  string `json:"channel_type"` // email, telegram, discord, webhook
-	ChannelValue string `json:"channel_value"` // email address, chat ID, webhook URL
-	Enabled      bool   `json:"enabled"`
+	ID           int64     `json:"id"`
+	UserID       int64     `json:"user_id"`
+	ChannelType  string    `json:"channel_type"`  // email, telegram, discord, webhook
+	ChannelValue string    `json:"channel_value"` // email address, chat ID, webhook URL
+	Enabled      bool      `json:"enabled"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -139,23 +139,23 @@ func NewPriceAlertsService(config *Config) (*PriceAlertsService, error) {
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName,
 	)
-	
+
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if err := initDatabase(db); err != nil {
 		return nil, err
 	}
-	
+
 	service := &PriceAlertsService{
 		db:           db,
 		config:       config,
 		priceCache:   make(map[string]PriceData),
 		alertWorkers: make(map[int64]*AlertWorker),
 	}
-	
+
 	return service, nil
 }
 
@@ -206,7 +206,7 @@ func initDatabase(db *sql.DB) error {
 	CREATE INDEX idx_notification_channels_user_id ON notification_channels(user_id);
 	CREATE INDEX idx_alert_history_alert_id ON alert_history(alert_id);
 	`
-	
+
 	_, err := db.Exec(schema)
 	return err
 }
@@ -226,7 +226,7 @@ func (s *PriceAlertsService) CreateAlert(userID int64, tokenAddress, tokenSymbol
 		&alert.AlertType, &alert.Threshold, &alert.Enabled,
 		&alert.LastTriggered, &alert.TriggerCount, &alert.CreatedAt, &alert.UpdatedAt,
 	)
-	
+
 	return &alert, err
 }
 
@@ -236,12 +236,12 @@ func (s *PriceAlertsService) GetAlerts(userID int64) ([]PriceAlert, error) {
 		       enabled, last_triggered, trigger_count, created_at, updated_at
 		FROM price_alerts WHERE user_id = $1 ORDER BY created_at DESC
 	`, userID)
-	
+
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var alerts []PriceAlert
 	for rows.Next() {
 		var a PriceAlert
@@ -253,7 +253,7 @@ func (s *PriceAlertsService) GetAlerts(userID int64) ([]PriceAlert, error) {
 		}
 		alerts = append(alerts, a)
 	}
-	
+
 	return alerts, nil
 }
 
@@ -263,12 +263,12 @@ func (s *PriceAlertsService) GetAlertsByToken(tokenAddress string) ([]PriceAlert
 		       enabled, last_triggered, trigger_count, created_at, updated_at
 		FROM price_alerts WHERE token_address = $1 AND enabled = true
 	`, tokenAddress)
-	
+
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var alerts []PriceAlert
 	for rows.Next() {
 		var a PriceAlert
@@ -280,7 +280,7 @@ func (s *PriceAlertsService) GetAlertsByToken(tokenAddress string) ([]PriceAlert
 		}
 		alerts = append(alerts, a)
 	}
-	
+
 	return alerts, nil
 }
 
@@ -289,7 +289,7 @@ func (s *PriceAlertsService) UpdateAlert(alertID, userID int64, threshold float6
 		UPDATE price_alerts SET threshold = $1, enabled = $2, updated_at = CURRENT_TIMESTAMP
 		WHERE id = $3 AND user_id = $4
 	`, threshold, enabled, alertID, userID)
-	
+
 	return err
 }
 
@@ -307,22 +307,22 @@ func (s *PriceAlertsService) TriggerAlert(alertID int64, oldPrice, newPrice floa
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = $1
 	`, alertID)
-	
+
 	if err != nil {
 		return err
 	}
-	
+
 	// Record history
 	percentage := 0.0
 	if oldPrice > 0 {
 		percentage = ((newPrice - oldPrice) / oldPrice) * 100
 	}
-	
+
 	_, err = s.db.Exec(`
 		INSERT INTO alert_history (alert_id, old_price, new_price, percentage)
 		VALUES ($1, $2, $3, $4)
 	`, alertID, oldPrice, newPrice, percentage)
-	
+
 	return err
 }
 
@@ -332,12 +332,12 @@ func (s *PriceAlertsService) GetAlertHistory(alertID int64, limit int) ([]AlertH
 		FROM alert_history WHERE alert_id = $1
 		ORDER BY triggered_at DESC LIMIT $2
 	`, alertID, limit)
-	
+
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var history []AlertHistory
 	for rows.Next() {
 		var h AlertHistory
@@ -347,7 +347,7 @@ func (s *PriceAlertsService) GetAlertHistory(alertID int64, limit int) ([]AlertH
 		}
 		history = append(history, h)
 	}
-	
+
 	return history, nil
 }
 
@@ -365,7 +365,7 @@ func (s *PriceAlertsService) AddChannel(userID int64, channelType, channelValue 
 		&channel.ID, &channel.UserID, &channel.ChannelType,
 		&channel.ChannelValue, &channel.Enabled, &channel.CreatedAt,
 	)
-	
+
 	return &channel, err
 }
 
@@ -374,12 +374,12 @@ func (s *PriceAlertsService) GetChannels(userID int64) ([]NotificationChannel, e
 		SELECT id, user_id, channel_type, channel_value, enabled, created_at
 		FROM notification_channels WHERE user_id = $1
 	`, userID)
-	
+
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var channels []NotificationChannel
 	for rows.Next() {
 		var c NotificationChannel
@@ -389,7 +389,7 @@ func (s *PriceAlertsService) GetChannels(userID int64) ([]NotificationChannel, e
 		}
 		channels = append(channels, c)
 	}
-	
+
 	return channels, nil
 }
 
@@ -419,7 +419,7 @@ func (s *PriceAlertsService) UpdatePrice(tokenAddress string, price, volume24h, 
 		Timestamp:    time.Now().Unix(),
 	}
 	s.cacheMu.Unlock()
-	
+
 	// Update database
 	_, err := s.db.Exec(`
 		INSERT INTO price_feed (token_address, price, volume_24h, change_24h, updated_at)
@@ -427,7 +427,7 @@ func (s *PriceAlertsService) UpdatePrice(tokenAddress string, price, volume24h, 
 		ON CONFLICT (token_address) DO UPDATE SET
 			price = $2, volume_24h = $3, change_24h = $4, updated_at = CURRENT_TIMESTAMP
 	`, tokenAddress, price, volume24h, change24h)
-	
+
 	return err
 }
 
@@ -438,18 +438,18 @@ func (s *PriceAlertsService) GetPrice(tokenAddress string) (*PriceData, error) {
 		return &cached, nil
 	}
 	s.cacheMu.RUnlock()
-	
+
 	// Fetch from database
 	var price PriceData
 	err := s.db.QueryRow(`
 		SELECT token_address, price, volume_24h, change_24h, EXTRACT(EPOCH FROM updated_at)::bigint
 		FROM price_feed WHERE token_address = $1
 	`, tokenAddress).Scan(&price.TokenAddress, &price.Price, &price.Volume24h, &price.Change24h, &price.Timestamp)
-	
+
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &price, nil
 }
 
@@ -463,18 +463,18 @@ func (s *PriceAlertsService) SendNotification(userID int64, alert *PriceAlert, o
 	if err != nil {
 		return err
 	}
-	
+
 	message := fmt.Sprintf(
 		"🔔 Price Alert: %s\n\nToken: %s (%s)\nAlert Type: %s\nOld Price: $%.6f\nNew Price: $%.6f\nChange: %.2f%%",
 		alert.AlertType, alert.TokenSymbol, alert.TokenAddress,
 		alert.AlertType, oldPrice, newPrice, ((newPrice-oldPrice)/oldPrice)*100,
 	)
-	
+
 	for _, channel := range channels {
 		if !channel.Enabled {
 			continue
 		}
-		
+
 		switch channel.ChannelType {
 		case "email":
 			s.sendEmail(channel.ChannelValue, "Price Alert", message)
@@ -484,13 +484,13 @@ func (s *PriceAlertsService) SendNotification(userID int64, alert *PriceAlert, o
 			s.sendDiscord(channel.ChannelValue, message)
 		case "webhook":
 			s.sendWebhook(channel.ChannelValue, map[string]interface{}{
-				"alert": alert,
+				"alert":     alert,
 				"old_price": oldPrice,
 				"new_price": newPrice,
 			})
 		}
 	}
-	
+
 	return nil
 }
 
@@ -519,7 +519,7 @@ func (s *PriceAlertsService) sendWebhook(url string, data map[string]interface{}
 	payload, _ := json.Marshal(data)
 	req, _ := http.NewRequest("POST", url, strings.NewReader(string(payload)))
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	client := &http.Client{Timeout: 10 * time.Second}
 	client.Do(req)
 }
@@ -533,16 +533,16 @@ func (s *PriceAlertsService) CheckAlerts(tokenAddress string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	alerts, err := s.GetAlertsByToken(tokenAddress)
 	if err != nil {
 		return err
 	}
-	
+
 	for _, alert := range alerts {
 		triggered := false
 		var oldPrice float64
-		
+
 		switch alert.AlertType {
 		case "above":
 			if price.Price > alert.Threshold {
@@ -570,17 +570,17 @@ func (s *PriceAlertsService) CheckAlerts(tokenAddress string) error {
 				oldPrice = price.Volume24h * 0.9
 			}
 		}
-		
+
 		if triggered {
 			if err := s.TriggerAlert(alert.ID, oldPrice, price.Price); err != nil {
 				continue
 			}
-			
+
 			// Send notifications
-			s.SendNotification(alert.UserID, alert, oldPrice, price.Price)
+			s.SendNotification(alert.UserID, &alert, oldPrice, price.Price)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -590,7 +590,7 @@ func (s *PriceAlertsService) CheckAlerts(tokenAddress string) error {
 
 func (s *PriceAlertsService) RegisterRoutes(router *gin.Engine) {
 	api := router.Group("/api/v1")
-	
+
 	auth := api.Group("")
 	auth.Use(s.authMiddleware())
 	{
@@ -600,170 +600,170 @@ func (s *PriceAlertsService) RegisterRoutes(router *gin.Engine) {
 		auth.PUT("/alerts/:id", s.handleUpdateAlert)
 		auth.DELETE("/alerts/:id", s.handleDeleteAlert)
 		auth.GET("/alerts/:id/history", s.handleGetAlertHistory)
-		
+
 		// Channels
 		auth.GET("/channels", s.handleGetChannels)
 		auth.POST("/channels", s.handleAddChannel)
 		auth.DELETE("/channels/:id", s.handleDeleteChannel)
 		auth.PUT("/channels/:id/toggle", s.handleToggleChannel)
 	}
-	
+
 	// Price feed (internal)
 	api.POST("/price/update", s.handleUpdatePrice)
 }
 
 func (s *PriceAlertsService) handleGetAlerts(c *gin.Context) {
 	userID := c.GetInt64("user_id")
-	
+
 	alerts, err := s.GetAlerts(userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"alerts": alerts})
 }
 
 func (s *PriceAlertsService) handleCreateAlert(c *gin.Context) {
 	userID := c.GetInt64("user_id")
-	
+
 	var req struct {
 		TokenAddress string  `json:"token_address" binding:"required"`
 		TokenSymbol  string  `json:"token_symbol" binding:"required"`
 		AlertType    string  `json:"alert_type" binding:"required,oneof=above below change_up change_down volume"`
 		Threshold    float64 `json:"threshold" binding:"required"`
 	}
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	alert, err := s.CreateAlert(userID, req.TokenAddress, req.TokenSymbol, req.AlertType, req.Threshold)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusCreated, alert)
 }
 
 func (s *PriceAlertsService) handleUpdateAlert(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	alertID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	
+
 	var req struct {
 		Threshold float64 `json:"threshold"`
 		Enabled   *bool   `json:"enabled"`
 	}
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	
+
 	if err := s.UpdateAlert(alertID, userID, req.Threshold, enabled); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"message": "alert updated"})
 }
 
 func (s *PriceAlertsService) handleDeleteAlert(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	alertID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	
+
 	if err := s.DeleteAlert(alertID, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"message": "alert deleted"})
 }
 
 func (s *PriceAlertsService) handleGetAlertHistory(c *gin.Context) {
 	alertID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	
+
 	history, err := s.GetAlertHistory(alertID, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"history": history})
 }
 
 func (s *PriceAlertsService) handleGetChannels(c *gin.Context) {
 	userID := c.GetInt64("user_id")
-	
+
 	channels, err := s.GetChannels(userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"channels": channels})
 }
 
 func (s *PriceAlertsService) handleAddChannel(c *gin.Context) {
 	userID := c.GetInt64("user_id")
-	
+
 	var req struct {
 		ChannelType  string `json:"channel_type" binding:"required,oneof=email telegram discord webhook"`
 		ChannelValue string `json:"channel_value" binding:"required"`
 	}
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	channel, err := s.AddChannel(userID, req.ChannelType, req.ChannelValue)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusCreated, channel)
 }
 
 func (s *PriceAlertsService) handleDeleteChannel(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	channelID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	
+
 	if err := s.DeleteChannel(channelID, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"message": "channel deleted"})
 }
 
 func (s *PriceAlertsService) handleToggleChannel(c *gin.Context) {
 	userID := c.GetInt64("user_id")
 	channelID, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	
+
 	var req struct {
 		Enabled bool `json:"enabled"`
 	}
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	if err := s.ToggleChannel(channelID, userID, req.Enabled); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"message": "channel toggled"})
 }
 
@@ -774,20 +774,20 @@ func (s *PriceAlertsService) handleUpdatePrice(c *gin.Context) {
 		Volume24h    float64 `json:"volume_24h"`
 		Change24h    float64 `json:"change_24h"`
 	}
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	if err := s.UpdatePrice(req.TokenAddress, req.Price, req.Volume24h, req.Change24h); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	// Check alerts
 	s.CheckAlerts(req.TokenAddress)
-	
+
 	c.JSON(http.StatusOK, gin.H{"message": "price updated"})
 }
 
@@ -799,7 +799,7 @@ func (s *PriceAlertsService) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		
+
 		// Simplified - extract user from token
 		userID := int64(1)
 		c.Set("user_id", userID)
@@ -813,42 +813,42 @@ func (s *PriceAlertsService) authMiddleware() gin.HandlerFunc {
 
 func main() {
 	config := LoadConfig()
-	
+
 	service, err := NewPriceAlertsService(config)
 	if err != nil {
 		fmt.Printf("Failed to start service: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	router := gin.Default()
 	router.Use(gin.Recovery())
-	
+
 	service.RegisterRoutes(router)
-	
+
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "healthy"})
 	})
-	
+
 	addr := fmt.Sprintf(":%d", config.ServerPort)
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: router,
 	}
-	
+
 	go func() {
 		fmt.Printf("Starting Price Alerts service on %s\n", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("Server error: %v\n", err)
 		}
 	}()
-	
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	
+
 	srv.Shutdown(ctx)
 	fmt.Println("Server exited")
 }

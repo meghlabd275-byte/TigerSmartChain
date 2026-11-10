@@ -22,37 +22,37 @@ type Config struct {
 
 // ValidatorInfo represents validator information
 type ValidatorInfo struct {
-	Address           string  `json:"address"`
-	Name             string  `json:"name"`
-	Website          string  `json:"website"`
-	CommissionRate   float64 `json:"commissionRate"`
-	TotalStake      float64 `json:"totalStake"`
-	SelfStake        float64 `json:"selfStake"`
-	DelegatorsCount int     `json:"delegatorsCount"`
-	BlocksProposed  int64   `json:"blocksProposed"`
-	BlocksMissed    int64   `json:"blocksMissed"`
-	Uptime          float64 `json:"uptime"`
-	Rewards         float64 `json:"rewards"`
-	SelfRewards     float64 `json:"selfRewards"`
-	DelegatorRewards float64 `json:"delegatorRewards"`
-	IsActive        bool    `json:"isActive"`
-	IsJailed        bool    `json:"isJailed"`
-	JailReason      string  `json:"jailReason,omitempty"`
-	JailedUntil    *time.Time `json:"jailedUntil,omitempty"`
-	LastProposed   int64   `json:"lastProposed"`
-	FirstProposed  int64   `json:"firstProposed"`
+	Address          string     `json:"address"`
+	Name             string     `json:"name"`
+	Website          string     `json:"website"`
+	CommissionRate   float64    `json:"commissionRate"`
+	TotalStake       float64    `json:"totalStake"`
+	SelfStake        float64    `json:"selfStake"`
+	DelegatorsCount  int        `json:"delegatorsCount"`
+	BlocksProposed   int64      `json:"blocksProposed"`
+	BlocksMissed     int64      `json:"blocksMissed"`
+	Uptime           float64    `json:"uptime"`
+	Rewards          float64    `json:"rewards"`
+	SelfRewards      float64    `json:"selfRewards"`
+	DelegatorRewards float64    `json:"delegatorRewards"`
+	IsActive         bool       `json:"isActive"`
+	IsJailed         bool       `json:"isJailed"`
+	JailReason       string     `json:"jailReason,omitempty"`
+	JailedUntil      *time.Time `json:"jailedUntil,omitempty"`
+	LastProposed     int64      `json:"lastProposed"`
+	FirstProposed    int64      `json:"firstProposed"`
 }
 
 // ValidatorPerformance represents validator performance metrics
 type ValidatorPerformance struct {
-	Address         string    `json:"address"`
-	Period          string    `json:"period"` // daily, weekly, monthly
-	BlocksProposed  int64     `json:"blocksProposed"`
-	BlocksMissed    int64     `json:"blocksMissed"`
-	Uptime          float64   `json:"uptime"`
-	Rewards         float64   `json:"rewards"`
-	AvgBlockTime    float64   `json:"avgBlockTime"`
-	Participation   float64   `json:"participation"`
+	Address        string  `json:"address"`
+	Period         string  `json:"period"` // daily, weekly, monthly
+	BlocksProposed int64   `json:"blocksProposed"`
+	BlocksMissed   int64   `json:"blocksMissed"`
+	Uptime         float64 `json:"uptime"`
+	Rewards        float64 `json:"rewards"`
+	AvgBlockTime   float64 `json:"avgBlockTime"`
+	Participation  float64 `json:"participation"`
 }
 
 // SlashEvent represents a slashing event
@@ -120,14 +120,14 @@ func (s *Server) startUpdater() {
 
 func (s *Server) updateValidatorMetrics() error {
 	ctx := context.Background()
-	
+
 	// Get all validators
 	rows, err := s.pool.Query(ctx, `SELECT address FROM validators`)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	
+
 	var validators []string
 	for rows.Next() {
 		var addr string
@@ -136,7 +136,7 @@ func (s *Server) updateValidatorMetrics() error {
 		}
 		validators = append(validators, addr)
 	}
-	
+
 	for _, v := range validators {
 		if err := s.calculateUptime(ctx, v); err != nil {
 			fmt.Printf("failed to calculate uptime for %s: %v\n", v, err)
@@ -145,7 +145,7 @@ func (s *Server) updateValidatorMetrics() error {
 			fmt.Printf("failed to calculate rewards for %s: %v\n", v, err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -163,21 +163,21 @@ func (s *Server) calculateUptime(ctx context.Context, validator string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	total := proposed + missed
 	uptime := float64(0)
 	if total > 0 {
 		uptime = float64(proposed) / float64(total) * 100
 	}
-	
+
 	// Store in Redis for quick access
 	s.redis.Set(ctx, fmt.Sprintf("validator:uptime:%s", validator), fmt.Sprintf("%.4f", uptime), time.Hour)
-	
+
 	return nil
 }
 
 func (s *Server) calculateRewards(ctx context.Context, validator string) error {
-	// Calculate rewards based on blocks proposed
+	// Count the blocks this validator actually proposed in the last 24h.
 	var blocksProposed int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM blocks WHERE miner = $1 AND timestamp > $2`,
@@ -186,18 +186,41 @@ func (s *Server) calculateRewards(ctx context.Context, validator string) error {
 	if err != nil {
 		return err
 	}
-	
-	// Block reward (mock - should come from chain)
-	blockReward := 0.0625 // TGR per block
-	
-	selfStake := blockReward * 0.1 // 10% self stake
-	delegatorRewards := blockReward * 0.9 * 0.9 // 90% to delegators after commission
-	
-	totalRewards := float64(blocksProposed) * blockReward
-	
+
+	// The block reward is chain consensus configuration, not a constant: read
+	// it from the chain_params table populated by the node.
+	var blockReward float64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(value, 0) FROM chain_params WHERE key = 'block_reward'`,
+	).Scan(&blockReward); err != nil {
+		return fmt.Errorf("read block_reward from chain_params: %w", err)
+	}
+
+	// Commission is a per-validator on-chain parameter expressed in percent.
+	var commissionPercent float64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(commission_rate, 0) FROM validators WHERE address = $1`,
+		validator,
+	).Scan(&commissionPercent); err != nil {
+		return fmt.Errorf("read commission_rate for %s: %w", validator, err)
+	}
+
+	grossRewards := float64(blocksProposed) * blockReward
+	selfRewards := grossRewards * commissionPercent / 100
+	delegatorRewards := grossRewards - selfRewards
+	totalRewards := selfRewards + delegatorRewards
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO validator_rewards (validator_address, self_rewards, delegator_rewards, total_rewards, block_number, timestamp)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		validator, selfRewards, delegatorRewards, totalRewards, blocksProposed, time.Now().Unix(),
+	); err != nil {
+		return fmt.Errorf("store validator rewards: %w", err)
+	}
+
 	// Store rewards
 	s.redis.Set(ctx, fmt.Sprintf("validator:rewards:%s", validator), fmt.Sprintf("%.8f", totalRewards), time.Hour)
-	
+
 	return nil
 }
 
@@ -213,29 +236,29 @@ func (s *Server) GetValidators(ctx context.Context) ([]ValidatorInfo, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var validators []ValidatorInfo
 	for rows.Next() {
 		var v ValidatorInfo
-		if err := rows.Scan(&v.Address, &v.Name, &v.CommissionRate, &v.TotalStake, 
-			&v.SelfStake, &v.DelegatorsCount, &v.BlocksProposed, &v.BlocksMissed, 
+		if err := rows.Scan(&v.Address, &v.Name, &v.CommissionRate, &v.TotalStake,
+			&v.SelfStake, &v.DelegatorsCount, &v.BlocksProposed, &v.BlocksMissed,
 			&v.Uptime, &v.IsActive, &v.IsJailed, &v.JailReason); err != nil {
 			continue
 		}
-		
+
 		// Get uptime from Redis
 		if uptime, err := s.redis.Get(ctx, fmt.Sprintf("validator:uptime:%s", v.Address)).Result(); err == nil {
 			fmt.Sscanf(uptime, "%f", &v.Uptime)
 		}
-		
+
 		// Get rewards from Redis
 		if rewards, err := s.redis.Get(ctx, fmt.Sprintf("validator:rewards:%s", v.Address)).Result(); err == nil {
 			fmt.Sscanf(rewards, "%f", &v.Rewards)
 		}
-		
+
 		validators = append(validators, v)
 	}
-	
+
 	return validators, nil
 }
 
@@ -254,16 +277,16 @@ func (s *Server) GetValidator(ctx context.Context, address string) (*ValidatorIn
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Get real-time metrics from Redis
 	if uptime, err := s.redis.Get(ctx, fmt.Sprintf("validator:uptime:%s", address)).Result(); err == nil {
 		fmt.Sscanf(uptime, "%f", &v.Uptime)
 	}
-	
+
 	if rewards, err := s.redis.Get(ctx, fmt.Sprintf("validator:rewards:%s", address)).Result(); err == nil {
 		fmt.Sscanf(rewards, "%f", &v.Rewards)
 	}
-	
+
 	return &v, nil
 }
 
@@ -281,7 +304,7 @@ func (s *Server) GetValidatorPerformance(ctx context.Context, address, period st
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &perf, nil
 }
 
@@ -297,7 +320,7 @@ func (s *Server) GetSlashEvents(ctx context.Context, address string, limit int) 
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var events []SlashEvent
 	for rows.Next() {
 		var e SlashEvent
@@ -308,17 +331,17 @@ func (s *Server) GetSlashEvents(ctx context.Context, address string, limit int) 
 		e.Timestamp = time.Unix(timestamp, 0)
 		events = append(events, e)
 	}
-	
+
 	return events, nil
 }
 
 // GetValidatorRewards returns validator rewards history
 func (s *Server) GetValidatorRewards(ctx context.Context, address string, days int) ([]struct {
-	SelfRewards     float64
+	SelfRewards      float64
 	DelegatorRewards float64
-	TotalRewards   float64
-	BlockNumber    int64
-	Timestamp      time.Time
+	TotalRewards     float64
+	BlockNumber      int64
+	Timestamp        time.Time
 }, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT self_rewards, delegator_rewards, total_rewards, block_number, timestamp
@@ -330,22 +353,22 @@ func (s *Server) GetValidatorRewards(ctx context.Context, address string, days i
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var rewards []struct {
-		SelfRewards     float64
+		SelfRewards      float64
 		DelegatorRewards float64
-		TotalRewards   float64
-		BlockNumber    int64
-		Timestamp      time.Time
+		TotalRewards     float64
+		BlockNumber      int64
+		Timestamp        time.Time
 	}
-	
+
 	for rows.Next() {
 		var r struct {
-			SelfRewards     float64
+			SelfRewards      float64
 			DelegatorRewards float64
-			TotalRewards   float64
-			BlockNumber    int64
-			Timestamp      time.Time
+			TotalRewards     float64
+			BlockNumber      int64
+			Timestamp        time.Time
 		}
 		var timestamp int64
 		if err := rows.Scan(&r.SelfRewards, &r.DelegatorRewards, &r.TotalRewards, &r.BlockNumber, &timestamp); err != nil {
@@ -354,7 +377,7 @@ func (s *Server) GetValidatorRewards(ctx context.Context, address string, days i
 		r.Timestamp = time.Unix(timestamp, 0)
 		rewards = append(rewards, r)
 	}
-	
+
 	return rewards, nil
 }
 

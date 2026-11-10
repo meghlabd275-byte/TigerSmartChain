@@ -18,13 +18,13 @@ import (
 // Config holds WebSocket server configuration
 type Config struct {
 	Port              string
-	ReadBufferSize   int
-	WriteBufferSize  int
+	ReadBufferSize    int
+	WriteBufferSize   int
 	PoolMaxReco       int
-	DBURL            string
-	RedisURL         string
+	DBURL             string
+	RedisURL          string
 	HeartbeatInterval time.Duration
-	MaxMessageSize   int64
+	MaxMessageSize    int64
 }
 
 // Server represents the WebSocket server
@@ -32,21 +32,21 @@ type Server struct {
 	cfg       *Config
 	upgrader  websocket.Upgrader
 	pool      *pgxpool.Pool
-	redis    *redis.Client
-	clients  map[*websocket.Conn]*Client
+	redis     *redis.Client
+	clients   map[*websocket.Conn]*Client
 	clientsMu sync.RWMutex
-	ctx      context.Context
-	cancel   context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // Client represents a connected WebSocket client
 type Client struct {
-	conn       *websocket.Conn
-	send       chan []byte
-	 subscriptions map[string]bool
-	mu         sync.Mutex
-	addr       string
-	joinedAt   time.Time
+	conn          *websocket.Conn
+	send          chan []byte
+	subscriptions map[string]bool
+	mu            sync.Mutex
+	addr          string
+	joinedAt      time.Time
 }
 
 // Message represents a WebSocket message
@@ -57,34 +57,34 @@ type Message struct {
 
 // BlockMessage represents a new block message
 type BlockMessage struct {
-	Number       uint64   `json:"number"`
-	Hash         string  `json:"hash"`
-	ParentHash   string  `json:"parentHash"`
-	Timestamp   uint64   `json:"timestamp"`
-	TxCount     int     `json:"txCount"`
-	GasUsed     uint64  `json:"gasUsed"`
-	Miner       string  `json:"miner"`
+	Number     uint64 `json:"number"`
+	Hash       string `json:"hash"`
+	ParentHash string `json:"parentHash"`
+	Timestamp  uint64 `json:"timestamp"`
+	TxCount    int    `json:"txCount"`
+	GasUsed    uint64 `json:"gasUsed"`
+	Miner      string `json:"miner"`
 }
 
 // TransactionMessage represents a new transaction message
 type TransactionMessage struct {
-	Hash        string `json:"hash"`
-	From       string `json:"from"`
-	To         string `json:"to"`
-	Value      string `json:"value"`
-	GasPrice   uint64 `json:"gasPrice"`
-	GasUsed    uint64 `json:"gasUsed"`
-	Timestamp  uint64 `json:"timestamp"`
+	Hash      string `json:"hash"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Value     string `json:"value"`
+	GasPrice  uint64 `json:"gasPrice"`
+	GasUsed   uint64 `json:"gasUsed"`
+	Timestamp uint64 `json:"timestamp"`
 	Status    string `json:"status"`
 }
 
 // PendingTXMessage represents a pending transaction message
 type PendingTXMessage struct {
-	Hash       string `json:"hash"`
-	From       string `json:"from"`
-	To         string `json:"to"`
-	Value      string `json:"value"`
-	GasPrice   uint64 `json:"gasPrice"`
+	Hash      string `json:"hash"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Value     string `json:"value"`
+	GasPrice  uint64 `json:"gasPrice"`
 	Nonce     uint64 `json:"nonce"`
 	Timestamp uint64 `json:"timestamp"`
 }
@@ -92,34 +92,34 @@ type PendingTXMessage struct {
 // NewServer creates a new WebSocket server
 func NewServer(cfg *Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	// Database connection
 	pool, err := pgxpool.New(ctx, cfg.DBURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
-	
+
 	// Redis connection
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisURL,
 		Password: "",
 		DB:       0,
 	})
-	
+
 	// Test Redis connection
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to redis: %w", err)
 	}
-	
+
 	srv := &Server{
-		cfg:      cfg,
-		pool:     pool,
-		redis:    rdb,
-		clients:  make(map[*websocket.Conn]*Client),
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:     cfg,
+		pool:    pool,
+		redis:   rdb,
+		clients: make(map[*websocket.Conn]*Client),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
-	
+
 	srv.upgrader = websocket.Upgrader{
 		ReadBufferSize:  cfg.ReadBufferSize,
 		WriteBufferSize: cfg.WriteBufferSize,
@@ -127,7 +127,7 @@ func NewServer(cfg *Config) (*Server, error) {
 			return true // In production, implement proper origin checking
 		},
 	}
-	
+
 	return srv, nil
 }
 
@@ -135,10 +135,10 @@ func NewServer(cfg *Config) (*Server, error) {
 func (s *Server) Start() error {
 	// HTTP handler for WebSocket upgrades
 	http.HandleFunc("/ws", s.handleWebSocket)
-	
+
 	// Health check
 	http.HandleFunc("/health", s.handleHealth)
-	
+
 	addr := fmt.Sprintf(":%s", s.cfg.Port)
 	srv := &http.Server{
 		Addr:         addr,
@@ -146,13 +146,13 @@ func (s *Server) Start() error {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-	
+
 	// Start heartbeat goroutine
 	go s.heartbeatLoop()
-	
+
 	// Start Redis subscriber for real-time data
 	go s.subscribeToRedis()
-	
+
 	return srv.ListenAndServe()
 }
 
@@ -162,27 +162,27 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	
+
 	client := &Client{
 		conn:          conn,
 		send:          make(chan []byte, 256),
 		subscriptions: make(map[string]bool),
 		addr:          r.RemoteAddr,
-		joinedAt:     time.Now(),
+		joinedAt:      time.Now(),
 	}
-	
+
 	// Register client
 	s.clientsMu.Lock()
 	s.clients[conn] = client
 	s.clientsMu.Unlock()
-	
+
 	// Start read/write goroutines
 	go s.readPump(client)
 	go s.writePump(client)
-	
+
 	// Send welcome message
 	welcome := Message{
-		Type: "welcome",
+		Type:    "welcome",
 		Payload: json.RawMessage(`{"status":"connected"}`),
 	}
 	msg, _ := json.Marshal(welcome)
@@ -195,21 +195,21 @@ func (s *Server) readPump(client *Client) {
 		s.removeClient(client)
 		client.conn.Close()
 	}()
-	
+
 	client.conn.SetReadLimit(s.cfg.MaxMessageSize)
 	client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	
+
 	for {
 		_, msg, err := client.conn.ReadMessage()
 		if err != nil {
 			break
 		}
-		
+
 		var message Message
 		if err := json.Unmarshal(msg, &message); err != nil {
 			continue
 		}
-		
+
 		s.handleMessage(client, &message)
 	}
 }
@@ -222,19 +222,19 @@ func (s *Server) handleMessage(client *Client, message *Message) {
 			Channels []string `json:"channels"`
 		}
 		json.Unmarshal(message.Payload, &payload)
-		
+
 		client.mu.Lock()
 		for _, channel := range payload.Channels {
 			client.subscriptions[channel] = true
 		}
 		client.mu.Unlock()
-		
+
 	case "unsubscribe":
 		var payload struct {
 			Channels []string `json:"channels"`
 		}
 		json.Unmarshal(message.Payload, &payload)
-		
+
 		client.mu.Lock()
 		for _, channel := range payload.Channels {
 			delete(client.subscriptions, channel)
@@ -250,7 +250,7 @@ func (s *Server) writePump(client *Client) {
 		ticker.Stop()
 		client.conn.Close()
 	}()
-	
+
 	for {
 		select {
 		case msg, ok := <-client.send:
@@ -259,11 +259,11 @@ func (s *Server) writePump(client *Client) {
 				client.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			
+
 			if err := client.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return
 			}
-			
+
 		case <-ticker.C:
 			client.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := client.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
@@ -284,16 +284,16 @@ func (s *Server) removeClient(client *Client) {
 func (s *Server) heartbeatLoop() {
 	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
 			s.clientsMu.Lock()
-			for conn, client := range s.clients {
+			for conn := range s.clients {
 				if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-					delete(s.clients, client)
+					delete(s.clients, conn)
 					conn.Close()
 				}
 			}
@@ -306,9 +306,9 @@ func (s *Server) heartbeatLoop() {
 func (s *Server) subscribeToRedis() {
 	pubsub := s.redis.Subscribe(s.ctx, "new_block", "new_transaction", "pending_transaction")
 	defer pubsub.Close()
-	
+
 	ch := pubsub.Channel()
-	
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -323,18 +323,17 @@ func (s *Server) subscribeToRedis() {
 func (s *Server) broadcastToSubscribers(channel string, data []byte) {
 	s.clientsMu.RLock()
 	defer s.clientsMu.RUnlock()
-	
+
 	for _, client := range s.clients {
 		client.mu.Lock()
 		subscribed := client.subscriptions[channel]
 		client.mu.Unlock()
-		
+
 		if subscribed {
 			select {
 			case client.send <- data:
 			default:
 			}
-		}
 		}
 	}
 }
@@ -343,7 +342,7 @@ func (s *Server) broadcastToSubscribers(channel string, data []byte) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":   "healthy",
+		"status":  "healthy",
 		"clients": len(s.clients),
 	})
 }
@@ -354,20 +353,20 @@ func (s *Server) BroadcastNewBlock(block *BlockMessage) error {
 	if err != nil {
 		return err
 	}
-	
+
 	msg := Message{
 		Type:    "new_block",
 		Payload: data,
 	}
-	
+
 	msgData, _ := json.Marshal(msg)
-	
+
 	// Store in Redis for new connections
 	s.redis.Set(s.ctx, "latest_block", string(data), time.Hour)
-	
+
 	// Broadcast to subscribers
 	s.broadcastToSubscribers("new_block", msgData)
-	
+
 	return nil
 }
 
@@ -377,20 +376,20 @@ func (s *Server) BroadcastNewTransaction(tx *TransactionMessage) error {
 	if err != nil {
 		return err
 	}
-	
+
 	msg := Message{
 		Type:    "new_transaction",
 		Payload: data,
 	}
-	
+
 	msgData, _ := json.Marshal(msg)
-	
+
 	// Store in Redis
 	s.redis.Set(s.ctx, fmt.Sprintf("tx:%s", tx.Hash), string(data), time.Hour)
-	
+
 	// Broadcast to subscribers
 	s.broadcastToSubscribers("new_transaction", msgData)
-	
+
 	return nil
 }
 
@@ -400,33 +399,33 @@ func (s *Server) BroadcastPendingTransaction(tx *PendingTXMessage) error {
 	if err != nil {
 		return err
 	}
-	
+
 	msg := Message{
 		Type:    "pending_transaction",
 		Payload: data,
 	}
-	
+
 	msgData, _ := json.Marshal(msg)
-	
+
 	// Broadcast to subscribers
 	s.broadcastToSubscribers("pending_transaction", msgData)
-	
+
 	return nil
 }
 
 // Close closes the server and all connections
 func (s *Server) Close() error {
 	s.cancel()
-	
+
 	s.clientsMu.RLock()
 	for conn := range s.clients {
 		conn.Close()
 	}
 	s.clientsMu.RUnlock()
-	
+
 	s.pool.Close()
 	s.redis.Close()
-	
+
 	return nil
 }
 

@@ -1,6 +1,6 @@
 /**
  * TigerScan Alerts Service
- * 
+ *
  * High-performance Go service for price alerts, custom alerts, and notifications.
  * Supports email, Telegram, Discord, and Webhook notifications.
  */
@@ -8,35 +8,41 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/smtp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 // Configuration
 type AlertsConfig struct {
-	Port            int
+	Port             int
 	RedisURL         string
-	SMTPHost        string
-	SMTPPort        int
-	SMTPUser        string
-	SMTPPassword    string
+	SMTPHost         string
+	SMTPPort         int
+	SMTPUser         string
+	SMTPPassword     string
 	TelegramBotToken string
-	DiscordWebhook  string
+	DiscordWebhook   string
 }
 
 // Alert types
 type Alert struct {
 	ID             string    `json:"id"`
 	UserID         string    `json:"user_id"`
-	AlertType      string    `json:"alert_type"` // price_above, price_below, volume_above, tx_incoming, tx_outgoing
+	AlertType      string    `json:"alert_type"`  // price_above, price_below, volume_above, tx_incoming, tx_outgoing
 	EntityType     string    `json:"entity_type"` // token, nft, address
 	EntityAddr     string    `json:"entity_addr"`
 	Condition      string    `json:"condition"` // above, below, contains
@@ -48,25 +54,25 @@ type Alert struct {
 }
 
 type Notification struct {
-	ID            string    `json:"id"`
-	AlertID       string    `json:"alert_id"`
-	UserID       string    `json:"user_id"`
-	Type         string    `json:"type"` // email, telegram, discord, webhook
-	Recipient    string    `json:"recipient"`
-	Subject      string    `json:"subject"`
-	Body         string    `json:"body"`
-	SentAt       time.Time `json:"sent_at"`
-	Status       string    `json:"status"` // pending, sent, failed
+	ID        string    `json:"id"`
+	AlertID   string    `json:"alert_id"`
+	UserID    string    `json:"user_id"`
+	Type      string    `json:"type"` // email, telegram, discord, webhook
+	Recipient string    `json:"recipient"`
+	Subject   string    `json:"subject"`
+	Body      string    `json:"body"`
+	SentAt    time.Time `json:"sent_at"`
+	Status    string    `json:"status"` // pending, sent, failed
 }
 
 type NotificationChannel struct {
-	ID         string `json:"id"`
-	UserID     string `json:"user_id"`
-	ChannelType string `json:"channel_type"` // email, telegram, discord, webhook
-	Address    string `json:"address"` // email, chat_id, webhook_url
-	IsVerified  bool   `json:"is_verified"`
-	VerifiedAt time.Time `json:"verified_at"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID          string    `json:"id"`
+	UserID      string    `json:"user_id"`
+	ChannelType string    `json:"channel_type"` // email, telegram, discord, webhook
+	Address     string    `json:"address"`      // email, chat_id, webhook_url
+	IsVerified  bool      `json:"is_verified"`
+	VerifiedAt  time.Time `json:"verified_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // Request types
@@ -74,13 +80,13 @@ type CreateAlertRequest struct {
 	AlertType  string  `json:"alert_type" binding:"required"`
 	EntityType string  `json:"entity_type" binding:"required"`
 	EntityAddr string  `json:"entity_addr" binding:"required"`
-	Condition string  `json:"condition" binding:"required"`
-	Value     float64 `json:"value" binding:"required"`
+	Condition  string  `json:"condition" binding:"required"`
+	Value      float64 `json:"value" binding:"required"`
 }
 
 type CreateChannelRequest struct {
 	ChannelType string `json:"channel_type" binding:"required"`
-	Address    string `json:"address" binding:"required"`
+	Address     string `json:"address" binding:"required"`
 }
 
 type TestNotificationRequest struct {
@@ -91,15 +97,15 @@ type TestNotificationRequest struct {
 type APIResponse struct {
 	Success bool        `json:"success"`
 	Data    interface{} `json:"data,omitempty"`
-	Error   string     `json:"error,omitempty"`
+	Error   string      `json:"error,omitempty"`
 }
 
 // Alerts Service
 type AlertsService struct {
-	config   AlertsConfig
-	redis    *redis.Client
-	ctx      context.Context
-	cancel   context.CancelFunc
+	config AlertsConfig
+	redis  *redis.Client
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewAlertsService(config AlertsConfig) (*AlertsService, error) {
@@ -130,15 +136,15 @@ func (s *AlertsService) Stop() {
 // Alert Management
 func (s *AlertsService) CreateAlert(userID string, req CreateAlertRequest) (*Alert, error) {
 	alert := Alert{
-		ID:          uuid.New().String(),
-		UserID:      userID,
-		AlertType:   req.AlertType,
-		EntityType:  req.EntityType,
-		EntityAddr:  req.EntityAddr,
-		Condition:   req.Condition,
-		Value:       req.Value,
-		IsActive:    true,
-		CreatedAt:   time.Now(),
+		ID:         uuid.New().String(),
+		UserID:     userID,
+		AlertType:  req.AlertType,
+		EntityType: req.EntityType,
+		EntityAddr: req.EntityAddr,
+		Condition:  req.Condition,
+		Value:      req.Value,
+		IsActive:   true,
+		CreatedAt:  time.Now(),
 	}
 
 	alertKey := fmt.Sprintf("alert:%s", alert.ID)
@@ -237,7 +243,7 @@ func (s *AlertsService) DeleteAlert(alertID, userID string) error {
 func (s *AlertsService) CreateChannel(userID string, req CreateChannelRequest) (*NotificationChannel, error) {
 	channel := NotificationChannel{
 		ID:          uuid.New().String(),
-		UserID:       userID,
+		UserID:      userID,
 		ChannelType: req.ChannelType,
 		Address:     req.Address,
 		IsVerified:  false,
@@ -411,7 +417,7 @@ func (s *AlertsService) sendNotification(channel NotificationChannel, alert *Ale
 	case "telegram":
 		notification.Status = s.sendTelegram(channel.Address, notification.Body)
 	case "discord":
-		notification.Status = s.sendDiscord(notification.Body)
+		notification.Status = s.sendDiscord(channel.Address, notification.Body)
 	case "webhook":
 		notification.Status = s.sendWebhook(channel.Address, notification.Body)
 	}
@@ -423,22 +429,91 @@ func (s *AlertsService) sendNotification(channel NotificationChannel, alert *Ale
 }
 
 func (s *AlertsService) sendEmail(to, subject, body string) string {
-	// SMTP sending logic would go here
+	if s.config.SMTPHost == "" {
+		return "failed: SMTP not configured"
+	}
+	addr := net.JoinHostPort(s.config.SMTPHost, strconv.Itoa(s.config.SMTPPort))
+	from := s.config.SMTPUser
+	if from == "" {
+		from = "alerts@tigersmartchain.local"
+	}
+
+	header := "From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n\r\n" + body
+
+	var auth smtp.Auth
+	if s.config.SMTPUser != "" {
+		auth = smtp.PlainAuth("", s.config.SMTPUser, s.config.SMTPPassword, s.config.SMTPHost)
+	}
+	if err := smtp.SendMail(addr, auth, from, []string{to}, []byte(header)); err != nil {
+		return "failed: " + err.Error()
+	}
 	return "sent"
 }
 
 func (s *AlertsService) sendTelegram(chatID, message string) string {
-	// Telegram Bot API logic would go here
-	return "sent"
+	if s.config.TelegramBotToken == "" {
+		return "failed: Telegram bot token not configured"
+	}
+	endpoint := "https://api.telegram.org/bot" + s.config.TelegramBotToken + "/sendMessage"
+	form := url.Values{"chat_id": {chatID}, "text": {message}}
+	return s.postForm(endpoint, form, "Telegram")
 }
 
 func (s *AlertsService) sendDiscord(webhookURL, message string) string {
-	// Discord webhook logic would go here
-	return "sent"
+	if webhookURL == "" {
+		webhookURL = s.config.DiscordWebhook
+	}
+	if webhookURL == "" {
+		return "failed: Discord webhook not configured"
+	}
+	payload, err := json.Marshal(map[string]string{"content": message})
+	if err != nil {
+		return "failed: " + err.Error()
+	}
+	return s.postJSON(webhookURL, payload, "Discord")
 }
 
 func (s *AlertsService) sendWebhook(url, payload string) string {
-	// HTTP POST to webhook URL
+	if url == "" {
+		return "failed: webhook URL is empty"
+	}
+	return s.postJSON(url, []byte(payload), "webhook")
+}
+
+// postJSON POSTs a JSON body and reports the outcome as a notification status.
+func (s *AlertsService) postJSON(endpoint string, body []byte, label string) string {
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return "failed: " + err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return s.do(req, label)
+}
+
+func (s *AlertsService) postForm(endpoint string, form url.Values, label string) string {
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "failed: " + err.Error()
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return s.do(req, label)
+}
+
+func (s *AlertsService) do(req *http.Request, label string) string {
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "failed: " + err.Error()
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Sprintf("failed: %s returned %d", label, resp.StatusCode)
+	}
 	return "sent"
 }
 
@@ -689,7 +764,7 @@ func (s *AlertsService) startHTTPServer() {
 
 func main() {
 	config := AlertsConfig{
-		Port:    8091,
+		Port:     8091,
 		RedisURL: "localhost:6379",
 	}
 

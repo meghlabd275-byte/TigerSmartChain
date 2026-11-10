@@ -37,10 +37,10 @@ type Config struct {
 	SessionDuration   time.Duration
 	RequireEmailVerification bool
 	Enable2FA            bool
-	argon2Time          int
-	argon2Memory        int
-	argon2Threads       int
-	argon2KeyLen       uint32
+	argon2Time          uint32
+	argon2Memory        uint32
+	argon2Threads       uint8
+	argon2KeyLen        uint32
 }
 
 // User represents an authenticated user
@@ -238,10 +238,7 @@ func (s *Server) Register(ctx context.Context, email, username, password string)
 	saltStr := base64.StdEncoding.EncodeToString(salt)
 	
 	// Hash password using Argon2
-	hash, err := argon2.IDKey([]byte(password), salt, s.cfg.argon2Time, s.cfg.argon2Memory, s.cfg.argon2Threads, s.cfg.argon2KeyLen)
-	if err != nil {
-		return nil, err
-	}
+	hash := argon2.IDKey([]byte(password), salt, s.cfg.argon2Time, s.cfg.argon2Memory, s.cfg.argon2Threads, s.cfg.argon2KeyLen)
 	hashStr := base64.StdEncoding.EncodeToString(hash)
 	
 	// Create user
@@ -291,10 +288,7 @@ func (s *Server) Login(ctx context.Context, email, password, ipAddress, userAgen
 	}
 	
 	// Verify password using Argon2
-	hash, err := argon2.IDKey([]byte(password), salt, s.cfg.argon2Time, s.cfg.argon2Memory, s.cfg.argon2Threads, s.cfg.argon2KeyLen)
-	if err != nil {
-		return "", "", nil, err
-	}
+	hash := argon2.IDKey([]byte(password), salt, s.cfg.argon2Time, s.cfg.argon2Memory, s.cfg.argon2Threads, s.cfg.argon2KeyLen)
 	hashStr := base64.StdEncoding.EncodeToString(hash)
 	
 	if hashStr != user.PasswordHash {
