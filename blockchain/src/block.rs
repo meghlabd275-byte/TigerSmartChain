@@ -333,6 +333,101 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+
+// =============================================================================
+// EIP-155 TRANSACTION SIGNING
+// =============================================================================
+
+/// The EIP-155 signing hash of a legacy transaction.
+///
+/// The signed preimage is `[nonce, gasPrice, gasLimit, to, value, data,
+/// chainId, 0, 0]`; including the chain id is what prevents a transaction
+/// signed for one chain from being replayed on another.
+pub fn signing_hash(tx: &Transaction, chain_id: u64) -> Result<[u8; 32], ValidationError> {
+    let to = match &tx.to {
+        Some(address) => fixed_item(address, 20)?,
+        None => RlpItem::Bytes(Vec::new()),
+    };
+    let fields = vec![
+        RlpItem::from_u64(tx.nonce),
+        RlpItem::from_u64(tx.gas_price),
+        RlpItem::from_u64(tx.gas),
+        to,
+        quantity_item(&tx.value)?,
+        RlpItem::Bytes(decode_hex_field(&tx.input, None)?),
+        RlpItem::from_u64(chain_id),
+        RlpItem::Bytes(Vec::new()),
+        RlpItem::Bytes(Vec::new()),
+    ];
+    Ok(tiger_crypto::keccak256(&RlpItem::list(fields).encode()))
+}
+
+/// Fill in a transaction's signature fields by signing its EIP-155 hash.
+///
+/// Sets `v`, `r`, `s` and the transaction `hash`.
+pub fn sign_transaction(
+    tx: &mut Transaction,
+    chain_id: u64,
+    private_key: &[u8; 32],
+) -> Result<(), ValidationError> {
+    let hash = signing_hash(tx, chain_id)?;
+    let signature = tiger_crypto::sign(&hash, private_key)
+        .map_err(|_| ValidationError::MalformedField("private_key"))?;
+
+    tx.v = format!("0x{:x}", signature.v(Some(chain_id)));
+    tx.r = format!("0x{}", hex_encode(&signature.r()));
+    tx.s = format!("0x{}", hex_encode(&signature.s()));
+    tx.hash = transaction_hash(tx)?;
+    Ok(())
+}
+
+/// Recover the sender address of a signed legacy transaction.
+///
+/// This is how a node verifies that a transaction was authorised by the
+/// account whose nonce and balance it is about to spend.
+pub fn recover_transaction_sender(
+    tx: &Transaction,
+    chain_id: u64,
+) -> Result<[u8; 20], ValidationError> {
+    let v = decode_hex_quantity(&tx.v)?;
+    let v_value = bytes_to_u64(&v);
+    let r = decode_hex_quantity(&tx.r)?;
+    let s = decode_hex_quantity(&tx.s)?;
+    if r.len() > 32 || s.len() > 32 {
+        return Err(ValidationError::MalformedField("signature"));
+    }
+
+    // EIP-155 encodes the chain id in v as v = recovery_id + 35 + 2 * chain_id.
+    // Values of 27/28 are the pre-EIP-155 form.
+    let recovery_id = match v_value {
+        27 | 28 => (v_value - 27) as u8,
+        other => {
+            let expected_parity_base = 35 + 2 * chain_id;
+            if other < expected_parity_base {
+                return Err(ValidationError::MalformedField("v"));
+            }
+            ((other - expected_parity_base) % 2) as u8
+        }
+    };
+
+    let mut signature = [0u8; 64];
+    signature[32 - r.len()..32].copy_from_slice(&r);
+    signature[64 - s.len()..].copy_from_slice(&s);
+
+    let hash = signing_hash(tx, chain_id)?;
+    tiger_crypto::recover_sender(&hash, &signature, recovery_id)
+        .map_err(|_| ValidationError::MalformedField("signature"))
+}
+
+/// Big-endian byte string to u64, saturating at 8 bytes.
+fn bytes_to_u64(bytes: &[u8]) -> u64 {
+    let mut out = 0u64;
+    for &b in bytes.iter().take(8) {
+        out = (out << 8) | b as u64;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +672,87 @@ mod tests {
             validate_block(&block, None, &test_config()),
             Err(ValidationError::TransactionMissingHash(0))
         ));
+    }
+
+    #[test]
+    fn eip155_signing_hash_matches_the_specification() {
+        // The canonical EIP-155 example: chain id 1, private key 0x4646..46.
+        let tx = Transaction {
+            hash: String::new(),
+            nonce: 9,
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            from: format!("0x{}", hex_encode(&[0x00; 20])),
+            to: Some(format!("0x{}", hex_encode(&[0x35; 20]))),
+            value: format!("0x{}", hex_encode(&1_000_000_000_000_000_000u64.to_be_bytes())),
+            gas_price: 20_000_000_000,
+            gas: 21_000,
+            input: "0x".to_string(),
+            v: "0x0".to_string(),
+            r: "0x0".to_string(),
+            s: "0x0".to_string(),
+        };
+        assert_eq!(
+            hex_encode(&signing_hash(&tx, 1).unwrap()),
+            "daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53"
+        );
+    }
+
+    #[test]
+    fn sign_then_recover_round_trips_to_the_signer() {
+        let mut key = [0u8; 32];
+        key.fill(0x46);
+
+        let mut tx = reference_tx();
+        // reference_tx declares a sender of 0x11..11, but the signer is
+        // 0x46..46; recovery must report the real signer, not the declared one.
+        sign_transaction(&mut tx, 6666, &key).unwrap();
+
+        // The signature fields must be populated and the hash consistent.
+        assert_ne!(tx.v, "0x0");
+        assert_eq!(tx.hash, transaction_hash(&tx).unwrap());
+
+        let recovered = recover_transaction_sender(&tx, 6666).unwrap();
+        assert_eq!(
+            hex_encode(&recovered),
+            "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f",
+            "recovered sender must be the address of the signing key"
+        );
+    }
+
+    #[test]
+    fn recovering_on_the_wrong_chain_id_yields_a_different_sender() {
+        let mut key = [0u8; 32];
+        key.fill(0x46);
+        let mut tx = reference_tx();
+        sign_transaction(&mut tx, 6666, &key).unwrap();
+
+        let correct = recover_transaction_sender(&tx, 6666).unwrap();
+        // Recovering with a different chain id changes the signing hash, so
+        // the recovered key cannot be the same. This is exactly the replay
+        // protection EIP-155 provides.
+        let wrong = recover_transaction_sender(&tx, 1);
+        match wrong {
+            Ok(addr) => assert_ne!(addr, correct),
+            Err(_) => {} // a malformed v for that chain is also acceptable
+        }
+    }
+
+    #[test]
+    fn tampered_transaction_fails_sender_recovery() {
+        let mut key = [0u8; 32];
+        key.fill(0x46);
+        let mut tx = reference_tx();
+        sign_transaction(&mut tx, 6666, &key).unwrap();
+        let original = recover_transaction_sender(&tx, 6666).unwrap();
+
+        // Change the value after signing: recovery must not return the signer.
+        tx.value = "0x7d0".to_string();
+        match recover_transaction_sender(&tx, 6666) {
+            Ok(addr) => assert_ne!(addr, original, "tampering must change the sender"),
+            Err(_) => {}
+        }
     }
 
     #[test]

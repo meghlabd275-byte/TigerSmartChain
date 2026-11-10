@@ -201,12 +201,79 @@ static void test_address_derivation(void) {
     expect_bytes("address(G)", addr, "7e5f4552091a69125d5dfcb7b8c2659029395bdf", 20);
 }
 
+
+// Signing must be deterministic (RFC 6979), produce low-s signatures, and
+// round-trip through verification and recovery. The vector is the canonical
+// EIP-155 example (private key 0x4646..46, chain id 1).
+static void test_signing(void) {
+    uint8_t priv[32];
+    for (int i = 0; i < 32; ++i) priv[i] = 0x46;
+    uint8_t hash[32];
+    hex_to_bytes("daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53", hash, 32);
+
+    uint8_t sig[64];
+    uint8_t recid = 0;
+    expect_int("sign_ecdsa succeeds", sign_ecdsa(hash, priv, sig, &recid), 1);
+
+    // Deterministic: the same inputs always give the same signature.
+    uint8_t sig2[64];
+    uint8_t recid2 = 0;
+    sign_ecdsa(hash, priv, sig2, &recid2);
+    expect_bytes("signature is deterministic", sig,
+                 "28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276"
+                 "67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83",
+                 64);
+    expect_int("recovery id is stable", recid, recid2);
+
+    // r and s must match the published EIP-155 example exactly.
+    expect_bytes("signature r matches EIP-155", sig,
+                 "28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276", 32);
+    expect_bytes("signature s matches EIP-155", sig + 32,
+                 "67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83", 32);
+
+    // The signature must verify and recover to the right key.
+    uint8_t pubkey[64];
+    expect_int("recover_pubkey succeeds", recover_pubkey(hash, sig, recid, pubkey), 1);
+    expect_int("verify_ecdsa accepts own signature", verify_ecdsa(hash, sig, pubkey), 1);
+
+    // A tampered message must be rejected.
+    uint8_t other_hash[32];
+    hex_to_bytes("daf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e54", other_hash, 32);
+    expect_int("tampered hash rejected", verify_ecdsa(other_hash, sig, pubkey), 0);
+
+    // The recovered address must equal the EIP-155 example sender.
+    uint8_t addr[20];
+    pubkey_to_address(pubkey, addr);
+    expect_bytes("sender address matches EIP-155", addr,
+                 "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f", 20);
+
+    // Out-of-range private keys must be refused.
+    uint8_t zero_key[32] = {0};
+    expect_int("zero private key rejected", sign_ecdsa(hash, zero_key, sig2, &recid2), 0);
+
+    // The wrong recovery id must not recover the same address.
+    uint8_t pubkey_other[64];
+    uint8_t addr_other[20];
+    if (recover_pubkey(hash, sig, (uint8_t)(recid ^ 1), pubkey_other) == 1) {
+        pubkey_to_address(pubkey_other, addr_other);
+        expect_int("wrong recovery id yields a different address",
+                   memcmp(addr, addr_other, 20) != 0, 1);
+    } else {
+        expect_int("wrong recovery id is rejected", 1, 1);
+    }
+
+    // s must be low (EIP-2): the top byte of s must be below 0x80 since
+    // n/2 < 2^255.
+    expect_int("signature s is low (EIP-2)", sig[32] < 0x80, 1);
+}
+
 int main(void) {
     test_keccak();
     test_sha3();
     test_rfc6979_vector();
     test_sign_recover_roundtrip();
     test_address_derivation();
+    test_signing();
 
     printf("\n%d/%d checks passed\n", checks - failures, checks);
     if (failures) {

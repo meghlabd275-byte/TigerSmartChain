@@ -43,6 +43,16 @@ int recover_pubkey(const uint8_t* msg_hash, const uint8_t* sig, uint8_t recovery
  */
 void pubkey_to_address(const uint8_t* pubkey, uint8_t* address_out);
 
+/* Sign a 32-byte digest with a 32-byte private key.
+ * Uses deterministic RFC 6979 nonces, so no random source is required and the
+ * same input always produces the same signature. The signature is low-s
+ * normalised (EIP-2) and written as 64 bytes, r || s.
+ * recovery_id_out receives the recovery id (0 or 1) used by recover_pubkey.
+ * Returns 1 on success, 0 if the key is out of range or the digest is unusable.
+ */
+int sign_ecdsa(const uint8_t* msg_hash, const uint8_t* privkey, uint8_t* sig_out,
+               uint8_t* recovery_id_out);
+
 #ifdef __cplusplus
 }
 #endif
