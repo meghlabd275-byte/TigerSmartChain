@@ -1,234 +1,222 @@
-//! Encryption module for TigerSmartChain
-//! 
-//! Provides AES-256-GCM encryption for secure data protection.
+//! Authenticated encryption for TigerSmartChain.
+//!
+//! [`encrypt`] is AES-256-GCM. Every call draws a fresh 96-bit nonce from the
+//! operating system CSPRNG, and the 128-bit GCM tag is verified before any
+//! plaintext is returned, so a tampered ciphertext fails to decrypt rather
+//! than yielding corrupt data.
+//!
+//! Keys come from [`generate_key`], which also uses the OS CSPRNG. A key
+//! derived from a clock reading is guessable and is not accepted here.
+
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce as GcmNonce};
+use rand_core::{OsRng, RngCore};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{Error, Result};
 
-/// AES-256-GCM Encryption key (256-bit)
-#[derive(Clone)]
+/// The nonce length AES-GCM uses here. 96 bits is the size the construction
+/// was designed around; other lengths are hashed internally, which adds cost
+/// without adding security.
+const NONCE_LEN: usize = 12;
+
+/// The GCM authentication tag length.
+const TAG_LEN: usize = 16;
+
+/// A 256-bit AES key.
+///
+/// The bytes are zeroed on drop and are not printed, so a key cannot leak
+/// through a log line or a debug dump.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptionKey {
     bytes: [u8; 32],
 }
 
-/// Initialization Vector / Nonce (96-bit for AES-GCM)
-#[derive(Clone, Debug, PartialEq)]
-pub struct Nonce {
-    bytes: [u8; 12],
+impl std::fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EncryptionKey(<redacted>)")
+    }
 }
 
-/// Encrypted data with authentication tag
+/// A 96-bit nonce. Must never repeat under the same key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nonce {
+    bytes: [u8; NONCE_LEN],
+}
+
+/// A ciphertext with the nonce and tag needed to open it.
 #[derive(Clone, Debug)]
 pub struct EncryptedData {
     ciphertext: Vec<u8>,
     nonce: Nonce,
-    tag: [u8; 16],
+    tag: [u8; TAG_LEN],
 }
 
-/// Generate a new encryption key
+/// Generate a new key from the operating system CSPRNG.
 pub fn generate_key() -> EncryptionKey {
-    use crate::hashing::keccak256;
-    use core::time::SystemTime;
-    
-    // Use time-based randomness for key generation
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    
-    let mut seed = [0u8; 32];
-    for (i, byte) in seed.iter_mut().enumerate() {
-        *byte = ((now >> i) & 0xFF) ^ 0xA5 ^ (i as u8);
-    }
-    
-    let hash = keccak256(&seed);
-    
-    EncryptionKey { bytes: hash }
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    EncryptionKey { bytes }
 }
 
-/// Generate a random nonce
+/// Build a key from raw bytes.
+///
+/// This is the way to load a key from a secret store. It does not stretch the
+/// input: a low-entropy byte string stays low-entropy.
+pub fn key_from_bytes(bytes: [u8; 32]) -> EncryptionKey {
+    EncryptionKey { bytes }
+}
+
+/// Generate a random nonce from the operating system CSPRNG.
 pub fn generate_nonce() -> Nonce {
-    use core::time::SystemTime;
-    
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    
-    let mut nonce_bytes = [0u8; 12];
-    for (i, byte) in nonce_bytes.iter_mut().enumerate() {
-        *byte = ((now >> (i * 5)) & 0xFF) as u8;
-    }
-    
-    Nonce { bytes: nonce_bytes }
+    let mut bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut bytes);
+    Nonce { bytes }
 }
 
-/// Encrypt data using AES-256-GCM
+/// Encrypt `plaintext` with AES-256-GCM under `key`.
 pub fn encrypt(key: &EncryptionKey, plaintext: &[u8]) -> Result<EncryptedData> {
-    use crate::hashing::keccak256;
-    
-    // Generate nonce
+    encrypt_aad(key, plaintext, &[])
+}
+
+/// Encrypt `plaintext` with AES-256-GCM, authenticating `aad` alongside it.
+///
+/// The additional data is not encrypted, but it is covered by the tag: if it
+/// differs at decryption time, the tag check fails.
+pub fn encrypt_aad(key: &EncryptionKey, plaintext: &[u8], aad: &[u8]) -> Result<EncryptedData> {
+    let cipher = Aes256Gcm::new_from_slice(&key.bytes)
+        .map_err(|e| Error::EncryptionFailed(e.to_string()))?;
+
     let nonce = generate_nonce();
-    
-    // Derive encryption key from key and nonce
-    let mut key_material = Vec::with_capacity(32 + 12);
-    key_material.extend_from_slice(&key.bytes);
-    key_material.extend_from_slice(&nonce.bytes);
-    
-    let encryption_key = keccak256(&key_material);
-    
-    // XOR encrypt (simplified - in production use AES-GCM)
-    let ciphertext = xor_encrypt(plaintext, &encryption_key);
-    
-    // Generate authentication tag
-    let mut tag_material = Vec::new();
-    tag_material.extend_from_slice(&ciphertext);
-    tag_material.extend_from_slice(&nonce.bytes);
-    let tag_hash = keccak256(&tag_material);
-    let mut tag = [0u8; 16];
-    tag.copy_from_slice(&tag_hash[..16]);
-    
+
+    // aes-gcm appends the 16-byte tag to the ciphertext, so split it back out
+    // to keep the tag a separate field.
+    let mut sealed = cipher
+        .encrypt(
+            GcmNonce::from_slice(&nonce.bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| Error::EncryptionFailed(e.to_string()))?;
+
+    if sealed.len() < TAG_LEN {
+        return Err(Error::EncryptionFailed(
+            "ciphertext shorter than the authentication tag".to_string(),
+        ));
+    }
+
+    let tag_start = sealed.len() - TAG_LEN;
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&sealed[tag_start..]);
+    sealed.truncate(tag_start);
+
     Ok(EncryptedData {
-        ciphertext,
+        ciphertext: sealed,
         nonce,
         tag,
     })
 }
 
-/// Decrypt data using AES-256-GCM
+/// Decrypt AES-256-GCM data.
+///
+/// Fails with [`Error::DecryptionFailed`] if the key is wrong, the ciphertext
+/// was altered, or the nonce or tag was changed.
 pub fn decrypt(key: &EncryptionKey, encrypted: &EncryptedData) -> Result<Vec<u8>> {
-    use crate::hashing::keccak256;
-    
-    // Reconstruct encryption key
-    let mut key_material = Vec::with_capacity(32 + 12);
-    key_material.extend_from_slice(&key.bytes);
-    key_material.extend_from_slice(&encrypted.nonce.bytes);
-    
-    let encryption_key = keccak256(&key_material);
-    
-    // XOR decrypt
-    let plaintext = xor_decrypt(&encrypted.ciphertext, &encryption_key);
-    
-    // Verify tag
-    let mut tag_material = Vec::new();
-    tag_material.extend_from_slice(&encrypted.ciphertext);
-    tag_material.extend_from_slice(&encrypted.nonce.bytes);
-    let expected_tag = keccak256(&tag_material);
-    
-    if &expected_tag[..16] != &encrypted.tag {
-        return Err(Error::DecryptionFailed("authentication tag mismatch".to_string()));
-    }
-    
-    Ok(plaintext)
+    decrypt_aad(key, encrypted, &[])
 }
 
-/// XOR-based encryption (simplified)
-fn xor_encrypt(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    plaintext
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| b ^ key[i % 32])
-        .collect()
-}
-
-/// XOR-based decryption
-fn xor_decrypt(ciphertext: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    // XOR is symmetric
-    xor_encrypt(ciphertext, key)
-}
-
-/// Encrypt with additional authenticated data
-pub fn encrypt_aad(
-    key: &EncryptionKey,
-    plaintext: &[u8],
-    aad: &[u8],
-) -> Result<EncryptedData> {
-    use crate::hashing::keccak256;
-    
-    let mut encrypted = encrypt(key, plaintext)?;
-    
-    // Include AAD in tag
-    let aad_hash = keccak256(aad);
-    for i in 0..16 {
-        encrypted.tag[i] ^= aad_hash[i];
-    }
-    
-    Ok(encrypted)
-}
-
-/// Decrypt with additional authenticated data
+/// Decrypt AES-256-GCM data that was sealed with additional authenticated
+/// data. The same `aad` must be supplied, or the tag check fails.
 pub fn decrypt_aad(
     key: &EncryptionKey,
     encrypted: &EncryptedData,
     aad: &[u8],
 ) -> Result<Vec<u8>> {
-    use crate::hashing::keccak256;
-    
-    // Verify AAD in tag
-    let aad_hash = keccak256(aad);
-    let mut tag_with_aad = encrypted.tag;
-    for i in 0..16 {
-        tag_with_aad[i] ^= aad_hash[i];
-    }
-    
-    decrypt(key, encrypted)
+    let cipher = Aes256Gcm::new_from_slice(&key.bytes)
+        .map_err(|e| Error::DecryptionFailed(e.to_string()))?;
+
+    let mut sealed = Vec::with_capacity(encrypted.ciphertext.len() + TAG_LEN);
+    sealed.extend_from_slice(&encrypted.ciphertext);
+    sealed.extend_from_slice(&encrypted.tag);
+
+    cipher
+        .decrypt(
+            GcmNonce::from_slice(&encrypted.nonce.bytes),
+            Payload {
+                msg: &sealed,
+                aad,
+            },
+        )
+        .map_err(|_| Error::DecryptionFailed("authentication tag mismatch".to_string()))
 }
 
 impl EncryptionKey {
-    /// Get key bytes
+    /// Borrow the raw key bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.bytes
     }
-    
-    /// Convert to hex string
+
+    /// Hex-encode the key.
+    ///
+    /// Prefer to keep keys out of logs and out of version control.
     pub fn to_hex(&self) -> String {
         hex::encode(self.bytes)
     }
 }
 
 impl Nonce {
-    /// Get nonce bytes
-    pub fn as_bytes(&self) -> &[u8; 12] {
+    /// Borrow the nonce bytes.
+    pub fn as_bytes(&self) -> &[u8; NONCE_LEN] {
         &self.bytes
     }
 }
 
 impl EncryptedData {
-    /// Get ciphertext
+    /// The ciphertext, without the nonce or tag.
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
     }
-    
-    /// Get nonce
+
+    /// The nonce used for this message.
     pub fn nonce(&self) -> &Nonce {
         &self.nonce
     }
-    
-    /// Get authentication tag
-    pub fn tag(&self) -> &[u8; 16] {
+
+    /// The authentication tag.
+    pub fn tag(&self) -> &[u8; TAG_LEN] {
         &self.tag
     }
-    
-    /// Serialize to bytes
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&self.nonce.bytes);
-        result.extend_from_slice(&self.tag);
-        result.extend_from_slice(&self.ciphertext);
-        result
-    }
-}
 
-/// Simple hex encoding
-mod hex {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-    
-    pub fn encode(data: &[u8]) -> String {
-        let mut result = String::with_capacity(data.len() * 2);
-        for &byte in data {
-            result.push(HEX_CHARS[(byte >> 4) as usize] as char);
-            result.push(HEX_CHARS[(byte & 0x0F) as usize] as char);
+    /// Pack as `nonce || tag || ciphertext`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(NONCE_LEN + TAG_LEN + self.ciphertext.len());
+        out.extend_from_slice(&self.nonce.bytes);
+        out.extend_from_slice(&self.tag);
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    /// Unpack from `nonce || tag || ciphertext`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < NONCE_LEN + TAG_LEN {
+            return Err(Error::InvalidData(
+                "encrypted payload is shorter than nonce plus tag".to_string(),
+            ));
         }
-        result
+
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&bytes[..NONCE_LEN]);
+
+        let mut tag = [0u8; TAG_LEN];
+        tag.copy_from_slice(&bytes[NONCE_LEN..NONCE_LEN + TAG_LEN]);
+
+        Ok(EncryptedData {
+            ciphertext: bytes[NONCE_LEN + TAG_LEN..].to_vec(),
+            nonce: Nonce { bytes: nonce },
+            tag,
+        })
     }
 }
 
@@ -237,49 +225,147 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encrypt_decrypt() {
+    fn round_trip() {
         let key = generate_key();
         let plaintext = b"Secret message";
-        
+
         let encrypted = encrypt(&key, plaintext).unwrap();
-        let decrypted = decrypt(&key, &encrypted).unwrap();
-        
-        assert_eq!(decrypted, plaintext);
+        assert_eq!(decrypt(&key, &encrypted).unwrap(), plaintext);
     }
 
     #[test]
-    fn test_different_nonces() {
+    fn empty_plaintext_round_trips() {
         let key = generate_key();
-        let plaintext = b"Test message";
-        
-        let encrypted1 = encrypt(&key, plaintext).unwrap();
-        let encrypted2 = encrypt(&key, plaintext).unwrap();
-        
-        // Different nonces should produce different ciphertext
-        assert_ne!(encrypted1.ciphertext, encrypted2.ciphertext);
+        let encrypted = encrypt(&key, b"").unwrap();
+        assert_eq!(decrypt(&key, &encrypted).unwrap(), b"");
     }
 
     #[test]
-    fn test_wrong_key() {
-        let key1 = generate_key();
-        let key2 = generate_key();
-        let plaintext = b"Secret";
-        
-        let encrypted = encrypt(&key1, plaintext).unwrap();
-        let result = decrypt(&key2, &encrypted);
-        
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_encrypt_aad() {
+    fn nonce_is_not_reused() {
         let key = generate_key();
-        let plaintext = b"Secret data";
-        let aad = b"Additional data";
-        
-        let encrypted = encrypt_aad(&key, plaintext, aad).unwrap();
-        let decrypted = decrypt_aad(&key, &encrypted, aad).unwrap();
-        
-        assert_eq!(decrypted, plaintext);
+        let first = encrypt(&key, b"same plaintext").unwrap();
+        let second = encrypt(&key, b"same plaintext").unwrap();
+
+        assert_ne!(first.nonce(), second.nonce());
+        assert_ne!(first.ciphertext(), second.ciphertext());
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let encrypted = encrypt(&generate_key(), b"Secret").unwrap();
+        assert!(decrypt(&generate_key(), &encrypted).is_err());
+    }
+
+    #[test]
+    fn tampered_ciphertext_is_rejected() {
+        let key = generate_key();
+        let mut encrypted = encrypt(&key, b"transfer 1 TGR").unwrap();
+        encrypted.ciphertext[0] ^= 0x01;
+
+        assert!(decrypt(&key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn tampered_tag_is_rejected() {
+        let key = generate_key();
+        let mut encrypted = encrypt(&key, b"data").unwrap();
+        encrypted.tag[0] ^= 0x01;
+
+        assert!(decrypt(&key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn tampered_nonce_is_rejected() {
+        let key = generate_key();
+        let mut encrypted = encrypt(&key, b"data").unwrap();
+        encrypted.nonce.bytes[0] ^= 0x01;
+
+        assert!(decrypt(&key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn aad_round_trip() {
+        let key = generate_key();
+        let encrypted = encrypt_aad(&key, b"Secret data", b"context").unwrap();
+        assert_eq!(
+            decrypt_aad(&key, &encrypted, b"context").unwrap(),
+            b"Secret data"
+        );
+    }
+
+    #[test]
+    fn mismatched_aad_is_rejected() {
+        let key = generate_key();
+        let encrypted = encrypt_aad(&key, b"Secret data", b"context").unwrap();
+
+        assert!(decrypt_aad(&key, &encrypted, b"other context").is_err());
+        assert!(decrypt(&key, &encrypted).is_err());
+    }
+
+    #[test]
+    fn aad_protects_the_tag() {
+        // A payload sealed with AAD must not open without it, and one sealed
+        // without AAD must not open with it.
+        let key = generate_key();
+
+        let with_aad = encrypt_aad(&key, b"msg", b"binding").unwrap();
+        assert!(decrypt(&key, &with_aad).is_err());
+
+        let without_aad = encrypt(&key, b"msg").unwrap();
+        assert!(decrypt_aad(&key, &without_aad, b"binding").is_err());
+    }
+
+    #[test]
+    fn serialisation_round_trip() {
+        let key = generate_key();
+        let encrypted = encrypt(&key, b"payload").unwrap();
+
+        let packed = encrypted.to_bytes();
+        let unpacked = EncryptedData::from_bytes(&packed).unwrap();
+
+        assert_eq!(unpacked.nonce(), encrypted.nonce());
+        assert_eq!(unpacked.tag(), encrypted.tag());
+        assert_eq!(unpacked.ciphertext(), encrypted.ciphertext());
+        assert_eq!(decrypt(&key, &unpacked).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn truncated_payload_is_rejected() {
+        assert!(EncryptedData::from_bytes(&[0u8; NONCE_LEN + TAG_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn ciphertext_is_the_same_length_as_the_plaintext() {
+        // GCM is a stream mode, so no padding is added. The tag is stored
+        // separately rather than appended.
+        let key = generate_key();
+        let plaintext = vec![0xAB; 1000];
+        let encrypted = encrypt(&key, &plaintext).unwrap();
+
+        assert_eq!(encrypted.ciphertext().len(), plaintext.len());
+    }
+
+    #[test]
+    fn key_does_not_appear_in_debug_output() {
+        let key = generate_key();
+        let rendered = format!("{:?}", key);
+        assert!(!rendered.contains(&key.to_hex()));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn known_answer() {
+        // NIST AES-256-GCM test vector: all-zero key and nonce, empty message
+        // and empty AAD. The expected tag is 530f8afbc74536b9a963b4f1c4cb738b.
+        let key = EncryptionKey { bytes: [0u8; 32] };
+        let nonce = Nonce { bytes: [0u8; NONCE_LEN] };
+
+        let cipher = Aes256Gcm::new_from_slice(&key.bytes).unwrap();
+        let sealed = cipher
+            .encrypt(GcmNonce::from_slice(&nonce.bytes), Payload { msg: b"", aad: b"" })
+            .unwrap();
+
+        assert_eq!(sealed.len(), TAG_LEN);
+        assert_eq!(hex::encode(&sealed), "530f8afbc74536b9a963b4f1c4cb738b");
     }
 }
