@@ -536,6 +536,121 @@ impl WorldState {
         }
         trie.root_hash()
     }
+
+    /// Build the account trie exactly as [`WorldState::state_root`] does.
+    ///
+    /// The state root is committed to in every block header, so a proof has to
+    /// be taken from the same trie the root was computed from. Rebuilding it
+    /// here keeps the two in step; deriving one and proving against the other
+    /// would let a proof be produced that does not verify against the header.
+    fn account_trie(&self) -> Trie {
+        let mut trie = Trie::new();
+        for (address, account) in self.iter_sorted() {
+            if is_empty_account(account) {
+                continue;
+            }
+            trie.insert(&keccak256(&address), &encode_account(account));
+        }
+        trie
+    }
+
+    /// Produce a Merkle proof of an account, as `eth_getProof` returns it: the
+    /// account's fields, the proof against the state root, and one storage
+    /// proof per requested slot.
+    ///
+    /// An account that does not exist (or exists but is empty, which is not
+    /// stored) is proven absent: the proof shows the key is not in the trie,
+    /// which is what lets a light client trust a zero balance.
+    pub fn prove_account(&self, address: &Address, slots: &[[u8; 32]]) -> AccountProof {
+        let trie = self.account_trie();
+        let key = keccak256(address);
+        let proof = trie.prove(&key);
+
+        let account = self.accounts.get(address).filter(|a| !is_empty_account(a));
+
+        let (balance, nonce, code_hash, storage_hash, storage) = match account {
+            Some(account) => {
+                let storage_trie = storage_trie_for(&account.storage);
+                let entries = slots
+                    .iter()
+                    .map(|slot| StorageProofEntry {
+                        key: *slot,
+                        value: account.storage.get(slot).copied().unwrap_or([0u8; 32]),
+                        proof: storage_trie.prove(&keccak256(slot)),
+                    })
+                    .collect();
+                (
+                    account.balance,
+                    account.nonce,
+                    account.code_hash,
+                    account.storage_root,
+                    entries,
+                )
+            }
+            // An absent account holds nothing, so each slot proves to zero.
+            None => (
+                [0u8; 32],
+                0,
+                EMPTY_CODE_HASH,
+                EMPTY_STATE_ROOT,
+                slots
+                    .iter()
+                    .map(|slot| StorageProofEntry {
+                        key: *slot,
+                        value: [0u8; 32],
+                        proof: Vec::new(),
+                    })
+                    .collect(),
+            ),
+        };
+
+        AccountProof {
+            address: *address,
+            balance,
+            nonce,
+            code_hash,
+            storage_hash,
+            account_proof: proof,
+            storage,
+        }
+    }
+}
+
+/// A Merkle proof of an account and one of its storage slots.
+#[derive(Debug, Clone)]
+pub struct AccountProof {
+    pub address: Address,
+    pub balance: [u8; 32],
+    pub nonce: u64,
+    pub code_hash: [u8; 32],
+    pub storage_hash: [u8; 32],
+    /// RLP nodes from the account trie root down to the account.
+    pub account_proof: Vec<Vec<u8>>,
+    /// One entry per requested storage slot, in the order the slots were asked
+    /// for.
+    pub storage: Vec<StorageProofEntry>,
+}
+
+/// A proof for a single storage slot.
+#[derive(Debug, Clone)]
+pub struct StorageProofEntry {
+    pub key: [u8; 32],
+    pub value: [u8; 32],
+    /// RLP nodes from the account's storage root down to the slot.
+    pub proof: Vec<Vec<u8>>,
+}
+
+/// Build the storage trie for a set of slots, matching the layout
+/// [`storage_root`] computes.
+fn storage_trie_for(slots: &HashMap<[u8; 32], [u8; 32]>) -> Trie {
+    let mut trie = Trie::new();
+    let mut keys: Vec<&[u8; 32]> = slots.keys().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let encoded = rlp_storage_value(&slots[key]).encode();
+        trie.insert(&keccak256(key), &encoded);
+    }
+    trie
 }
 
 // =============================================================================
@@ -765,6 +880,113 @@ mod tests {
         assert_eq!(
             to_hex(&state.state_root()),
             "6779436c64ba6aca6d5776eb5c6292437577bf0e7e02928ba13035642b2da6cd"
+        );
+    }
+    #[test]
+    fn an_account_proof_verifies_against_the_state_root() {
+        use crate::trie::Trie;
+
+        let mut state = WorldState::new();
+        let address = addr(0x77);
+        let mut balance = [0u8; 32];
+        balance[31] = 0x40;
+        state.set_balance(&address, balance);
+        state.set_nonce(&address, 7);
+
+        let root = state.state_root();
+        let proof = state.prove_account(&address, &[]);
+
+        assert_eq!(proof.balance, balance);
+        assert_eq!(proof.nonce, 7);
+        assert!(!proof.account_proof.is_empty(), "a stored account needs a path");
+
+        // The proof must resolve to the account's own RLP encoding under the
+        // header's state root. If it did not, a light client would reject it.
+        let expected = encode_account(state.account(&address).unwrap());
+        let resolved = Trie::verify_proof(&root, &keccak256(&address), &proof.account_proof);
+        assert_eq!(resolved, Some(Some(expected)));
+    }
+
+    #[test]
+    fn a_proof_of_absence_verifies_for_an_unknown_account() {
+        use crate::trie::Trie;
+
+        let mut state = WorldState::new();
+        state.set_balance(&addr(0x01), u256_from_u64(1));
+
+        let missing = addr(0xAB);
+        let root = state.state_root();
+        let proof = state.prove_account(&missing, &[]);
+
+        // The account fields are zero and the proof shows the key is absent.
+        assert_eq!(proof.balance, [0u8; 32]);
+        assert_eq!(proof.nonce, 0);
+        let resolved = Trie::verify_proof(&root, &keccak256(&missing), &proof.account_proof);
+        assert_eq!(resolved, Some(None), "absence must be provable");
+    }
+
+    #[test]
+    fn a_storage_slot_proof_verifies_against_the_accounts_storage_root() {
+        use crate::trie::Trie;
+
+        let mut state = WorldState::new();
+        let address = addr(0x21);
+        state.set_balance(&address, u256_from_u64(1));
+
+        let mut slot = [0u8; 32];
+        slot[31] = 3;
+        let value = u256_from_u64(0xbeef);
+        state.set_storage(&address, slot, value);
+
+        let proof = state.prove_account(&address, &[slot]);
+        assert_eq!(proof.storage.len(), 1, "one entry per requested slot");
+        let entry = &proof.storage[0];
+        assert_eq!(entry.key, slot);
+        assert_eq!(entry.value, value);
+        assert!(
+            !entry.proof.is_empty(),
+            "a written slot needs a path in the storage trie"
+        );
+
+        // The storage proof must resolve under the storage root the account
+        // commits to, which is itself covered by the account proof.
+        let resolved = Trie::verify_proof(
+            &proof.storage_hash,
+            &keccak256(&slot),
+            &entry.proof,
+        );
+        let expected = crate::rlp::RlpItem::encode(&rlp_storage_value(&value));
+        assert_eq!(resolved, Some(Some(expected)));
+
+        // An unwritten slot proves to zero rather than being omitted.
+        let mut empty_slot = [0u8; 32];
+        empty_slot[31] = 9;
+        let p2 = state.prove_account(&address, &[empty_slot]);
+        assert_eq!(p2.storage[0].value, [0u8; 32]);
+    }
+
+    #[test]
+    fn a_proof_does_not_verify_against_a_different_state_root() {
+        use crate::trie::Trie;
+
+        let mut state = WorldState::new();
+        state.set_balance(&addr(0x01), u256_from_u64(1));
+        let root_before = state.state_root();
+        let proof = state.prove_account(&addr(0x01), &[]);
+
+        // The proof is valid against the root it was taken at ...
+        assert_eq!(
+            Trie::verify_proof(&root_before, &keccak256(&addr(0x01)), &proof.account_proof),
+            Some(Some(encode_account(state.account(&addr(0x01)).unwrap())))
+        );
+
+        // ... and invalid against the root after a later change.
+        state.set_balance(&addr(0x02), u256_from_u64(2));
+        let later_root = state.state_root();
+        assert_ne!(later_root, root_before, "the state root must have moved");
+        assert_eq!(
+            Trie::verify_proof(&later_root, &keccak256(&addr(0x01)), &proof.account_proof),
+            None
         );
     }
 }

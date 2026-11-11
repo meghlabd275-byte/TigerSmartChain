@@ -438,6 +438,17 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
             Ok(value) => RpcResponse::success(Value::Array(value), id),
             Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
         },
+        "eth_getProof" => match address_param(params, 0) {
+            Ok(address) => match storage_slots_param(params, 1) {
+                Ok(slots) => {
+                    let world = node.world_state().lock().await;
+                    let proof = world.prove_account(&address, &slots);
+                    RpcResponse::success(account_proof_json(&proof), id)
+                }
+                Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+            },
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
         "eth_accounts" => {
             // This node holds no wallet keys, so it controls no accounts.
             // Reporting an empty list is the truthful answer, and it is what
@@ -720,6 +731,43 @@ fn decode_legacy_transaction(bytes: &[u8]) -> Result<tiger_blockchain::types::Tr
         v: format!("0x{v:x}"),
         r: format!("0x{}", tiger_blockchain::hex_encode(&r)),
         s: format!("0x{}", tiger_blockchain::hex_encode(&s)),
+    })
+}
+
+/// Serialise an account proof the way `eth_getProof` defines it.
+///
+/// Storage slots are echoed in the order they were requested, each with the
+/// value that slot currently holds and the proof for it. A client pairs the
+/// two by index, so the order must be preserved rather than sorted.
+fn account_proof_json(proof: &tiger_state::AccountProof) -> Value {
+    let storage = proof
+        .storage
+        .iter()
+        .map(|entry| {
+            json!({
+                "key": format!("0x{}", tiger_blockchain::hex_encode(&entry.key)),
+                "value": hex_quantity(&entry.value),
+                "proof": entry
+                    .proof
+                    .iter()
+                    .map(|node| format!("0x{}", tiger_blockchain::hex_encode(node)))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "address": format!("0x{}", tiger_blockchain::hex_encode(&proof.address)),
+        "accountProof": proof
+            .account_proof
+            .iter()
+            .map(|node| format!("0x{}", tiger_blockchain::hex_encode(node)))
+            .collect::<Vec<_>>(),
+        "balance": hex_quantity(&proof.balance),
+        "codeHash": format!("0x{}", tiger_blockchain::hex_encode(&proof.code_hash)),
+        "nonce": hex_u64_str(proof.nonce),
+        "storageHash": format!("0x{}", tiger_blockchain::hex_encode(&proof.storage_hash)),
+        "storage": storage,
     })
 }
 
@@ -1269,6 +1317,34 @@ fn hex_bytes_str(bytes: &[u8]) -> String {
 
 fn string_param(params: &Value, index: usize) -> Option<String> {
     params.get(index)?.as_str().map(|s| s.to_string())
+}
+
+/// Parse the storage-slot list of `eth_getProof` into 32-byte words.
+///
+/// A slot may be sent as a bare quantity, so a value shorter than 32 bytes is
+/// left-padded rather than rejected. Anything longer than 32 bytes is not a
+/// slot index and is an error.
+fn storage_slots_param(params: &Value, index: usize) -> Result<Vec<[u8; 32]>, String> {
+    let Some(Value::Array(items)) = params.get(index) else {
+        return Ok(Vec::new());
+    };
+    let mut slots = Vec::with_capacity(items.len());
+    for item in items {
+        let hex = item
+            .as_str()
+            .ok_or_else(|| "storage slot must be a hex string".to_string())?;
+        let bytes = decode_hex(hex)?;
+        if bytes.len() > 32 {
+            return Err(format!(
+                "storage slot must be at most 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        let mut word = [0u8; 32];
+        word[32 - bytes.len()..].copy_from_slice(&bytes);
+        slots.push(word);
+    }
+    Ok(slots)
 }
 
 fn address_param(params: &Value, index: usize) -> Result<[u8; 20], String> {
