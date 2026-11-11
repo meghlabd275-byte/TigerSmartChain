@@ -11,6 +11,7 @@ use tokio::signal;
 
 mod config;
 mod debug_rpc;
+mod filters;
 mod node;
 mod p2p;
 mod rpc_server;

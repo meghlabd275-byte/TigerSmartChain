@@ -482,17 +482,18 @@ pub fn apply_transaction_traced(
         ));
     }
 
+    // An account created by a transaction is present even when it ends up with
+    // no code: EIP-161 has the creator's nonce bump to 1, which is what makes
+    // the account exist and what stops a later creation landing on the same
+    // address. Leaving the account absent would also make a later transfer to
+    // it charge the new-account surcharge again, so the state root here would
+    // differ from every other client's.
     if is_creation && result.output.is_empty() {
-        return Ok((
-            TransitionOutcome {
-                success: false,
-                gas_used,
-                output: result.output,
-                contract_address: None,
-                logs: Vec::new(),
-            },
-            TraceDiffs::default(),
-        ));
+        if let Some(address) = contract_address {
+            if host.state.nonce(&address) == 0 {
+                host.state.set_nonce(&address, 1);
+            }
+        }
     }
 
     Ok((
@@ -956,6 +957,68 @@ mod tests {
         assert!(outcome.gas_used >= 21_000);
         // The recipient must not keep the value of a reverted call.
         assert_eq!(state.balance(&contract), wei(0));
+    }
+
+    #[test]
+    fn a_creation_that_returns_no_code_still_succeeds() {
+        // An init program that returns nothing is a legitimate creation: it
+        // deploys an account with no code. The transaction succeeds, the
+        // account exists with a nonce of one, and the nonce increment is what
+        // makes it exist.
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        state.set_balance(&sender, wei(10_000_000));
+
+        let request = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1),
+            gas_limit: 100_000,
+            to: None,
+            value: [0u8; 32],
+            data: vec![0x00],
+            sender,
+        };
+
+        let outcome = apply_transaction(&mut state, &request, &block()).unwrap();
+        assert!(
+            outcome.success,
+            "a creation returning no code must succeed, not be rejected"
+        );
+
+        let created = outcome
+            .contract_address
+            .expect("a successful creation reports its address");
+        assert_eq!(created, create_address(&sender, 0));
+        assert!(state.code(&created).is_empty());
+        assert_eq!(state.nonce(&created), 1, "EIP-161 creator nonce");
+        assert!(state.exists(&created), "the account must exist");
+    }
+
+    #[test]
+    fn a_creation_that_returns_code_deploys_it() {
+        // The init program stores the one byte 0x60 and returns it, so the
+        // deployed account has real code and the reported address is the
+        // keccak256(rlp([sender, nonce])) one.
+        let mut state = WorldState::new();
+        let sender = addr(0x22);
+        state.set_balance(&sender, wei(10_000_000));
+
+        // PUSH1 0x60, PUSH1 0x00, MSTORE8, PUSH1 0x01, PUSH1 0x00, RETURN
+        let init = vec![0x60, 0x60, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3];
+        let request = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1),
+            gas_limit: 100_000,
+            to: None,
+            value: [0u8; 32],
+            data: init,
+            sender,
+        };
+
+        let outcome = apply_transaction(&mut state, &request, &block()).unwrap();
+        assert!(outcome.success);
+        let created = outcome.contract_address.unwrap();
+        assert_eq!(state.code(&created), vec![0x60]);
     }
 
     #[test]

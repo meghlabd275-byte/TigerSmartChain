@@ -9,6 +9,7 @@
 //! parser. Only the JSON-RPC envelope is parsed here; the node's own types
 //! handle the payloads.
 
+use crate::filters::{FilterKind, LogFilter};
 use crate::node::TigerNode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -221,11 +222,14 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
         }
         "net_listening" => RpcResponse::success(json!(node.is_running().await), id),
         "net_peerCount" => {
-            // Peer count is not tracked directly by the sync status, so the
-            // number of known states is reported as the observable figure
-            // rather than inventing a number.
-            let status = node.get_sync_status().read().await;
-            RpcResponse::success(hex_u64(status.known_states), id)
+            // The number of peers this node is actually connected to. Without
+            // the P2P service running that is zero, which is the truthful
+            // answer rather than a placeholder.
+            let count = match node.p2p() {
+                Some(p2p) => p2p.peer_count().await as u64,
+                None => 0,
+            };
+            RpcResponse::success(hex_u64(count), id)
         }
         "eth_chainId" => RpcResponse::success(hex_u64(node.config().chain_id), id),
         "eth_blockNumber" => {
@@ -410,15 +414,23 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
             RpcResponse::success(hex_u64(0), id)
         }
         "eth_syncing" => {
-            let status = node.get_sync_status().read().await;
-            if status.syncing {
+            // Syncing means the network is ahead of this node. The highest
+            // height any peer has reported is the real target, so this is
+            // driven by the peer table rather than a flag nothing sets.
+            let current = {
+                let manager = node.get_chain_manager().await;
+                manager.chain().height()
+            };
+            let highest = match node.p2p() {
+                Some(p2p) => p2p.best_peer_height().await.unwrap_or(current),
+                None => current,
+            };
+            if highest > current {
                 RpcResponse::success(
                     json!({
-                        "startingBlock": hex_u64_str(status.starting_block),
-                        "currentBlock": hex_u64_str(status.current_block),
-                        "highestBlock": hex_u64_str(status.highest_block),
-                        "pulledStates": hex_u64_str(status.pulled_states),
-                        "knownStates": hex_u64_str(status.known_states),
+                        "startingBlock": hex_u64_str(current),
+                        "currentBlock": hex_u64_str(current),
+                        "highestBlock": hex_u64_str(highest),
                     }),
                     id,
                 )
@@ -517,6 +529,185 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
             }
             None => RpcResponse::error(INVALID_PARAMS, "missing data", id),
         },
+        "eth_newFilter" => match new_log_filter(node, params).await {
+            Ok(filter_id) => RpcResponse::success(hex_u64(filter_id), id),
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_newBlockFilter" => {
+            let height = {
+                let manager = node.get_chain_manager().await;
+                manager.chain().height()
+            };
+            let mut filters = node.get_filters().await;
+            match filters.install(FilterKind::Blocks, height) {
+                Ok(filter_id) => RpcResponse::success(hex_u64(filter_id), id),
+                Err(e) => RpcResponse::error(INTERNAL_ERROR, e, id),
+            }
+        }
+        "eth_newPendingTransactionFilter" => {
+            let height = {
+                let manager = node.get_chain_manager().await;
+                manager.chain().height()
+            };
+            let mut filters = node.get_filters().await;
+            match filters.install(FilterKind::PendingTransactions, height) {
+                Ok(filter_id) => RpcResponse::success(hex_u64(filter_id), id),
+                Err(e) => RpcResponse::error(INTERNAL_ERROR, e, id),
+            }
+        }
+        "eth_getFilterChanges" => match filter_id_param(params) {
+            Ok(filter_id) => match filter_changes(node, filter_id).await {
+                Ok(value) => RpcResponse::success(value, id),
+                Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+            },
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_getFilterLogs" => match filter_id_param(params) {
+            Ok(filter_id) => match filter_logs(node, filter_id).await {
+                Ok(value) => RpcResponse::success(value, id),
+                Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+            },
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_uninstallFilter" => match filter_id_param(params) {
+            Ok(filter_id) => {
+                let mut filters = node.get_filters().await;
+                RpcResponse::success(json!(filters.uninstall(filter_id)), id)
+            }
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_getBlockReceipts" => match block_receipts(node, params).await {
+            Ok(value) => RpcResponse::success(value, id),
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_coinbase" => RpcResponse::success(
+            json!(node.config().validator_addr.clone().unwrap_or_default()),
+            id,
+        ),
+        "eth_mining" => {
+            // True only when this node is an authority that may propose.
+            let height = {
+                let manager = node.get_chain_manager().await;
+                manager.chain().height()
+            };
+            let consensus = node.get_consensus().await;
+            let mining = !node.config().validators.is_empty()
+                && consensus.is_authorised_proposer(
+                    height + 1,
+                    node.config().validator_addr.as_deref().unwrap_or(""),
+                );
+            RpcResponse::success(json!(mining), id)
+        }
+        "eth_hashrate" => {
+            // PoSA has no hashing; the honest answer is zero rather than an
+            // invented figure.
+            RpcResponse::success(hex_u64(0), id)
+        }
+        "eth_createAccessList" => match create_access_list(node, params).await {
+            Ok(value) => RpcResponse::success(value, id),
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "admin_peers" => {
+            let peers = match node.p2p() {
+                Some(p2p) => p2p.peers().await,
+                None => Vec::new(),
+            };
+            let list: Vec<Value> = peers
+                .iter()
+                .map(|peer| {
+                    json!({
+                        "id": peer.id,
+                        "name": format!("TigerSmartChain/v{}", env!("CARGO_PKG_VERSION")),
+                        "enode": format!("enode://{}@{}", peer.id, peer.address),
+                        "network": {
+                            "localAddress": node.config().listen_addr,
+                            "remoteAddress": peer.address,
+                            "inbound": !peer.outbound,
+                            "trusted": false,
+                            "static": false,
+                        },
+                        "protocols": {
+                            "eth": {
+                                "version": 66,
+                                "difficulty": "0x0",
+                                "head": peer.head_hash,
+                            }
+                        },
+                    })
+                })
+                .collect();
+            RpcResponse::success(Value::Array(list), id)
+        }
+        "admin_nodeInfo" => {
+            let peer_id = node.p2p().map(|p2p| p2p.peer_id()).unwrap_or_default();
+            RpcResponse::success(
+                json!({
+                    "id": peer_id,
+                    "name": format!("TigerSmartChain/v{}", env!("CARGO_PKG_VERSION")),
+                    "enode": format!("enode://{peer_id}@{}", node.config().listen_addr),
+                    "enr": "",
+                    "ip": node.config().listen_addr,
+                    "listenAddr": node.config().listen_addr,
+                    "ports": { "discovery": 0, "listener": 0 },
+                    "protocols": {
+                        "eth": {
+                            "network": node.config().chain_id,
+                            "difficulty": "0x0",
+                            "genesis": node.genesis_hash(),
+                            "head": node.head_hash().await,
+                        }
+                    },
+                }),
+                id,
+            )
+        }
+        "txpool_status" => {
+            let mempool = node.get_mempool().await;
+            let pending = mempool.pending().len();
+            RpcResponse::success(
+                json!({
+                    "pending": hex_u64_str(pending as u64),
+                    "queued": hex_u64_str(0),
+                }),
+                id,
+            )
+        }
+        "txpool_content" => {
+            let mempool = node.get_mempool().await;
+            let mut pending = serde_json::Map::new();
+            for tx in mempool.pending() {
+                let entry = pending
+                    .entry(tx.from.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Value::Object(map) = entry {
+                    map.insert(tx.nonce.to_string(), transaction_to_json_pool(tx));
+                }
+            }
+            RpcResponse::success(
+                json!({ "pending": Value::Object(pending), "queued": json!({}) }),
+                id,
+            )
+        }
+        "txpool_inspect" => {
+            let mempool = node.get_mempool().await;
+            let mut pending = serde_json::Map::new();
+            for tx in mempool.pending() {
+                let entry = pending
+                    .entry(tx.from.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Value::Object(map) = entry {
+                    let to = tx.to.clone().unwrap_or_else(|| "contract creation".to_string());
+                    map.insert(
+                        tx.nonce.to_string(),
+                        Value::String(format!("{} wei to {to}", tx.value)),
+                    );
+                }
+            }
+            RpcResponse::success(
+                json!({ "pending": Value::Object(pending), "queued": json!({}) }),
+                id,
+            )
+        }
         _ => RpcResponse::error(METHOD_NOT_FOUND, format!("method not found: {method}"), id),
     }
 }
@@ -1100,42 +1291,86 @@ async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, Str
 /// array), `blockHash`, and `topics` (with `null` wildcards and nested arrays
 /// for OR-matching), which is the full shape clients send.
 async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, String> {
-    let filter = params.get(0).ok_or_else(|| "missing filter".to_string())?;
+    let filter_json = params.get(0).ok_or_else(|| "missing filter".to_string())?;
+    let height = {
+        let manager = node.get_chain_manager().await;
+        manager.chain().height()
+    };
+    let filter = parse_log_filter(filter_json, height)?;
 
     let manager = node.get_chain_manager().await;
     let chain = manager.chain();
-    let height = chain.height();
+    let numbers = log_block_numbers(chain, &filter, height);
+    Ok(collect_logs(chain, &filter, &numbers))
+}
+
+/// Turn a log filter's JSON body into a [`LogFilter`].
+fn parse_log_filter(filter: &Value, height: u64) -> Result<LogFilter, String> {
+    let block_hash = filter
+        .get("blockHash")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // A `blockHash` filter pins the search to one block and cannot be combined
-    // with a range.
-    let numbers: Vec<u64> = if let Some(block_hash) = filter.get("blockHash").and_then(|v| v.as_str())
-    {
-        match chain.get_block_by_hash(block_hash) {
-            Some(block) => vec![block.header.number],
-            None => return Ok(Vec::new()),
-        }
+    // with a range, so the range is only parsed when there is no hash.
+    let (from_block, to_block) = if block_hash.is_some() {
+        (None, None)
     } else {
         let from = match filter.get("fromBlock").and_then(|v| v.as_str()) {
-            Some(tag) => parse_block_tag(tag, height).ok_or_else(|| "invalid fromBlock".to_string())?,
+            Some(tag) => parse_block_tag(tag, height)
+                .ok_or_else(|| "invalid fromBlock".to_string())?,
             None => 0,
         };
         let to = match filter.get("toBlock").and_then(|v| v.as_str()) {
-            Some(tag) => parse_block_tag(tag, height).ok_or_else(|| "invalid toBlock".to_string())?,
+            Some(tag) => {
+                parse_block_tag(tag, height).ok_or_else(|| "invalid toBlock".to_string())?
+            }
             None => height,
         };
-        if from > to {
-            return Ok(Vec::new());
-        }
-        // A block tag of `pending` can exceed the current height; clamp so the
-        // scan stays within the chain.
-        (from..=to.min(height)).collect()
+        (Some(from), Some(to))
     };
 
-    let address_filter = parse_address_filter(filter.get("address"))?;
-    let topic_filter = parse_topic_filter(filter.get("topics"))?;
+    Ok(LogFilter {
+        from_block,
+        to_block,
+        address: parse_address_filter(filter.get("address"))?,
+        topics: parse_topic_filter(filter.get("topics"))?,
+        block_hash,
+    })
+}
 
+/// The block numbers a log filter covers, clamped to the chain.
+fn log_block_numbers(
+    chain: &tiger_blockchain::Blockchain,
+    filter: &LogFilter,
+    height: u64,
+) -> Vec<u64> {
+    if let Some(hash) = &filter.block_hash {
+        return match chain.get_block_by_hash(hash) {
+            Some(block) => vec![block.header.number],
+            None => Vec::new(),
+        };
+    }
+
+    let from = filter.from_block.unwrap_or(0);
+    let to = filter.to_block.unwrap_or(height);
+    if from > to {
+        return Vec::new();
+    }
+    // A block tag of `pending` can exceed the current height; clamp so the
+    // scan stays within the chain.
+    (from..=to.min(height)).collect()
+}
+
+/// Collect the logs of `numbers` that match `filter`.
+fn collect_logs(
+    chain: &tiger_blockchain::Blockchain,
+    filter: &LogFilter,
+    numbers: &[u64],
+) -> Vec<Value> {
     let mut out = Vec::new();
-    for number in numbers {
+
+    for &number in numbers {
         let block = match chain.get_block(number) {
             Some(block) => block,
             None => continue,
@@ -1154,11 +1389,13 @@ async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, S
                 None => continue,
             };
             for log in &receipt.logs {
-                let matches_address = address_filter
+                let matches_address = filter
+                    .address
                     .as_ref()
                     .map(|set| set.contains(&log.address))
                     .unwrap_or(true);
-                let matches_topics = topic_filter
+                let matches_topics = filter
+                    .topics
                     .as_ref()
                     .map(|f| topics_match(f, &log.topics))
                     .unwrap_or(true);
@@ -1184,7 +1421,178 @@ async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, S
         }
     }
 
-    Ok(out)
+    out
+}
+
+/// `eth_newFilter`: install a log filter and return its id.
+async fn new_log_filter(node: &Arc<TigerNode>, params: &Value) -> Result<u64, String> {
+    let filter_json = params.get(0).ok_or_else(|| "missing filter".to_string())?;
+    let height = {
+        let manager = node.get_chain_manager().await;
+        manager.chain().height()
+    };
+    let filter = parse_log_filter(filter_json, height)?;
+    let mut filters = node.get_filters().await;
+    filters.install(FilterKind::Logs(filter), height)
+}
+
+/// `eth_getFilterChanges`: what a filter has to report since the last poll.
+async fn filter_changes(node: &Arc<TigerNode>, id: u64) -> Result<Value, String> {
+    let height = {
+        let manager = node.get_chain_manager().await;
+        manager.chain().height()
+    };
+
+    let mut filters = node.get_filters().await;
+    let filter = filters
+        .get_mut(id)
+        .ok_or_else(|| format!("filter {id} not found"))?;
+
+    match &filter.kind {
+        FilterKind::Logs(log_filter) => {
+            let log_filter = log_filter.clone();
+            let from = filter.last_block.saturating_add(1);
+            filter.last_block = height;
+
+            if from > height {
+                return Ok(Value::Array(Vec::new()));
+            }
+
+            let manager = node.get_chain_manager().await;
+            let chain = manager.chain();
+            let numbers = match &log_filter.block_hash {
+                Some(hash) => match chain.get_block_by_hash(hash) {
+                    Some(block) => vec![block.header.number],
+                    None => Vec::new(),
+                },
+                None => {
+                    let to = log_filter.to_block.unwrap_or(height).min(height);
+                    if from > to {
+                        Vec::new()
+                    } else {
+                        (from..=to).collect()
+                    }
+                }
+            };
+            Ok(Value::Array(collect_logs(chain, &log_filter, &numbers)))
+        }
+
+        FilterKind::Blocks => {
+            let from = filter.last_block.saturating_add(1);
+            filter.last_block = height;
+
+            let manager = node.get_chain_manager().await;
+            let chain = manager.chain();
+            let hashes: Vec<Value> = (from..=height)
+                .filter_map(|number| chain.get_block(number))
+                .filter_map(|block| tiger_blockchain::block_hash(&block.header).ok())
+                .map(Value::String)
+                .collect();
+            Ok(Value::Array(hashes))
+        }
+
+        FilterKind::PendingTransactions => {
+            let mempool = node.get_mempool().await;
+            let pending: Vec<String> =
+                mempool.pending().iter().map(|tx| tx.hash.clone()).collect();
+
+            let changes: Vec<Value> = pending
+                .iter()
+                .filter(|hash| !filter.seen.contains(*hash))
+                .map(|hash| Value::String(hash.clone()))
+                .collect();
+
+            // The reported set is rebuilt from the pool rather than accumulated
+            // forever, so a long-lived filter cannot grow without bound.
+            filter.seen = pending.into_iter().collect();
+            Ok(Value::Array(changes))
+        }
+    }
+}
+
+/// `eth_getFilterLogs`: every log a filter matches, not just the new ones.
+async fn filter_logs(node: &Arc<TigerNode>, id: u64) -> Result<Value, String> {
+    let height = {
+        let manager = node.get_chain_manager().await;
+        manager.chain().height()
+    };
+
+    let filters = node.get_filters().await;
+    let filter = filters
+        .get(id)
+        .ok_or_else(|| format!("filter {id} not found"))?;
+
+    let log_filter = match &filter.kind {
+        FilterKind::Logs(log_filter) => log_filter.clone(),
+        _ => return Err(format!("filter {id} is not a log filter")),
+    };
+    drop(filters);
+
+    let manager = node.get_chain_manager().await;
+    let chain = manager.chain();
+    let numbers = log_block_numbers(chain, &log_filter, height);
+    Ok(Value::Array(collect_logs(chain, &log_filter, &numbers)))
+}
+
+/// A filter id, as a hex quantity.
+fn filter_id_param(params: &Value) -> Result<u64, String> {
+    let raw = string_param(params, 0).ok_or_else(|| "missing filter id".to_string())?;
+    parse_u64_hex(&raw).ok_or_else(|| format!("invalid filter id: {raw}"))
+}
+
+/// A pool transaction, in the shape `txpool_content` reports.
+fn transaction_to_json_pool(tx: &tiger_blockchain::types::Transaction) -> Value {
+    json!({
+        "hash": tx.hash,
+        "nonce": hex_u64_str(tx.nonce),
+        "from": tx.from,
+        "to": tx.to,
+        "value": tx.value,
+        "gas": hex_u64_str(tx.gas),
+        "gasPrice": hex_u64_str(tx.gas_price),
+        "input": tx.input,
+    })
+}
+
+/// `eth_getBlockReceipts`: every receipt in a block.
+async fn block_receipts(node: &Arc<TigerNode>, params: &Value) -> Result<Value, String> {
+    let tag = string_param(params, 0).ok_or_else(|| "missing block tag".to_string())?;
+    let manager = node.get_chain_manager().await;
+    let chain = manager.chain();
+    let height = chain.height();
+
+    // The argument may be a number, a tag, or a block hash.
+    let block = if let Some(number) = parse_block_tag(&tag, height) {
+        chain.get_block(number)
+    } else {
+        chain.get_block_by_hash(&tag)
+    };
+
+    let block = match block {
+        Some(block) => block,
+        None => return Ok(Value::Null),
+    };
+    let block_hash = tiger_blockchain::block_hash(&block.header)
+        .unwrap_or_else(|_| format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])));
+
+    let receipts: Vec<Value> = (0..block.transactions.len())
+        .filter_map(|index| receipt_to_json(chain, block, index, &block_hash))
+        .collect();
+    Ok(Value::Array(receipts))
+}
+
+/// `eth_createAccessList`: run a call and report the state it touched.
+///
+/// The EVM here has no access-list optimisation and TigerSmartChain has no
+/// EIP-2930/1559 pricing, so the honest result is an empty access list plus the
+/// real gas estimate. Reporting an invented list would be worse than reporting
+/// none.
+async fn create_access_list(node: &Arc<TigerNode>, params: &Value) -> Result<Value, String> {
+    let gas = estimate_gas(node, params).await?;
+    Ok(json!({
+        "accessList": [],
+        "gasUsed": hex_u64_str(gas),
+    }))
 }
 
 /// Parse the `address` field of a log filter: a single address or a list.

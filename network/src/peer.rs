@@ -225,6 +225,9 @@ impl PeerManager {
                     // height it claims. It is only a hint: every block it
                     // sends is still validated.
                     score: peer.height as f64,
+                    height: peer.height,
+                    head_hash: peer.head_hash.clone(),
+                    outbound: peer.outbound,
                 })
             })
             .collect()

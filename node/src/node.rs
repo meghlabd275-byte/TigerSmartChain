@@ -77,6 +77,9 @@ pub struct TigerNode {
     /// The peer-to-peer service, once it is listening. `None` before startup
     /// or when the listen address could not be bound.
     p2p: std::sync::OnceLock<Arc<crate::p2p::P2pService>>,
+
+    /// Installed RPC filters (`eth_newFilter` and friends).
+    filters: tokio::sync::Mutex<crate::filters::FilterRegistry>,
 }
 
 impl TigerNode {
@@ -170,7 +173,15 @@ impl TigerNode {
             tasks,
             storage,
             p2p: std::sync::OnceLock::new(),
+            filters: tokio::sync::Mutex::new(crate::filters::FilterRegistry::new()),
         })
+    }
+
+    /// The installed RPC filters.
+    pub async fn get_filters(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::filters::FilterRegistry> {
+        self.filters.lock().await
     }
 
     /// Attach the peer-to-peer service so block production can announce
@@ -182,6 +193,23 @@ impl TigerNode {
     /// The peer-to-peer service, if it is running.
     pub fn p2p(&self) -> Option<&Arc<crate::p2p::P2pService>> {
         self.p2p.get()
+    }
+
+    /// The genesis block's hash.
+    pub fn genesis_hash(&self) -> String {
+        let block = genesis_block_from(&self.genesis);
+        tiger_blockchain::block_hash(&block.header)
+            .unwrap_or_else(|_| format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])))
+    }
+
+    /// The current head block's hash.
+    pub async fn head_hash(&self) -> String {
+        let manager = self.chain_manager.lock().await;
+        let chain = manager.chain();
+        chain
+            .get_block(chain.height())
+            .and_then(|block| tiger_blockchain::block_hash(&block.header).ok())
+            .unwrap_or_default()
     }
 
     /// Restore the chain and world state from disk, if a snapshot exists.

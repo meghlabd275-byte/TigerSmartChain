@@ -16,6 +16,13 @@ pub struct Peer {
     pub last_seen: i64,
     pub latency: u64,
     pub score: f64,
+    /// Height the peer last reported in its status message. Zero until it has
+    /// reported one.
+    pub height: u64,
+    /// Hash of the peer's head block as it last reported it.
+    pub head_hash: String,
+    /// Whether this node dialled the peer, rather than the other way round.
+    pub outbound: bool,
 }
 
 /// A peer identity: the peer's 32-byte Ed25519 public key.

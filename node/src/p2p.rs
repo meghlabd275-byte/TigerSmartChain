@@ -42,6 +42,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct P2pService {
     manager: Arc<Mutex<PeerManager>>,
     node: Arc<TigerNode>,
+    identity: Identity,
 }
 
 impl P2pService {
@@ -83,6 +84,7 @@ impl P2pService {
         let service = Arc::new(Self {
             manager,
             node: Arc::clone(&node),
+            identity: identity.clone(),
         });
 
         // Accept loop.
@@ -166,9 +168,24 @@ impl P2pService {
         Ok(Some(service))
     }
 
+    /// This node's own peer id, as a hex string.
+    pub fn peer_id(&self) -> String {
+        self.identity.peer_id().to_string()
+    }
+
     /// The number of connected peers.
     pub async fn peer_count(&self) -> usize {
         self.manager.lock().await.peer_count()
+    }
+
+    /// The greatest height any connected peer claims to have reached.
+    ///
+    /// This is the network's view of the chain head, which is what makes
+    /// `eth_syncing` meaningful: this node is behind when that number is above
+    /// its own height.
+    pub async fn best_peer_height(&self) -> Option<u64> {
+        let manager = self.manager.lock().await;
+        manager.snapshot().iter().map(|peer| peer.height).max()
     }
 
     /// A snapshot of the connected peers.
