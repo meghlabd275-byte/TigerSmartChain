@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 tiger-crypto = { path = "../crypto" }
+tiger-precompile = { path = "../precompile" }
 tiger-state = { path = "../state" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -16,6 +17,7 @@ thiserror = "1.0"
 hex = "0.4.3"
 ethnum = "1"
 sha3 = "0.10"
+secp256k1 = { version = "0.29", features = ["recovery"] }
 
 [profile.release]
 opt-level = 3

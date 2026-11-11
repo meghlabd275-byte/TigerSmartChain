@@ -666,6 +666,39 @@ impl Executor {
                         value_transferred = value_ok;
                     }
 
+                    // A call to a precompiled contract runs a built-in function
+                    // rather than bytecode. Without this branch a contract that
+                    // verifies signatures with `ecrecover` would find no code
+                    // at `0x01` and the call would report success with empty
+                    // output, accepting every signature.
+                    if value_ok && crate::precompiles::is_precompile(&to) {
+                        ctx.return_data = Vec::new();
+                        let call_result = crate::precompiles::run(&to, &calldata, call_gas);
+                        let (ok, gas_cost) = match call_result {
+                            Ok(out) => {
+                                ctx.return_data = out.output;
+                                (true, out.gas_used)
+                            }
+                            Err(err) => (false, err.gas_used),
+                        };
+                        gas_used += gas_cost;
+
+                        if ol > 0 {
+                            let mut buf = vec![0u8; ol];
+                            let take = ctx.return_data.len().min(ol);
+                            buf[..take].copy_from_slice(&ctx.return_data[..take]);
+                            ctx.memory.ensure_capacity(oo, ol);
+                            ctx.memory.store(oo, &buf);
+                        }
+
+                        if !ok && value_transferred {
+                            let _ = host.transfer(&to, &ctx.address, value_word.clone());
+                        }
+                        ctx.stack.push(EvmWord::from_u64(if ok { 1 } else { 0 }));
+                        pc += 1;
+                        continue;
+                    }
+
                     // An account with no code is a plain value transfer.
                     if callee_code.is_empty() || !value_ok {
                         ctx.return_data = Vec::new();
@@ -881,6 +914,80 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::host::MemoryHost;
+
+    /// A contract that calls the identity precompile at `0x04` with 3 bytes of
+    /// input taken from its own calldata, then returns the precompile's output.
+    ///
+    /// Bytecode: copy 3 bytes of calldata to memory[0..3], call `0x04` with
+    /// that as input and memory[32..35] as output, then return those 3 bytes.
+    #[test]
+    fn a_contract_can_call_the_identity_precompile() {
+        let code = vec![
+            0x60, 0x03, // PUSH1 3          (length)
+            0x60, 0x00, // PUSH1 0          (calldata offset)
+            0x60, 0x00, // PUSH1 0          (memory offset)
+            0x37, // CALLDATACOPY
+            0x60, 0x03, // PUSH1 3          (out length)
+            0x60, 0x20, // PUSH1 32         (out offset)
+            0x60, 0x03, // PUSH1 3          (in length)
+            0x60, 0x00, // PUSH1 0          (in offset)
+            0x60, 0x00, // PUSH1 0          (value)
+            0x60, 0x04, // PUSH1 4          (address = identity)
+            0x61, 0xff, 0xff, // PUSH2 0xffff (gas)
+            0xf1, // CALL
+            0x50, // POP              (discard success flag)
+            0x60, 0x03, // PUSH1 3          (return length)
+            0x60, 0x20, // PUSH1 32         (return offset)
+            0xf3, // RETURN
+        ];
+
+        let mut host = MemoryHost::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.address = Address([0x33u8; 20]);
+        ctx.gas = 1_000_000;
+        ctx.data = b"abc".to_vec();
+
+        let result = Executor::new().execute_with_host(&code, &mut ctx, &mut host);
+        assert!(result.success, "the call must succeed");
+        assert_eq!(result.output, b"abc", "the precompile must echo its input");
+
+        // The precompile's cost must have been charged: identity is 15 + 3.
+        assert!(
+            result.gas_used >= 18,
+            "precompile gas must be charged, got {}",
+            result.gas_used
+        );
+    }
+
+    /// A call to a precompile address whose input the precompile rejects must
+    /// report failure (a zero on the stack), not a false success.
+    #[test]
+    fn a_precompile_that_rejects_its_input_reports_failure() {
+        // blake2f (0x09) requires exactly 213 bytes; call it with none.
+        let code = vec![
+            0x60, 0x00, // PUSH1 0 (out length)
+            0x60, 0x00, // PUSH1 0 (out offset)
+            0x60, 0x00, // PUSH1 0 (in length)
+            0x60, 0x00, // PUSH1 0 (in offset)
+            0x60, 0x00, // PUSH1 0 (value)
+            0x60, 0x09, // PUSH1 9 (address = blake2f)
+            0x61, 0xff, 0xff, // PUSH2 0xffff (gas)
+            0xf1, // CALL
+            0x00, // STOP
+        ];
+
+        let mut host = MemoryHost::new();
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 1_000_000;
+
+        let _ = Executor::new().execute_with_host(&code, &mut ctx, &mut host);
+        // The CALL result is the top of the stack: it must be zero.
+        assert_eq!(
+            ctx.stack.pop().unwrap().as_u64(),
+            0,
+            "a rejected precompile call must push zero"
+        );
+    }
 
     #[test]
     fn test_add_op() {

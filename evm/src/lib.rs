@@ -9,6 +9,7 @@ pub mod diff;
 pub mod executor;
 pub mod host;
 pub mod opcodes;
+pub mod precompiles;
 pub mod trace;
 pub mod transition;
 pub mod types;
@@ -17,6 +18,7 @@ pub use diff::{BalanceDiff, StateDiffRecorder, StorageDiff};
 pub use executor::{Executor, NullTracer};
 pub use host::{Host, MemoryHost};
 pub use opcodes::*;
+pub use precompiles::{is_precompile, run as run_precompile, PrecompileError, PrecompileOutput};
 pub use trace::{mnemonic, opcode_name, Step, StepTracer, StepTracerBuffer, TraceSummary};
 pub use transition::{
     apply_transaction, apply_transaction_traced, create_address, intrinsic_gas, BlockContext,
