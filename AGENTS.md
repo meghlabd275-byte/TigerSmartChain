@@ -178,3 +178,97 @@ left-padded. `blockchain/src/block.rs` has separate `decode_hex_field` and
 - C++: `cd crypto_cpp && make test`
 - Crates are standalone (no workspace). `state` depends on `crypto`; `evm`
   depends on `crypto` + `state`; `blockchain` depends on `crypto` + `state`.
+
+## Session 2026-11-11 — precompiles, persistence, mempool, receipts
+
+### Commits pushed to main
+- `b804e95` — EVM precompile dispatch.
+- `23227d9` — chain persistence + mempool nonce ordering + receipt completeness.
+
+### EVM precompiles (WAS COMPLETELY MISSING — the earlier notes in this file
+### claiming `precompile/` was "FIXED" only covered the individual functions,
+### not their dispatch)
+- `evm/src/precompiles.rs` (new): address detection for 0x01-0x09, the full
+  Ethereum gas schedule, and dispatch. `ecrecover` (flat 3000), `sha256`
+  (60 + 12/word), `ripemd160` (600 + 120/word), `identity` (15 + 3/word),
+  `modexp` (EIP-198 + EIP-2565 length words), `ecadd` (150), `ecmul` (6000),
+  `ecpairing` (45000 + 34000/pair, input padded to whole pairs), `blake2f`
+  (gas == rounds, input must be exactly 213 bytes).
+- `evm/src/executor.rs` CALL arm now checks `is_precompile(&to)` BEFORE the
+  no-code path and routes to the dispatch. Without this, a call to 0x01 found
+  no code and reported success with empty output — a signature-verifying
+  contract would accept every signature.
+- Precompiles added: `precompile/src/ripemd160.rs` (0x03) and
+  `precompile/src/blake2f.rs` (0x09). blake2f is verified against
+  `hashlib.blake2b(b"abc")` — note the expected value is the BLAKE2b digest
+  with the default parameter block folded into h[0] (`h[0] ^= 0x01010040`),
+  which is how to cross-check it. EIP-152 vector hexes for IV-state are easy to
+  mis-transcribe; build them with Python `struct.pack` and paste the result.
+- `evm/Cargo.toml` now depends on `tiger-precompile` and `secp256k1`
+  (recovery) — the latter only for tests.
+
+### Chain persistence (WAS COMPLETELY MISSING)
+- `data_dir` was accepted by the CLI and never used. Every restart lost the
+  whole chain. Now `node/src/storage.rs` writes `chain.json` + `state.json`
+  into the data dir.
+- Atomic write: temp file → `sync_all()` → `rename()`. Version-tagged
+  (`STORAGE_VERSION`). The state snapshot records `state_root`; `load_state`
+  recomputes it from the restored accounts and fails on mismatch, so a
+  truncated/tampered file is caught.
+- `TigerNode::start()` calls `restore_from_disk()` BEFORE installing genesis
+  (otherwise genesis is re-applied on top of an already-allocated state).
+  Genesis install, each produced block, and the state are persisted.
+- A snapshot from a different chain id is refused.
+- `WorldState`'s account bytes needed hex serde: `state/src/account.rs` has a
+  `bytes_serde` module (JSON object keys must be strings, so
+  `HashMap<[u8;32],[u8;32]>` cannot be derived). Addresses in `StateSnapshot`
+  are hex strings for the same reason.
+
+### Mempool (REWRITTEN — had real ordering bugs)
+- Old `pending()` returned `HashMap` values in hash order, so a sender's
+  transactions could be applied out of nonce order and every block would reject
+  the later ones. Also `queued`/`max_queued` were dead fields.
+- Now grouped by sender, nonce-ordered; same-nonce resend REPLACES (this is how
+  a client bumps gas price); pool is bounded and evicts the cheapest to admit a
+  better payer; `pending()` orders senders by best gas price.
+- The old `TxPool` struct was unused and removed.
+
+### Receipt completeness (REAL BUG FIXED)
+- `produce_block` kept a transaction in the block when `apply_transaction`
+  returned `Err`, but pushed no receipt. Receipts list then shorter than the tx
+  list ⇒ later receipts mis-indexed and clients reject the block. Every
+  included tx now gets exactly one receipt; a rejected one gets
+  `status: false` and is charged `intrinsic_gas`.
+- `evm/src/transition.rs`: the early `return Err(InsufficientFundsForGas)`
+  inside the value-transfer branch returned AFTER `state.debit(&sender, max)`
+  but WITHOUT `state.restore(pre_state)` — burning gas for a tx that never made
+  it into a block. Now restores.
+
+### Test counts (all passing, 244 total)
+crypto 22, state 28, evm 72, blockchain 40, consensus 15, precompile 20, node 47.
+
+### Live-node verification recipe (used repeatedly, keep it)
+- Genesis with the hardhat account #1 funded:
+  `0x70997970C51812dc3A010C7d01b50e0d17dc79C8`, key
+  `0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`.
+  `eth_account` is installed, so sign with
+  `Account.sign_transaction(tx, KEY).raw_transaction.hex()` (chainId 6666).
+- Run: `./node/target/debug/tigersmartchaind --chain-id 6666
+  --rpc-addr 127.0.0.1:8545 --listen-addr 127.0.0.1:30303
+  --data-dir DIR --genesis-file G --validators 0xaa00..00
+  --validator-addr 0xaa00..00 --slot-duration-secs 1`
+- Kill with `pkill -f 'tigersmartchaind --chain-id 6666'` (specific enough).
+- To verify persistence: note `eth_blockNumber`, restart with the same
+  `--data-dir`, confirm the log says "Restored N block(s)" and the height does
+  NOT reset.
+
+### Still missing / not yet done (do not trust earlier claims about these)
+- `network/` is data structures only: NO transport. `SyncManager::start_sync`
+  just sets a bool. No libp2p, no peer handshake, no block propagation, no
+  devp2p. This is the single largest gap.
+- `go_services/internal/gateway/endpoints.go`: ~118 `getMockData` handlers.
+- Explorer services, DEX, gas tracker, historical state, frontend: partially
+  real; needs a fresh line-by-line pass.
+- No root Cargo workspace; 147 independent crates. Only these are wired into
+  the running node: crypto, state, evm, blockchain, consensus, precompile,
+  node, network (types only).
