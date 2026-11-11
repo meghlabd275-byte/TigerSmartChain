@@ -3,34 +3,29 @@ name = "tiger-load-balancer"
 version = "1.0.0"
 edition = "2021"
 authors = ["TigerScan Team"]
-description = "High-performance Load Balancer for TigerScan"
+description = "Load balancer for TigerScan: seven real selection algorithms with health checking"
 license = "MIT"
 
+[lib]
+name = "tiger_load_balancer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tiger-load-balancer"
+path = "src/main.rs"
+
 [dependencies]
-# Web framework
 actix-web = "4"
-actix-rt = "2"
-actix-cors = "0.7"
-
-# Async
 tokio = { version = "1", features = ["full"] }
-futures = "0.3"
-
-# HTTP client
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
-
-# Logging
 log = "0.4"
 env_logger = "0.10"
-
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
 
-# Time
-chrono = { version = "0.4", features = ["serde"] }
-
-# Health checks
-http = "0.2"
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [profile.release]
 opt-level = 3
