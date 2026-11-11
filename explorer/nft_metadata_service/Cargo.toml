@@ -20,7 +20,6 @@ thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 base64 = "0.21"
-ipfs-api = "0.3"
 
 [lib]
 name = "tigerscan_nft_metadata"

@@ -45,7 +45,6 @@ metrics = "0.6"
 config = "0.13"
 
 # IPFS
-ipfs-api = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"
