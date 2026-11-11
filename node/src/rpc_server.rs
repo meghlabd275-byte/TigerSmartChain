@@ -328,6 +328,24 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
             },
             None => RpcResponse::error(INVALID_PARAMS, "missing raw transaction", id),
         },
+        "debug_traceTransaction" => match string_param(params, 0) {
+            Some(hash) => match crate::debug_rpc::debug_trace_transaction(node, &hash, params.get(1)).await {
+                Ok(trace) => RpcResponse::success(trace, id),
+                Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+            },
+            None => RpcResponse::error(INVALID_PARAMS, "missing transaction hash", id),
+        },
+        "debug_traceCall" => match crate::debug_rpc::debug_trace_call(node, params).await {
+            Ok(trace) => RpcResponse::success(trace, id),
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "debug_traceBlockByNumber" => match params.get(0).and_then(|v| v.as_str()) {
+            Some(tag) => match crate::debug_rpc::debug_trace_block(node, tag, params.get(1)).await {
+                Ok(traces) => RpcResponse::success(Value::Array(traces), id),
+                Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+            },
+            None => RpcResponse::error(INVALID_PARAMS, "missing block tag", id),
+        },
         "web3_sha3" => match string_param(params, 0) {
             Some(data) => {
                 let bytes = match decode_hex(&data) {
@@ -637,12 +655,12 @@ fn parse_block_tag(tag: &str, height: u64) -> Option<u64> {
     }
 }
 
-fn hex_u64(value: u64) -> Value {
+pub fn hex_u64(value: u64) -> Value {
     Value::String(format!("0x{value:x}"))
 }
 
 /// Lowercase `0x`-prefixed hex, for embedding inside a `json!` literal.
-fn hex_u64_str(value: u64) -> String {
+pub fn hex_u64_str(value: u64) -> String {
     format!("0x{value:x}")
 }
 
@@ -675,7 +693,7 @@ fn address_param(params: &Value, index: usize) -> Result<[u8; 20], String> {
     parse_address(&value)
 }
 
-fn parse_address(value: &str) -> Result<[u8; 20], String> {
+pub fn parse_address(value: &str) -> Result<[u8; 20], String> {
     let bytes = decode_hex(value)?;
     if bytes.len() != 20 {
         return Err(format!("expected a 20-byte address, got {} bytes", bytes.len()));
@@ -685,7 +703,7 @@ fn parse_address(value: &str) -> Result<[u8; 20], String> {
     Ok(out)
 }
 
-fn parse_u256(value: &str) -> Result<[u8; 32], String> {
+pub fn parse_u256(value: &str) -> Result<[u8; 32], String> {
     let bytes = decode_hex(value)?;
     if bytes.len() > 32 {
         return Err("value does not fit in 256 bits".to_string());
@@ -701,7 +719,7 @@ fn parse_u64_hex(value: &str) -> Option<u64> {
 }
 
 /// Decode hex, tolerating a missing `0x` prefix and an odd digit count.
-fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+pub fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let trimmed = value.strip_prefix("0x").unwrap_or(value);
     let padded = if trimmed.len() % 2 != 0 {
         format!("0{trimmed}")

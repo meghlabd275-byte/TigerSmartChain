@@ -11,6 +11,7 @@ use tokio::signal;
 use tokio::sync::RwLock;
 
 mod config;
+mod debug_rpc;
 mod node;
 mod rpc_server;
 

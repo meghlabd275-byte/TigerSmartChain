@@ -105,12 +105,16 @@ impl Executor {
 
         let mut pending: Option<Step> = None;
         let mut step_count = 0usize;
+        let capture_memory = tracer.wants_memory();
 
         while pc < code.len() {
             // Flush the opcode executed by the previous iteration now that its
             // effects on the stack are visible.
             if let Some(mut step) = pending.take() {
                 step.stack = ctx.stack.entries();
+                if capture_memory {
+                    step.memory = Some(ctx.memory.as_slice().to_vec());
+                }
                 tracer.step(&step);
                 step_count += 1;
             }
@@ -139,6 +143,7 @@ impl Executor {
                 gas_cost: cost,
                 depth: 1,
                 stack: Vec::new(),
+                memory: None,
                 error: None,
             });
 
@@ -758,6 +763,9 @@ impl Executor {
 
         if let Some(mut step) = pending.take() {
             step.stack = ctx.stack.entries();
+            if capture_memory {
+                step.memory = Some(ctx.memory.as_slice().to_vec());
+            }
             tracer.step(&step);
             step_count += 1;
         }
@@ -786,7 +794,7 @@ impl Executor {
 }
 
 /// Tracer that discards every event, used when tracing is not requested.
-struct NullTracer;
+pub struct NullTracer;
 
 impl StepTracer for NullTracer {
     fn step(&mut self, _step: &Step) {}
@@ -1025,12 +1033,6 @@ mod tests {
 
     fn host_addr(b: u8) -> Address {
         Address([b; 20])
-    }
-
-    fn word_addr(b: u8) -> EvmWord {
-        let mut bytes = [0u8; 32];
-        bytes[12..].copy_from_slice(&[b; 20]);
-        EvmWord(bytes)
     }
 
     #[test]

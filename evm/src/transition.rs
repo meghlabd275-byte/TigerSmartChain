@@ -286,6 +286,32 @@ pub fn apply_transaction(
     tx: &TransactionRequest,
     block: &BlockContext,
 ) -> Result<TransitionOutcome, TransitionError> {
+    apply_transaction_traced(state, tx, block, &mut crate::executor::NullTracer)
+        .map(|(outcome, _)| outcome)
+}
+
+/// The state writes a traced transaction performed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TraceDiffs {
+    /// Storage slots whose final value differs from their initial value.
+    pub storage: Vec<crate::diff::StorageDiff>,
+    /// Accounts whose final balance differs from their initial balance.
+    pub balances: Vec<crate::diff::BalanceDiff>,
+}
+
+/// Apply a transaction while reporting every executed opcode to `tracer`, and
+/// return the state writes the transaction performed.
+///
+/// This is the implementation behind [`apply_transaction`] and behind
+/// `debug_traceTransaction`, so a trace describes the execution the chain
+/// actually performed rather than a separate replay. A reverted transaction
+/// reports no writes, because a revert discards them.
+pub fn apply_transaction_traced(
+    state: &mut WorldState,
+    tx: &TransactionRequest,
+    block: &BlockContext,
+    tracer: &mut dyn crate::trace::StepTracer,
+) -> Result<(TransitionOutcome, TraceDiffs), TransitionError> {
     let sender = tx.sender;
 
     // 1. Nonce must match exactly, so transactions apply in order and cannot
@@ -356,34 +382,41 @@ pub fn apply_transaction(
     };
     ctx.address = crate::Address(exec_address);
 
-    // 6. Move the value before execution.
-    if tx.value != [0u8; 32] {
-        if !host.transfer(
-            &crate::Address(sender),
-            &crate::Address(exec_address),
-            EvmWord(tx.value),
-        ) {
-            // Cannot happen after the balance check above, but a failure here
-            // must not leave the sender charged.
-            host.transfer(
-                &crate::Address(sender),
-                &crate::Address(sender),
-                EvmWord::zero(),
-            );
-            return Err(TransitionError::InsufficientFundsForGas);
-        }
-    }
+    // 6 and 7. Every host write the transaction performs goes through the
+    // recorder, so the recorded before/after values are the real transitions
+    // this execution caused.
+    let mut diffs = TraceDiffs::default();
+    let result = {
+        let mut recording = crate::diff::StateDiffRecorder::new(&mut host);
 
-    // 7. Execute.
-    let executor = Executor::new();
-    let result = executor.execute_with_host(&exec_code, &mut ctx, &mut host);
-
-    // A creation deploys the returned code at the new address.
-    if result.success {
-        if let Some(address) = contract_address {
-            host.set_code(&crate::Address(address), result.output.clone());
+        // Move the value before execution.
+        if tx.value != [0u8; 32] {
+            if !recording.transfer(
+                &crate::Address(sender),
+                &crate::Address(exec_address),
+                EvmWord(tx.value),
+            ) {
+                // Cannot happen after the balance check above, but a failure
+                // here must not leave the sender charged.
+                return Err(TransitionError::InsufficientFundsForGas);
+            }
         }
-    }
+
+        let executor = Executor::new();
+        let result =
+            executor.execute_traced_with_host(&exec_code, &mut ctx, &mut recording, tracer);
+
+        // A creation deploys the returned code at the new address.
+        if result.success {
+            if let Some(address) = contract_address {
+                recording.set_code(&crate::Address(address), result.output.clone());
+            }
+        }
+
+        diffs.storage = recording.storage_diffs();
+        diffs.balances = recording.balance_diffs();
+        result
+    };
 
     // If the transaction reverted, discard every state change it made —
     // storage writes, the value transfer, created code — while keeping the
@@ -391,6 +424,9 @@ pub fn apply_transaction(
     // moved, so restoring it returns the value to the sender as well.
     if !result.success {
         host.state.restore(pre_state);
+        // The writes were discarded, so reporting them would misrepresent the
+        // resulting state.
+        diffs = TraceDiffs::default();
     }
 
     // 8. Gas accounting. Execution has the intrinsic cost removed from its
@@ -419,29 +455,38 @@ pub fn apply_transaction(
     host.state.set_nonce(&sender_addr, tx.nonce + 1);
 
     if !result.success {
-        return Ok(TransitionOutcome {
-            success: false,
-            gas_used,
-            output: result.output,
-            contract_address: None,
-        });
+        return Ok((
+            TransitionOutcome {
+                success: false,
+                gas_used,
+                output: result.output,
+                contract_address: None,
+            },
+            diffs,
+        ));
     }
 
     if is_creation && result.output.is_empty() {
-        return Ok(TransitionOutcome {
-            success: false,
-            gas_used,
-            output: result.output,
-            contract_address: None,
-        });
+        return Ok((
+            TransitionOutcome {
+                success: false,
+                gas_used,
+                output: result.output,
+                contract_address: None,
+            },
+            TraceDiffs::default(),
+        ));
     }
 
-    Ok(TransitionOutcome {
-        success: true,
-        gas_used,
-        output: result.output,
-        contract_address,
-    })
+    Ok((
+        TransitionOutcome {
+            success: true,
+            gas_used,
+            output: result.output,
+            contract_address,
+        },
+        diffs,
+    ))
 }
 
 /// The CREATE address for `sender` at `nonce`:
@@ -536,6 +581,184 @@ mod tests {
         // Beneficiary received the fees.
         assert_eq!(state.balance(&addr(0x55)), wei(21_000));
         // The nonce advanced.
+        assert_eq!(state.nonce(&sender), 1);
+    }
+
+    #[test]
+    fn a_traced_transfer_reports_the_steps_and_the_balance_writes() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        let recipient = addr(0x22);
+        state.set_balance(&sender, wei(1_000_000));
+        state.set_nonce(&sender, 0);
+
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1),
+            gas_limit: 21_000,
+            to: Some(recipient),
+            value: wei(1000),
+            data: Vec::new(),
+            sender,
+        };
+
+        let mut tracer = crate::trace::StepTracerBuffer::new(64);
+        let (outcome, diffs) =
+            apply_transaction_traced(&mut state, &tx, &block(), &mut tracer).unwrap();
+
+        assert!(outcome.success);
+
+        // A transfer to an account without code executes no opcodes, so the
+        // interpreter charges no gas. The 21,000 intrinsic charge is accounted
+        // for by the transition, not by the interpreter.
+        assert!(tracer.steps().is_empty());
+        let summary = tracer.summary().expect("summary is recorded");
+        assert!(summary.success);
+        assert_eq!(summary.gas_used, 0);
+        assert_eq!(outcome.gas_used, 21_000);
+
+        // The value transfer is reported with the before/after values observed
+        // at the moment of the write. The up-front gas charge has already been
+        // debited by then, so `before` is the balance net of that charge rather
+        // than the account's opening balance.
+        let sender_diff = diffs
+            .balances
+            .iter()
+            .find(|d| d.address == crate::Address(sender))
+            .expect("sender balance change is reported");
+        // Step 4 debits `gas_limit * gas_price + value` before execution, so by
+        // the time the transfer runs the sender is already down that amount.
+        let after_upfront_debit = 1_000_000 - 21_000 - 1000;
+        assert_eq!(sender_diff.before, EvmWord(wei(after_upfront_debit)));
+        assert_eq!(sender_diff.after, EvmWord(wei(after_upfront_debit - 1000)));
+
+        let recipient_diff = diffs
+            .balances
+            .iter()
+            .find(|d| d.address == crate::Address(recipient))
+            .expect("recipient balance change is reported");
+        assert_eq!(recipient_diff.before, EvmWord::zero());
+        assert_eq!(recipient_diff.after, EvmWord(wei(1000)));
+    }
+
+    #[test]
+    fn a_traced_contract_call_reports_every_executed_opcode() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        let contract = addr(0x33);
+        state.set_balance(&sender, wei(1_000_000));
+        state.set_nonce(&sender, 0);
+
+        // PUSH1 0x01, PUSH1 0x02, ADD, PUSH1 0x00, MSTORE, PUSH1 0x20,
+        // PUSH1 0x00, RETURN -- stores 3 in memory and returns it.
+        let code = vec![
+            0x60, 0x01, 0x60, 0x02, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        state.set_code(&contract, code);
+
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1),
+            gas_limit: 100_000,
+            to: Some(contract),
+            value: wei(0),
+            data: Vec::new(),
+            sender,
+        };
+
+        let mut tracer = crate::trace::StepTracerBuffer::new(128);
+        let (outcome, _) =
+            apply_transaction_traced(&mut state, &tx, &block(), &mut tracer).unwrap();
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output.len(), 32);
+        assert_eq!(outcome.output[31], 3);
+
+        let steps = tracer.steps();
+        let names: Vec<&str> = steps.iter().map(|s| s.op).collect();
+        assert_eq!(
+            names,
+            vec!["PUSH1", "PUSH1", "ADD", "PUSH1", "MSTORE", "PUSH1", "PUSH1", "RETURN"],
+            "every executed opcode must be reported in order"
+        );
+    }
+
+    #[test]
+    fn a_traced_contract_write_reports_the_storage_slot() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        let contract = addr(0x44);
+        state.set_balance(&sender, wei(1_000_000));
+        state.set_nonce(&sender, 0);
+
+        // PUSH1 0x2a, PUSH1 0x01, SSTORE, STOP -- storage[1] = 42.
+        let code = vec![0x60, 0x2a, 0x60, 0x01, 0x55, 0x00];
+        state.set_code(&contract, code);
+
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1),
+            gas_limit: 100_000,
+            to: Some(contract),
+            value: wei(0),
+            data: Vec::new(),
+            sender,
+        };
+
+        let mut tracer = crate::trace::StepTracerBuffer::new(64);
+        let (outcome, diffs) =
+            apply_transaction_traced(&mut state, &tx, &block(), &mut tracer).unwrap();
+        assert!(outcome.success);
+
+        let slot_diff = diffs
+            .storage
+            .iter()
+            .find(|d| d.address == crate::Address(contract))
+            .expect("the storage write is reported");
+        assert_eq!(slot_diff.slot, EvmWord::from_u64(1));
+        assert_eq!(slot_diff.before, EvmWord::zero());
+        assert_eq!(slot_diff.after, EvmWord::from_u64(42));
+
+        // The write really landed in the world state.
+        let mut slot = [0u8; 32];
+        slot[31] = 1;
+        let mut expected = [0u8; 32];
+        expected[31] = 42;
+        assert_eq!(state.storage(&contract, &slot), expected);
+    }
+
+    #[test]
+    fn a_reverted_traced_transaction_reports_no_state_writes() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        let contract = addr(0x66);
+        state.set_balance(&sender, wei(1_000_000));
+        state.set_nonce(&sender, 0);
+
+        // PUSH1 0x2a, PUSH1 0x01, SSTORE, PUSH1 0x00, PUSH1 0x00, REVERT
+        let code = vec![0x60, 0x2a, 0x60, 0x01, 0x55, 0x60, 0x00, 0x60, 0x00, 0xfd];
+        state.set_code(&contract, code);
+
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1),
+            gas_limit: 100_000,
+            to: Some(contract),
+            value: wei(0),
+            data: Vec::new(),
+            sender,
+        };
+
+        let mut tracer = crate::trace::StepTracerBuffer::new(64);
+        let (outcome, diffs) =
+            apply_transaction_traced(&mut state, &tx, &block(), &mut tracer).unwrap();
+
+        assert!(!outcome.success);
+        // The storage write was rolled back, so nothing may be reported.
+        assert!(diffs.storage.is_empty());
+        // The opcodes still ran and are still reported.
+        assert!(tracer.steps().len() >= 6);
+        // The nonce still advanced because the transaction was included.
         assert_eq!(state.nonce(&sender), 1);
     }
 

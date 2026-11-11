@@ -381,6 +381,11 @@ impl Memory {
         self.data.len()
     }
 
+    /// The allocated memory, as a contiguous byte image.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn ensure_capacity(&mut self, offset: usize, length: usize) {
         let end = offset + length;
         if end > self.data.len() {

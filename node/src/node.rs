@@ -73,6 +73,16 @@ pub struct TigerNode {
 impl TigerNode {
     /// Create a new TigerNode instance.
     pub async fn new(config: Config) -> Result<Self> {
+        let genesis = load_genesis(&config)?;
+        Self::from_genesis(config, genesis).await
+    }
+
+    /// Create a node from an explicit genesis definition.
+    ///
+    /// [`TigerNode::new`] reads the genesis from disk and delegates here, so a
+    /// caller that already holds a genesis (a test, or a node started from an
+    /// embedded chain spec) builds exactly the same node.
+    pub async fn from_genesis(config: Config, genesis: Genesis) -> Result<Self> {
         info!("Initializing TigerSmartChain node...");
 
         // Validate configuration
@@ -84,31 +94,7 @@ impl TigerNode {
         // Initialize the world state (trie-backed accounts) and apply the
         // genesis allocation. Without this every pre-funded account would
         // start empty, so no transaction could ever pay for gas.
-        let mut world_state = WorldState::new();
-        let genesis = load_genesis(&config)?;
-        for (address, account) in &genesis.alloc {
-            let parsed = match parse_address(address) {
-                Ok(address) => address,
-                Err(e) => {
-                    warn!("skipping genesis account {address}: {e}");
-                    continue;
-                }
-            };
-            if let Some(balance) = parse_genesis_balance(&account.balance) {
-                world_state.set_balance(&parsed, balance);
-            } else {
-                warn!("skipping genesis balance for {address}: not a valid amount");
-            }
-            if let Some(nonce) = account.nonce {
-                world_state.set_nonce(&parsed, nonce);
-            }
-            if let Some(code) = &account.code {
-                if let Ok(bytes) = hex_decode_checked(code) {
-                    world_state.set_code(&parsed, bytes);
-                }
-            }
-        }
-        let world_state = tokio::sync::Mutex::new(world_state);
+        let world_state = tokio::sync::Mutex::new(state_from_genesis(&genesis));
         info!(
             "World state initialized with {} genesis account(s)",
             genesis.alloc.len()
@@ -416,6 +402,11 @@ impl TigerNode {
         &self.world_state
     }
 
+    /// The genesis definition this chain was started from.
+    pub fn genesis(&self) -> &Genesis {
+        &self.genesis
+    }
+
     /// Get the mempool instance (locked).
     pub async fn get_mempool(&self) -> tokio::sync::MutexGuard<'_, Mempool> {
         self.mempool.lock().await
@@ -450,6 +441,39 @@ impl TigerNode {
 // =============================================================================
 // BLOCK PRODUCTION
 // =============================================================================
+
+/// Build the world state a chain starts from: an empty state with the genesis
+/// allocation applied.
+///
+/// `debug_traceTransaction` needs the state a block started from, which is this
+/// state with every earlier block replayed onto it, so the construction is
+/// shared with node startup rather than duplicated.
+pub fn state_from_genesis(genesis: &Genesis) -> WorldState {
+    let mut world_state = WorldState::new();
+    for (address, account) in &genesis.alloc {
+        let parsed = match parse_address(address) {
+            Ok(address) => address,
+            Err(e) => {
+                warn!("skipping genesis account {address}: {e}");
+                continue;
+            }
+        };
+        if let Some(balance) = parse_genesis_balance(&account.balance) {
+            world_state.set_balance(&parsed, balance);
+        } else {
+            warn!("skipping genesis balance for {address}: not a valid amount");
+        }
+        if let Some(nonce) = account.nonce {
+            world_state.set_nonce(&parsed, nonce);
+        }
+        if let Some(code) = &account.code {
+            if let Ok(bytes) = hex_decode_checked(code) {
+                world_state.set_code(&parsed, bytes);
+            }
+        }
+    }
+    world_state
+}
 
 /// Create a genesis block configuration for the given chain ID.
 fn create_genesis_block(chain_id: u64) -> Genesis {
@@ -560,7 +584,7 @@ fn hex_decode_checked(value: &str) -> Result<Vec<u8>, String> {
 /// The genesis header is a real header: its transactions root is the empty
 /// trie root and its state root is the root of the (empty) world state, so it
 /// hashes consistently with every other client.
-fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
+pub fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
     use tiger_blockchain::types::{Block, BlockHeader};
     use tiger_blockchain::EMPTY_TRIE_ROOT;
 
@@ -603,7 +627,7 @@ fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
 ///
 /// Transactions that fail validation or revert are still included (they paid
 /// for their gas) but do not change state beyond the gas charge.
-fn produce_block(
+pub fn produce_block(
     chain_manager: &mut ChainManager,
     world_state: &mut WorldState,
     transactions: &[Transaction],
@@ -743,7 +767,10 @@ fn produce_block(
 ///
 /// Returns `None` when the sender cannot be recovered, which means the
 /// transaction is not authorised and must not be applied.
-fn transaction_to_request(tx: &Transaction, chain_id: u64) -> Option<tiger_evm::transition::TransactionRequest> {
+pub fn transaction_to_request(
+    tx: &Transaction,
+    chain_id: u64,
+) -> Option<tiger_evm::transition::TransactionRequest> {
     use tiger_blockchain::recover_transaction_sender;
 
     let sender = recover_transaction_sender(tx, chain_id).ok()?;

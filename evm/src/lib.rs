@@ -5,6 +5,7 @@
 //! node's actual state rather than from placeholders. [`transition`] applies a
 //! signed transaction to the world state.
 
+pub mod diff;
 pub mod executor;
 pub mod host;
 pub mod opcodes;
@@ -12,13 +13,14 @@ pub mod trace;
 pub mod transition;
 pub mod types;
 
-pub use executor::Executor;
+pub use diff::{BalanceDiff, StateDiffRecorder, StorageDiff};
+pub use executor::{Executor, NullTracer};
 pub use host::{Host, MemoryHost};
 pub use opcodes::*;
 pub use trace::{mnemonic, opcode_name, Step, StepTracer, StepTracerBuffer, TraceSummary};
 pub use transition::{
-    apply_transaction, create_address, intrinsic_gas, BlockContext, StateHost,
-    TransactionRequest, TransitionError, TransitionOutcome,
+    apply_transaction, apply_transaction_traced, create_address, intrinsic_gas, BlockContext,
+    StateHost, TraceDiffs, TransactionRequest, TransitionError, TransitionOutcome,
 };
 pub use types::*;
 

@@ -25,6 +25,9 @@ pub struct Step {
     pub depth: u32,
     /// Stack contents after execution, bottom first.
     pub stack: Vec<EvmWord>,
+    /// Memory contents after execution, or `None` when the tracer did not ask
+    /// for them.
+    pub memory: Option<Vec<u8>>,
     /// Error raised by the opcode, if any.
     pub error: Option<String>,
 }
@@ -51,6 +54,14 @@ pub trait StepTracer {
     fn step(&mut self, step: &Step);
     /// Called once when execution finishes, whether or not it succeeded.
     fn finish(&mut self, summary: &TraceSummary);
+
+    /// Whether the tracer wants the memory image attached to every step.
+    ///
+    /// Copying memory on every step is quadratic in the number of steps, so it
+    /// is opt-in and defaults to off.
+    fn wants_memory(&self) -> bool {
+        false
+    }
 }
 
 /// A tracer that keeps every step, bounded by `capacity` to keep memory use
@@ -60,6 +71,7 @@ pub struct StepTracerBuffer {
     steps: Vec<Step>,
     capacity: usize,
     truncated: bool,
+    capture_memory: bool,
     summary: Option<TraceSummary>,
 }
 
@@ -70,7 +82,16 @@ impl StepTracerBuffer {
             steps: Vec::new(),
             capacity,
             truncated: false,
+            capture_memory: false,
             summary: None,
+        }
+    }
+
+    /// Create a buffer that also records the memory image of every step.
+    pub fn with_memory(capacity: usize) -> Self {
+        Self {
+            capture_memory: true,
+            ..Self::new(capacity)
         }
     }
 
@@ -101,6 +122,10 @@ impl StepTracer for StepTracerBuffer {
 
     fn finish(&mut self, summary: &TraceSummary) {
         self.summary = Some(summary.clone());
+    }
+
+    fn wants_memory(&self) -> bool {
+        self.capture_memory
     }
 }
 
@@ -265,7 +290,6 @@ pub fn opcode_name(op: Opcode) -> &'static str {
         REVERT => "REVERT",
         INVALID => "INVALID",
         SELFDESTRUCT => "SELFDESTRUCT",
-        _ => "UNKNOWN",
     }
 }
 
