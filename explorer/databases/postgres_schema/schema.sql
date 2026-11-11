@@ -1580,3 +1580,29 @@ CREATE TABLE IF NOT EXISTS votes (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(proposal_id, voter)
 );
+
+-- ============================================================================
+-- ALERT SUBSCRIPTIONS
+-- ============================================================================
+-- A user asks to be told when something happens at an address. The row is the
+-- standing instruction; the delivery itself is performed by the notifier that
+-- polls this table, so a restart of the notifier loses no subscription.
+
+CREATE TABLE IF NOT EXISTS alert_subscriptions (
+    id BIGSERIAL PRIMARY KEY,
+    address VARCHAR(42) NOT NULL,
+    alert_types TEXT[] NOT NULL,
+    webhook_id BIGINT REFERENCES webhooks(id) ON DELETE CASCADE,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(address, webhook_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_subscriptions_address
+    ON alert_subscriptions(address) WHERE is_active;
+
+-- A log row that fails to parse into the topics column is worse than no row,
+-- because the unique index below would then silently skip the real event.
+CREATE INDEX IF NOT EXISTS idx_logs_tx_hash_log_index
+    ON logs(transaction_hash, log_index);

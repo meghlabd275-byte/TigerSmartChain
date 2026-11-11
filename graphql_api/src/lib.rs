@@ -20,14 +20,15 @@
 //! let graphql = async_graphql::Schema::build(schema).data(pool).finish();
 //! ```
 
+pub mod db;
+pub mod model;
 pub mod schema;
 pub mod queries;
 pub mod mutations;
 pub mod subscriptions;
-pub mod resolvers;
 
+pub use db::Database;
 pub use schema::*;
 pub use queries::*;
 pub use mutations::*;
 pub use subscriptions::*;
-pub use resolvers::*;

@@ -3,11 +3,9 @@
  * Complete implementation in Rust for high performance
  */
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashMap;
 use std::fs;
 
-use ethers::types::Address;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
@@ -36,6 +34,11 @@ pub struct VerificationResult {
     pub bytecode_hash: String,
     pub runtime_hash: String,
     pub matches: bool,
+    /// The ABI the compiler produced, as JSON. A client needs it to call the
+    /// verified contract, so verification is not complete without it.
+    pub abi: String,
+    /// The libraries the source references, and whether each was linked.
+    pub libraries: Vec<LibraryInfo>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -66,10 +69,13 @@ pub enum ProxyType {
     UUPS,
     Beacon,
     Diamond,
+    /// An EIP-1167 minimal proxy, which copies a fixed implementation address
+    /// into its own code instead of reading a storage slot.
+    Minimal,
     Custom,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryInfo {
     pub name: String,
     pub address: String,
@@ -145,47 +151,86 @@ impl ContractVerifier {
             .map_err(|e| VerifierError::ParseError(format!("hex decode: {}", e)))
     }
 
-    /// Verify a contract with multi-file sources
+    /// Verify a contract with multi-file sources.
+    ///
+    /// The source is compiled with the requested compiler and the resulting
+    /// runtime bytecode is compared against the code deployed at the address.
+    /// `success` and `matches` are true only when that comparison passed, so a
+    /// compilation that does not reproduce the deployed code is reported as a
+    /// failure rather than a verification.
     pub fn verify(&self, request: ContractVerificationRequest) -> Result<VerificationResult, VerifierError> {
-        // Parse source code
         let sources = self.parse_multi_file_sources(&request.source_code)?;
-        
-        // Validate compiler version
+
         if !self.compiler_versions.contains(&request.compiler_version) {
             return Err(VerifierError::UnsupportedCompiler(request.compiler_version));
         }
-        
-        // Check for libraries
-        let libraries = self.extract_libraries(&sources)?;
-        
-        // Detect proxy pattern
-        let proxy_info = self.detect_proxy(&sources);
-        
-        // Verify compilation
+
+        let mut libraries = self.extract_libraries(&sources)?;
+        // A library the source calls but that was not linked compiles to a
+        // placeholder address, so the runtime bytecode cannot match. Record
+        // which ones were linked so the report can say so.
+        for library in &mut libraries {
+            if let Some(address) = request.libraries.get(&library.name) {
+                library.address = address.clone();
+                library.linked = true;
+            }
+        }
+
         let compiled = self.compile_sources(&sources, &request)?;
-        
-        // Calculate hashes
+
         let creation_hash = Self::hash_bytecode(&compiled.creation_bytecode);
         let runtime_hash = Self::hash_bytecode(&compiled.runtime_bytecode);
-        
-        // Check if matches on-chain bytecode. Fetch the deployed runtime
-        // bytecode via eth_getCode and compare it against the locally
-        // compiled runtime bytecode (with the metadata hash stripped, since
-        // the deployed contract may have been compiled with different
-        // metadata settings). Returns false if no RPC URL is configured or
-        // the bytecode does not match.
-        let matches = match self.fetch_onchain_bytecode(&request.address) {
-            Ok(onchain) => bytecode_matches(&compiled.runtime_bytecode, &onchain),
-            Err(_) => false,
+
+        // The deployed code is needed twice: to decide the match and to find
+        // the proxy pattern, which lives in the deployed code rather than in
+        // the source.
+        let onchain = self.fetch_onchain_bytecode(&request.address).ok();
+        let proxy_info = self.detect_proxy(&sources, onchain.as_deref());
+
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let matches = match &onchain {
+            Some(code) => {
+                if bytecode_matches(&compiled.runtime_bytecode, code) {
+                    true
+                } else {
+                    errors.push(
+                        "compiled runtime bytecode does not match the deployed code".to_string(),
+                    );
+                    false
+                }
+            }
+            None => {
+                errors.push(
+                    "could not read the deployed bytecode, so the match is unknown".to_string(),
+                );
+                false
+            }
         };
-        
+        if let Some(info) = &proxy_info {
+            warnings.push(format!("proxy pattern detected: {:?}", info.proxy_type));
+        }
+        let unlinked: Vec<String> = libraries
+            .iter()
+            .filter(|library| !library.linked)
+            .map(|library| library.name.clone())
+            .collect();
+        if !unlinked.is_empty() {
+            warnings.push(format!(
+                "libraries referenced but not linked: {}",
+                unlinked.join(", ")
+            ));
+        }
+
         Ok(VerificationResult {
-            success: true,
+            success: matches,
             bytecode_hash: creation_hash,
             runtime_hash,
             matches,
-            errors: vec![],
-            warnings: proxy_info.map(|p| vec![format!("Proxy detected: {:?}", p.proxy_type)]).unwrap_or_default(),
+            abi: compiled.abi,
+            libraries,
+            errors,
+            warnings,
         })
     }
 
@@ -255,18 +300,63 @@ impl ContractVerifier {
         Ok(libraries)
     }
 
-    /// Detect proxy pattern
-    fn detect_proxy(&self, sources: &MultiFileSource) -> Option<ProxyInfo> {
-        let proxy_patterns = [
-            ("0x4d5a9be9", ProxyType::Transparent), // EIP-1967
-            ("0x360894a13ba1a3210667c82849203898a4788263", ProxyType::Transparent),
-            ("0xe1c7392a", ProxyType::UUPS), // UUPS upgradeable
-            ("0x5c60da1b", ProxyType::Beacon), // Beacon proxy
+    /// Detect a proxy pattern.
+    ///
+    /// Two signals are used, strongest first. The deployed bytecode is checked
+    /// for the EIP-1967 storage slots and the EIP-1167 minimal-proxy shape,
+    /// which a proxy carries whichever source it was built from. When no code
+    /// is available the source text is inspected for the upgradeable patterns
+    /// instead, which is weaker but is the best that can be done before
+    /// deployment.
+    fn detect_proxy(&self, sources: &MultiFileSource, onchain: Option<&[u8]>) -> Option<ProxyInfo> {
+        // EIP-1967 and EIP-1822 storage slot constants. A proxy reads its
+        // implementation or beacon from one of these, so its presence in the
+        // deployed code identifies the pattern without needing the source.
+        const EIP1967_IMPLEMENTATION: [u8; 32] = [
+            0x36, 0x08, 0x94, 0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x20,
+            0x38, 0x98, 0xa4, 0x78, 0x82, 0x63, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
         ];
-        
+        const EIP1967_BEACON: [u8; 32] = [
+            0xa3, 0xf0, 0xad, 0x74, 0x68, 0xc2, 0x9c, 0xc0, 0x0a, 0x9c, 0x4d, 0xdc, 0x0a, 0x3a,
+            0xa3, 0x1e, 0x0b, 0x50, 0x2c, 0x0d, 0x70, 0x4b, 0x62, 0x9c, 0x5c, 0x2c, 0x2b, 0x2a,
+            0x53, 0x9e, 0x9a, 0x6d,
+        ];
+        if let Some(code) = onchain {
+            if code.windows(EIP1967_BEACON.len()).any(|w| w == EIP1967_BEACON) {
+                return Some(ProxyInfo {
+                    implementation: None,
+                    proxy_type: ProxyType::Beacon,
+                    admin: None,
+                });
+            }
+            if code
+                .windows(EIP1967_IMPLEMENTATION.len())
+                .any(|w| w == EIP1967_IMPLEMENTATION)
+            {
+                return Some(ProxyInfo {
+                    implementation: None,
+                    proxy_type: ProxyType::Transparent,
+                    admin: None,
+                });
+            }
+            // An EIP-1167 minimal proxy copies a fixed implementation address
+            // into its own code rather than reading a storage slot, so its
+            // shape identifies it and the address is readable from the code.
+            const MINIMAL_PROXY_PREFIX: [u8; 10] =
+                [0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x34, 0x3d, 0x73];
+            if code.len() == 45 && code.starts_with(&MINIMAL_PROXY_PREFIX) {
+                return Some(ProxyInfo {
+                    implementation: Some(format!("0x{}", hex::encode(&code[10..30]))),
+                    proxy_type: ProxyType::Minimal,
+                    admin: None,
+                });
+            }
+        }
+
         for file in &sources.files {
             let content = file.content.to_lowercase();
-            
+
             // Check for upgradeable modifiers
             if content.contains("initializable") && content.contains("upgradeable") {
                 if content.contains("constructor") && content.contains("_upgrade") {
@@ -282,7 +372,7 @@ impl ContractVerifier {
                     admin: None,
                 });
             }
-            
+
             // Check for Diamond pattern
             if content.contains("diamond") && content.contains("facets") {
                 return Some(ProxyInfo {
@@ -292,11 +382,11 @@ impl ContractVerifier {
                 });
             }
         }
-        
+
         None
     }
 
-    /// Compile sources (simplified - would integrate with solc in production)
+    /// Compile the sources with the requested `solc` version.
     fn compile_sources(&self, sources: &MultiFileSource, request: &ContractVerificationRequest) -> Result<CompiledContract, VerifierError> {
         // Write each source file into a temporary project directory and invoke
         // the real `solc` binary via `solc --combined-json` to produce real
@@ -416,16 +506,30 @@ impl ContractVerifier {
         &self.compiler_versions
     }
 
-    /// Verify constructor arguments
-    pub fn verify_constructor_args(&self, bytecode: &[u8], args: &str) -> Result<bool, VerifierError> {
-        let args_bytes = hex::decode(args.trim_start_matches("0x"))
-            .map_err(|e| VerifierError::ParseError(e.to_string()))?;
-        
-        // Check if args are present in bytecode
-        let bytecode_str = hex::encode(bytecode);
-        let args_hex = args.trim_start_matches("0x");
-        
-        Ok(bytecode_str.contains(args_hex))
+    /// Verify that the supplied constructor arguments appear in the creation
+    /// bytecode.
+    ///
+    /// The comparison is over bytes, so an odd-length hex string — which has
+    /// no byte representation — is rejected rather than silently mis-decoded.
+    pub fn verify_constructor_args(
+        &self,
+        bytecode: &[u8],
+        args: &str,
+    ) -> Result<bool, VerifierError> {
+        let args = args.trim().trim_start_matches("0x");
+        if args.len() % 2 != 0 {
+            return Err(VerifierError::ParseError(
+                "constructor arguments must be an even number of hex digits".to_string(),
+            ));
+        }
+        let args_bytes = hex::decode(args).map_err(|e| VerifierError::ParseError(e.to_string()))?;
+        if args_bytes.is_empty() {
+            // No arguments were supplied, so there is nothing to look for.
+            return Ok(true);
+        }
+        Ok(bytecode
+            .windows(args_bytes.len())
+            .any(|window| window == args_bytes.as_slice()))
     }
 }
 
@@ -515,32 +619,86 @@ impl SourcifyClient {
         }
     }
 
-    /// Fetch contract source from Sourcify
-    pub async fn fetch_sources(&self, address: &str, chain_id: &str) -> Result<Option<MultiFileSource>, VerifierError> {
+    /// Fetch contract source from Sourcify.
+    ///
+    /// The endpoint returns `{status, files: [{name, content}]}`. A contract
+    /// with no published sources answers `false`, which is reported as `None`
+    /// rather than as an empty file list: the two mean different things.
+    pub async fn fetch_sources(
+        &self,
+        address: &str,
+        chain_id: &str,
+    ) -> Result<Option<MultiFileSource>, VerifierError> {
         let url = format!("{}/files/{}/{}", self.base_url, chain_id, address);
-        
-        let response = self.client.get(&url).send().await
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| VerifierError::ParseError(e.to_string()))?;
-        
+
         if response.status() == 404 {
             return Ok(None);
         }
-        
-        let json: serde_json::Value = response.json().await
+
+        let json: serde_json::Value = response
+            .json()
+            .await
             .map_err(|e| VerifierError::ParseError(e.to_string()))?;
-        
-        // Parse response into MultiFileSource
-        // Simplified for demo
-        
+
+        let status = json.get("status").and_then(|v| v.as_str()).unwrap_or_default();
+        if status == "false" || status.eq_ignore_ascii_case("error") {
+            return Ok(None);
+        }
+        let files = match json.get("files").and_then(|v| v.as_array()) {
+            Some(files) if !files.is_empty() => files,
+            _ => return Ok(None),
+        };
+
+        let mut sources = Vec::with_capacity(files.len());
+        let mut imports = HashMap::new();
+        for file in files {
+            let name = file
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let content = file
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            imports.insert(name.clone(), content.clone());
+            let path = if name.starts_with('/') {
+                name.clone()
+            } else {
+                format!("/{name}")
+            };
+            sources.push(SourceFile {
+                name,
+                content,
+                path,
+            });
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(MultiFileSource {
-            files: vec![],
-            imports: HashMap::new(),
+            files: sources,
+            imports,
         }))
     }
 
     /// Verify contract matches Sourcify sources
     pub async fn verify_match(&self, address: &str, chain_id: &str) -> Result<bool, VerifierError> {
-        let url = format!("{}/check-by-addresses/{}", self.base_url, address);
+        let url = format!(
+            "{}/check-by-addresses?addresses={}&chainIds={}",
+            self.base_url, address, chain_id
+        );
         
         let response = self.client.get(&url).send().await
             .map_err(|e| VerifierError::ParseError(e.to_string()))?;
@@ -619,7 +777,49 @@ mod tests {
             imports: HashMap::new(),
         };
         
-        let proxy = verifier.detect_proxy(&sources);
+        let proxy = verifier.detect_proxy(&sources, None);
         assert!(proxy.is_some());
+
+        // The deployed code decides the pattern when it is available: an
+        // EIP-1967 implementation slot marks a transparent proxy whatever the
+        // source says.
+        let mut code = vec![0x60, 0x80, 0x60, 0x40, 0x52];
+        code.extend_from_slice(&[
+            0x36, 0x08, 0x94, 0xa1, 0x3b, 0xa1, 0xa3, 0x21, 0x06, 0x67, 0xc8, 0x28, 0x49, 0x20,
+            0x38, 0x98, 0xa4, 0x78, 0x82, 0x63, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+        ]);
+        let detected = verifier.detect_proxy(&sources, Some(&code));
+        assert!(matches!(
+            detected.map(|info| info.proxy_type),
+            Some(ProxyType::Transparent)
+        ));
+
+        // An EIP-1167 minimal proxy is identified by its shape and its target
+        // is read out of the code.
+        let mut minimal = vec![0x36, 0x3d, 0x3d, 0x37, 0x3d, 0x3d, 0x3d, 0x34, 0x3d, 0x73];
+        minimal.extend_from_slice(&[0x11; 20]);
+        minimal.extend_from_slice(&[
+            0x5a, 0xf4, 0x3d, 0x82, 0x80, 0x3e, 0x90, 0x3d, 0x91, 0x60, 0x2a, 0x57, 0xfd, 0x5b,
+            0xf3,
+        ]);
+        assert_eq!(minimal.len(), 45);
+        let detected = verifier.detect_proxy(&sources, Some(&minimal)).unwrap();
+        assert!(matches!(detected.proxy_type, ProxyType::Minimal));
+        assert_eq!(detected.implementation.unwrap(), format!("0x{}", "11".repeat(20)));
+    }
+
+    #[test]
+    fn constructor_arguments_are_compared_as_bytes() {
+        let verifier = ContractVerifier::new();
+        // 0xdeadbeef appears in the bytecode, 0xcafebabe does not.
+        let bytecode = vec![0x60, 0x80, 0xde, 0xad, 0xbe, 0xef, 0x00];
+        assert!(verifier.verify_constructor_args(&bytecode, "0xdeadbeef").unwrap());
+        assert!(!verifier.verify_constructor_args(&bytecode, "0xcafebabe").unwrap());
+        // No arguments means nothing to find.
+        assert!(verifier.verify_constructor_args(&bytecode, "0x").unwrap());
+        // An odd-length hex string has no byte representation and must be
+        // rejected rather than mis-decoded.
+        assert!(verifier.verify_constructor_args(&bytecode, "0xabc").is_err());
     }
 }
