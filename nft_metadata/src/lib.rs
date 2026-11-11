@@ -13,6 +13,7 @@
 //! - Collection analytics
 
 pub mod indexer;
+pub mod ssrf;
 pub mod types;
 pub mod ipfs;
 pub mod arweave;
@@ -20,4 +21,5 @@ pub mod arweave;
 pub use indexer::NFTMetadataIndexer;
 pub use types::*;
 pub use ipfs::IPFSClient;
+pub use ssrf::{is_disallowed_address, validate_uri};
 pub use arweave::ArweaveClient;

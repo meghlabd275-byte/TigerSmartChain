@@ -1,6 +1,5 @@
 //! NFT Metadata Types for TigerScan
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
