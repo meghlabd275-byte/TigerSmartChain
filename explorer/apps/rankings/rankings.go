@@ -22,23 +22,23 @@ type Database interface {
 }
 
 type Address struct {
-	Rank      int
-	Address  string
-	Balance  string
+	Rank    int
+	Address string
+	Balance string
 	TxCount int
 }
 
 type Token struct {
-	Rank       int
+	Rank      int
 	Address   string
 	Name      string
 	Symbol    string
-	Holders  int
+	Holders   int
 	Volume24h string
 }
 
 type NFT struct {
-	Rank     int
+	Rank    int
 	Address string
 	Name    string
 	Volume  string
@@ -46,12 +46,12 @@ type NFT struct {
 }
 
 type Validator struct {
-	Rank        int
+	Rank       int
 	Address    string
 	Name       string
-	Uptime    float64
+	Uptime     float64
 	Delegators int
-	Stake     string
+	Stake      string
 }
 
 func NewServer() *Server {

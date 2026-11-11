@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -34,12 +35,12 @@ type Config struct {
 	// Authentication
 	APIKey string `json:"api_key,omitempty"`
 	// TLS settings
-	UseTLS bool   `json:"use_tls"`
+	UseTLS   bool   `json:"use_tls"`
 	CertFile string `json:"cert_file,omitempty"`
-	KeyFile string `json:"key_file,omitempty"`
+	KeyFile  string `json:"key_file,omitempty"`
 	// Connection pool settings
-	MaxConns       int           `json:"max_conns"`
-	MaxConcurrent int          `json:"max_concurrent"`
+	MaxConns      int           `json:"max_conns"`
+	MaxConcurrent int           `json:"max_concurrent"`
 	Timeout       time.Duration `json:"timeout"`
 	// Retry settings
 	MaxRetries int           `json:"max_retries"`
@@ -48,43 +49,43 @@ type Config struct {
 	CacheEnabled bool          `json:"cache_enabled"`
 	CacheTTL     time.Duration `json:"cache_ttl"`
 	// Rate limiting
-	RateLimit int           `json:"rate_limit"` // requests per second
-	Burst    int           `json:"burst"`
+	RateLimit int `json:"rate_limit"` // requests per second
+	Burst     int `json:"burst"`
 	// Encryption key for sensitive data
 	EncryptionKey *[32]byte `json:"-"`
 }
 
 // Client is a high-performance RPC client with security features
 type Client struct {
-	config     *Config
-	pools      []*connPool
-	wsPools    []*wsPool
-	mu         sync.RWMutex
+	config      *Config
+	pools       []*connPool
+	wsPools     []*wsPool
+	mu          sync.RWMutex
 	currentPool int
-	metrics    *Metrics
-	cache      *Cache
-	rateLimit  *RateLimiter
-	encryptor *Encryptor
+	metrics     *Metrics
+	cache       *Cache
+	rateLimit   *RateLimiter
+	encryptor   *Encryptor
 	healthCheck *HealthChecker
 }
 
 // connPool manages a pool of RPC connections
 type connPool struct {
-	client     *rpc.Client
-	url        string
-	mu         sync.Mutex
-	inUse      int
-	available  int
-	lastUsed   time.Time
-	failed     bool
-	failCount  int
+	client    *rpc.Client
+	url       string
+	mu        sync.Mutex
+	inUse     int
+	available int
+	lastUsed  time.Time
+	failed    bool
+	failCount int
 }
 
 // wsPool manages WebSocket connections
 type wsPool struct {
-	conn       *rpc.Client
-	url        string
-	mu         sync.Mutex
+	conn      *rpc.Client
+	url       string
+	mu        sync.Mutex
 	subs      map[string]*Subscription
 	inUse     int
 	lastUsed  time.Time
@@ -94,7 +95,7 @@ type wsPool struct {
 
 // Subscription represents a WebSocket subscription
 type Subscription struct {
-	ID       string
+	ID      string
 	Type    string
 	Channel chan interface{}
 	sub     *rpc.ClientSubscription
@@ -102,37 +103,37 @@ type Subscription struct {
 
 // Metrics tracks client metrics
 type Metrics struct {
-	mu            sync.RWMutex
-	Requests      uint64
-	Successes     uint64
-	Failures      uint64
-	LatencySum    time.Duration
-	LatencyCount  uint64
-	ActiveConns   uint64
+	mu           sync.RWMutex
+	Requests     uint64
+	Successes    uint64
+	Failures     uint64
+	LatencySum   time.Duration
+	LatencyCount uint64
+	ActiveConns  uint64
 	CacheHits    uint64
 	CacheMisses  uint64
 }
 
 // Cache implements LRU cache
 type Cache struct {
-	mu       sync.RWMutex
-	items    map[string]*CacheItem
-	lru      []string
-	maxSize  int
-	ttl      time.Duration
+	mu      sync.RWMutex
+	items   map[string]*CacheItem
+	lru     []string
+	maxSize int
+	ttl     time.Duration
 }
 
 type CacheItem struct {
-	Value    interface{}
-	Expiry  time.Time
+	Value  interface{}
+	Expiry time.Time
 }
 
 // RateLimiter implements token bucket rate limiting
 type RateLimiter struct {
-	mu       sync.Mutex
-	tokens   float64
-	max     float64
-	rate    float64 // tokens per second
+	mu         sync.Mutex
+	tokens     float64
+	max        float64
+	rate       float64 // tokens per second
 	lastRefill time.Time
 }
 
@@ -143,18 +144,18 @@ type Encryptor struct {
 
 // HealthChecker monitors endpoint health
 type HealthChecker struct {
-	mu          sync.RWMutex
-	endpoints   map[string]*EndpointHealth
-	interval    time.Duration
-	threshold   float64
+	mu        sync.RWMutex
+	endpoints map[string]*EndpointHealth
+	interval  time.Duration
+	threshold float64
 }
 
 type EndpointHealth struct {
-	URL           string
-	Latency       time.Duration
-	SuccessRate   float64
-	LastCheck     time.Time
-	Status       string
+	URL         string
+	Latency     time.Duration
+	SuccessRate float64
+	LastCheck   time.Time
+	Status      string
 }
 
 // NewClient creates a new RPC client
@@ -190,8 +191,8 @@ func NewClient(config *Config) (*Client, error) {
 	}
 
 	client := &Client{
-		config:    config,
-		metrics:   &Metrics{},
+		config:  config,
+		metrics: &Metrics{},
 		rateLimit: &RateLimiter{
 			max:    float64(config.Burst),
 			tokens: float64(config.Burst),
@@ -199,7 +200,7 @@ func NewClient(config *Config) (*Client, error) {
 		},
 		healthCheck: &HealthChecker{
 			endpoints: make(map[string]*EndpointHealth),
-			interval: 30 * time.Second,
+			interval:  30 * time.Second,
 			threshold: 0.95,
 		},
 	}
@@ -213,9 +214,9 @@ func NewClient(config *Config) (*Client, error) {
 	if config.CacheEnabled {
 		client.cache = &Cache{
 			items:   make(map[string]*CacheItem),
-			lru:    make([]string, 0, 1000),
+			lru:     make([]string, 0, 1000),
 			maxSize: 10000,
-			ttl:    config.CacheTTL,
+			ttl:     config.CacheTTL,
 		}
 	}
 
@@ -251,8 +252,8 @@ func (c *Client) initPools() error {
 			continue
 		}
 		c.wsPools[i] = &wsPool{
-			conn:  client,
-			url:   url,
+			conn: client,
+			url:  url,
 			subs: make(map[string]*Subscription),
 		}
 	}
@@ -273,7 +274,7 @@ func (c *Client) createRPCClient(url string) (*rpc.Client, error) {
 			TLSHandshakeTimeout: 10 * time.Second,
 			// Security: disable weak ciphers
 			TLSClientConfig: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
+				MinVersion:       tls.VersionTLS12,
 				CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 				CipherSuites: []uint16{
 					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -659,9 +660,9 @@ func (c *Client) GetLogs(ctx context.Context, filter *FilterQuery) ([]*types.Log
 type FilterQuery struct {
 	FromBlock string   `json:"fromBlock,omitempty"`
 	ToBlock   string   `json:"toBlock,omitempty"`
-	Address  string   `json:"address,omitempty"`
-	Topics   []string `json:"topics,omitempty"`
-	BlockHash string  `json:"blockHash,omitempty"`
+	Address   string   `json:"address,omitempty"`
+	Topics    []string `json:"topics,omitempty"`
+	BlockHash string   `json:"blockHash,omitempty"`
 }
 
 // Subscribe creates a new WebSocket subscription
@@ -682,10 +683,10 @@ func (c *Client) Subscribe(eventType string, channel chan interface{}) (string, 
 
 	subID := string(rpc.NewID())
 	pool.subs[subID] = &Subscription{
-		ID:       subID,
-		Type:     eventType,
-		Channel:  channel,
-		sub:      sub,
+		ID:      subID,
+		Type:    eventType,
+		Channel: channel,
+		sub:     sub,
 	}
 
 	// Start forwarding messages
@@ -817,7 +818,7 @@ func (c *Cache) set(key string, value interface{}) {
 	}
 
 	c.items[key] = &CacheItem{
-		Value: value,
+		Value:  value,
 		Expiry: time.Now().Add(c.ttl),
 	}
 	c.lru = append(c.lru, key)
@@ -862,7 +863,7 @@ func (c *Client) GetMetrics() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"requests":        c.metrics.Requests,
+		"requests":       c.metrics.Requests,
 		"successes":      c.metrics.Successes,
 		"failures":       c.metrics.Failures,
 		"avg_latency":    avgLatency.String(),
@@ -896,29 +897,106 @@ func toHex(n uint64) string {
 	return fmt.Sprintf("0x%x", n)
 }
 
+// decodeBlock converts an eth_getBlockBy* JSON object into a types.Block.
+//
+// go-ethereum deliberately provides no Block.UnmarshalJSON: a block body is not
+// self-describing in the header alone, so the header and body are decoded
+// separately and recombined. Blocks whose transactions come back as bare hashes
+// (fullTx=false) are rejected rather than silently returning a block with an
+// empty body, which would corrupt every downstream count.
 func decodeBlock(result map[string]interface{}) (*types.Block, error) {
 	if result == nil {
 		return nil, fmt.Errorf("nil block")
 	}
 
-	// Simplified block decoding
-	return nil, nil // Full implementation would decode all fields
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode block: %w", err)
+	}
+
+	var header types.Header
+	if err := json.Unmarshal(raw, &header); err != nil {
+		return nil, fmt.Errorf("decode block header: %w", err)
+	}
+
+	var envelope struct {
+		Transactions []json.RawMessage `json:"transactions"`
+		Uncles       []json.RawMessage `json:"uncles"`
+		Withdrawals  []json.RawMessage `json:"withdrawals"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("decode block body: %w", err)
+	}
+
+	body := types.Body{}
+
+	for i, rawTx := range envelope.Transactions {
+		if len(rawTx) == 0 || rawTx[0] != '{' {
+			return nil, fmt.Errorf("block %s returned transaction %d as a hash; request full transactions",
+				header.Number, i)
+		}
+		var tx types.Transaction
+		if err := json.Unmarshal(rawTx, &tx); err != nil {
+			return nil, fmt.Errorf("decode block transaction %d: %w", i, err)
+		}
+		body.Transactions = append(body.Transactions, &tx)
+	}
+
+	for i, rawUncle := range envelope.Uncles {
+		var uncle types.Header
+		if err := json.Unmarshal(rawUncle, &uncle); err != nil {
+			return nil, fmt.Errorf("decode block uncle %d: %w", i, err)
+		}
+		body.Uncles = append(body.Uncles, &uncle)
+	}
+
+	for i, rawWithdrawal := range envelope.Withdrawals {
+		var w types.Withdrawal
+		if err := json.Unmarshal(rawWithdrawal, &w); err != nil {
+			return nil, fmt.Errorf("decode block withdrawal %d: %w", i, err)
+		}
+		body.Withdrawals = append(body.Withdrawals, &w)
+	}
+
+	return types.NewBlockWithHeader(&header).WithBody(body), nil
 }
 
+// decodeTransaction converts an eth_getTransactionByHash JSON object into a
+// types.Transaction.
 func decodeTransaction(result map[string]interface{}) (*types.Transaction, error) {
 	if result == nil {
 		return nil, fmt.Errorf("nil transaction")
 	}
 
-	return nil, nil // Full implementation would decode all fields
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode transaction: %w", err)
+	}
+
+	var tx types.Transaction
+	if err := json.Unmarshal(raw, &tx); err != nil {
+		return nil, fmt.Errorf("decode transaction: %w", err)
+	}
+	return &tx, nil
 }
 
+// decodeReceipt converts an eth_getTransactionReceipt JSON object into a
+// types.Receipt.
 func decodeReceipt(result map[string]interface{}) (*types.Receipt, error) {
 	if result == nil {
 		return nil, fmt.Errorf("nil receipt")
 	}
 
-	return nil, nil // Full implementation would decode all fields
+	raw, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode receipt: %w", err)
+	}
+
+	var receipt types.Receipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		return nil, fmt.Errorf("decode receipt: %w", err)
+	}
+	return &receipt, nil
 }
 
 func parseUint256(s string) (*big.Int, error) {
@@ -1011,10 +1089,10 @@ func (c *Client) HealthCheck() map[string]interface{} {
 	result := make(map[string]interface{})
 	for url, health := range c.healthCheck.endpoints {
 		result[url] = map[string]interface{}{
-			"latency":     health.Latency.String(),
+			"latency":      health.Latency.String(),
 			"success_rate": health.SuccessRate,
-			"status":     health.Status,
-			"last_check": health.LastCheck.Format(time.RFC3339),
+			"status":       health.Status,
+			"last_check":   health.LastCheck.Format(time.RFC3339),
 		}
 	}
 

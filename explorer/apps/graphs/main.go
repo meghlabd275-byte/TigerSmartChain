@@ -11,52 +11,51 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v5"
-	
 )
 
 // Config holds the graph API configuration
 type Config struct {
-	DBURL       string
-	RedisURL    string
-	Port       string
-	CacheTTL   time.Duration
+	DBURL    string
+	RedisURL string
+	Port     string
+	CacheTTL time.Duration
 }
 
 // GraphService handles graph data requests
 type GraphService struct {
-	config      *Config
-	db          *pgx.Conn
-	redis       *redis.Client
+	config *Config
+	db     *pgx.Conn
+	redis  *redis.Client
 }
 
 // NewGraphService creates a new graph service
 func NewGraphService(config *Config) (*GraphService, error) {
 	ctx := context.Background()
-	
+
 	db, err := pgx.Connect(ctx, config.DBURL)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	rdb, err := redis.ParseURL(config.RedisURL)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	redisClient := redis.NewClient(rdb)
-	
+
 	return &GraphService{
-		config:    config,
-		db:       db,
-		redis:    redisClient,
+		config: config,
+		db:     db,
+		redis:  redisClient,
 	}, nil
 }
 
 // ChartDataPoint represents a single data point on a chart
 type ChartDataPoint struct {
 	Timestamp time.Time `json:"timestamp"`
-	Value     float64  `json:"value"`
-	Label     string   `json:"label,omitempty"`
+	Value     float64   `json:"value"`
+	Label     string    `json:"label,omitempty"`
 }
 
 // ChartResponse represents a chart data response
@@ -66,23 +65,23 @@ type ChartResponse struct {
 
 // ChartSeries represents a data series
 type ChartSeries struct {
-	Name   string        `json:"name"`
-	Type   string        `json:"type"`
-	Data  []ChartDataPoint `json:"data"`
+	Name string           `json:"name"`
+	Type string           `json:"type"`
+	Data []ChartDataPoint `json:"data"`
 }
 
 // handleTPSChart handles TPS chart data
 func (s *GraphService) handleTPSChart(c *gin.Context) {
 	interval := c.DefaultQuery("interval", "24h")
 	startTime, endTime := s.parseInterval(interval)
-	
+
 	// Try cache first
 	cacheKey := fmt.Sprintf("chart:tps:%s", interval)
 	if cached, err := s.redis.Get(c.Request.Context(), cacheKey).Result(); err == nil {
 		c.JSON(http.StatusOK, gin.H{"data": cached})
 		return
 	}
-	
+
 	query := `
 		SELECT date_trunc('minute', timestamp) as ts, 
 		       COUNT(*) as tps
@@ -91,20 +90,20 @@ func (s *GraphService) handleTPSChart(c *gin.Context) {
 		GROUP BY date_trunc('minute', timestamp)
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, startTime, endTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	series := ChartSeries{
 		Name: "TPS",
 		Type: "line",
 		Data: []ChartDataPoint{},
 	}
-	
+
 	for rows.Next() {
 		var dp ChartDataPoint
 		if err := rows.Scan(&dp.Timestamp, &dp.Value); err != nil {
@@ -113,10 +112,10 @@ func (s *GraphService) handleTPSChart(c *gin.Context) {
 		}
 		series.Data = append(series.Data, dp)
 	}
-	
+
 	// Cache the result
 	s.redis.Set(c.Request.Context(), cacheKey, series, s.config.CacheTTL)
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{series},
 	})
@@ -126,7 +125,7 @@ func (s *GraphService) handleTPSChart(c *gin.Context) {
 func (s *GraphService) handleGasChart(c *gin.Context) {
 	interval := c.DefaultQuery("interval", "24h")
 	startTime, _ := s.parseInterval(interval)
-	
+
 	query := `
 		SELECT date_trunc('hour', timestamp) as ts,
 		       AVG(gas_price) as avg_gas,
@@ -137,18 +136,18 @@ func (s *GraphService) handleGasChart(c *gin.Context) {
 		GROUP BY date_trunc('hour', timestamp)
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, startTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	avgSeries := ChartSeries{Name: "Average Gas", Type: "line", Data: []ChartDataPoint{}}
 	minSeries := ChartSeries{Name: "Min Gas", Type: "line", Data: []ChartDataPoint{}}
 	maxSeries := ChartSeries{Name: "Max Gas", Type: "line", Data: []ChartDataPoint{}}
-	
+
 	for rows.Next() {
 		var avg, min, max float64
 		var ts time.Time
@@ -160,7 +159,7 @@ func (s *GraphService) handleGasChart(c *gin.Context) {
 		minSeries.Data = append(minSeries.Data, ChartDataPoint{Timestamp: ts, Value: min})
 		maxSeries.Data = append(maxSeries.Data, ChartDataPoint{Timestamp: ts, Value: max})
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{avgSeries, minSeries, maxSeries},
 	})
@@ -170,7 +169,7 @@ func (s *GraphService) handleGasChart(c *gin.Context) {
 func (s *GraphService) handleTVLChart(c *gin.Context) {
 	interval := c.DefaultQuery("interval", "30d")
 	startTime, _ := s.parseInterval(interval)
-	
+
 	query := `
 		SELECT date_trunc('day', timestamp) as ts,
 		       SUM(value) as tvl
@@ -179,20 +178,20 @@ func (s *GraphService) handleTVLChart(c *gin.Context) {
 		GROUP BY date_trunc('day', timestamp)
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, startTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	series := ChartSeries{
 		Name: "TVL",
 		Type: "area",
 		Data: []ChartDataPoint{},
 	}
-	
+
 	for rows.Next() {
 		var dp ChartDataPoint
 		if err := rows.Scan(&dp.Timestamp, &dp.Value); err != nil {
@@ -201,7 +200,7 @@ func (s *GraphService) handleTVLChart(c *gin.Context) {
 		}
 		series.Data = append(series.Data, dp)
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{series},
 	})
@@ -211,7 +210,7 @@ func (s *GraphService) handleTVLChart(c *gin.Context) {
 func (s *GraphService) handleMarketCapChart(c *gin.Context) {
 	interval := c.DefaultQuery("interval", "30d")
 	startTime, _ := s.parseInterval(interval)
-	
+
 	query := `
 		SELECT date_trunc('day', timestamp) as ts,
 		       SUM(circulating_supply * price) as market_cap
@@ -220,20 +219,20 @@ func (s *GraphService) handleMarketCapChart(c *gin.Context) {
 		GROUP BY date_trunc('day', timestamp)
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, startTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	series := ChartSeries{
 		Name: "Market Cap",
 		Type: "area",
 		Data: []ChartDataPoint{},
 	}
-	
+
 	for rows.Next() {
 		var dp ChartDataPoint
 		if err := rows.Scan(&dp.Timestamp, &dp.Value); err != nil {
@@ -242,7 +241,7 @@ func (s *GraphService) handleMarketCapChart(c *gin.Context) {
 		}
 		series.Data = append(series.Data, dp)
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{series},
 	})
@@ -253,7 +252,7 @@ func (s *GraphService) handleTokenPriceChart(c *gin.Context) {
 	address := c.Param("address")
 	interval := c.DefaultQuery("interval", "30d")
 	startTime, _ := s.parseInterval(interval)
-	
+
 	query := `
 		SELECT date_trunc('hour', timestamp) as ts,
 		       price, volume_24h, market_cap
@@ -261,18 +260,18 @@ func (s *GraphService) handleTokenPriceChart(c *gin.Context) {
 		WHERE token_address = $1 AND timestamp >= $2
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, address, startTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	priceSeries := ChartSeries{Name: "Price", Type: "line", Data: []ChartDataPoint{}}
 	volumeSeries := ChartSeries{Name: "Volume", Type: "bar", Data: []ChartDataPoint{}}
 	capSeries := ChartSeries{Name: "Market Cap", Type: "line", Data: []ChartDataPoint{}}
-	
+
 	for rows.Next() {
 		var dp ChartDataPoint
 		var volume, cap float64
@@ -284,7 +283,7 @@ func (s *GraphService) handleTokenPriceChart(c *gin.Context) {
 		volumeSeries.Data = append(volumeSeries.Data, ChartDataPoint{Timestamp: dp.Timestamp, Value: volume})
 		capSeries.Data = append(capSeries.Data, ChartDataPoint{Timestamp: dp.Timestamp, Value: cap})
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{priceSeries, volumeSeries, capSeries},
 	})
@@ -294,7 +293,7 @@ func (s *GraphService) handleTokenPriceChart(c *gin.Context) {
 func (s *GraphService) handleTransactionVolumeChart(c *gin.Context) {
 	interval := c.DefaultQuery("interval", "30d")
 	startTime, _ := s.parseInterval(interval)
-	
+
 	query := `
 		SELECT date_trunc('day', timestamp) as ts,
 		       COUNT(*) as tx_count,
@@ -304,17 +303,17 @@ func (s *GraphService) handleTransactionVolumeChart(c *gin.Context) {
 		GROUP BY date_trunc('day', timestamp)
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, startTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	countSeries := ChartSeries{Name: "Transaction Count", Type: "bar", Data: []ChartDataPoint{}}
 	volumeSeries := ChartSeries{Name: "Volume", Type: "area", Data: []ChartDataPoint{}}
-	
+
 	for rows.Next() {
 		var ts time.Time
 		var count int64
@@ -326,7 +325,7 @@ func (s *GraphService) handleTransactionVolumeChart(c *gin.Context) {
 		countSeries.Data = append(countSeries.Data, ChartDataPoint{Timestamp: ts, Value: float64(count)})
 		volumeSeries.Data = append(volumeSeries.Data, ChartDataPoint{Timestamp: ts, Value: volume})
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{countSeries, volumeSeries},
 	})
@@ -335,7 +334,7 @@ func (s *GraphService) handleTransactionVolumeChart(c *gin.Context) {
 // handleHolderDistributionChart handles holder distribution pie chart
 func (s *GraphService) handleHolderDistributionChart(c *gin.Context) {
 	address := c.Param("address")
-	
+
 	query := `
 		SELECT 
 			CASE 
@@ -353,16 +352,16 @@ func (s *GraphService) handleHolderDistributionChart(c *gin.Context) {
 		GROUP BY category
 		ORDER BY count DESC
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, address)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	series := ChartSeries{Name: "Holders", Type: "pie", Data: []ChartDataPoint{}}
-	
+
 	for rows.Next() {
 		var dp ChartDataPoint
 		if err := rows.Scan(&dp.Label, &dp.Value); err != nil {
@@ -371,7 +370,7 @@ func (s *GraphService) handleHolderDistributionChart(c *gin.Context) {
 		}
 		series.Data = append(series.Data, dp)
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{series},
 	})
@@ -380,7 +379,7 @@ func (s *GraphService) handleHolderDistributionChart(c *gin.Context) {
 // handleGasHeatmap handles gas price heatmap data
 func (s *GraphService) handleGasHeatmap(c *gin.Context) {
 	days := c.DefaultQuery("days", "7")
-	
+
 	query := `
 		SELECT 
 			EXTRACT(DOW FROM timestamp) as day_of_week,
@@ -391,22 +390,22 @@ func (s *GraphService) handleGasHeatmap(c *gin.Context) {
 		GROUP BY day_of_week, hour
 		ORDER BY day_of_week, hour
 	`
-	
+
 	daysInt, _ := strconv.Atoi(days)
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, daysInt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	type HeatmapPoint struct {
 		X     int     `json:"x"`
 		Y     int     `json:"y"`
 		Value float64 `json:"value"`
 	}
-	
+
 	var data []HeatmapPoint
 	for rows.Next() {
 		var hp HeatmapPoint
@@ -416,7 +415,7 @@ func (s *GraphService) handleGasHeatmap(c *gin.Context) {
 		}
 		data = append(data, hp)
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{"heatmap": data})
 }
 
@@ -424,7 +423,7 @@ func (s *GraphService) handleGasHeatmap(c *gin.Context) {
 func (s *GraphService) handleDailyStatsChart(c *gin.Context) {
 	interval := c.DefaultQuery("interval", "30d")
 	startTime, _ := s.parseInterval(interval)
-	
+
 	query := `
 		SELECT date_trunc('day', timestamp) as ts,
 		       COUNT(*) as tx_count,
@@ -436,19 +435,19 @@ func (s *GraphService) handleDailyStatsChart(c *gin.Context) {
 		GROUP BY date_trunc('day', timestamp)
 		ORDER BY ts
 	`
-	
+
 	rows, err := s.db.Query(c.Request.Context(), query, startTime)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
-	
+
 	txSeries := ChartSeries{Name: "Transactions", Type: "bar", Data: []ChartDataPoint{}}
 	addrSeries := ChartSeries{Name: "Active Addresses", Type: "line", Data: []ChartDataPoint{}}
 	gasSeries := ChartSeries{Name: "Avg Gas", Type: "line", Data: []ChartDataPoint{}}
 	feeSeries := ChartSeries{Name: "Gas Fees", Type: "area", Data: []ChartDataPoint{}}
-	
+
 	for rows.Next() {
 		var dp ChartDataPoint
 		var activeAddr int64
@@ -462,7 +461,7 @@ func (s *GraphService) handleDailyStatsChart(c *gin.Context) {
 		gasSeries.Data = append(gasSeries.Data, ChartDataPoint{Timestamp: dp.Timestamp, Value: avgGas})
 		feeSeries.Data = append(feeSeries.Data, ChartDataPoint{Timestamp: dp.Timestamp, Value: fees})
 	}
-	
+
 	c.JSON(http.StatusOK, ChartResponse{
 		Series: []ChartSeries{txSeries, addrSeries, gasSeries, feeSeries},
 	})
@@ -472,7 +471,7 @@ func (s *GraphService) handleDailyStatsChart(c *gin.Context) {
 func (s *GraphService) parseInterval(interval string) (time.Time, time.Time) {
 	now := time.Now()
 	var start time.Time
-	
+
 	switch interval {
 	case "1h":
 		start = now.Add(-1 * time.Hour)
@@ -489,14 +488,14 @@ func (s *GraphService) parseInterval(interval string) (time.Time, time.Time) {
 	default:
 		start = now.Add(-24 * time.Hour)
 	}
-	
+
 	return start, now
 }
 
 // Router sets up the graph API router
 func (s *GraphService) Router() *gin.Engine {
 	r := gin.Default()
-	
+
 	r.GET("/charts/tps", s.handleTPSChart)
 	r.GET("/charts/gas", s.handleGasChart)
 	r.GET("/charts/tvl", s.handleTVLChart)
@@ -506,7 +505,7 @@ func (s *GraphService) Router() *gin.Engine {
 	r.GET("/charts/holders/:address", s.handleHolderDistributionChart)
 	r.GET("/charts/heatmap", s.handleGasHeatmap)
 	r.GET("/charts/daily", s.handleDailyStatsChart)
-	
+
 	return r
 }
 
@@ -519,16 +518,16 @@ func (s *GraphService) Start() error {
 // StartGraphServer starts the graph API server
 func StartGraphServer(port string, dbURL string, redisURL string) error {
 	config := &Config{
-		DBURL:     dbURL,
-		RedisURL:  redisURL,
+		DBURL:    dbURL,
+		RedisURL: redisURL,
 		Port:     port,
-		CacheTTL:  5 * time.Minute,
+		CacheTTL: 5 * time.Minute,
 	}
-	
+
 	svc, err := NewGraphService(config)
 	if err != nil {
 		return err
 	}
-	
+
 	return svc.Start()
 }

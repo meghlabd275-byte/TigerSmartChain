@@ -12,32 +12,31 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
-	
 )
 
 // Config holds the export service configuration
 type Config struct {
-	DBURL        string
-	Port         string
-	MaxRows      int
-	BatchSize    int
-	AllowCustom  bool
+	DBURL       string
+	Port        string
+	MaxRows     int
+	BatchSize   int
+	AllowCustom bool
 }
 
 // ExportFormat represents the export format
 type ExportFormat string
 
 const (
-	FormatJSON  ExportFormat = "json"
-	FormatCSV   ExportFormat = "csv"
-	FormatXML   ExportFormat = "xml"
+	FormatJSON   ExportFormat = "json"
+	FormatCSV    ExportFormat = "csv"
+	FormatXML    ExportFormat = "xml"
 	FormatNDJSON ExportFormat = "ndjson"
 )
 
 // ExportService handles data export requests
 type ExportService struct {
-	config     *Config
-	db         *pgx.Conn
+	config *Config
+	db     *pgx.Conn
 }
 
 // NewExportService creates a new export service
@@ -47,31 +46,31 @@ func NewExportService(config *Config) (*ExportService, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return &ExportService{
-		config:    config,
-		db:        db,
+		config: config,
+		db:     db,
 	}, nil
 }
 
 // ExportRequest represents an export request
 type ExportRequest struct {
-	Type      string      `json:"type" form:"type"`
-	Address  string      `json:"address" form:"address"`
-	StartBlock uint64   `json:"startBlock" form:"startBlock"`
-	EndBlock uint64     `json:"endBlock" form:"endBlock"`
-	StartTime time.Time `json:"startTime" form:"startTime"`
-	EndTime   time.Time `json:"endTime" form:"endTime"`
-	Format   string      `json:"format" form:"format"`
-	Limit    int        `json:"limit" form:"limit"`
-	Page     int        `json:"page" form:"page"`
+	Type       string    `json:"type" form:"type"`
+	Address    string    `json:"address" form:"address"`
+	StartBlock uint64    `json:"startBlock" form:"startBlock"`
+	EndBlock   uint64    `json:"endBlock" form:"endBlock"`
+	StartTime  time.Time `json:"startTime" form:"startTime"`
+	EndTime    time.Time `json:"endTime" form:"endTime"`
+	Format     string    `json:"format" form:"format"`
+	Limit      int       `json:"limit" form:"limit"`
+	Page       int       `json:"page" form:"page"`
 }
 
 // ExportResponse represents an export response
 type ExportResponse struct {
 	TotalRecords int         `json:"totalRecords"`
-	Data        interface{} `json:"data"`
-	ExportedAt  time.Time   `json:"exportedAt"`
+	Data         interface{} `json:"data"`
+	ExportedAt   time.Time   `json:"exportedAt"`
 }
 
 // handleExport handles the main export endpoint
@@ -85,7 +84,7 @@ func (s *ExportService) handleExport(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// Set defaults
 	if req.Limit == 0 {
 		req.Limit = s.config.MaxRows
@@ -93,11 +92,11 @@ func (s *ExportService) handleExport(c *gin.Context) {
 	if req.Format == "" {
 		req.Format = string(FormatJSON)
 	}
-	
+
 	// Validate export type
 	switch req.Type {
-	case "transactions", "token_transfers", "nft_transfers", "blocks", 
-	     "token_holders", "nft_holders", "internal_transfers", "logs":
+	case "transactions", "token_transfers", "nft_transfers", "blocks",
+		"token_holders", "nft_holders", "internal_transfers", "logs":
 		// Valid types
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -106,11 +105,11 @@ func (s *ExportService) handleExport(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	ctx := c.Request.Context()
 	var data interface{}
 	var err error
-	
+
 	switch req.Type {
 	case "transactions":
 		data, err = s.exportTransactions(ctx, req)
@@ -132,7 +131,7 @@ func (s *ExportService) handleExport(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid type"})
 		return
 	}
-	
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"status":  "0",
@@ -140,7 +139,7 @@ func (s *ExportService) handleExport(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// Format output
 	switch ExportFormat(req.Format) {
 	case FormatCSV:
@@ -150,8 +149,8 @@ func (s *ExportService) handleExport(c *gin.Context) {
 	default:
 		c.JSON(http.StatusOK, ExportResponse{
 			TotalRecords: s.countRecords(data),
-			Data:        data,
-			ExportedAt:  time.Now(),
+			Data:         data,
+			ExportedAt:   time.Now(),
 		})
 	}
 }
@@ -164,10 +163,10 @@ func (s *ExportService) exportTransactions(ctx context.Context, req ExportReques
 		FROM transactions
 		WHERE 1=1
 	`
-	
+
 	args := []interface{}{}
 	argIdx := 1
-	
+
 	if req.Address != "" {
 		query += fmt.Sprintf(" AND (from_address = $%d OR to_address = $%d)", argIdx, argIdx)
 		args = append(args, req.Address)
@@ -193,29 +192,29 @@ func (s *ExportService) exportTransactions(ctx context.Context, req ExportReques
 		args = append(args, req.EndTime)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY block_number DESC, transaction_index DESC LIMIT $%d", argIdx)
 	args = append(args, req.Limit)
-	
+
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	type Transaction struct {
-		Hash           string    `json:"hash"`
-		BlockNumber   uint64    `json:"blockNumber"`
-		From          string    `json:"from"`
-		To            string    `json:"to"`
-		Value         string    `json:"value"`
-		GasPrice      uint64    `json:"gasPrice"`
-		GasUsed       uint64    `json:"gasUsed"`
-		Timestamp    time.Time `json:"timestamp"`
-		Status        string    `json:"status"`
-		TransactionIndex uint64 `json:"transactionIndex"`
+		Hash             string    `json:"hash"`
+		BlockNumber      uint64    `json:"blockNumber"`
+		From             string    `json:"from"`
+		To               string    `json:"to"`
+		Value            string    `json:"value"`
+		GasPrice         uint64    `json:"gasPrice"`
+		GasUsed          uint64    `json:"gasUsed"`
+		Timestamp        time.Time `json:"timestamp"`
+		Status           string    `json:"status"`
+		TransactionIndex uint64    `json:"transactionIndex"`
 	}
-	
+
 	var results []Transaction
 	for rows.Next() {
 		var t Transaction
@@ -225,7 +224,7 @@ func (s *ExportService) exportTransactions(ctx context.Context, req ExportReques
 		}
 		results = append(results, t)
 	}
-	
+
 	return results, nil
 }
 
@@ -237,10 +236,10 @@ func (s *ExportService) exportTokenTransfers(ctx context.Context, req ExportRequ
 		FROM token_transfers
 		WHERE 1=1
 	`
-	
+
 	args := []interface{}{}
 	argIdx := 1
-	
+
 	if req.Address != "" {
 		query += fmt.Sprintf(" AND token_address = $%d", argIdx)
 		args = append(args, req.Address)
@@ -256,36 +255,36 @@ func (s *ExportService) exportTokenTransfers(ctx context.Context, req ExportRequ
 		args = append(args, req.EndBlock)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY block_number DESC LIMIT $%d", argIdx)
 	args = append(args, req.Limit)
-	
+
 	type Transfer struct {
 		TxHash      string    `json:"transactionHash"`
-		BlockNumber uint64   `json:"blockNumber"`
+		BlockNumber uint64    `json:"blockNumber"`
 		Token       string    `json:"tokenAddress"`
 		From        string    `json:"from"`
 		To          string    `json:"to"`
 		Amount      string    `json:"amount"`
 		Timestamp   time.Time `json:"timestamp"`
 	}
-	
+
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var results []Transfer
 	for rows.Next() {
 		var t Transfer
-		if err := rows.Scan(&t.TxHash, &t.BlockNumber, &t.Token, 
+		if err := rows.Scan(&t.TxHash, &t.BlockNumber, &t.Token,
 			&t.From, &t.To, &t.Amount, &t.Timestamp); err != nil {
 			return nil, err
 		}
 		results = append(results, t)
 	}
-	
+
 	return results, nil
 }
 
@@ -297,10 +296,10 @@ func (s *ExportService) exportNFTTransfers(ctx context.Context, req ExportReques
 		FROM nft_transfers
 		WHERE 1=1
 	`
-	
+
 	args := []interface{}{}
 	argIdx := 1
-	
+
 	if req.Address != "" {
 		query += fmt.Sprintf(" AND token_address = $%d", argIdx)
 		args = append(args, req.Address)
@@ -316,36 +315,36 @@ func (s *ExportService) exportNFTTransfers(ctx context.Context, req ExportReques
 		args = append(args, req.EndBlock)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY block_number DESC LIMIT $%d", argIdx)
 	args = append(args, req.Limit)
-	
+
 	type Transfer struct {
 		TxHash      string    `json:"transactionHash"`
-		BlockNumber uint64   `json:"blockNumber"`
+		BlockNumber uint64    `json:"blockNumber"`
 		Token       string    `json:"tokenAddress"`
 		TokenID     string    `json:"tokenId"`
 		From        string    `json:"from"`
 		To          string    `json:"to"`
 		Timestamp   time.Time `json:"timestamp"`
 	}
-	
+
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var results []Transfer
 	for rows.Next() {
 		var t Transfer
-		if err := rows.Scan(&t.TxHash, &t.BlockNumber, &t.Token, 
+		if err := rows.Scan(&t.TxHash, &t.BlockNumber, &t.Token,
 			&t.TokenID, &t.From, &t.To, &t.Timestamp); err != nil {
 			return nil, err
 		}
 		results = append(results, t)
 	}
-	
+
 	return results, nil
 }
 
@@ -357,10 +356,10 @@ func (s *ExportService) exportBlocks(ctx context.Context, req ExportRequest) (in
 		FROM blocks
 		WHERE 1=1
 	`
-	
+
 	args := []interface{}{}
 	argIdx := 1
-	
+
 	if req.StartBlock > 0 {
 		query += fmt.Sprintf(" AND number >= $%d", argIdx)
 		args = append(args, req.StartBlock)
@@ -371,38 +370,38 @@ func (s *ExportService) exportBlocks(ctx context.Context, req ExportRequest) (in
 		args = append(args, req.EndBlock)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY number DESC LIMIT $%d", argIdx)
 	args = append(args, req.Limit)
-	
+
 	type Block struct {
 		Number           uint64    `json:"number"`
-		Hash            string    `json:"hash"`
-		ParentHash      string    `json:"parentHash"`
-		Miner           string    `json:"miner"`
-		GasUsed         uint64    `json:"gasUsed"`
-		GasLimit        uint64    `json:"gasLimit"`
-		Timestamp       time.Time `json:"timestamp"`
-		TransactionCount uint64  `json:"transactionCount"`
-		UncleCount      uint64    `json:"uncleCount"`
+		Hash             string    `json:"hash"`
+		ParentHash       string    `json:"parentHash"`
+		Miner            string    `json:"miner"`
+		GasUsed          uint64    `json:"gasUsed"`
+		GasLimit         uint64    `json:"gasLimit"`
+		Timestamp        time.Time `json:"timestamp"`
+		TransactionCount uint64    `json:"transactionCount"`
+		UncleCount       uint64    `json:"uncleCount"`
 	}
-	
+
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var results []Block
 	for rows.Next() {
 		var b Block
-		if err := rows.Scan(&b.Number, &b.Hash, &b.ParentHash, &b.Miner, 
+		if err := rows.Scan(&b.Number, &b.Hash, &b.ParentHash, &b.Miner,
 			&b.GasUsed, &b.GasLimit, &b.Timestamp, &b.TransactionCount, &b.UncleCount); err != nil {
 			return nil, err
 		}
 		results = append(results, b)
 	}
-	
+
 	return results, nil
 }
 
@@ -415,19 +414,19 @@ func (s *ExportService) exportTokenHolders(ctx context.Context, req ExportReques
 		ORDER BY balance DESC
 		LIMIT $2
 	`
-	
+
 	rows, err := s.db.Query(ctx, query, req.Address, req.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	type Holder struct {
-		Address    string `json:"address"`
-		Balance   string `json:"balance"`
-		Percent   string `json:"percent"`
+		Address string `json:"address"`
+		Balance string `json:"balance"`
+		Percent string `json:"percent"`
 	}
-	
+
 	var results []Holder
 	for rows.Next() {
 		var h Holder
@@ -436,7 +435,7 @@ func (s *ExportService) exportTokenHolders(ctx context.Context, req ExportReques
 		}
 		results = append(results, h)
 	}
-	
+
 	return results, nil
 }
 
@@ -450,18 +449,18 @@ func (s *ExportService) exportNFTHolders(ctx context.Context, req ExportRequest)
 		ORDER BY tokens_owned DESC
 		LIMIT $2
 	`
-	
+
 	rows, err := s.db.Query(ctx, query, req.Address, req.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	type Holder struct {
 		Address     string `json:"address"`
 		TokensOwned uint64 `json:"tokensOwned"`
 	}
-	
+
 	var results []Holder
 	for rows.Next() {
 		var h Holder
@@ -470,7 +469,7 @@ func (s *ExportService) exportNFTHolders(ctx context.Context, req ExportRequest)
 		}
 		results = append(results, h)
 	}
-	
+
 	return results, nil
 }
 
@@ -482,10 +481,10 @@ func (s *ExportService) exportInternalTransfers(ctx context.Context, req ExportR
 		FROM internal_transactions
 		WHERE 1=1
 	`
-	
+
 	args := []interface{}{}
 	argIdx := 1
-	
+
 	if req.Address != "" {
 		query += fmt.Sprintf(" AND (from_address = $%d OR to_address = $%d)", argIdx, argIdx)
 		args = append(args, req.Address)
@@ -501,36 +500,36 @@ func (s *ExportService) exportInternalTransfers(ctx context.Context, req ExportR
 		args = append(args, req.EndBlock)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY block_number DESC, trace_address LIMIT $%d", argIdx)
 	args = append(args, req.Limit)
-	
+
 	type Transfer struct {
-		TxHash       string `json:"transactionHash"`
+		TxHash      string `json:"transactionHash"`
 		BlockNumber uint64 `json:"blockNumber"`
 		From        string `json:"from"`
 		To          string `json:"to"`
 		Value       string `json:"value"`
 		TraceAddr   string `json:"traceAddress"`
-		Type       string `json:"type"`
+		Type        string `json:"type"`
 	}
-	
+
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var results []Transfer
 	for rows.Next() {
 		var t Transfer
-		if err := rows.Scan(&t.TxHash, &t.BlockNumber, &t.From, 
+		if err := rows.Scan(&t.TxHash, &t.BlockNumber, &t.From,
 			&t.To, &t.Value, &t.TraceAddr, &t.Type); err != nil {
 			return nil, err
 		}
 		results = append(results, t)
 	}
-	
+
 	return results, nil
 }
 
@@ -541,10 +540,10 @@ func (s *ExportService) exportLogs(ctx context.Context, req ExportRequest) (inte
 		FROM logs
 		WHERE 1=1
 	`
-	
+
 	args := []interface{}{}
 	argIdx := 1
-	
+
 	if req.Address != "" {
 		query += fmt.Sprintf(" AND address = $%d", argIdx)
 		args = append(args, req.Address)
@@ -560,48 +559,48 @@ func (s *ExportService) exportLogs(ctx context.Context, req ExportRequest) (inte
 		args = append(args, req.EndBlock)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY block_number DESC, log_index LIMIT $%d", argIdx)
 	args = append(args, req.Limit)
-	
+
 	type Log struct {
-		TxHash     string   `json:"transactionHash"`
-		BlockNum  uint64   `json:"blockNumber"`
-		Address   string   `json:"address"`
-		Topics    []string `json:"topics"`
-		Data      string   `json:"data"`
-		LogIndex  uint64   `json:"logIndex"`
+		TxHash   string   `json:"transactionHash"`
+		BlockNum uint64   `json:"blockNumber"`
+		Address  string   `json:"address"`
+		Topics   []string `json:"topics"`
+		Data     string   `json:"data"`
+		LogIndex uint64   `json:"logIndex"`
 	}
-	
+
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var results []Log
 	for rows.Next() {
 		var l Log
 		var topics string
-		if err := rows.Scan(&l.TxHash, &l.BlockNum, &l.Address, 
+		if err := rows.Scan(&l.TxHash, &l.BlockNum, &l.Address,
 			&topics, &l.Data, &l.LogIndex); err != nil {
 			return nil, err
 		}
 		results = append(results, l)
 	}
-	
+
 	return results, nil
 }
 
 // writeCSV writes data in CSV format
 func (s *ExportService) writeCSV(c *gin.Context, data interface{}, dataType string) {
 	c.Header("Content-Type", "text/csv")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s_%s.csv", 
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s_%s.csv",
 		dataType, time.Now().Format("20060102")))
-	
+
 	writer := csv.NewWriter(c.Writer)
 	defer writer.Flush()
-	
+
 	// Write header and data based on type
 	switch dataType {
 	case "transactions":
@@ -611,7 +610,7 @@ func (s *ExportService) writeCSV(c *gin.Context, data interface{}, dataType stri
 	case "blocks":
 		writer.Write([]string{"number", "hash", "parentHash", "miner", "gasUsed", "gasLimit", "timestamp", "transactionCount"})
 	}
-	
+
 	// In production, iterate over data and write rows
 	writer.Write([]string{})
 }
@@ -619,9 +618,9 @@ func (s *ExportService) writeCSV(c *gin.Context, data interface{}, dataType stri
 // writeNDJSON writes data in NDJSON format
 func (s *ExportService) writeNDJSON(c *gin.Context, data interface{}) {
 	c.Header("Content-Type", "application/x-ndjson")
-	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=export_%s.ndjson", 
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=export_%s.ndjson",
 		time.Now().Format("20060102")))
-	
+
 	encoder := json.NewEncoder(c.Writer)
 	encoder.SetEscapeHTML(false)
 	encoder.Encode(data)
@@ -640,10 +639,10 @@ func (s *ExportService) countRecords(data interface{}) int {
 // Router sets up the export router
 func (s *ExportService) Router() *gin.Engine {
 	r := gin.Default()
-	
+
 	r.GET("/export", s.handleExport)
 	r.POST("/export", s.handleExport)
-	
+
 	return r
 }
 
@@ -656,16 +655,16 @@ func (s *ExportService) Start() error {
 // StartExportServer starts the export server
 func StartExportServer(port string, dbURL string) error {
 	config := &Config{
-		DBURL:    dbURL,
+		DBURL:   dbURL,
 		Port:    port,
 		MaxRows: 100000,
 	}
-	
+
 	svc, err := NewExportService(config)
 	if err != nil {
 		return err
 	}
-	
+
 	return svc.Start()
 }
 

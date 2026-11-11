@@ -10,8 +10,8 @@ import (
 
 // Server provides notifications API.
 type Server struct {
-	mu sync.RWMutex
-	db Database
+	mu          sync.RWMutex
+	db          Database
 	subscribers map[string]map[string]chan []byte
 }
 
@@ -21,14 +21,14 @@ type Database interface {
 }
 
 type Notification struct {
-	ID        string `json:"id"`
-	UserID   string `json:"user_id"`
-	Type     string `json:"type"`
-	Title    string `json:"title"`
-	Message  string `json:"message"`
-	Data     map[string]string `json:"data"`
-	Read     bool   `json:"read"`
-	CreatedAt int64  `json:"created_at"`
+	ID        string            `json:"id"`
+	UserID    string            `json:"user_id"`
+	Type      string            `json:"type"`
+	Title     string            `json:"title"`
+	Message   string            `json:"message"`
+	Data      map[string]string `json:"data"`
+	Read      bool              `json:"read"`
+	CreatedAt int64             `json:"created_at"`
 }
 
 func NewServer() *Server {
@@ -59,7 +59,7 @@ func (s *Server) HandleGetNotifications(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) HandleMarkRead(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		UserID string `json:"user_id"`
+		UserID  string `json:"user_id"`
 		NotifID string `json:"notif_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -115,7 +115,7 @@ func (s *Server) Notify(userID, channelID string, message []byte) {
 
 func (s *Server) HandleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		UserID string `json:"user_id"`
+		UserID    string `json:"user_id"`
 		ChannelID string `json:"channel_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

@@ -23,28 +23,28 @@ type Database interface {
 }
 
 type Block struct {
-	Number    uint64
-	Hash     string
-	TxCount  int
+	Number  uint64
+	Hash    string
+	TxCount int
 }
 
 type Transaction struct {
-	Hash    string
-	From   string
-	To     string
-	Value  string
+	Hash  string
+	From  string
+	To    string
+	Value string
 }
 
 type Token struct {
 	Address string
-	Name   string
-	Symbol string
+	Name    string
+	Symbol  string
 }
 
 type Address struct {
 	Address string
 	Balance string
-	Type   string
+	Type    string
 }
 
 func NewServer() *Server {
@@ -103,10 +103,10 @@ func (s *Server) search(query string) SearchResults {
 }
 
 type SearchResults struct {
-	Blocks      []Block      `json:"blocks"`
+	Blocks       []Block       `json:"blocks"`
 	Transactions []Transaction `json:"transactions"`
-	Tokens     []Token     `json:"tokens"`
-	Addresses  []Address   `json:"addresses"`
+	Tokens       []Token       `json:"tokens"`
+	Addresses    []Address     `json:"addresses"`
 }
 
 func (s *Server) HandleAutoComplete(w http.ResponseWriter, r *http.Request) {

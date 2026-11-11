@@ -23,10 +23,10 @@ import (
 // =============================================================================
 
 type Config struct {
-	DB              *sql.DB
+	DB               *sql.DB
 	Redis            *redis.Client
-	MaxPoints       int
-	CacheTTL        time.Duration
+	MaxPoints        int
+	CacheTTL         time.Duration
 	DefaultTimeframe string
 }
 
@@ -49,21 +49,21 @@ type PriceResponse struct {
 }
 
 type PriceMeta struct {
-	Symbol       string  `json:"symbol"`
-	TokenAddress string  `json:"tokenAddress,omitempty"`
-	Timeframe     string  `json:"timeframe"`
-	TotalPoints  int     `json:"totalPoints"`
-	StartTime    int64   `json:"startTime"`
-	EndTime      int64   `json:"endTime"`
+	Symbol       string `json:"symbol"`
+	TokenAddress string `json:"tokenAddress,omitempty"`
+	Timeframe    string `json:"timeframe"`
+	TotalPoints  int    `json:"totalPoints"`
+	StartTime    int64  `json:"startTime"`
+	EndTime      int64  `json:"endTime"`
 }
 
 type priceRow struct {
 	Timestamp int64
-	Price    float64
+	Price     float64
 }
 
 type PriceAggregator struct {
-	cfg    *Config
+	cfg   *Config
 	mu    sync.RWMutex
 	cache map[string]*CacheEntry
 }
@@ -81,7 +81,7 @@ func NewServer(cfg *Config) *PriceAggregator {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	
+
 	if cfg.MaxPoints == 0 {
 		cfg.MaxPoints = 5000
 	}
@@ -91,9 +91,9 @@ func NewServer(cfg *Config) *PriceAggregator {
 	if cfg.DefaultTimeframe == "" {
 		cfg.DefaultTimeframe = "1h"
 	}
-	
+
 	return &PriceAggregator{
-		cfg:    cfg,
+		cfg:   cfg,
 		cache: make(map[string]*CacheEntry),
 	}
 }
@@ -105,20 +105,20 @@ func NewServer(cfg *Config) *PriceAggregator {
 // GetPriceHistory handles GET /api/v1/prices/:address
 func (s *PriceAggregator) GetPriceHistory(c *gin.Context) {
 	ctx := c.Request.Context()
-	
+
 	tokenAddress := c.Param("address")
 	if tokenAddress == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Token address required"})
 		return
 	}
-	
+
 	// Parse query parameters
 	timeframe := c.DefaultQuery("timeframe", s.cfg.DefaultTimeframe)
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
 	if limit <= 0 || limit > s.cfg.MaxPoints {
 		limit = s.cfg.MaxPoints
 	}
-	
+
 	// Validate timeframe
 	validTimeframes := map[string]time.Duration{
 		"1m":  time.Minute,
@@ -129,25 +129,25 @@ func (s *PriceAggregator) GetPriceHistory(c *gin.Context) {
 		"1d":  24 * time.Hour,
 		"1w":  7 * 24 * time.Hour,
 	}
-	
+
 	duration, ok := validTimeframes[timeframe]
 	if !ok {
 		duration = time.Hour
 	}
-	
+
 	// Generate cache key
 	cacheKey := fmt.Sprintf("price_history:%s:%s:%d", tokenAddress, timeframe, limit)
-	
+
 	// Check cache
 	if entry := s.getCacheEntry(cacheKey); entry != nil {
 		c.JSON(http.StatusOK, entry.Data)
 		return
 	}
-	
+
 	// Calculate time range
 	endTime := time.Now()
 	startTime := endTime.Add(-duration * time.Duration(limit))
-	
+
 	// Fetch price data from database
 	prices, err := s.fetchPriceHistory(ctx, tokenAddress, startTime, endTime, timeframe)
 	if err != nil {
@@ -156,67 +156,67 @@ func (s *PriceAggregator) GetPriceHistory(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// Build response
 	response := &PriceResponse{
 		Prices: prices,
 		Meta: PriceMeta{
 			TokenAddress: tokenAddress,
-			Timeframe:   timeframe,
-			TotalPoints: len(prices),
-			StartTime:   startTime.Unix(),
-			EndTime:     endTime.Unix(),
+			Timeframe:    timeframe,
+			TotalPoints:  len(prices),
+			StartTime:    startTime.Unix(),
+			EndTime:      endTime.Unix(),
 		},
 	}
-	
+
 	// Cache response
 	s.setCacheEntry(cacheKey, response)
-	
+
 	c.JSON(http.StatusOK, response)
 }
 
 // GetLatestPrice handles GET /api/v1/prices/:address/latest
 func (s *PriceAggregator) GetLatestPrice(c *gin.Context) {
 	ctx := c.Request.Context()
-	
+
 	tokenAddress := c.Param("address")
 	if tokenAddress == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Token address required"})
 		return
 	}
-	
+
 	// Try cache first
 	cacheKey := fmt.Sprintf("price_latest:%s", tokenAddress)
 	if entry := s.getCacheEntry(cacheKey); entry != nil {
 		c.JSON(http.StatusOK, entry.Data)
 		return
 	}
-	
+
 	// Fetch latest price
 	var price float64
 	var timestamp int64
 	var volume float64
-	
+
 	query := `
 		SELECT price_usd, timestamp, volume_24h
 		FROM tokens
 		WHERE address = $1
 		LIMIT 1
 	`
-	
+
 	err := s.cfg.DB.QueryRowContext(ctx, query, tokenAddress).Scan(&price, &timestamp, &volume)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Price not found"})
 		return
 	}
-	
+
 	response := gin.H{
 		"price":     price,
 		"timestamp": timestamp,
 		"volume":    volume,
 		"change24h": 0.0,
 	}
-	
+
 	c.JSON(http.StatusOK, response)
 }
 
@@ -238,13 +238,13 @@ func (s *PriceAggregator) fetchPriceHistory(
 		WHERE token_address = $1 AND timestamp >= $2 AND timestamp <= $3
 		ORDER BY timestamp ASC
 	`
-	
+
 	rows, err := s.cfg.DB.QueryContext(ctx, query, tokenAddress, startTime.Unix(), endTime.Unix())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var rawPrices []priceRow
 	for rows.Next() {
 		var row priceRow
@@ -253,12 +253,12 @@ func (s *PriceAggregator) fetchPriceHistory(
 		}
 		rawPrices = append(rawPrices, row)
 	}
-	
+
 	// If we have enough data, use it
 	if len(rawPrices) > 0 {
 		return aggregatePrices(rawPrices, timeframe)
 	}
-	
+
 	// Generate from transactions
 	return s.generatePriceFromTransactions(ctx, tokenAddress, startTime, endTime, timeframe)
 }
@@ -273,13 +273,13 @@ func (s *PriceAggregator) generatePriceFromTransactions(
 	bucketMinutes := map[string]int{
 		"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
 	}
-	
+
 	bucketSize := bucketMinutes[timeframe]
 	if bucketSize == 0 {
 		bucketSize = 60
 	}
 	bucketSizeSec := bucketSize * 60
-	
+
 	query := `
 		SELECT 
 			(b.timestamp / $1) * $1 as bucket,
@@ -294,28 +294,28 @@ func (s *PriceAggregator) generatePriceFromTransactions(
 		GROUP BY bucket
 		ORDER BY bucket ASC
 	`
-	
+
 	rows, err := s.cfg.DB.QueryContext(ctx, query, bucketSizeSec, tokenAddress, startTime.Unix(), endTime.Unix())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var prices []PricePoint
 	for rows.Next() {
 		var p PricePoint
 		var bucket int64
 		var volume int64
-		
+
 		if err := rows.Scan(&bucket, &p.Open, &p.High, &p.Low, &p.Close, &volume); err != nil {
 			continue
 		}
-		
+
 		p.Timestamp = bucket * 1000
 		p.Volume = float64(volume)
 		prices = append(prices, p)
 	}
-	
+
 	// A window with no trades has no prices. An empty series is the honest
 	// answer; inventing one would show the caller a market that never traded.
 	return prices, nil
@@ -326,40 +326,40 @@ func aggregatePrices(rawPrices []priceRow, timeframe string) ([]PricePoint, erro
 	bucketMinutes := map[string]int{
 		"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
 	}
-	
+
 	bucketSize := bucketMinutes[timeframe]
 	if bucketSize == 0 {
 		bucketSize = 60
 	}
-	
+
 	bucketSizeSec := int64(bucketSize * 60)
 	buckets := make(map[int64][]float64)
-	
+
 	for _, p := range rawPrices {
 		bucket := (p.Timestamp / bucketSizeSec) * bucketSizeSec
 		buckets[bucket] = append(buckets[bucket], p.Price)
 	}
-	
+
 	var prices []PricePoint
 	var sortedBuckets []int64
-	
+
 	for bucket := range buckets {
 		sortedBuckets = append(sortedBuckets, bucket)
 	}
 	sort.Slice(sortedBuckets, func(i, j int) bool { return sortedBuckets[i] < sortedBuckets[j] })
-	
+
 	for _, bucket := range sortedBuckets {
 		pricesInBucket := buckets[bucket]
 		if len(pricesInBucket) == 0 {
 			continue
 		}
-		
+
 		open := pricesInBucket[0]
 		close := pricesInBucket[len(pricesInBucket)-1]
-		
+
 		var high, low float64 = close, close
 		var volume float64
-		
+
 		for _, p := range pricesInBucket {
 			if p > high {
 				high = p
@@ -369,17 +369,17 @@ func aggregatePrices(rawPrices []priceRow, timeframe string) ([]PricePoint, erro
 			}
 			volume += p
 		}
-		
+
 		prices = append(prices, PricePoint{
 			Timestamp: bucket * 1000,
 			Open:      open,
-			High:     high,
-			Low:      low,
-			Close:    close,
-			Volume:   volume,
+			High:      high,
+			Low:       low,
+			Close:     close,
+			Volume:    volume,
 		})
 	}
-	
+
 	return prices, nil
 }
 
@@ -390,19 +390,19 @@ func aggregatePrices(rawPrices []priceRow, timeframe string) ([]PricePoint, erro
 func (s *PriceAggregator) getCacheEntry(key string) *CacheEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	entry, ok := s.cache[key]
 	if !ok || time.Now().After(entry.ExpiresAt) {
 		return nil
 	}
-	
+
 	return entry
 }
 
 func (s *PriceAggregator) setCacheEntry(key string, data *PriceResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	s.cache[key] = &CacheEntry{
 		Data:      data,
 		ExpiresAt: time.Now().Add(s.cfg.CacheTTL),

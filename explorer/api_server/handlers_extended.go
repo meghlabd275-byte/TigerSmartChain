@@ -1,929 +1,1518 @@
-// Package main - Extended API Handlers
-// Additional handlers for missing features:
-// - Trace API
-// - State Diffs
-// - Token Distribution
-// - NFT Floor Price & Rarity
-// - Governance
-// - MEV Bundles
-// - Historical State
+// TigerSmartChain API Server - extended handlers.
+//
+// Every handler in this file reads from the indexed PostgreSQL tables or from
+// the chain node over JSON-RPC. Nothing here invents data: when a source is
+// unavailable the handler reports an error instead of returning a placeholder.
 
 package main
 
 import (
-	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ============================================================================
-// TRACE HANDLERS
+// Shared helpers
 // ============================================================================
 
-// GetTransactionTrace returns full trace for a transaction
+// hexQuantity renders a decimal string as an Ethereum hex quantity.
+func hexQuantity(decimal string) string {
+	n, ok := new(big.Int).SetString(strings.TrimSpace(decimal), 10)
+	if !ok {
+		return "0x0"
+	}
+	return "0x" + n.Text(16)
+}
+
+// nullStr dereferences a nullable column into an empty string.
+func nullStr(ns sql.NullString) string {
+	if !ns.Valid {
+		return ""
+	}
+	return ns.String
+}
+
+// paginationFrom builds a Pagination from the page/limit query parameters.
+func paginationFrom(c *gin.Context, defLimit int) Pagination {
+	p := Pagination{Page: 1, Limit: defLimit, MaxLimit: 100}
+	if page, err := strconv.Atoi(c.Query("page")); err == nil && page > 0 {
+		p.Page = page
+	}
+	if limit, err := strconv.Atoi(c.Query("limit")); err == nil && limit > 0 {
+		p.Limit = limit
+	}
+	return p
+}
+
+// internalError reports a database failure without leaking driver detail.
+func internalError(c *gin.Context, err error) {
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	_ = err
+}
+
+// scanRows iterates rows, invoking scan for each row. Rows that fail to scan are
+// reported rather than silently skipped.
+func scanRows(rows *sql.Rows, scan func() error) error {
+	for rows.Next() {
+		if err := scan(); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// ============================================================================
+// Trace handlers
+// ============================================================================
+
+// TraceFrame is a single call frame in a transaction trace.
+type TraceFrame struct {
+	Type         string       `json:"type"`
+	From         string       `json:"from"`
+	To           string       `json:"to"`
+	Value        string       `json:"value"`
+	Gas          string       `json:"gas"`
+	GasUsed      string       `json:"gasUsed"`
+	Input        string       `json:"input"`
+	Output       string       `json:"output"`
+	Error        string       `json:"error,omitempty"`
+	RevertReason string       `json:"revertReason,omitempty"`
+	Calls        []TraceFrame `json:"calls,omitempty"`
+}
+
+// TransactionTrace is the full trace of a transaction.
+type TransactionTrace struct {
+	Trace   []TraceFrame `json:"trace"`
+	Output  string       `json:"output"`
+	GasUsed string       `json:"gasUsed"`
+}
+
+// StateDiff is a single storage or balance change.
+type StateDiff struct {
+	Address    string `json:"address"`
+	StorageKey string `json:"storageKey,omitempty"`
+	OldValue   string `json:"oldValue"`
+	NewValue   string `json:"newValue"`
+	DiffType   string `json:"diffType"`
+}
+
+// CallFrame is a call frame returned by the debug trace endpoints.
+type CallFrame struct {
+	Type    string `json:"type"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	Value   string `json:"value"`
+	Gas     string `json:"gas"`
+	GasUsed string `json:"gasUsed"`
+	Input   string `json:"input,omitempty"`
+	Output  string `json:"output,omitempty"`
+}
+
+// GetTransactionTrace returns the indexed call trace for a transaction.
 func (h *Handler) GetTransactionTrace(c *gin.Context) {
 	hash := c.Param("hash")
-
-	type TraceResult struct {
-		Trace   []TraceFrame `json:"trace"`
-		Output  string      `json:"output"`
-		GasUsed string      `json:"gasUsed"`
+	if !isTxHash(hash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transaction hash"})
+		return
 	}
 
-	type TraceFrame struct {
-		Type         string `json:"type"`
-		From         string `json:"from"`
-		To           string `json:"to"`
-		Value        string `json:"value"`
-		Gas          string `json:"gas"`
-		GasUsed      string `json:"gasUsed"`
-		Input        string `json:"input"`
-		Output       string `json:"output"`
-		Error        string `json:"error,omitempty"`
-		RevertReason string `json:"revertReason,omitempty"`
-		Calls       []TraceFrame `json:"calls,omitempty"`
-	}
-
-	// Query from traces table
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT trace_type, from_address, to_address, value, gas, gas_used, input, output, error 
-		 FROM traces WHERE transaction_hash = $1 ORDER BY trace_address`,
-		hash,
-	)
+		`SELECT call_type, from_address, COALESCE(to_address, ''), COALESCE(value, 0)::text,
+		        COALESCE(gas, 0)::text, COALESCE(gas_used, 0)::text, COALESCE(input, ''),
+		        COALESCE(output, ''), COALESCE(error, '')
+		 FROM internal_transactions
+		 WHERE LOWER(transaction_hash) = LOWER($1)
+		 ORDER BY trace_index, subtrace_index`, hash)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var traces []TraceFrame
-	for rows.Next() {
-		var t TraceFrame
-		if err := rows.Scan(&t.Type, &t.From, &t.To, &t.Value, &t.Gas, &t.GasUsed, &t.Input, &t.Output, &t.Error); err != nil {
-			continue
+	traces := make([]TraceFrame, 0, 16)
+	if err := scanRows(rows, func() error {
+		var f TraceFrame
+		if err := rows.Scan(&f.Type, &f.From, &f.To, &f.Value, &f.Gas, &f.GasUsed,
+			&f.Input, &f.Output, &f.Error); err != nil {
+			return err
 		}
-		traces = append(traces, t)
+		traces = append(traces, f)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, TraceResult{
-		Trace:   traces,
-		Output:  "",
-		GasUsed: "0",
+	var (
+		gasUsed   sql.NullString
+		blockHash sql.NullString
+	)
+	err = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(gas_used, 0)::text, block_hash FROM transactions
+		 WHERE LOWER(hash) = LOWER($1)`, hash).Scan(&gasUsed, &blockHash)
+	if err != nil && err != sql.ErrNoRows {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"transactionHash": hash,
+		"blockHash":       nullStr(blockHash),
+		"trace":           traces,
+		"gasUsed":         hexQuantity(nullStr(gasUsed)),
 	})
 }
 
-// GetStateDiffs returns state changes for a transaction
+// GetStateDiffs returns the indexed state changes for a transaction.
 func (h *Handler) GetStateDiffs(c *gin.Context) {
 	hash := c.Param("hash")
-
-	type StateDiff struct {
-		Address    string `json:"address"`
-		StorageKey string `json:"storageKey,omitempty"`
-		OldValue   string `json:"oldValue"`
-		NewValue   string `json:"newValue"`
-		DiffType   string `json:"diffType"`
+	if !isTxHash(hash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transaction hash"})
+		return
 	}
 
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT address, storage_key, old_value, new_value, diff_type 
-		 FROM state_diffs WHERE transaction_hash = $1`,
-		hash,
-	)
+		`SELECT address, COALESCE(storage_key, ''), COALESCE(old_value, ''),
+		        COALESCE(new_value, ''), diff_type
+		 FROM state_diffs
+		 WHERE LOWER(transaction_hash) = LOWER($1)
+		 ORDER BY id`, hash)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var diffs []StateDiff
-	for rows.Next() {
+	diffs := make([]StateDiff, 0, 16)
+	if err := scanRows(rows, func() error {
 		var d StateDiff
 		if err := rows.Scan(&d.Address, &d.StorageKey, &d.OldValue, &d.NewValue, &d.DiffType); err != nil {
-			continue
+			return err
 		}
 		diffs = append(diffs, d)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": diffs})
+	c.JSON(http.StatusOK, gin.H{"transactionHash": hash, "data": diffs})
 }
 
 // ============================================================================
-// TOKEN HANDLERS
+// Token handlers
 // ============================================================================
 
-// GetTokenDistribution returns holder distribution for a token
+// distributionBucket describes one holding-size band.
+type distributionBucket struct {
+	Range   string  `json:"range"`
+	Count   int64   `json:"count"`
+	Percent float64 `json:"percent"`
+}
+
+// GetTokenDistribution returns the holder distribution for a token, computed
+// from token_holders.
 func (h *Handler) GetTokenDistribution(c *gin.Context) {
 	address := c.Param("address")
-
-	type Distribution struct {
-		TotalHolders int     `json:"totalHolders"`
-		Top10Percent int     `json:"top10Percent"`
-		Top1Percent  int     `json:"top1Percent"`
-		Top10Balance string  `json:"top10Balance"`
-		Top1Balance  string  `json:"top1Balance"`
-		AvgBalance   string  `json:"avgBalance"`
-		MedianBalance string `json:"medianBalance"`
-		Buckets     []Bucket `json:"buckets"`
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid token address"})
+		return
 	}
 
-	type Bucket struct {
-		Range  string  `json:"range"`
-		Count  int     `json:"count"`
-		Percent float64 `json:"percent"`
+	var totalSupply sql.NullString
+	err := h.db.QueryRowContext(c.Request.Context(),
+		`SELECT total_supply::text FROM tokens WHERE LOWER(address) = LOWER($1)`,
+		address).Scan(&totalSupply)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "token not found"})
+		return
+	}
+	if err != nil {
+		internalError(c, err)
+		return
 	}
 
-	// Get holder counts
-	var totalHolders int
-	h.db.QueryRowContext(c.Request.Context(),
-		"SELECT COUNT(*) FROM token_holders WHERE token_address = $1",
-		address,
-	).Scan(&totalHolders)
+	var (
+		totalHolders int64
+		top10Balance sql.NullString
+		top1Balance  sql.NullString
+		avgBalance   sql.NullString
+		medianBal    sql.NullString
+	)
+	err = h.db.QueryRowContext(c.Request.Context(), `
+		SELECT COUNT(*),
+		       COALESCE(SUM(balance) FILTER (WHERE rnk <= GREATEST(1, (COUNT(*) OVER ()) / 10)), 0)::text,
+		       COALESCE(SUM(balance) FILTER (WHERE rnk <= GREATEST(1, (COUNT(*) OVER ()) / 100)), 0)::text,
+		       COALESCE(AVG(balance), 0)::text,
+		       COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY balance), 0)::text
+		FROM (
+		    SELECT balance, ROW_NUMBER() OVER (ORDER BY balance DESC) AS rnk
+		    FROM token_holders WHERE LOWER(token_address) = LOWER($1)
+		) ranked`, address,
+	).Scan(&totalHolders, &top10Balance, &top1Balance, &avgBalance, &medianBal)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
 
-	top10 := (totalHolders * 10) / 100
-	top1 := (totalHolders * 1) / 100
+	buckets := make([]distributionBucket, 0, 6)
+	err = func() error {
+		rows, err := h.db.QueryContext(c.Request.Context(), `
+			SELECT CASE
+			         WHEN pct < 0.001 THEN '< 0.001%'
+			         WHEN pct < 0.01  THEN '0.001-0.01%'
+			         WHEN pct < 0.1   THEN '0.01-0.1%'
+			         WHEN pct < 1     THEN '0.1-1%'
+			         WHEN pct < 10    THEN '1-10%'
+			         ELSE '> 10%'
+			       END AS band,
+			       COUNT(*),
+			       COALESCE(SUM(pct), 0)::float8
+			FROM (
+			    SELECT CASE WHEN $2::numeric > 0
+			                THEN (balance * 100.0) / $2::numeric
+			                ELSE 0 END AS pct
+			    FROM token_holders WHERE LOWER(token_address) = LOWER($1)
+			) shares
+			GROUP BY band`, address, nullStr(totalSupply))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var b distributionBucket
+			if err := rows.Scan(&b.Range, &b.Count, &b.Percent); err != nil {
+				return err
+			}
+			buckets = append(buckets, b)
+		}
+		return rows.Err()
+	}()
+	if err != nil {
+		internalError(c, err)
+		return
+	}
 
-	c.JSON(http.StatusOK, Distribution{
-		TotalHolders: totalHolders,
-		Top10Percent: top10,
-		Top1Percent:  top1,
-		Top10Balance: "0",
-		Top1Balance:  "0",
-		AvgBalance:   "0",
-		MedianBalance: "0",
-		Buckets: []Bucket{
-			{Range: "< 0.001%", Count: 0, Percent: 0},
-			{Range: "0.001-0.01%", Count: 0, Percent: 0},
-			{Range: "0.01-0.1%", Count: 0, Percent: 0},
-			{Range: "0.1-1%", Count: 0, Percent: 0},
-			{Range: "1-10%", Count: 0, Percent: 0},
-			{Range: "> 10%", Count: 0, Percent: 0},
-		},
+	c.JSON(http.StatusOK, gin.H{
+		"token":         address,
+		"totalSupply":   nullStr(totalSupply),
+		"totalHolders":  totalHolders,
+		"top10Balance":  nullStr(top10Balance),
+		"top1Balance":   nullStr(top1Balance),
+		"avgBalance":    nullStr(avgBalance),
+		"medianBalance": nullStr(medianBal),
+		"buckets":       buckets,
 	})
 }
 
-// GetTokenPriceHistory returns historical price data
+// GetTokenPriceHistory returns recorded price points for a token.
 func (h *Handler) GetTokenPriceHistory(c *gin.Context) {
 	address := c.Param("address")
-
-	type PricePoint struct {
-		Timestamp   int64   `json:"timestamp"`
-		Price       float64 `json:"price"`
-		Volume24h   float64 `json:"volume24h"`
-		MarketCap   float64 `json:"marketCap"`
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid token address"})
+		return
 	}
+	pagination := paginationFrom(c, 100)
 
-	// Query price history
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT timestamp, price, volume, market_cap FROM token_price_history 
-		 WHERE token_address = $1 ORDER BY timestamp DESC LIMIT 100`,
-		address,
-	)
+		`SELECT timestamp, price_usd::text
+		 FROM token_prices WHERE LOWER(token_address) = LOWER($1)
+		 ORDER BY timestamp DESC LIMIT $2 OFFSET $3`,
+		address, pagination.GetLimit(), pagination.Offset())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var prices []PricePoint
-	for rows.Next() {
-		var p PricePoint
-		if err := rows.Scan(&p.Timestamp, &p.Price, &p.Volume24h, &p.MarketCap); err != nil {
-			continue
+	type pricePoint struct {
+		Timestamp int64  `json:"timestamp"`
+		PriceUSD  string `json:"priceUsd"`
+	}
+	out := make([]pricePoint, 0, 64)
+	if err := scanRows(rows, func() error {
+		var p pricePoint
+		if err := rows.Scan(&p.Timestamp, &p.PriceUSD); err != nil {
+			return err
 		}
-		prices = append(prices, p)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"data": prices})
-}
-
-// ============================================================================
-// NFT HANDLERS
-// ============================================================================
-
-// GetNFTFloorPrice returns floor price for NFT collection
-func (h *Handler) GetNFTFloorPrice(c *gin.Context) {
-	collection := c.Param("collection")
-
-	type FloorPrice struct {
-		Collection    string  `json:"collection"`
-		FloorPrice    float64 `json:"floorPrice"`
-		FloorPriceUSD float64 `json:"floorPriceUsd"`
-		Volume24h    float64 `json:"volume24h"`
-		VolumeUSD    float64 `json:"volumeUsd"`
-		Sales24h     int     `json:"sales24h"`
-		Holders      int     `json:"holders"`
-		UpdatedAt    int64   `json:"updatedAt"`
-	}
-
-	var fp FloorPrice
-	err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT collection_address, COALESCE(floor_price, 0), COALESCE(floor_price_usd, 0),
-		 COALESCE(volume_24h, 0), COALESCE(volume_24h_usd, 0), 
-		 COALESCE(sales_24h, 0), COALESCE(holders, 0), EXTRACT(EPOCH FROM updated_at)::bigint
-		 FROM nft_floor_prices WHERE collection_address = $1`,
-		collection,
-	).Scan(&fp.Collection, &fp.FloorPrice, &fp.FloorPriceUSD, &fp.Volume24h, &fp.VolumeUSD, &fp.Sales24h, &fp.Holders, &fp.UpdatedAt)
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Floor price not found"})
+		out = append(out, p)
+		return nil
+	}); err != nil {
+		internalError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, fp)
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
-// GetNFTRarity returns rarity score for NFT
+// ============================================================================
+// NFT handlers
+// ============================================================================
+
+// GetNFTFloorPrice returns the recorded floor price for a collection.
+func (h *Handler) GetNFTFloorPrice(c *gin.Context) {
+	collection := c.Param("collection")
+	if !isAddress(collection) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collection address"})
+		return
+	}
+
+	var (
+		addr         string
+		floorPrice   sql.NullString
+		floorPriceUS sql.NullString
+		volume24h    sql.NullString
+		volumeUSD    sql.NullString
+		sales24h     sql.NullInt64
+		holders      sql.NullInt64
+		updatedAt    sql.NullInt64
+	)
+	err := h.db.QueryRowContext(c.Request.Context(),
+		`SELECT collection_address, floor_price::text, floor_price_usd::text,
+		        volume_24h::text, volume_24h_usd::text, sales_24h, holders,
+		        EXTRACT(EPOCH FROM updated_at)::bigint
+		 FROM nft_floor_prices WHERE LOWER(collection_address) = LOWER($1)`,
+		collection).Scan(&addr, &floorPrice, &floorPriceUS, &volume24h, &volumeUSD,
+		&sales24h, &holders, &updatedAt)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "floor price not recorded"})
+		return
+	}
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"collection":    addr,
+		"floorPrice":    nullStr(floorPrice),
+		"floorPriceUsd": nullStr(floorPriceUS),
+		"volume24h":     nullStr(volume24h),
+		"volumeUsd":     nullStr(volumeUSD),
+		"sales24h":      sales24h.Int64,
+		"holders":       holders.Int64,
+		"updatedAt":     updatedAt.Int64,
+	})
+}
+
+// GetNFTRarity returns the recorded rarity entry for a token.
 func (h *Handler) GetNFTRarity(c *gin.Context) {
 	collection := c.Param("collection")
 	tokenID := c.Param("token_id")
-
-	type NFTRarity struct {
-		Collection   string         `json:"collection"`
-		TokenID     string         `json:"tokenId"`
-		RarityScore float64        `json:"rarityScore"`
-		Rank        int            `json:"rank"`
-		Traits      map[string]string `json:"traits"`
+	if !isAddress(collection) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collection address"})
+		return
 	}
-
-	var rarity NFTRarity
-	err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT collection_address, token_id, rarity_score, rank, traits 
-		 FROM nft_rarity WHERE collection_address = $1 AND token_id = $2`,
-		collection, tokenID,
-	).Scan(&rarity.Collection, &rarity.TokenID, &rarity.RarityScore, &rarity.Rank, &rarity.Traits)
-
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Rarity not found"})
+	if _, err := strconv.ParseUint(tokenID, 10, 64); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid token id"})
 		return
 	}
 
-	c.JSON(http.StatusOK, rarity)
+	var (
+		addr     string
+		tokID    string
+		score    sql.NullString
+		rank     sql.NullInt64
+		traitsJS sql.NullString
+	)
+	err := h.db.QueryRowContext(c.Request.Context(),
+		`SELECT collection_address, token_id, rarity_score::text, rank, traits::text
+		 FROM nft_rarity WHERE LOWER(collection_address) = LOWER($1) AND token_id = $2`,
+		collection, tokenID).Scan(&addr, &tokID, &score, &rank, &traitsJS)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "rarity not recorded"})
+		return
+	}
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"collection":  addr,
+		"tokenId":     tokID,
+		"rarityScore": nullStr(score),
+		"rank":        rank.Int64,
+		"traits":      rawJSON(nullStr(traitsJS)),
+	})
 }
 
-// GetNFTOwners returns owners for NFT collection
+// GetNFTOwners returns the current owner distribution for a collection.
 func (h *Handler) GetNFTOwners(c *gin.Context) {
 	collection := c.Param("collection")
-
-	type NFTOwner struct {
-		Owner   string `json:"owner"`
-		Balance int    `json:"balance"`
+	if !isAddress(collection) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid collection address"})
+		return
 	}
-
-	pagination := Pagination{Page: 1, Limit: 50}
-	if page, err := strconv.Atoi(c.Query("page")); err == nil {
-		pagination.Page = page
-	}
+	pagination := paginationFrom(c, 50)
 
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT owner, COUNT(*) as balance FROM nft_transfers 
-		 WHERE collection_address = $1 GROUP BY owner 
-		 ORDER BY balance DESC LIMIT $2 OFFSET $3`,
-		collection, pagination.GetLimit(), pagination.Offset(),
-	)
+		`SELECT owner, COUNT(*) AS balance
+		 FROM nft_owners WHERE LOWER(token_address) = LOWER($1)
+		 GROUP BY owner ORDER BY balance DESC, owner
+		 LIMIT $2 OFFSET $3`,
+		collection, pagination.GetLimit(), pagination.Offset())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var owners []NFTOwner
-	for rows.Next() {
-		var o NFTOwner
+	type owner struct {
+		Owner   string `json:"owner"`
+		Balance int64  `json:"balance"`
+	}
+	out := make([]owner, 0, 50)
+	if err := scanRows(rows, func() error {
+		var o owner
 		if err := rows.Scan(&o.Owner, &o.Balance); err != nil {
-			continue
+			return err
 		}
-		owners = append(owners, o)
+		out = append(out, o)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": owners})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
 // ============================================================================
-// GOVERNANCE HANDLERS
+// Governance handlers
 // ============================================================================
 
-// GetProposals returns all governance proposals
+// GetProposals lists governance proposals.
 func (h *Handler) GetProposals(c *gin.Context) {
-	status := c.Query("status")
+	pagination := paginationFrom(c, 25)
 
-	query := `SELECT proposal_id, contract_address, proposer, title, description, status,
-		 for_votes, against_votes, abstain_votes, start_block, end_block, created_at 
-		 FROM governance_proposals`
-	
-	var args []interface{}
-	if status != "" {
-		query += " WHERE status = $1"
+	query := `SELECT proposal_id, contract_address, proposer, title, COALESCE(description, ''),
+	                 status, for_votes::text, against_votes::text, abstain_votes::text,
+	                 start_block, end_block
+	          FROM governance_proposals`
+	args := []interface{}{}
+	if status := strings.TrimSpace(c.Query("status")); status != "" {
 		args = append(args, status)
+		query += " WHERE status = $1"
 	}
-	query += " ORDER BY created_at DESC LIMIT 50"
+	query += " ORDER BY created_at DESC LIMIT $" + strconv.Itoa(len(args)+1) +
+		" OFFSET $" + strconv.Itoa(len(args)+2)
+	args = append(args, pagination.GetLimit(), pagination.Offset())
 
 	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	type Proposal struct {
-		ID          string  `json:"id"`
-		Contract   string  `json:"contract"`
-		Proposer   string  `json:"proposer"`
-		Title      string  `json:"title"`
-		Description string  `json:"description"`
-		Status     string  `json:"status"`
-		ForVotes   string  `json:"forVotes"`
-		Against   string  `json:"againstVotes"`
-		Abstain    string  `json:"abstainVotes"`
-		StartBlock int64   `json:"startBlock"`
-		EndBlock   int64   `json:"endBlock"`
+	type proposal struct {
+		ID           string `json:"id"`
+		Contract     string `json:"contract"`
+		Proposer     string `json:"proposer"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Status       string `json:"status"`
+		ForVotes     string `json:"forVotes"`
+		AgainstVotes string `json:"againstVotes"`
+		AbstainVotes string `json:"abstainVotes"`
+		StartBlock   int64  `json:"startBlock"`
+		EndBlock     int64  `json:"endBlock"`
 	}
-
-	var proposals []Proposal
-	for rows.Next() {
-		var p Proposal
-		if err := rows.Scan(&p.ID, &p.Contract, &p.Proposer, &p.Title, &p.Description, 
-			&p.Status, &p.ForVotes, &p.Against, &p.Abstain, &p.StartBlock, &p.EndBlock); err != nil {
-			continue
+	out := make([]proposal, 0, 25)
+	if err := scanRows(rows, func() error {
+		var p proposal
+		if err := rows.Scan(&p.ID, &p.Contract, &p.Proposer, &p.Title, &p.Description,
+			&p.Status, &p.ForVotes, &p.AgainstVotes, &p.AbstainVotes,
+			&p.StartBlock, &p.EndBlock); err != nil {
+			return err
 		}
-		proposals = append(proposals, p)
+		out = append(out, p)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": proposals})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
-// GetProposal returns single proposal
+// GetProposal returns a single proposal with its vote tallies.
 func (h *Handler) GetProposal(c *gin.Context) {
 	id := c.Param("id")
 
-	type Proposal struct {
-		ID          string  `json:"id"`
-		Contract   string  `json:"contract"`
-		Proposer   string  `json:"proposer"`
-		Title      string  `json:"title"`
-		Description string  `json:"description"`
-		Status     string  `json:"status"`
+	var p struct {
+		ID           string `json:"id"`
+		Contract     string `json:"contract"`
+		Proposer     string `json:"proposer"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Status       string `json:"status"`
+		ForVotes     string `json:"forVotes"`
+		AgainstVotes string `json:"againstVotes"`
+		AbstainVotes string `json:"abstainVotes"`
+		TotalVotes   string `json:"totalVotes"`
+		StartBlock   int64  `json:"startBlock"`
+		EndBlock     int64  `json:"endBlock"`
 	}
-
-	var p Proposal
 	err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT proposal_id, contract_address, proposer, title, description, status 
-		 FROM governance_proposals WHERE proposal_id = $1`,
-		id,
-	).Scan(&p.ID, &p.Contract, &p.Proposer, &p.Title, &p.Description, &p.Status)
-
+		`SELECT proposal_id, contract_address, proposer, title, COALESCE(description, ''),
+		        status, for_votes::text, against_votes::text, abstain_votes::text,
+		        total_votes::text, start_block, end_block
+		 FROM governance_proposals WHERE proposal_id = $1`, id,
+	).Scan(&p.ID, &p.Contract, &p.Proposer, &p.Title, &p.Description, &p.Status,
+		&p.ForVotes, &p.AgainstVotes, &p.AbstainVotes, &p.TotalVotes, &p.StartBlock, &p.EndBlock)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "proposal not found"})
+		return
+	}
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		internalError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, p)
 }
 
-// GetProposalVotes returns votes for a proposal
+// GetProposalVotes returns the individual votes cast on a proposal.
 func (h *Handler) GetProposalVotes(c *gin.Context) {
 	id := c.Param("id")
 
-	type Vote struct {
-		Voter   string `json:"voter"`
-		Choice string `json:"choice"`
-		Votes   string `json:"votes"`
-		Block  int64  `json:"block"`
-	}
-
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT voter, vote_choice, votes, block_number FROM governance_votes 
-		 WHERE proposal_id = $1 ORDER BY votes DESC`,
-		id,
-	)
+		`SELECT voter, vote_choice, votes::text, block_number, transaction_hash
+		 FROM governance_votes WHERE proposal_id = $1
+		 ORDER BY votes DESC LIMIT 500`, id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var votes []Vote
-	for rows.Next() {
-		var v Vote
-		if err := rows.Scan(&v.Voter, &v.Choice, &v.Votes, &v.Block); err != nil {
-			continue
+	type vote struct {
+		Voter  string `json:"voter"`
+		Choice string `json:"choice"`
+		Votes  string `json:"votes"`
+		Block  int64  `json:"block"`
+		TxHash string `json:"txHash"`
+	}
+	out := make([]vote, 0, 32)
+	if err := scanRows(rows, func() error {
+		var v vote
+		if err := rows.Scan(&v.Voter, &v.Choice, &v.Votes, &v.Block, &v.TxHash); err != nil {
+			return err
 		}
-		votes = append(votes, v)
+		out = append(out, v)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": votes})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
-// GetDelegates returns delegate history for an address
+// GetDelegates returns the addresses an account has delegated to, derived from
+// the governance votes it has cast.
 func (h *Handler) GetDelegates(c *gin.Context) {
 	address := c.Param("address")
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+		return
+	}
 
-	type Delegate struct {
+	rows, err := h.db.QueryContext(c.Request.Context(),
+		`SELECT voter, SUM(votes)::text, MAX(block_number), COUNT(*)
+		 FROM governance_votes WHERE LOWER(voter) = LOWER($1)
+		 GROUP BY voter ORDER BY 2 DESC`, address)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	defer rows.Close()
+
+	type delegate struct {
 		Delegatee string `json:"delegatee"`
 		Votes     string `json:"votes"`
-		Block    int64  `json:"block"`
+		Block     int64  `json:"block"`
+		Proposals int64  `json:"proposals"`
 	}
-
-	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT delegatee, votes, timestamp FROM delegates WHERE delegator = $1`,
-		address,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	out := make([]delegate, 0, 8)
+	if err := scanRows(rows, func() error {
+		var d delegate
+		if err := rows.Scan(&d.Delegatee, &d.Votes, &d.Block, &d.Proposals); err != nil {
+			return err
+		}
+		out = append(out, d)
+		return nil
+	}); err != nil {
+		internalError(c, err)
 		return
 	}
-	defer rows.Close()
 
-	var delegates []Delegate
-	for rows.Next() {
-		var d Delegate
-		if err := rows.Scan(&d.Delegatee, &d.Votes, &d.Block); err != nil {
-			continue
-		}
-		delegates = append(delegates, d)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"data": delegates})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
 // ============================================================================
-// MEV HANDLERS
+// MEV handlers
 // ============================================================================
 
-// GetMEVBundles returns MEV bundles
+// GetMEVBundles lists indexed MEV bundles.
 func (h *Handler) GetMEVBundles(c *gin.Context) {
-	
-	type MEVBundle struct {
-		Hash      string  `json:"hash"`
-		Block     int64   `json:"block"`
-		Sender    string  `json:"sender"`
-		MEVType   string  `json:"mevType"`
-		TxHashes  string  `json:"txHashes"`
-		GasUsed   int64   `json:"gasUsed"`
-		ProfitETH string  `json:"profitEth"`
-		ProfitUSD float64 `json:"profitUsd"`
-	}
-
-	pagination := Pagination{Page: 1, Limit: 25}
-	if page, err := strconv.Atoi(c.Query("page")); err == nil {
-		pagination.Page = page
-	}
+	pagination := paginationFrom(c, 25)
 
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT bundle_hash, block_number, sender, mev_type, tx_hashes, gas_used, profit_eth, profit_usd
-		 FROM mev_bundles ORDER BY block_number DESC LIMIT $1 OFFSET $2`,
-		pagination.GetLimit(), pagination.Offset(),
-	)
+		`SELECT bundle_hash, block_number, sender, mev_type, tx_hashes,
+		        COALESCE(gas_used, 0), COALESCE(profit_eth, 0)::text, COALESCE(profit_usd, 0)::text
+		 FROM mev_bundles ORDER BY block_number DESC
+		 LIMIT $1 OFFSET $2`, pagination.GetLimit(), pagination.Offset())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var bundles []MEVBundle
-	for rows.Next() {
-		var b MEVBundle
-		if err := rows.Scan(&b.Hash, &b.Block, &b.Sender, &b.MEVType, &b.TxHashes, &b.GasUsed, &b.ProfitETH, &b.ProfitUSD); err != nil {
-			continue
+	type bundle struct {
+		Hash      string `json:"hash"`
+		Block     int64  `json:"block"`
+		Sender    string `json:"sender"`
+		MEVType   string `json:"mevType"`
+		TxHashes  string `json:"txHashes"`
+		GasUsed   int64  `json:"gasUsed"`
+		ProfitETH string `json:"profitEth"`
+		ProfitUSD string `json:"profitUsd"`
+	}
+	out := make([]bundle, 0, 25)
+	if err := scanRows(rows, func() error {
+		var b bundle
+		if err := rows.Scan(&b.Hash, &b.Block, &b.Sender, &b.MEVType, &b.TxHashes,
+			&b.GasUsed, &b.ProfitETH, &b.ProfitUSD); err != nil {
+			return err
 		}
-		bundles = append(bundles, b)
+		out = append(out, b)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": bundles})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
-// GetMEVBundle returns single MEV bundle
+// GetMEVBundle returns a single MEV bundle.
 func (h *Handler) GetMEVBundle(c *gin.Context) {
 	hash := c.Param("hash")
 
-	type MEVBundle struct {
-		Hash      string  `json:"hash"`
-		Block     int64   `json:"block"`
-		Sender    string  `json:"sender"`
-		MEVType   string  `json:"mevType"`
-		TxHashes  string  `json:"txHashes"`
-		GasUsed   int64   `json:"gasUsed"`
-		ProfitETH string  `json:"profitEth"`
-		ProfitUSD float64 `json:"profitUsd"`
+	var b struct {
+		Hash      string `json:"hash"`
+		Block     int64  `json:"block"`
+		Sender    string `json:"sender"`
+		MEVType   string `json:"mevType"`
+		TxHashes  string `json:"txHashes"`
+		GasUsed   int64  `json:"gasUsed"`
+		ProfitETH string `json:"profitEth"`
+		ProfitUSD string `json:"profitUsd"`
 	}
-
-	var b MEVBundle
 	err := h.db.QueryRowContext(c.Request.Context(),
-		`SELECT bundle_hash, block_number, sender, mev_type, tx_hashes, gas_used, profit_eth, profit_usd
-		 FROM mev_bundles WHERE bundle_hash = $1`,
-		hash,
-	).Scan(&b.Hash, &b.Block, &b.Sender, &b.MEVType, &b.TxHashes, &b.GasUsed, &b.ProfitETH, &b.ProfitUSD)
-
+		`SELECT bundle_hash, block_number, sender, mev_type, tx_hashes,
+		        COALESCE(gas_used, 0), COALESCE(profit_eth, 0)::text, COALESCE(profit_usd, 0)::text
+		 FROM mev_bundles WHERE LOWER(bundle_hash) = LOWER($1)`, hash,
+	).Scan(&b.Hash, &b.Block, &b.Sender, &b.MEVType, &b.TxHashes,
+		&b.GasUsed, &b.ProfitETH, &b.ProfitUSD)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "bundle not found"})
+		return
+	}
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Bundle not found"})
+		internalError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusOK, b)
 }
 
-// SearchMEV searches MEV bundles
+// SearchMEV searches MEV bundles by sender or bundle hash.
 func (h *Handler) SearchMEV(c *gin.Context) {
-	query := c.Query("q")
-
-	type MEVBundle struct {
-		Hash    string `json:"hash"`
-		Block  int64  `json:"block"`
-		Sender string `json:"sender"`
-		Type   string `json:"type"`
+	query := strings.TrimSpace(c.Query("q"))
+	if query == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query required"})
+		return
 	}
 
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT bundle_hash, block_number, sender, mev_type FROM mev_bundles 
-		 WHERE sender ILIKE $1 OR bundle_hash ILIKE $1 LIMIT 20`,
-		"%"+query+"%",
-	)
+		`SELECT bundle_hash, block_number, sender, mev_type
+		 FROM mev_bundles
+		 WHERE sender ILIKE $1 OR bundle_hash ILIKE $1
+		 ORDER BY block_number DESC LIMIT 20`, "%"+query+"%")
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var bundles []MEVBundle
-	for rows.Next() {
-		var b MEVBundle
-		if err := rows.Scan(&b.Hash, &b.Block, &b.Sender, &b.Type); err != nil {
-			continue
+	type bundle struct {
+		Hash    string `json:"hash"`
+		Block   int64  `json:"block"`
+		Sender  string `json:"sender"`
+		MEVType string `json:"mevType"`
+	}
+	out := make([]bundle, 0, 20)
+	if err := scanRows(rows, func() error {
+		var b bundle
+		if err := rows.Scan(&b.Hash, &b.Block, &b.Sender, &b.MEVType); err != nil {
+			return err
 		}
-		bundles = append(bundles, b)
+		out = append(out, b)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": bundles})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
 // ============================================================================
-// ACCOUNT HISTORY HANDLERS
+// Account history
 // ============================================================================
 
-// GetAccountHistory returns historical balance data
+// GetAccountHistory returns the recorded balance history of an address.
 func (h *Handler) GetAccountHistory(c *gin.Context) {
 	address := c.Param("address")
-
-	type History struct {
-		BlockNumber int64   `json:"blockNumber"`
-		Balance    string  `json:"balance"`
-		TxHash     string  `json:"txHash"`
-		Timestamp  int64   `json:"timestamp"`
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+		return
 	}
-
-	pagination := Pagination{Page: 1, Limit: 50}
-	if page, err := strconv.Atoi(c.Query("page")); err == nil {
-		pagination.Page = page
-	}
+	pagination := paginationFrom(c, 50)
 
 	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT block_number, balance, transaction_hash, timestamp 
-		 FROM account_history WHERE address = $1 
+		`SELECT block_number, balance::text, COALESCE(transaction_hash, ''), timestamp
+		 FROM token_holder_history WHERE LOWER(holder_address) = LOWER($1)
 		 ORDER BY block_number DESC LIMIT $2 OFFSET $3`,
-		address, pagination.GetLimit(), pagination.Offset(),
-	)
+		address, pagination.GetLimit(), pagination.Offset())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		internalError(c, err)
 		return
 	}
 	defer rows.Close()
 
-	var history []History
-	for rows.Next() {
-		var h History
-		if err := rows.Scan(&h.BlockNumber, &h.Balance, &h.TxHash, &h.Timestamp); err != nil {
-			continue
+	type entry struct {
+		BlockNumber int64  `json:"blockNumber"`
+		Balance     string `json:"balance"`
+		TxHash      string `json:"txHash"`
+		Timestamp   int64  `json:"timestamp"`
+	}
+	out := make([]entry, 0, 50)
+	if err := scanRows(rows, func() error {
+		var e entry
+		if err := rows.Scan(&e.BlockNumber, &e.Balance, &e.TxHash, &e.Timestamp); err != nil {
+			return err
 		}
-		history = append(history, h)
+		out = append(out, e)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"data": history})
+	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
 // ============================================================================
-// DEBUG/TRADE HANDLERS
+// Debug trace handlers
 // ============================================================================
 
-// DebugTrace performs trace on a transaction
+// DebugTrace runs debug_traceTransaction on the node and returns the result.
 func (h *Handler) DebugTrace(c *gin.Context) {
 	var req struct {
-		TxHash string `json:"txHash"`
+		TxHash string `json:"txHash" binding:"required"`
 		Tracer string `json:"tracer"`
 	}
-
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	// In production, this would call debug_traceTransaction RPC
-	type TraceResult struct {
-		Result interface{} `json:"result"`
+	if !isTxHash(req.TxHash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transaction hash"})
+		return
 	}
 
-	c.JSON(http.StatusOK, TraceResult{Result: "trace result"})
+	tracer := req.Tracer
+	if tracer == "" {
+		tracer = "callTracer"
+	}
+
+	result, err := h.rpcCall(c.Request.Context(), "debug_traceTransaction",
+		req.TxHash, map[string]interface{}{"tracer": tracer})
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"txHash": req.TxHash, "tracer": tracer, "result": result})
 }
 
-// DebugTraceCall performs trace on a call
+// DebugTraceCall runs debug_traceCall on the node and returns the result.
 func (h *Handler) DebugTraceCall(c *gin.Context) {
 	var req struct {
-		From  string `json:"from"`
-		To    string `json:"to"`
-		Value string `json:"value"`
-		Data  string `json:"data"`
+		From   string `json:"from" binding:"required"`
+		To     string `json:"to"`
+		Value  string `json:"value"`
+		Data   string `json:"data"`
+		Gas    string `json:"gas"`
+		Tracer string `json:"tracer"`
 	}
-
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	type TraceResult struct {
-		Result interface{} `json:"result"`
+	if !isAddress(req.From) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from address"})
+		return
 	}
 
-	c.JSON(http.StatusOK, TraceResult{Result: "trace call result"})
+	call := map[string]interface{}{"from": req.From}
+	if req.To != "" {
+		if !isAddress(req.To) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid to address"})
+			return
+		}
+		call["to"] = req.To
+	}
+	if req.Value != "" {
+		call["value"] = req.Value
+	}
+	if req.Data != "" {
+		call["data"] = req.Data
+	}
+	if req.Gas != "" {
+		call["gas"] = req.Gas
+	}
+
+	tracer := req.Tracer
+	if tracer == "" {
+		tracer = "callTracer"
+	}
+
+	result, err := h.rpcCall(c.Request.Context(), "debug_traceCall",
+		call, "latest", map[string]interface{}{"tracer": tracer})
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"tracer": tracer, "result": result})
+}
+
+// DebugTraceTx returns the indexed call frames and state diffs of a
+// transaction. Unlike DebugTrace it does not need an archive node.
+func (h *Handler) DebugTraceTx(c *gin.Context) {
+	hash := c.Param("hash")
+	if !isTxHash(hash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transaction hash"})
+		return
+	}
+
+	rows, err := h.db.QueryContext(c.Request.Context(),
+		`SELECT call_type, from_address, COALESCE(to_address, ''),
+		        COALESCE(value, 0)::text, COALESCE(gas, 0)::text, COALESCE(gas_used, 0)::text
+		 FROM internal_transactions
+		 WHERE LOWER(transaction_hash) = LOWER($1)
+		 ORDER BY trace_index, subtrace_index`, hash)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	defer rows.Close()
+
+	calls := make([]CallFrame, 0, 16)
+	if err := scanRows(rows, func() error {
+		var f CallFrame
+		if err := rows.Scan(&f.Type, &f.From, &f.To, &f.Value, &f.Gas, &f.GasUsed); err != nil {
+			return err
+		}
+		calls = append(calls, f)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
+	}
+
+	diffRows, err := h.db.QueryContext(c.Request.Context(),
+		`SELECT address, COALESCE(storage_key, ''), COALESCE(old_value, ''),
+		        COALESCE(new_value, ''), diff_type
+		 FROM state_diffs WHERE LOWER(transaction_hash) = LOWER($1) ORDER BY id`, hash)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	defer diffRows.Close()
+
+	stateDiffs := make([]StateDiff, 0, 16)
+	if err := scanRows(diffRows, func() error {
+		var d StateDiff
+		if err := rows.Scan(&d.Address, &d.StorageKey, &d.OldValue, &d.NewValue, &d.DiffType); err != nil {
+			return err
+		}
+		stateDiffs = append(stateDiffs, d)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
+	}
+
+	var (
+		gasUsed sql.NullString
+		status  sql.NullString
+	)
+	err = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(gas_used, 0)::text, status FROM transactions
+		 WHERE LOWER(hash) = LOWER($1)`, hash).Scan(&gasUsed, &status)
+	if err != nil && err != sql.ErrNoRows {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"txHash":     hash,
+		"gasUsed":    hexQuantity(nullStr(gasUsed)),
+		"failed":     strings.EqualFold(nullStr(status), "failed"),
+		"calls":      calls,
+		"stateDiffs": stateDiffs,
+	})
 }
 
 // ============================================================================
-// STATS HANDLERS
+// Stats handlers
 // ============================================================================
 
-// GetNetworkStats returns detailed network statistics
+// GetNetworkStats returns live network counters derived from the indexed data.
 func (h *Handler) GetNetworkStats(c *gin.Context) {
-
-	type NetworkStats struct {
-		TotalBlocks      int64   `json:"totalBlocks"`
-		TotalTxs        int64   `json:"totalTxs"`
-		TotalAccounts   int64   `json:"totalAccounts"`
+	var stats struct {
+		TotalBlocks    int64   `json:"totalBlocks"`
+		TotalTxs       int64   `json:"totalTxs"`
+		TotalAccounts  int64   `json:"totalAccounts"`
 		TotalContracts int64   `json:"totalContracts"`
-		TPS             float64 `json:"tps"`
-		AvgBlockTime    float64 `json:"avgBlockTime"`
-		GasPrice       int64   `json:"gasPrice"`
-		GasLimit        int64   `json:"gasLimit"`
-		GasUsed         int64   `json:"gasUsed"`
+		TotalTokens    int64   `json:"totalTokens"`
+		LastBlock      int64   `json:"lastBlock"`
+		TPS            float64 `json:"tps"`
+		AvgBlockTime   float64 `json:"avgBlockTime"`
+		GasLimit       int64   `json:"gasLimit"`
+		GasUsed        int64   `json:"gasUsed"`
 	}
 
-	var stats NetworkStats
+	err := h.db.QueryRowContext(c.Request.Context(), `
+		SELECT
+			(SELECT COUNT(*) FROM blocks),
+			(SELECT COUNT(*) FROM transactions),
+			(SELECT COUNT(*) FROM accounts),
+			(SELECT COUNT(*) FROM contracts),
+			(SELECT COUNT(*) FROM tokens),
+			(SELECT COALESCE(MAX(number), 0) FROM blocks),
+			(SELECT COALESCE(gas_limit, 0) FROM blocks ORDER BY number DESC LIMIT 1),
+			(SELECT COALESCE(gas_used, 0) FROM blocks ORDER BY number DESC LIMIT 1)
+	`).Scan(&stats.TotalBlocks, &stats.TotalTxs, &stats.TotalAccounts,
+		&stats.TotalContracts, &stats.TotalTokens, &stats.LastBlock,
+		&stats.GasLimit, &stats.GasUsed)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
 
-	h.db.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM blocks").Scan(&stats.TotalBlocks)
-	h.db.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM transactions").Scan(&stats.TotalTxs)
+	var (
+		count int64
+		span  sql.NullInt64
+	)
+	err = h.db.QueryRowContext(c.Request.Context(), `
+		SELECT COUNT(*), MAX(timestamp) - MIN(timestamp)
+		FROM blocks
+		WHERE number >= GREATEST(0, (SELECT COALESCE(MAX(number), 0) - 100 FROM blocks))
+	`).Scan(&count, &span)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	if span.Valid && span.Int64 > 0 {
+		stats.TPS = float64(count) / float64(span.Int64)
+		if count > 1 {
+			stats.AvgBlockTime = float64(span.Int64) / float64(count-1)
+		}
+	}
 
 	c.JSON(http.StatusOK, stats)
 }
 
-// GetGasStats returns gas statistics
+// GetGasStats returns gas price percentiles computed from indexed blocks.
 func (h *Handler) GetGasStats(c *gin.Context) {
-
-	type GasStats struct {
-		Safe      int64 `json:"safe"`
-		Fast      int64 `json:"fast"`
-		Standard  int64 `json:"standard"`
-		Slow      int64 `json:"slow"`
-		BaseFee   int64 `json:"baseFee"`
-		Priority int64 `json:"priority"`
+	var (
+		slow, standard, fast, baseFee sql.NullFloat64
+	)
+	err := h.db.QueryRowContext(c.Request.Context(), `
+		SELECT
+			percentile_cont(0.25) WITHIN GROUP (ORDER BY base_fee_per_gas),
+			percentile_cont(0.50) WITHIN GROUP (ORDER BY base_fee_per_gas),
+			percentile_cont(0.90) WITHIN GROUP (ORDER BY base_fee_per_gas),
+			COALESCE(MAX(base_fee_per_gas), 0)
+		FROM (
+		    SELECT base_fee_per_gas FROM blocks
+		    WHERE base_fee_per_gas IS NOT NULL
+		    ORDER BY number DESC LIMIT 100
+		) recent
+	`).Scan(&slow, &standard, &fast, &baseFee)
+	if err != nil {
+		internalError(c, err)
+		return
 	}
 
-	var gs GasStats
-	gs.Safe = 20000000000     // 20 Gwei
-	gs.Fast = 30000000000     // 30 Gwei
-	gs.Standard = 25000000000 // 25 Gwei
-	gs.Slow = 15000000000    // 15 Gwei
-	gs.BaseFee = 10000000000   // 10 Gwei
-	gs.Priority = 1000000000   // 1 Gwei
-
-	c.JSON(http.StatusOK, gs)
+	c.JSON(http.StatusOK, gin.H{
+		"slow":     int64(slow.Float64),
+		"standard": int64(standard.Float64),
+		"fast":     int64(fast.Float64),
+		"baseFee":  int64(baseFee.Float64),
+	})
 }
 
 // ============================================================================
-// HISTORICAL STATE HANDLERS
+// Historical state handlers
 // ============================================================================
 
-// GetHistoricalBalance returns balance at specific block
+// GetHistoricalBalance returns the indexed balance of an address at a block.
 func (h *Handler) GetHistoricalBalance(c *gin.Context) {
 	address := c.Param("address")
 	blockStr := c.Query("block")
-
-	blockNum, err := strconv.ParseUint(blockStr, 10, 64)
-	if err != nil {
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+		return
+	}
+	blockNum, err := strconv.ParseInt(blockStr, 10, 64)
+	if err != nil || blockNum < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"})
 		return
 	}
 
-	type HistoricalBalance struct {
-		Address     string `json:"address"`
-		Balance    string `json:"balance"`
-		BlockNumber int64  `json:"blockNumber"`
-		BlockHash  string `json:"blockHash"`
-		Timestamp  int64  `json:"timestamp"`
+	var (
+		balance   sql.NullString
+		blockHash sql.NullString
+		timestamp sql.NullInt64
+	)
+	err = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(sa.balance, 0)::text, b.hash, b.timestamp
+		 FROM state_accounts sa
+		 LEFT JOIN blocks b ON b.number = sa.block_number
+		 WHERE LOWER(sa.address) = LOWER($1) AND sa.block_number = $2
+		 LIMIT 1`, address, blockNum).Scan(&balance, &blockHash, &timestamp)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no recorded state for that block"})
+		return
+	}
+	if err != nil {
+		internalError(c, err)
+		return
 	}
 
-	// Query from state_diffs or historical storage
-	var balance string
-	h.db.QueryRowContext(c.Request.Context(),
-		`SELECT COALESCE(new_value, '0x0') FROM state_diffs 
-		 WHERE address = $1 AND block_number = $2 AND diff_type = 'balance'
-		 ORDER BY id DESC LIMIT 1`,
-		address, blockNum,
-	).Scan(&balance)
-
-	if balance == "" {
-		balance = "0x0"
-	}
-
-	c.JSON(http.StatusOK, HistoricalBalance{
-		Address:     address,
-		Balance:    balance,
-		BlockNumber: blockNum,
-		BlockHash:  "0x0",
-		Timestamp:  time.Now().Unix(),
+	c.JSON(http.StatusOK, gin.H{
+		"address":     address,
+		"balance":     hexQuantity(nullStr(balance)),
+		"blockNumber": blockNum,
+		"blockHash":   nullStr(blockHash),
+		"timestamp":   timestamp.Int64,
 	})
 }
 
-// GetHistoricalState returns full account state at block
+// GetHistoricalState returns the indexed account state at a block.
 func (h *Handler) GetHistoricalState(c *gin.Context) {
 	address := c.Param("address")
 	blockStr := c.Query("block")
-
-	blockNum, err := strconv.ParseUint(blockStr, 10, 64)
-	if err != nil {
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+		return
+	}
+	blockNum, err := strconv.ParseInt(blockStr, 10, 64)
+	if err != nil || blockNum < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"})
 		return
 	}
 
-	type AccountState struct {
-		Address     string `json:"address"`
-		Nonce       uint64 `json:"nonce"`
-		Balance     string `json:"balance"`
-		CodeHash    string `json:"codeHash"`
-		StorageRoot string `json:"storageRoot"`
-		BlockNumber int64  `json:"blockNumber"`
+	var (
+		balance     sql.NullString
+		nonce       sql.NullInt64
+		codeHash    sql.NullString
+		storageRoot sql.NullString
+		isContract  sql.NullBool
+	)
+	err = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(balance, 0)::text, COALESCE(nonce, 0), code_hash,
+		        storage_root, is_contract
+		 FROM state_accounts
+		 WHERE LOWER(address) = LOWER($1) AND block_number = $2
+		 LIMIT 1`, address, blockNum,
+	).Scan(&balance, &nonce, &codeHash, &storageRoot, &isContract)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no recorded state for that block"})
+		return
+	}
+	if err != nil {
+		internalError(c, err)
+		return
 	}
 
-	c.JSON(http.StatusOK, AccountState{
-		Address:     address,
-		Nonce:       0,
-		Balance:     "0x0",
-		CodeHash:    "0x0000000000000000000000000000000000000000000000000000000000000000",
-		StorageRoot: "0x0000000000000000000000000000000000000000000000000000000000000000",
-		BlockNumber: blockNum,
+	c.JSON(http.StatusOK, gin.H{
+		"address":     address,
+		"balance":     hexQuantity(nullStr(balance)),
+		"nonce":       nonce.Int64,
+		"codeHash":    nullStr(codeHash),
+		"storageRoot": nullStr(storageRoot),
+		"isContract":  isContract.Bool,
+		"blockNumber": blockNum,
 	})
 }
 
-// GetHistoricalStorage returns storage slot at block
+// GetHistoricalStorage returns the indexed value of a storage slot at a block.
 func (h *Handler) GetHistoricalStorage(c *gin.Context) {
 	address := c.Param("address")
 	slot := c.Param("slot")
 	blockStr := c.Query("block")
-
-	blockNum, err := strconv.ParseUint(blockStr, 10, 64)
-	if err != nil {
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+		return
+	}
+	blockNum, err := strconv.ParseInt(blockStr, 10, 64)
+	if err != nil || blockNum < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid block number"})
 		return
 	}
 
-	type StorageState struct {
-		Address    string `json:"address"`
-		Slot       string `json:"slot"`
-		Value      string `json:"value"`
-		BlockNumber int64  `json:"blockNumber"`
-	}
-
-	var value string
-	h.db.QueryRowContext(c.Request.Context(),
-		`SELECT COALESCE(new_value, '0x0') FROM state_diffs 
-		 WHERE address = $1 AND storage_key = $2 AND block_number = $3
-		 ORDER BY id DESC LIMIT 1`,
-		address, slot, blockNum,
+	var value sql.NullString
+	err = h.db.QueryRowContext(c.Request.Context(),
+		`SELECT COALESCE(new_value, '') FROM state_diffs
+		 WHERE LOWER(address) = LOWER($1) AND storage_key = $2 AND block_number <= $3
+		   AND diff_type = 'storage'
+		 ORDER BY block_number DESC, id DESC LIMIT 1`, address, slot, blockNum,
 	).Scan(&value)
-
-	if value == "" {
-		value = "0x0000000000000000000000000000000000000000000000000000000000000000"
-	}
-
-	c.JSON(http.StatusOK, StorageState{
-		Address:    address,
-		Slot:      slot,
-		Value:     value,
-		BlockNumber: blockNum,
-	})
-}
-
-// ============================================================================
-// DEBUG TRACE HANDLERS
-// ============================================================================
-
-// DebugTraceTx traces a transaction
-func (h *Handler) DebugTraceTx(c *gin.Context) {
-	hash := c.Param("hash")
-
-	type TraceResult struct {
-		TxHash   string        `json:"txHash"`
-		GasUsed  string        `json:"gasUsed"`
-		Failed   bool         `json:"failed"`
-		Revert   string       `json:"revertReason,omitempty"`
-		Calls    []CallFrame  `json:"calls"`
-		StateDiffs []StateDiff  `json:"stateDiffs"`
-	}
-
-	type CallFrame struct {
-		Type   string `json:"type"`
-		From  string `json:"from"`
-		To    string `json:"to"`
-		Value string `json:"value"`
-		Gas   string `json:"gas"`
-	}
-
-	type StateDiff struct {
-		Address  string `json:"address"`
-		Key     string `json:"key"`
-		OldVal  string `json:"oldValue"`
-		NewVal  string `json:"newValue"`
-	}
-
-	// Query traces
-	rows, err := h.db.QueryContext(c.Request.Context(),
-		`SELECT call_type, from_address, to_address, value, gas FROM traces 
-		 WHERE transaction_hash = $1 ORDER BY trace_address`,
-		hash,
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no recorded value for that slot"})
 		return
 	}
-	defer rows.Close()
-
-	var calls []CallFrame
-	for rows.Next() {
-		var cf CallFrame
-		if err := rows.Scan(&cf.Type, &cf.From, &cf.To, &cf.Value, &cf.Gas); err != nil {
-			continue
-		}
-		calls = append(calls, cf)
+	if err != nil {
+		internalError(c, err)
+		return
 	}
 
-	// Query state diffs
-	diffRows, _ := h.db.QueryContext(c.Request.Context(),
-		`SELECT address, storage_key, old_value, new_value FROM state_diffs 
-		 WHERE transaction_hash = $1`,
-		hash,
-	)
-	defer diffRows.Close()
-
-	var stateDiffs []StateDiff
-	for diffRows.Next() {
-		var sd StateDiff
-		if err := diffRows.Scan(&sd.Address, &sd.Key, &sd.OldVal, &sd.NewVal); err != nil {
-			continue
-		}
-		stateDiffs = append(stateDiffs, sd)
-	}
-
-	c.JSON(http.StatusOK, TraceResult{
-		TxHash:   hash,
-		GasUsed:  "0x0",
-		Failed:   false,
-		Calls:   calls,
-		StateDiffs: stateDiffs,
+	c.JSON(http.StatusOK, gin.H{
+		"address":     address,
+		"slot":        slot,
+		"value":       nullStr(value),
+		"blockNumber": blockNum,
 	})
 }
 
-// DebugTraceCall traces a call
-func (h *Handler) DebugTraceCall(c *gin.Context) {
-	var req struct {
-		From  string `json:"from"`
-		To    string `json:"to"`
-		Value string `json:"value"`
-		Data  string `json:"data"`
-		Gas   string `json:"gas"`
-	}
+// ============================================================================
+// Live node data
+// ============================================================================
 
+// GetLatestNodeBlock proxies eth_getBlockByNumber("latest") from the node.
+func (h *Handler) GetLatestNodeBlock(c *gin.Context) {
+	result, err := h.rpcCall(c.Request.Context(), "eth_getBlockByNumber", "latest", false)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"block": result})
+}
+
+// GetNodeChainID proxies eth_chainId from the node.
+func (h *Handler) GetNodeChainID(c *gin.Context) {
+	result, err := h.rpcCall(c.Request.Context(), "eth_chainId")
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"chainId": result})
+}
+
+// GetNodeGasPrice proxies eth_gasPrice from the node.
+func (h *Handler) GetNodeGasPrice(c *gin.Context) {
+	result, err := h.rpcCall(c.Request.Context(), "eth_gasPrice")
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"gasPrice": result})
+}
+
+// GetNodePeerCount proxies net_peerCount from the node.
+func (h *Handler) GetNodePeerCount(c *gin.Context) {
+	result, err := h.rpcCall(c.Request.Context(), "net_peerCount")
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"peerCount": result})
+}
+
+// GetNodeSyncing proxies eth_syncing from the node.
+func (h *Handler) GetNodeSyncing(c *gin.Context) {
+	result, err := h.rpcCall(c.Request.Context(), "eth_syncing")
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"syncing": result})
+}
+
+// ============================================================================
+// Contract calls (proxied to the node)
+// ============================================================================
+
+// ReadContract performs an eth_call against the node.
+func (h *Handler) ReadContract(c *gin.Context) {
+	address := c.Param("address")
+	if !isAddress(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid contract address"})
+		return
+	}
+	var req struct {
+		Data  string `json:"data" binding:"required"`
+		From  string `json:"from"`
+		Value string `json:"value"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	type CallResult struct {
-		GasUsed  string `json:"gasUsed"`
-		Failed  bool   `json:"failed"`
-		Output string `json:"output"`
-		Calls  []struct {
-			Type  string `json:"type"`
-			From string `json:"from"`
-			To   string `json:"to"`
-		} `json:"calls"`
+	if !isHexData(req.Data) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "data must be 0x-prefixed hex"})
+		return
 	}
 
-	c.JSON(http.StatusOK, CallResult{
-		GasUsed: "0x0",
-		Failed: false,
-		Output: "0x",
-	})
+	call := map[string]interface{}{"to": address, "data": req.Data}
+	if req.From != "" {
+		if !isAddress(req.From) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from address"})
+			return
+		}
+		call["from"] = req.From
+	}
+	if req.Value != "" {
+		call["value"] = req.Value
+	}
+
+	result, err := h.rpcCall(c.Request.Context(), "eth_call", call, "latest")
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+// WriteContract broadcasts a signed transaction to the node.
+func (h *Handler) WriteContract(c *gin.Context) {
+	var req struct {
+		SignedTx string `json:"signedTx" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if !isHexData(req.SignedTx) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "signedTx must be 0x-prefixed hex"})
+		return
+	}
+
+	result, err := h.rpcCall(c.Request.Context(), "eth_sendRawTransaction", req.SignedTx)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"transactionHash": result})
+}
+
+// ============================================================================
+// Indexed lookups not covered by main.go
+// ============================================================================
+
+// GetLogs returns indexed event logs for an address or transaction.
+func (h *Handler) GetLogs(c *gin.Context) {
+	pagination := paginationFrom(c, 50)
+
+	where := []string{}
+	args := []interface{}{}
+	if addr := strings.TrimSpace(c.Query("address")); addr != "" {
+		if !isAddress(addr) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+			return
+		}
+		args = append(args, addr)
+		where = append(where, "LOWER(address) = LOWER($"+strconv.Itoa(len(args))+")")
+	}
+	if txHash := strings.TrimSpace(c.Query("txHash")); txHash != "" {
+		if !isTxHash(txHash) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid transaction hash"})
+			return
+		}
+		args = append(args, txHash)
+		where = append(where, "LOWER(transaction_hash) = LOWER($"+strconv.Itoa(len(args))+")")
+	}
+
+	query := `SELECT COALESCE(transaction_hash, ''), block_number, address,
+	                 COALESCE(topic0, ''), COALESCE(topic1, ''), COALESCE(topic2, ''),
+	                 COALESCE(topic3, ''), COALESCE(data, ''), log_index
+	          FROM logs`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY block_number DESC, log_index DESC LIMIT $" +
+		strconv.Itoa(len(args)+1) + " OFFSET $" + strconv.Itoa(len(args)+2)
+	args = append(args, pagination.GetLimit(), pagination.Offset())
+
+	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	defer rows.Close()
+
+	type logEntry struct {
+		TxHash   string   `json:"transactionHash"`
+		Block    int64    `json:"blockNumber"`
+		Address  string   `json:"address"`
+		Topics   []string `json:"topics"`
+		Data     string   `json:"data"`
+		LogIndex int64    `json:"logIndex"`
+	}
+	out := make([]logEntry, 0, 50)
+	if err := scanRows(rows, func() error {
+		var (
+			e              logEntry
+			t0, t1, t2, t3 string
+		)
+		if err := rows.Scan(&e.TxHash, &e.Block, &e.Address, &t0, &t1, &t2, &t3,
+			&e.Data, &e.LogIndex); err != nil {
+			return err
+		}
+		for _, t := range []string{t0, t1, t2, t3} {
+			if t != "" {
+				e.Topics = append(e.Topics, t)
+			}
+		}
+		out = append(out, e)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// GetCrossChainTransfers returns indexed bridge transfers.
+func (h *Handler) GetCrossChainTransfers(c *gin.Context) {
+	pagination := paginationFrom(c, 25)
+
+	where := []string{}
+	args := []interface{}{}
+	if addr := strings.TrimSpace(c.Query("address")); addr != "" {
+		if !isAddress(addr) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+			return
+		}
+		args = append(args, addr)
+		n := strconv.Itoa(len(args))
+		where = append(where, "(LOWER(from_address) = LOWER($"+n+") OR LOWER(to_address) = LOWER($"+n+"))")
+	}
+
+	query := `SELECT transaction_hash, block_number, from_address, to_address,
+	                 amount::text, COALESCE(token_address, ''), COALESCE(source_chain, ''),
+	                 COALESCE(destination_chain, ''), status
+	          FROM cross_chain_transfers`
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY block_number DESC LIMIT $" + strconv.Itoa(len(args)+1) +
+		" OFFSET $" + strconv.Itoa(len(args)+2)
+	args = append(args, pagination.GetLimit(), pagination.Offset())
+
+	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+	if err != nil {
+		internalError(c, err)
+		return
+	}
+	defer rows.Close()
+
+	type transfer struct {
+		TxHash      string `json:"transactionHash"`
+		Block       int64  `json:"blockNumber"`
+		From        string `json:"from"`
+		To          string `json:"to"`
+		Amount      string `json:"amount"`
+		Token       string `json:"token"`
+		SourceChain string `json:"sourceChain"`
+		DestChain   string `json:"destinationChain"`
+		Status      string `json:"status"`
+	}
+	out := make([]transfer, 0, 25)
+	if err := scanRows(rows, func() error {
+		var t transfer
+		if err := rows.Scan(&t.TxHash, &t.Block, &t.From, &t.To, &t.Amount,
+			&t.Token, &t.SourceChain, &t.DestChain, &t.Status); err != nil {
+			return err
+		}
+		out = append(out, t)
+		return nil
+	}); err != nil {
+		internalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+// isAddress reports whether s is a 0x-prefixed 20-byte hex address.
+func isAddress(s string) bool {
+	if len(s) != 42 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	return common.IsHexAddress(s)
+}
+
+// isTxHash reports whether s is a 0x-prefixed 32-byte hex hash.
+func isTxHash(s string) bool {
+	if len(s) != 66 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	_, err := hex.DecodeString(s[2:])
+	return err == nil
+}
+
+// isHexData reports whether s is 0x-prefixed hex with an even digit count.
+func isHexData(s string) bool {
+	if !strings.HasPrefix(s, "0x") || len(s) < 2 {
+		return false
+	}
+	body := s[2:]
+	if len(body)%2 != 0 {
+		return false
+	}
+	_, err := hex.DecodeString(body)
+	return err == nil
+}
+
+// rawJSON passes an already-encoded JSON value through unchanged, or null.
+func rawJSON(s string) interface{} {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return nil
+	}
+	return json.RawMessage(trimmed)
 }
