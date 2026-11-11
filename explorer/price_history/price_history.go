@@ -278,10 +278,11 @@ func (s *PriceAggregator) generatePriceFromTransactions(
 	if bucketSize == 0 {
 		bucketSize = 60
 	}
+	bucketSizeSec := bucketSize * 60
 	
 	query := `
 		SELECT 
-			(b.timestamp / ($1 * 60)) * ($1 * 60) as bucket,
+			(b.timestamp / $1) * $1 as bucket,
 			MIN(tt.value) as open,
 			MAX(tt.value) as high,
 			MIN(tt.value) as low,
@@ -294,7 +295,7 @@ func (s *PriceAggregator) generatePriceFromTransactions(
 		ORDER BY bucket ASC
 	`
 	
-	rows, err := s.cfg.DB.QueryContext(ctx, query, bucketSize, tokenAddress, startTime.Unix(), endTime.Unix())
+	rows, err := s.cfg.DB.QueryContext(ctx, query, bucketSizeSec, tokenAddress, startTime.Unix(), endTime.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -315,10 +316,8 @@ func (s *PriceAggregator) generatePriceFromTransactions(
 		prices = append(prices, p)
 	}
 	
-	if len(prices) == 0 {
-		return generateMockPrices(startTime, endTime, timeframe)
-	}
-	
+	// A window with no trades has no prices. An empty series is the honest
+	// answer; inventing one would show the caller a market that never traded.
 	return prices, nil
 }
 
@@ -379,53 +378,6 @@ func aggregatePrices(rawPrices []priceRow, timeframe string) ([]PricePoint, erro
 			Close:    close,
 			Volume:   volume,
 		})
-	}
-	
-	return prices, nil
-}
-
-// generateMockPrices generates mock price data
-func generateMockPrices(startTime, endTime time.Time, timeframe string) ([]PricePoint, error) {
-	bucketMinutes := map[string]int{
-		"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440, "1w": 10080,
-	}
-	
-	bucketSize := bucketMinutes[timeframe]
-	if bucketSize == 0 {
-		bucketSize = 60
-	}
-	
-	bucketSizeSec := int64(bucketSize * 60)
-	var prices []PricePoint
-	bucket := (startTime.Unix() / bucketSizeSec) * bucketSizeSec
-	price := 3000.0
-	
-	for bucket < endTime.Unix() {
-		change := (float64(bucket%100) - 50) / 1000
-		price *= 1 + change
-		
-		if price < 100 {
-			price = 100
-		}
-		if price > 10000 {
-			price = 10000
-		}
-		
-		high := price * 1.01
-		low := price * 0.99
-		open := price * (1 + change/2)
-		close := price
-		
-		prices = append(prices, PricePoint{
-			Timestamp: bucket * 1000,
-			Open:      open,
-			High:     high,
-			Low:      low,
-			Close:    close,
-			Volume:   float64(bucket % 1000),
-		})
-		
-		bucket += bucketSizeSec
 	}
 	
 	return prices, nil

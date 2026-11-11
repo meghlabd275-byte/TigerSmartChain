@@ -148,17 +148,26 @@ func (s *Server) calculatePoolAPR(ctx context.Context, poolAddr string) error {
 		return err
 	}
 	
-	// Calculate APR based on rewards (simplified)
-	// In production, this would come from actual reward distribution
-	apr := 0.0
-	if totalStaked > 0 {
-		// Mock APR calculation
-		apr = 12.5 + (totalStaked / 1e6) * 0.5
-		if apr > 25 {
-			apr = 25
-		}
+	// APR is the reward the pool actually paid out over the window, annualised
+	// against the stake that earned it. A pool with no stake, or one that has
+	// not paid anything yet, has no measurable rate; reporting a number anyway
+	// would tell a delegator to expect a return the pool has never produced.
+	const windowDays = 7
+	since := time.Now().Add(-windowDays * 24 * time.Hour).Unix()
+	var paidOut float64
+	err = s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(amount), 0)
+		FROM staking_rewards
+		WHERE pool_address = $1 AND timestamp >= $2`, poolAddr, since).Scan(&paidOut)
+	if err != nil {
+		return err
 	}
-	
+
+	apr := 0.0
+	if totalStaked > 0 && paidOut > 0 {
+		apr = (paidOut / totalStaked) * (365.0 / float64(windowDays)) * 100.0
+	}
+
 	// Update pool APR
 	_, err = s.pool.Exec(ctx, `UPDATE staking_pools SET apr = $1 WHERE address = $2`, apr, poolAddr)
 	if err != nil {

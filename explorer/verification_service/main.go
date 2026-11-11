@@ -8,15 +8,18 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math/big"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,8 +27,11 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
+
+// hexAddress matches a 20-byte hex address.
+var hexAddress = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 
 // ============================================================================
 // Configuration
@@ -36,6 +42,7 @@ type Config struct {
 	Database       DatabaseConfig `json:"database"`
 	SourcifyURL    string        `json:"sourcify_url"`
 	SolcPath       string        `json:"solc_path"`
+	RPCURL         string        `json:"rpc_url"`
 	Optimization  bool          `json:"optimization"`
 	EvmVersions    []string      `json:"evm_versions"`
 }
@@ -52,6 +59,7 @@ type DatabaseConfig struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Database string `json:"database"`
+	SSLMode  string `json:"sslmode"`
 }
 
 // ============================================================================
@@ -141,9 +149,15 @@ type ContractInfo struct {
 // ============================================================================
 
 func NewDB(cfg DatabaseConfig) (*sql.DB, error) {
+	// The connection carries credentials and query results, so TLS is required
+	// unless the operator explicitly opts out for a loopback database.
+	sslMode := cfg.SSLMode
+	if sslMode == "" {
+		sslMode = "require"
+	}
 	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database,
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, sslMode,
 	)
 
 	db, err := sql.Open("postgres", dsn)
@@ -194,35 +208,129 @@ func (s *VerificationService) worker(id int) {
 }
 
 func (s *VerificationService) compileContract(req VerificationRequest) *CompilationResult {
-	// Validate sources
-	if len(req.Sources) == 0 {
-		return &CompilationResult{
-			Success: false,
-			Errors:  []string{"No source files provided"},
-		}
-	}
+        if len(req.Sources) == 0 {
+                return &CompilationResult{
+                        Success: false,
+                        Errors:  []string{"no source files provided"},
+                }
+        }
+        if !s.isValidCompilerVersion(req.CompilerVersion) {
+                return &CompilationResult{
+                        Success: false,
+                        Errors:  []string{"invalid compiler version"},
+                }
+        }
 
-	// Validate compiler version
-	if !s.isValidCompilerVersion(req.CompilerVersion) {
-		return &CompilationResult{
-			Success: false,
-			Errors:  []string{"Invalid compiler version"},
-		}
-	}
+        return s.runSolc(req)
+}
 
-	// Simulate compilation (in production, use solc)
-	// For now, generate placeholder data
-	abi := s.generateABI(req.ContractName)
-	bytecode := s.generateBytecode(req.Sources)
-	runtime := s.generateRuntime(bytecode)
+// runSolc compiles the sources with the real compiler and returns the bytecode
+// and ABI it produced. Nothing is synthesised: a compiler that cannot be run,
+// or that rejects the source, is reported as a failure.
+func (s *VerificationService) runSolc(req VerificationRequest) *CompilationResult {
+        solc := s.config.SolcPath
+        if solc == "" {
+                solc = "solc"
+        }
 
-	return &CompilationResult{
-		Success:   true,
-		ABI:       abi,
-		Bytecode:  bytecode,
-		Runtime:   runtime,
-		Warnings:  []string{},
-	}
+        dir, err := os.MkdirTemp("", "tsc-verify-")
+        if err != nil {
+                return &CompilationResult{Success: false, Errors: []string{"temp dir: " + err.Error()}}
+        }
+        defer os.RemoveAll(dir)
+
+        // Every source is written to disk because solc resolves imports
+        // relative to the file it is given.
+        var paths []string
+        for name, content := range req.Sources {
+                clean := filepath.Clean("/" + name)
+                target := filepath.Join(dir, clean)
+                if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+                        return &CompilationResult{Success: false, Errors: []string{"mkdir: " + err.Error()}}
+                }
+                if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+                        return &CompilationResult{Success: false, Errors: []string{"write source: " + err.Error()}}
+                }
+                paths = append(paths, target)
+        }
+        sort.Strings(paths)
+
+        args := []string{"--combined-json", "bin,bin-runtime,abi", "--allow-paths", dir}
+        if req.Optimization {
+                args = append(args, "--optimize")
+                if req.OptimizationRuns > 0 {
+                        args = append(args, "--optimize-runs", strconv.Itoa(req.OptimizationRuns))
+                }
+        }
+        if req.EvmVersion != "" {
+                args = append(args, "--evm-version", req.EvmVersion)
+        }
+        args = append(args, paths...)
+
+        ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+        defer cancel()
+
+        var stdout, stderr bytes.Buffer
+        cmd := exec.CommandContext(ctx, solc, args...)
+        cmd.Stdout = &stdout
+        cmd.Stderr = &stderr
+        if err := cmd.Run(); err != nil {
+                detail := strings.TrimSpace(stderr.String())
+                if detail == "" {
+                        detail = err.Error()
+                }
+                return &CompilationResult{Success: false, Errors: []string{"solc: " + detail}}
+        }
+
+        var out struct {
+                Contracts map[string]struct {
+                        Bin        string          `json:"bin"`
+                        BinRuntime string          `json:"bin-runtime"`
+                        ABI        json.RawMessage `json:"abi"`
+                } `json:"contracts"`
+        }
+        if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+                return &CompilationResult{Success: false, Errors: []string{"solc output: " + err.Error()}}
+        }
+        if len(out.Contracts) == 0 {
+                return &CompilationResult{Success: false, Errors: []string{"solc produced no contracts"}}
+        }
+
+        // The key is "<file>:<Contract>". Prefer the contract the caller named;
+        // fall back to the only contract in the file when the name is absent.
+        key := ""
+        if req.ContractName != "" {
+                for k := range out.Contracts {
+                        if strings.HasSuffix(k, ":"+req.ContractName) {
+                                key = k
+                                break
+                        }
+                }
+        }
+        if key == "" && len(out.Contracts) == 1 {
+                for k := range out.Contracts {
+                        key = k
+                }
+        }
+        if key == "" {
+                return &CompilationResult{
+                        Success: false,
+                        Errors:  []string{"contract " + req.ContractName + " not found in compiler output"},
+                }
+        }
+
+        entry := out.Contracts[key]
+        abi := string(entry.ABI)
+        if abi == "" || abi == "null" {
+                abi = "[]"
+        }
+
+        return &CompilationResult{
+                Success:  true,
+                ABI:      abi,
+                Bytecode: "0x" + strings.TrimPrefix(entry.Bin, "0x"),
+                Runtime:  "0x" + strings.TrimPrefix(entry.BinRuntime, "0x"),
+        }
 }
 
 func (s *VerificationService) isValidCompilerVersion(version string) bool {
@@ -243,46 +351,99 @@ func (s *VerificationService) isValidCompilerVersion(version string) bool {
 	return false
 }
 
-func (s *VerificationService) generateABI(contractName string) string {
-	return `[{"inputs":[],"name":"test","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]`
-}
-
-func (s *VerificationService) generateBytecode(sources map[string]string) string {
-	// Generate deterministic bytecode from sources
-	hash := sha256.New()
-	for name, content := range sources {
-		hash.Write([]byte(name))
-		hash.Write([]byte(content))
-	}
-	hashBytes := hash.Sum(nil)
-	
-	// Return mock bytecode
-	return "0x" + hex.EncodeToString(hashBytes) + "6000556102c86001f3"
-}
-
-func (s *VerificationService) generateRuntime(bytecode string) string {
-	if len(bytecode) < 20 {
-		return bytecode
-	}
-	// Strip deployment code to get runtime
-	return bytecode[20:]
-}
-
 // ============================================================================
 // Proxy Detection
 // ============================================================================
 
+// DetectProxy reports whether the deployed code at an address is a proxy, and
+// which implementation it forwards to when that is readable from the code.
+//
+// The decision is made from the deployed bytecode, not from a guess: an
+// EIP-1967 proxy carries the implementation or beacon slot, and an EIP-1167
+// minimal proxy carries the target address in its own code.
 func (s *VerificationService) DetectProxy(address string) (bool, string, error) {
-	// Check for proxy patterns in contract code
-	// In production, analyze bytecode for proxy patterns
-	
-	proxyPatterns := []string{
-		"363d3d373d3d3d363d30545af43d82803e13d4528483e8182",
-		"3d3d3d3d363d3d3760343d3d3d3d37603d3d3d376051",
-	}
+        code, err := s.fetchCode(address)
+        if err != nil {
+                return false, "", err
+        }
+        if len(code) == 0 {
+                return false, "", fmt.Errorf("no code deployed at %s", address)
+        }
 
-	// Return mock result
-	return false, "", nil
+        // EIP-1967 storage slots. A transparent or UUPS proxy reads the
+        // implementation from the first; a beacon proxy reads the beacon from
+        // the second.
+        eip1967Implementation := mustHex("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")
+        eip1967Beacon := mustHex("a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50")
+        if bytes.Contains(code, eip1967Beacon) {
+                return true, "", nil
+        }
+        if bytes.Contains(code, eip1967Implementation) {
+                return true, "", nil
+        }
+
+        // EIP-1167 minimal proxy: a fixed 45-byte program whose only variable
+        // part is the 20-byte target address.
+        minimalPrefix := mustHex("363d3d373d3d3d363d73")
+        minimalSuffix := mustHex("5af43d82803e903d91602b57fd5bf3")
+        if len(code) == 45 && bytes.HasPrefix(code, minimalPrefix) && bytes.HasSuffix(code, minimalSuffix) {
+                target := code[len(minimalPrefix) : len(minimalPrefix)+20]
+                return true, "0x" + hex.EncodeToString(target), nil
+        }
+
+        return false, "", nil
+}
+
+// fetchCode reads the deployed bytecode via eth_getCode.
+func (s *VerificationService) fetchCode(address string) ([]byte, error) {
+        if s.config.RPCURL == "" {
+                return nil, fmt.Errorf("rpc_url is not configured, so the deployed code cannot be read")
+        }
+        if !hexAddress.MatchString(address) {
+                return nil, fmt.Errorf("invalid address %q", address)
+        }
+        body, err := json.Marshal(map[string]any{
+                "jsonrpc": "2.0",
+                "id":      1,
+                "method":  "eth_getCode",
+                "params":  []any{address, "latest"},
+        })
+        if err != nil {
+                return nil, err
+        }
+        client := &http.Client{Timeout: 15 * time.Second}
+        resp, err := client.Post(s.config.RPCURL, "application/json", bytes.NewReader(body))
+        if err != nil {
+                return nil, err
+        }
+        defer resp.Body.Close()
+
+        var out struct {
+                Result string `json:"result"`
+                Error  *struct {
+                        Message string `json:"message"`
+                } `json:"error"`
+        }
+        if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+                return nil, err
+        }
+        if out.Error != nil {
+                return nil, fmt.Errorf("rpc error: %s", out.Error.Message)
+        }
+        if out.Result == "" || out.Result == "0x" {
+                return nil, nil
+        }
+        return hex.DecodeString(strings.TrimPrefix(out.Result, "0x"))
+}
+
+// mustHex decodes a compile-time constant and panics if it is malformed, which
+// can only happen if the source is edited incorrectly.
+func mustHex(s string) []byte {
+        b, err := hex.DecodeString(s)
+        if err != nil {
+                panic("invalid hex constant: " + s)
+        }
+        return b
 }
 
 // ============================================================================
@@ -294,7 +455,7 @@ func (s *VerificationService) FetchFromSourcify(address, chainID string) (*Sourc
 		return nil, fmt.Errorf("Sourcify URL not configured")
 	}
 
-	url := fmt.Sprintf("%s/v1/verify/%s/%s", s.config.SourcifyURL, chainID, address)
+	url := fmt.Sprintf("%s/check-by-addresses?addresses=%s&chainIds=%s", s.config.SourcifyURL, address, chainID)
 	
 	resp, err := http.Get(url)
 	if err != nil {

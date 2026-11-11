@@ -5,24 +5,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math"
-	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,13 +35,43 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lib/pq"
-	"github.com/throttled/throttled"
 	"golang.org/x/time/rate"
 )
 
 // ============================================================================
 // Configuration
 // ============================================================================
+
+var (
+	hexAddress          = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
+	hexFunctionSelector = regexp.MustCompile(`^0x[0-9a-fA-F]{8}$`)
+	hexWord             = regexp.MustCompile(`^(0x)?[0-9a-fA-F]{64}$`)
+	hexRawTx            = regexp.MustCompile(`^0x[0-9a-fA-F]+$`)
+)
+
+// cell writes a scanned column straight into a map. Go does not allow taking
+// the address of a map element, so `rows.Scan(&row["hash"], ...)` cannot
+// compile; a cell holds the map and the key instead and implements
+// sql.Scanner, which is what the driver requires.
+type cell struct {
+	m   map[string]interface{}
+	key string
+}
+
+func (c *cell) Scan(src interface{}) error {
+	if c.m == nil {
+		return fmt.Errorf("cell for %q has no destination map", c.key)
+	}
+	// lib/pq returns []byte for every text and numeric column. Storing those
+	// bytes directly would make encoding/json emit base64, so text is kept as
+	// a string and everything else is stored as the driver returned it.
+	if b, ok := src.([]byte); ok {
+		c.m[c.key] = string(b)
+	} else {
+		c.m[c.key] = src
+	}
+	return nil
+}
 
 type Config struct {
 	Server      ServerConfig      `json:"server"`
@@ -52,6 +82,12 @@ type Config struct {
 	Webhook    WebhookConfig  `json:"webhook"`
 	JWT        JWTConfig     `json:"jwt"`
 	Encryption EncryptionConfig `json:"encryption"`
+	RPC        RPCConfig     `json:"rpc"`
+}
+
+type RPCConfig struct {
+	URL     string `json:"url"`
+	Timeout int    `json:"timeout_seconds"`
 }
 
 type ServerConfig struct {
@@ -222,7 +258,7 @@ func (r *RateLimiter) Ban(key string, duration time.Duration) {
 				client.bannedAt = time.Time{}
 			}
 			r.mu.Unlock()
-		}(duration)
+		}()
 	}
 }
 
@@ -272,10 +308,19 @@ func (m *APIKeyManager) Add(key *APIKey) {
 func (m *APIKeyManager) Get(key string) (*APIKey, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	k, ok := m.keys[key]
-	if !ok || k.Disabled {
+	// Compare in constant time so a caller cannot learn a stored key byte by
+	// byte from response timing.
+	var found *APIKey
+	for stored, k := range m.keys {
+		if subtle.ConstantTimeCompare([]byte(stored), []byte(key)) == 1 {
+			found = k
+			break
+		}
+	}
+	if found == nil || found.Disabled {
 		return nil, false
 	}
+	k := found
 	if k.ExpiresAt != nil && time.Now().After(*k.ExpiresAt) {
 		return nil, false
 	}
@@ -523,8 +568,8 @@ func (h *Handler) GetBlocks(c *gin.Context) {
 	var blocks []map[string]interface{}
 	for rows.Next() {
 		var b map[string]interface{}
-		if err := rows.Scan(&b["number"], &b["hash"], &b["parent_hash"], &b["miner"],
-			&b["gas_limit"], &b["gas_used"], &b["timestamp"], &b["tx_count"], &b["size"]); err == nil {
+		if err := rows.Scan(&cell{b, "number"}, &cell{b, "hash"}, &cell{b, "parent_hash"}, &cell{b, "miner"},
+			&cell{b, "gas_limit"}, &cell{b, "gas_used"}, &cell{b, "timestamp"}, &cell{b, "tx_count"}, &cell{b, "size"}); err == nil {
 			blocks = append(blocks, b)
 		}
 	}
@@ -548,12 +593,12 @@ func (h *Handler) GetBlock(c *gin.Context) {
 			 FROM blocks WHERE number = $1`,
 			num,
 		).Scan(
-			&block["number"], &block["hash"], &block["parent_hash"], &block["nonce"],
-			&block["sha3_uncles"], &block["logs_bloom"], &block["transactions_root"],
-			&block["state_root"], &block["receipts_root"], &block["miner"], &block["difficulty"],
-			&block["total_difficulty"], &block["gas_limit"], &block["gas_used"], &block["timestamp"],
-			&block["size"], &block["extra_data"], &block["base_fee_per_gas"], &block["tx_count"],
-			&block["reward"],
+			&cell{block, "number"}, &cell{block, "hash"}, &cell{block, "parent_hash"}, &cell{block, "nonce"},
+			&cell{block, "sha3_uncles"}, &cell{block, "logs_bloom"}, &cell{block, "transactions_root"},
+			&cell{block, "state_root"}, &cell{block, "receipts_root"}, &cell{block, "miner"}, &cell{block, "difficulty"},
+			&cell{block, "total_difficulty"}, &cell{block, "gas_limit"}, &cell{block, "gas_used"}, &cell{block, "timestamp"},
+			&cell{block, "size"}, &cell{block, "extra_data"}, &cell{block, "base_fee_per_gas"}, &cell{block, "tx_count"},
+			&cell{block, "reward"},
 		)
 	} else {
 		// Try as hash
@@ -565,12 +610,12 @@ func (h *Handler) GetBlock(c *gin.Context) {
 			 FROM blocks WHERE hash = $1`,
 			numberOrHash,
 		).Scan(
-			&block["number"], &block["hash"], &block["parent_hash"], &block["nonce"],
-			&block["sha3_uncles"], &block["logs_bloom"], &block["transactions_root"],
-			&block["state_root"], &block["receipts_root"], &block["miner"], &block["difficulty"],
-			&block["total_difficulty"], &block["gas_limit"], &block["gas_used"], &block["timestamp"],
-			&block["size"], &block["extra_data"], &block["base_fee_per_gas"], &block["tx_count"],
-			&block["reward"],
+			&cell{block, "number"}, &cell{block, "hash"}, &cell{block, "parent_hash"}, &cell{block, "nonce"},
+			&cell{block, "sha3_uncles"}, &cell{block, "logs_bloom"}, &cell{block, "transactions_root"},
+			&cell{block, "state_root"}, &cell{block, "receipts_root"}, &cell{block, "miner"}, &cell{block, "difficulty"},
+			&cell{block, "total_difficulty"}, &cell{block, "gas_limit"}, &cell{block, "gas_used"}, &cell{block, "timestamp"},
+			&cell{block, "size"}, &cell{block, "extra_data"}, &cell{block, "base_fee_per_gas"}, &cell{block, "tx_count"},
+			&cell{block, "reward"},
 		)
 	}
 
@@ -589,9 +634,9 @@ func (h *Handler) GetLatestBlock(c *gin.Context) {
 		`SELECT number, hash, parent_hash, miner, gas_limit, gas_used, timestamp, tx_count, size
 		 FROM blocks ORDER BY number DESC LIMIT 1`,
 	).Scan(
-		&block["number"], &block["hash"], &block["parent_hash"], &block["miner"],
-		&block["gas_limit"], &block["gas_used"], &block["timestamp"], &block["tx_count"],
-		&block["size"],
+		&cell{block, "number"}, &cell{block, "hash"}, &cell{block, "parent_hash"}, &cell{block, "miner"},
+		&cell{block, "gas_limit"}, &cell{block, "gas_used"}, &cell{block, "timestamp"}, &cell{block, "tx_count"},
+		&cell{block, "size"},
 	)
 
 	if err != nil {
@@ -636,9 +681,9 @@ func (h *Handler) GetTransactions(c *gin.Context) {
 	var txs []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["hash"], &t["from_address"], &t["to_address"], &t["value"],
-			&t["gas_price"], &t["gas_limit"], &t["gas_used"], &t["status"],
-			&t["block_number"], &t["timestamp"]); err == nil {
+		if err := rows.Scan(&cell{t, "hash"}, &cell{t, "from_address"}, &cell{t, "to_address"}, &cell{t, "value"},
+			&cell{t, "gas_price"}, &cell{t, "gas_limit"}, &cell{t, "gas_used"}, &cell{t, "status"},
+			&cell{t, "block_number"}, &cell{t, "timestamp"}); err == nil {
 			txs = append(txs, t)
 		}
 	}
@@ -657,10 +702,10 @@ func (h *Handler) GetTransaction(c *gin.Context) {
 		 FROM transactions WHERE hash = $1`,
 		hash,
 	).Scan(
-		&tx["hash"], &tx["nonce"], &tx["from_address"], &tx["to_address"],
-		&tx["value"], &tx["gas_price"], &tx["gas_limit"], &tx["gas_used"],
-		&tx["input"], &tx["v"], &tx["r"], &tx["s"], &tx["chain_id"],
-		&tx["status"], &tx["block_number"], &tx["timestamp"],
+		&cell{tx, "hash"}, &cell{tx, "nonce"}, &cell{tx, "from_address"}, &cell{tx, "to_address"},
+		&cell{tx, "value"}, &cell{tx, "gas_price"}, &cell{tx, "gas_limit"}, &cell{tx, "gas_used"},
+		&cell{tx, "input"}, &cell{tx, "v"}, &cell{tx, "r"}, &cell{tx, "s"}, &cell{tx, "chain_id"},
+		&cell{tx, "status"}, &cell{tx, "block_number"}, &cell{tx, "timestamp"},
 	)
 
 	if err != nil {
@@ -682,9 +727,9 @@ func (h *Handler) GetTransactionReceipt(c *gin.Context) {
 		 FROM transactions WHERE hash = $1`,
 		hash,
 	).Scan(
-		&receipt["transaction_hash"], &receipt["block_hash"], &receipt["block_number"],
-		&receipt["cumulative_gas_used"], &receipt["gas_used"], &receipt["contract_address"],
-		&receipt["logs"], &receipt["logs_bloom"], &receipt["status"],
+		&cell{receipt, "transaction_hash"}, &cell{receipt, "block_hash"}, &cell{receipt, "block_number"},
+		&cell{receipt, "cumulative_gas_used"}, &cell{receipt, "gas_used"}, &cell{receipt, "contract_address"},
+		&cell{receipt, "logs"}, &cell{receipt, "logs_bloom"}, &cell{receipt, "status"},
 	)
 
 	if err != nil {
@@ -712,8 +757,8 @@ func (h *Handler) GetInternalTransactions(c *gin.Context) {
 	var internals []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["depth"], &t["call_type"], &t["from_address"],
-			&t["to_address"], &t["value"], &t["input"], &t["output"]); err == nil {
+		if err := rows.Scan(&cell{t, "depth"}, &cell{t, "call_type"}, &cell{t, "from_address"},
+			&cell{t, "to_address"}, &cell{t, "value"}, &cell{t, "input"}, &cell{t, "output"}); err == nil {
 			internals = append(internals, t)
 		}
 	}
@@ -756,9 +801,9 @@ func (h *Handler) GetTokens(c *gin.Context) {
 	var tokens []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["address"], &t["name"], &t["symbol"], &t["decimals"],
-			&t["total_supply"], &t["holders_count"], &t["transfers_count"],
-			&t["price_usd"], &t["market_cap"], &t["is_verified"]); err == nil {
+		if err := rows.Scan(&cell{t, "address"}, &cell{t, "name"}, &cell{t, "symbol"}, &cell{t, "decimals"},
+			&cell{t, "total_supply"}, &cell{t, "holders_count"}, &cell{t, "transfers_count"},
+			&cell{t, "price_usd"}, &cell{t, "market_cap"}, &cell{t, "is_verified"}); err == nil {
 			tokens = append(tokens, t)
 		}
 	}
@@ -778,11 +823,11 @@ func (h *Handler) GetToken(c *gin.Context) {
 		 FROM tokens WHERE address = $1`,
 		address,
 	).Scan(
-		&token["address"], &token["name"], &token["symbol"], &token["decimals"],
-		&token["total_supply"], &token["holders_count"], &token["transfers_count"],
-		&token["price_usd"], &token["price_change_24h"], &token["market_cap"],
-		&token["volume_24h"], &token["is_verified"], &token["description"],
-		&token["website"], &token["social"],
+		&cell{token, "address"}, &cell{token, "name"}, &cell{token, "symbol"}, &cell{token, "decimals"},
+		&cell{token, "total_supply"}, &cell{token, "holders_count"}, &cell{token, "transfers_count"},
+		&cell{token, "price_usd"}, &cell{token, "price_change_24h"}, &cell{token, "market_cap"},
+		&cell{token, "volume_24h"}, &cell{token, "is_verified"}, &cell{token, "description"},
+		&cell{token, "website"}, &cell{token, "social"},
 	)
 
 	if err != nil {
@@ -811,7 +856,7 @@ func (h *Handler) GetTokenHolders(c *gin.Context) {
 	var holders []map[string]interface{}
 	for rows.Next() {
 		var h map[string]interface{}
-		if err := rows.Scan(&h["address"], &h["balance"], &h["percent_holdings"]); err == nil {
+		if err := rows.Scan(&cell{h, "address"}, &cell{h, "balance"}, &cell{h, "percent_holdings"}); err == nil {
 			holders = append(holders, h)
 		}
 	}
@@ -851,8 +896,8 @@ func (h *Handler) GetTokenTransfers(c *gin.Context) {
 	var transfers []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["from_address"], &t["to_address"], &t["value"],
-			&t["transaction_hash"], &t["block_number"]); err == nil {
+		if err := rows.Scan(&cell{t, "from_address"}, &cell{t, "to_address"}, &cell{t, "value"},
+			&cell{t, "transaction_hash"}, &cell{t, "block_number"}); err == nil {
 			transfers = append(transfers, t)
 		}
 	}
@@ -906,9 +951,9 @@ func (h *Handler) GetNFTCollections(c *gin.Context) {
 	var collections []map[string]interface{}
 	for rows.Next() {
 		var c map[string]interface{}
-		if err := rows.Scan(&c["address"], &c["name"], &c["symbol"], &c["contract_type"],
-			&c["total_supply"], &c["holders_count"], &c["transfers_count"],
-			&c["floor_price"], &c["volume_24h"], &c["is_verified"]); err == nil {
+		if err := rows.Scan(&cell{c, "address"}, &cell{c, "name"}, &cell{c, "symbol"}, &cell{c, "contract_type"},
+			&cell{c, "total_supply"}, &cell{c, "holders_count"}, &cell{c, "transfers_count"},
+			&cell{c, "floor_price"}, &cell{c, "volume_24h"}, &cell{c, "is_verified"}); err == nil {
 			collections = append(collections, c)
 		}
 	}
@@ -928,9 +973,9 @@ func (h *Handler) GetNFT(c *gin.Context) {
 		 FROM nfts WHERE token_address = $1 AND token_id = $2`,
 		collection, tokenID,
 	).Scan(
-		&nft["token_address"], &nft["token_id"], &nft["owner"], &nft["uri"],
-		&nft["metadata"], &nft["name"], &nft["description"], &nft["image_url"],
-		&nft["attributes"], &nft["is_burned"],
+		&cell{nft, "token_address"}, &cell{nft, "token_id"}, &cell{nft, "owner"}, &cell{nft, "uri"},
+		&cell{nft, "metadata"}, &cell{nft, "name"}, &cell{nft, "description"}, &cell{nft, "image_url"},
+		&cell{nft, "attributes"}, &cell{nft, "is_burned"},
 	)
 
 	if err != nil {
@@ -959,8 +1004,8 @@ func (h *Handler) GetNFTTransfers(c *gin.Context) {
 	var transfers []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["from_address"], &t["to_address"], &t["token_id"],
-			&t["value"], &t["transaction_hash"], &t["block_number"]); err == nil {
+		if err := rows.Scan(&cell{t, "from_address"}, &cell{t, "to_address"}, &cell{t, "token_id"},
+			&cell{t, "value"}, &cell{t, "transaction_hash"}, &cell{t, "block_number"}); err == nil {
 			transfers = append(transfers, t)
 		}
 	}
@@ -983,9 +1028,9 @@ func (h *Handler) GetAccount(c *gin.Context) {
 		 FROM accounts WHERE address = $1`,
 		address,
 	).Scan(
-		&account["address"], &account["balance"], &account["nonce"],
-		&account["code_hash"], &account["is_contract"], &account["is_verified"],
-		&account["token_balance_count"], &account["nft_balance_count"],
+		&cell{account, "address"}, &cell{account, "balance"}, &cell{account, "nonce"},
+		&cell{account, "code_hash"}, &cell{account, "is_contract"}, &cell{account, "is_verified"},
+		&cell{account, "token_balance_count"}, &cell{account, "nft_balance_count"},
 	)
 
 	if err != nil {
@@ -1021,9 +1066,9 @@ func (h *Handler) GetAccountTransactions(c *gin.Context) {
 	var txs []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["hash"], &t["from_address"], &t["to_address"],
-			&t["value"], &t["gas_used"], &t["status"], &t["block_number"],
-			&t["timestamp"]); err == nil {
+		if err := rows.Scan(&cell{t, "hash"}, &cell{t, "from_address"}, &cell{t, "to_address"},
+			&cell{t, "value"}, &cell{t, "gas_used"}, &cell{t, "status"}, &cell{t, "block_number"},
+			&cell{t, "timestamp"}); err == nil {
 			txs = append(txs, t)
 		}
 	}
@@ -1051,8 +1096,8 @@ func (h *Handler) GetAccountTokens(c *gin.Context) {
 	var tokens []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["token_address"], &t["name"], &t["symbol"],
-			&t["decimals"], &t["balance"]); err == nil {
+		if err := rows.Scan(&cell{t, "token_address"}, &cell{t, "name"}, &cell{t, "symbol"},
+			&cell{t, "decimals"}, &cell{t, "balance"}); err == nil {
 			tokens = append(tokens, t)
 		}
 	}
@@ -1080,8 +1125,8 @@ func (h *Handler) GetAccountNFTs(c *gin.Context) {
 	var nfts []map[string]interface{}
 	for rows.Next() {
 		var n map[string]interface{}
-		if err := rows.Scan(&n["token_address"], &n["name"], &n["token_id"],
-			&n["image_url"]); err == nil {
+		if err := rows.Scan(&cell{n, "token_address"}, &cell{n, "name"}, &cell{n, "token_id"},
+			&cell{n, "image_url"}); err == nil {
 			nfts = append(nfts, n)
 		}
 	}
@@ -1105,12 +1150,12 @@ func (h *Handler) GetContract(c *gin.Context) {
 		 FROM contracts WHERE address = $1`,
 		address,
 	).Scan(
-		&contract["address"], &contract["contract_name"], &contract["compiler"],
-		&contract["compiler_version"], &contract["optimization_enabled"],
-		&contract["optimization_runs"], &contract["evm_version"], &contract["license_type"],
-		&contract["source_code"], &contract["abi"], &contract["bytecode"],
-		&contract["runtime_bytecode"], &contract["is_verified"], &contract["verification_status"],
-		&contract["verified_at"],
+		&cell{contract, "address"}, &cell{contract, "contract_name"}, &cell{contract, "compiler"},
+		&cell{contract, "compiler_version"}, &cell{contract, "optimization_enabled"},
+		&cell{contract, "optimization_runs"}, &cell{contract, "evm_version"}, &cell{contract, "license_type"},
+		&cell{contract, "source_code"}, &cell{contract, "abi"}, &cell{contract, "bytecode"},
+		&cell{contract, "runtime_bytecode"}, &cell{contract, "is_verified"}, &cell{contract, "verification_status"},
+		&cell{contract, "verified_at"},
 	)
 
 	if err != nil {
@@ -1174,14 +1219,88 @@ func (h *Handler) ReadContract(c *gin.Context) {
 		return
 	}
 
-	// This is a placeholder - in production, make eth_call via RPC
-	c.JSON(http.StatusOK, gin.H{
-		"result": "0x",
+	result, err := h.ethCall(c.Request.Context(), address, body.Method, body.Params)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"result": result})
+}
+
+// ethCall executes a read-only call against the node and returns the raw
+// return data. The call is sent with an explicit zero `from`, so no account
+// state is assumed on the caller's behalf.
+func (h *Handler) ethCall(ctx context.Context, to, method string, params []string) (string, error) {
+	if h.config.RPC.URL == "" {
+		return "", fmt.Errorf("rpc url is not configured")
+	}
+	if !hexAddress.MatchString(to) {
+		return "", fmt.Errorf("invalid contract address %q", to)
+	}
+	if !hexFunctionSelector.MatchString(method) {
+		return "", fmt.Errorf("method must be a 4-byte hex selector, got %q", method)
+	}
+	for _, p := range params {
+		if !hexWord.MatchString(p) {
+			return "", fmt.Errorf("parameter %q is not a 32-byte hex word", p)
+		}
+	}
+
+	data := method
+	for _, p := range params {
+		data += strings.TrimPrefix(p, "0x")
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_call",
+		"params": []any{
+			map[string]any{
+				"to":   to,
+				"from": "0x0000000000000000000000000000000000000000",
+				"data": data,
+			},
+			"latest",
+		},
 	})
+	if err != nil {
+		return "", err
+	}
+
+	timeout := 15 * time.Second
+	if h.config.RPC.Timeout > 0 {
+		timeout = time.Duration(h.config.RPC.Timeout) * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(h.config.RPC.URL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.Error != nil {
+		return "", fmt.Errorf("rpc error: %s", out.Error.Message)
+	}
+	return out.Result, nil
 }
 
 func (h *Handler) WriteContract(c *gin.Context) {
 	address := c.Param("address")
+	if !hexAddress.MatchString(address) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid contract address"})
+		return
+	}
 
 	var body struct {
 		Method string `json:"method"`
@@ -1194,10 +1313,54 @@ func (h *Handler) WriteContract(c *gin.Context) {
 		return
 	}
 
-	// This is a placeholder - in production, send raw transaction via RPC
-	c.JSON(http.StatusOK, gin.H{
-		"hash": "0x",
+	if h.config.RPC.URL == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rpc url is not configured"})
+		return
+	}
+	if !hexRawTx.MatchString(body.Signed) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "signed transaction is not a hex string"})
+		return
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_sendRawTransaction",
+		"params":  []any{body.Signed},
 	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	timeout := 15 * time.Second
+	if h.config.RPC.Timeout > 0 {
+		timeout = time.Duration(h.config.RPC.Timeout) * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Post(h.config.RPC.URL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Result string `json:"result"`
+		Error  *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	if out.Error != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": out.Error.Message})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"hash": out.Result})
 }
 
 // ============================================================================
@@ -1219,9 +1382,9 @@ func (h *Handler) GetValidators(c *gin.Context) {
 	var validators []map[string]interface{}
 	for rows.Next() {
 		var v map[string]interface{}
-		if err := rows.Scan(&v["address"], &v["moniker"], &v["self_delegation"],
-			&v["delegation"], &v["total_stake"], &v["uptime"], &v["blocks_count"],
-			&v["is_active"]); err == nil {
+		if err := rows.Scan(&cell{v, "address"}, &cell{v, "moniker"}, &cell{v, "self_delegation"},
+			&cell{v, "delegation"}, &cell{v, "total_stake"}, &cell{v, "uptime"}, &cell{v, "blocks_count"},
+			&cell{v, "is_active"}); err == nil {
 			validators = append(validators, v)
 		}
 	}
@@ -1247,7 +1410,7 @@ func (h *Handler) Search(c *gin.Context) {
 		err := h.db.QueryRowContext(c.Request.Context(),
 			"SELECT address, balance, is_contract FROM accounts WHERE address = $1",
 			query,
-		).Scan(&account["address"], &account["balance"], &account["is_contract"])
+		).Scan(&cell{account, "address"}, &cell{account, "balance"}, &cell{account, "is_contract"})
 
 		if err == nil {
 			c.JSON(http.StatusOK, gin.H{"type": "address", "result": account})
@@ -1261,7 +1424,7 @@ func (h *Handler) Search(c *gin.Context) {
 		err := h.db.QueryRowContext(c.Request.Context(),
 			"SELECT hash, from, to, value FROM transactions WHERE hash = $1",
 			query,
-		).Scan(&tx["hash"], &tx["from"], &tx["to"], &tx["value"])
+		).Scan(&cell{tx, "hash"}, &cell{tx, "from"}, &cell{tx, "to"}, &cell{tx, "value"})
 
 		if err == nil {
 			c.JSON(http.StatusOK, gin.H{"type": "transaction", "result": tx})
@@ -1275,8 +1438,8 @@ func (h *Handler) Search(c *gin.Context) {
 		err := h.db.QueryRowContext(c.Request.Context(),
 			"SELECT number, hash, timestamp, miner, tx_count FROM blocks WHERE number = $1",
 			num,
-		).Scan(&block["number"], &block["hash"], &block["timestamp"],
-			&block["miner"], &block["tx_count"])
+		).Scan(&cell{block, "number"}, &cell{block, "hash"}, &cell{block, "timestamp"},
+			&cell{block, "miner"}, &cell{block, "tx_count"})
 
 		if err == nil {
 			c.JSON(http.StatusOK, gin.H{"type": "block", "result": block})
@@ -1294,7 +1457,7 @@ func (h *Handler) Search(c *gin.Context) {
 		defer rows.Close()
 		for rows.Next() {
 			var t map[string]interface{}
-			if err := rows.Scan(&t["address"], &t["name"], &t["symbol"]); err == nil {
+			if err := rows.Scan(&cell{t, "address"}, &cell{t, "name"}, &cell{t, "symbol"}); err == nil {
 				tokens = append(tokens, t)
 			}
 		}
@@ -1374,8 +1537,8 @@ func (h *Handler) GetPendingTransactions(c *gin.Context) {
 	var txs []map[string]interface{}
 	for rows.Next() {
 		var t map[string]interface{}
-		if err := rows.Scan(&t["hash"], &t["nonce"], &t["from_address"], &t["to_address"],
-			&t["value"], &t["gas_price"], &t["gas_limit"], &t["input"]); err == nil {
+		if err := rows.Scan(&cell{t, "hash"}, &cell{t, "nonce"}, &cell{t, "from_address"}, &cell{t, "to_address"},
+			&cell{t, "value"}, &cell{t, "gas_price"}, &cell{t, "gas_limit"}, &cell{t, "input"}); err == nil {
 			txs = append(txs, t)
 		}
 	}
@@ -1388,7 +1551,7 @@ func (h *Handler) GetPendingTransactions(c *gin.Context) {
 // ============================================================================
 
 func computeHMAC(data []byte, secret string) string {
-	h := sha256.New()
+	h := hmac.New(sha256.New, []byte(secret))
 	h.Write(data)
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
@@ -1490,15 +1653,7 @@ func main() {
 	}))
 
 	if config.RateLimit.Enabled {
-		store := throttled.NewMemoryStore(throttled.RateQuota{
-			MaxRate:  rate.Limit(config.RateLimit.RequestsPerSecond),
-			MaxBurst: config.RateLimit.Burst,
-		})
-		throttled := throttled.Throttle(store, &throttled.Quota{
-			MaxRate:  rate.Limit(config.RateLimit.RequestsPerSecond),
-			MaxBurst: config.RateLimit.Burst,
-		})
-		router.Use(throttled)
+		router.Use(RateLimitMiddleware(handler.rateLimiter))
 	}
 
 	// API routes
