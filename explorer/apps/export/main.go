@@ -13,9 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	
-	"tigersmartchain/explorer/services/tokens"
-	"tigersmartchain/explorer/services/nfts"
-	"tigersmartchain/explorer/services/analytics"
 )
 
 // Config holds the export service configuration
@@ -41,9 +38,6 @@ const (
 type ExportService struct {
 	config     *Config
 	db         *pgx.Conn
-	tokenSvc  *tokens.TokenService
-	nftSvc    *nfts.NFTService
-	analyticsSvc *analytics.AnalyticsService
 }
 
 // NewExportService creates a new export service
@@ -58,13 +52,6 @@ func NewExportService(config *Config) (*ExportService, error) {
 		config:    config,
 		db:        db,
 	}, nil
-}
-
-// SetServices sets the backend services
-func (s *ExportService) SetServices(tokenSvc *tokens.TokenService, nftSvc *nfts.NFTService, analyticsSvc *analytics.AnalyticsService) {
-	s.tokenSvc = tokenSvc
-	s.nftSvc = nftSvc
-	s.analyticsSvc = analyticsSvc
 }
 
 // ExportRequest represents an export request

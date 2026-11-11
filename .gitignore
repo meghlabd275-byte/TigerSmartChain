@@ -36,3 +36,7 @@ crypto_cpp/crypto_test
 
 # Node runtime data (chain, state, P2P identity key)
 node/data/
+
+# Go compiled binaries
+/explorer/cli
+/explorer/tigerscan-api

@@ -6,7 +6,6 @@ package rpc_client_complete
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
@@ -39,21 +38,21 @@ type Config struct {
 	// TLS settings
 	UseTLS bool `json:"use_tls"`
 	// HTTP client settings
-	HTTPTimeout time.Duration `json:"http_timeout"`
-	MaxIdleConns int `json:"max_idle_conns"`
+	HTTPTimeout  time.Duration `json:"http_timeout"`
+	MaxIdleConns int           `json:"max_idle_conns"`
 	// Connection pool settings
-	MaxConns       int           `json:"max_conns"`
-	MaxConcurrent int           `json:"max_concurrent"`
+	MaxConns      int `json:"max_conns"`
+	MaxConcurrent int `json:"max_concurrent"`
 	// Retry settings
 	MaxRetries int           `json:"max_retries"`
 	RetryDelay time.Duration `json:"retry_delay"`
 	// Cache settings
 	CacheEnabled bool          `json:"cache_enabled"`
 	CacheTTL     time.Duration `json:"cache_ttl"`
-	CacheSize   int           `json:"cache_size"`
+	CacheSize    int           `json:"cache_size"`
 	// Rate limiting
 	RateLimit int `json:"rate_limit"` // requests per second
-	Burst    int `json:"burst"`
+	Burst     int `json:"burst"`
 	// Archive mode
 	ArchiveMode bool `json:"archive_mode"`
 }
@@ -61,16 +60,16 @@ type Config struct {
 // DefaultConfig returns production default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		HTTPTimeout:     30 * time.Second,
-		MaxIdleConns:    100,
-		MaxConns:        100,
-		MaxConcurrent:   50,
-		MaxRetries:      3,
-		RetryDelay:      100 * time.Millisecond,
-		CacheEnabled:    true,
-		CacheTTL:       5 * time.Second,
-		CacheSize:      10000,
-		RateLimit:      100,
+		HTTPTimeout:   30 * time.Second,
+		MaxIdleConns:  100,
+		MaxConns:      100,
+		MaxConcurrent: 50,
+		MaxRetries:    3,
+		RetryDelay:    100 * time.Millisecond,
+		CacheEnabled:  true,
+		CacheTTL:      5 * time.Second,
+		CacheSize:     10000,
+		RateLimit:     100,
 		Burst:         200,
 		ArchiveMode:   false,
 	}
@@ -82,28 +81,28 @@ func DefaultConfig() *Config {
 
 // Client is a production-grade RPC client
 type Client struct {
-	config        *Config
+	config       *Config
 	pools        []*connPool
 	archivePools []*connPool
-	wsPools     []*wsPool
+	wsPools      []*wsPool
 	mu           sync.RWMutex
-	currentPool int
-	metrics     *Metrics
-	cache       *Cache
-	rateLimiter *RateLimiter
+	currentPool  int
+	metrics      *Metrics
+	cache        *Cache
+	rateLimiter  *RateLimiter
 }
 
 // Metrics tracks client performance
 type Metrics struct {
-	mu              sync.RWMutex
-	Requests        uint64
-	Successes       uint64
-	Failures        uint64
-	LatencySum      time.Duration
-	LatencyCount    uint64
-	ActiveConns     uint64
-	CacheHits       uint64
-	CacheMisses     uint64
+	mu             sync.RWMutex
+	Requests       uint64
+	Successes      uint64
+	Failures       uint64
+	LatencySum     time.Duration
+	LatencyCount   uint64
+	ActiveConns    uint64
+	CacheHits      uint64
+	CacheMisses    uint64
 	ArchiveQueries uint64
 }
 
@@ -114,9 +113,9 @@ func NewClient(config *Config) (*Client, error) {
 	}
 
 	client := &Client{
-		config:    config,
-		metrics:  &Metrics{},
-		cache:    NewCache(config.CacheSize, config.CacheTTL),
+		config:      config,
+		metrics:     &Metrics{},
+		cache:       NewCache(config.CacheSize, config.CacheTTL),
 		rateLimiter: NewRateLimiter(config.RateLimit, config.Burst),
 	}
 
@@ -167,12 +166,12 @@ func (c *Client) initPools() error {
 // ============================================================================
 
 type connPool struct {
-	client      *rpc.Client
-	url         string
-	mu          sync.Mutex
-	inUse       int
-	available   int
-	lastUsed    time.Time
+	client     *rpc.Client
+	url        string
+	mu         sync.Mutex
+	inUse      int
+	available  int
+	lastUsed   time.Time
 	failed     bool
 	failCount  int
 	latencySum time.Duration
@@ -201,7 +200,7 @@ func newConnPool(rpcURL string, config *Config) (*connPool, error) {
 
 	return &connPool{
 		client:    client,
-		url:      rpcURL,
+		url:       rpcURL,
 		available: config.MaxConns,
 	}, nil
 }
@@ -210,7 +209,7 @@ type wsPool struct {
 	client *rpc.Client
 	url    string
 	mu     sync.Mutex
-	subs  map[rpc.ID]*Subscription
+	subs   map[rpc.ID]*Subscription
 }
 
 type Subscription struct {
@@ -220,15 +219,15 @@ type Subscription struct {
 }
 
 func newWsPool(wsURL string, config *Config) (*wsPool, error) {
-	client, err := rpc.DialWebSocket(context.Background(), wsURL, "")
+	client, err := rpc.DialWebsocket(context.Background(), wsURL, "")
 	if err != nil {
 		return nil, err
 	}
 
 	return &wsPool{
 		client: client,
-		url:   wsURL,
-		subs:  make(map[rpc.ID]*Subscription),
+		url:    wsURL,
+		subs:   make(map[rpc.ID]*Subscription),
 	}, nil
 }
 
@@ -238,25 +237,25 @@ func newWsPool(wsURL string, config *Config) (*wsPool, error) {
 
 // Cache implements thread-safe LRU cache
 type Cache struct {
-	mu     sync.RWMutex
-	items  map[string]*CacheItem
-	lru    []string
+	mu      sync.RWMutex
+	items   map[string]*CacheItem
+	lru     []string
 	maxSize int
-	ttl    time.Duration
+	ttl     time.Duration
 }
 
 type CacheItem struct {
-	Value    interface{}
-	Expiry  time.Time
+	Value  interface{}
+	Expiry time.Time
 }
 
 // NewCache creates a new cache
 func NewCache(maxSize int, ttl time.Duration) *Cache {
 	return &Cache{
-		items:  make(map[string]*CacheItem),
-		lru:    make([]string, 0, maxSize),
+		items:   make(map[string]*CacheItem),
+		lru:     make([]string, 0, maxSize),
 		maxSize: maxSize,
-		ttl:    ttl,
+		ttl:     ttl,
 	}
 }
 
@@ -301,18 +300,18 @@ func (c *Cache) Set(key string, value interface{}) {
 
 // RateLimiter implements token bucket rate limiting
 type RateLimiter struct {
-	mu       sync.Mutex
-	tokens   float64
-	max      float64
-	rate     float64
+	mu         sync.Mutex
+	tokens     float64
+	max        float64
+	rate       float64
 	lastRefill time.Time
 }
 
 func NewRateLimiter(rate, burst int) *RateLimiter {
 	return &RateLimiter{
-		tokens:   float64(burst),
-		max:     float64(burst),
-		rate:    float64(rate),
+		tokens:     float64(burst),
+		max:        float64(burst),
+		rate:       float64(rate),
 		lastRefill: time.Now(),
 	}
 }
@@ -340,28 +339,28 @@ func (r *RateLimiter) Allow() bool {
 
 // BlockResult represents a block
 type BlockResult struct {
-	Number           hexutil.Uint64     `json:"number"`
-	Hash            common.Hash     `json:"hash"`
-	ParentHash      common.Hash     `json:"parentHash"`
-	Nonce           types.Nonce    `json:"nonce"`
-	Sha3Uncles     common.Hash    `json:"sha3Uncles"`
-	LogsBloom      types.Bloom    `json:"logsBloom"`
-	TransactionsRoot common.Hash  `json:"transactionsRoot"`
-	StateRoot      common.Hash   `json:"stateRoot"`
-	ReceiptsRoot   common.Hash   `json:"receiptsRoot"`
-	Miner          common.Address `json:"miner"`
-	Difficulty     hexutil.Uint64 `json:"difficulty"`
-	TotalDifficulty hexutil.Uint64 `json:"totalDifficulty"`
-	ExtraData     hexutil.Bytes `json:"extraData"`
-	GasLimit      hexutil.Uint64 `json:"gasLimit"`
-	GasUsed       hexutil.Uint64 `json:"gasUsed"`
-	Timestamp     hexutil.Uint64 `json:"timestamp"`
-	BaseFeePerGas hexutil.Uint64 `json:"baseFeePerGas"`
-	MixHash      common.Hash    `json:"mixHash"`
-	HashUncles   common.Hash  `json:"hashUncles"`
-	Size         hexutil.Uint64 `json:"size"`
-	Transactions []interface{} `json:"transactions"`
-	Uncles       []common.Hash `json:"uncles"`
+	Number           hexutil.Uint64   `json:"number"`
+	Hash             common.Hash      `json:"hash"`
+	ParentHash       common.Hash      `json:"parentHash"`
+	Nonce            types.BlockNonce `json:"nonce"`
+	Sha3Uncles       common.Hash      `json:"sha3Uncles"`
+	LogsBloom        types.Bloom      `json:"logsBloom"`
+	TransactionsRoot common.Hash      `json:"transactionsRoot"`
+	StateRoot        common.Hash      `json:"stateRoot"`
+	ReceiptsRoot     common.Hash      `json:"receiptsRoot"`
+	Miner            common.Address   `json:"miner"`
+	Difficulty       hexutil.Uint64   `json:"difficulty"`
+	TotalDifficulty  hexutil.Uint64   `json:"totalDifficulty"`
+	ExtraData        hexutil.Bytes    `json:"extraData"`
+	GasLimit         hexutil.Uint64   `json:"gasLimit"`
+	GasUsed          hexutil.Uint64   `json:"gasUsed"`
+	Timestamp        hexutil.Uint64   `json:"timestamp"`
+	BaseFeePerGas    hexutil.Uint64   `json:"baseFeePerGas"`
+	MixHash          common.Hash      `json:"mixHash"`
+	HashUncles       common.Hash      `json:"hashUncles"`
+	Size             hexutil.Uint64   `json:"size"`
+	Transactions     []interface{}    `json:"transactions"`
+	Uncles           []common.Hash    `json:"uncles"`
 }
 
 // GetBlockByNumber returns a block by number
@@ -428,20 +427,20 @@ func (c *Client) GetLatestBlock(ctx context.Context) (*BlockResult, error) {
 
 // TransactionResult represents a transaction
 type TransactionResult struct {
-	Hash             common.Hash    `json:"hash"`
-	Nonce            hexutil.Uint64 `json:"nonce"`
-	BlockHash        common.Hash  `json:"blockHash"`
-	BlockNumber      hexutil.Uint64 `json:"blockNumber"`
-	TransactionIndex hexutil.Uint64 `json:"transactionIndex"`
-	From            common.Address `json:"from"`
-	To              *common.Address `json:"to"`
-	Value           hexutil.Bytes  `json:"value"`
-	GasPrice        hexutil.Bytes `json:"gasPrice"`
-	Gas             hexutil.Uint64 `json:"gas"`
-	Input           hexutil.Bytes `json:"input"`
-	Raw             hexutil.Bytes `json:"raw"`
-	ChainID         *hexutil.Uint64 `json:"chainId"`
-	Type            *hexutil.Uint64 `json:"type"`
+	Hash             common.Hash     `json:"hash"`
+	Nonce            hexutil.Uint64  `json:"nonce"`
+	BlockHash        common.Hash     `json:"blockHash"`
+	BlockNumber      hexutil.Uint64  `json:"blockNumber"`
+	TransactionIndex hexutil.Uint64  `json:"transactionIndex"`
+	From             common.Address  `json:"from"`
+	To               *common.Address `json:"to"`
+	Value            hexutil.Bytes   `json:"value"`
+	GasPrice         hexutil.Bytes   `json:"gasPrice"`
+	Gas              hexutil.Uint64  `json:"gas"`
+	Input            hexutil.Bytes   `json:"input"`
+	Raw              hexutil.Bytes   `json:"raw"`
+	ChainID          *hexutil.Uint64 `json:"chainId"`
+	Type             *hexutil.Uint64 `json:"type"`
 }
 
 // GetTransactionByHash returns a transaction by hash
@@ -462,15 +461,15 @@ func (c *Client) GetTransactionByHash(ctx context.Context, txHash common.Hash) (
 
 // GetTransactionReceipt returns a transaction receipt
 type ReceiptResult struct {
-	TransactionHash   common.Hash    `json:"transactionHash"`
-	BlockHash       common.Hash   `json:"blockHash"`
-	BlockNumber     hexutil.Uint64 `json:"blockNumber"`
-	CumulativeGasUsed hexutil.Uint64 `json:"cumulativeGasUsed"`
-	GasUsed        hexutil.Uint64 `json:"gasUsed"`
-	ContractAddress *common.Address `json:"contractAddress"`
-	Logs           []types.Log  `json:"logs"`
-	LogsBloom      types.Bloom `json:"logsBloom"`
-	Status        hexutil.Uint64 `json:"status"`
+	TransactionHash   common.Hash     `json:"transactionHash"`
+	BlockHash         common.Hash     `json:"blockHash"`
+	BlockNumber       hexutil.Uint64  `json:"blockNumber"`
+	CumulativeGasUsed hexutil.Uint64  `json:"cumulativeGasUsed"`
+	GasUsed           hexutil.Uint64  `json:"gasUsed"`
+	ContractAddress   *common.Address `json:"contractAddress"`
+	Logs              []types.Log     `json:"logs"`
+	LogsBloom         types.Bloom     `json:"logsBloom"`
+	Status            hexutil.Uint64  `json:"status"`
 }
 
 func (c *Client) GetTransactionReceipt(ctx context.Context, txHash common.Hash) (*ReceiptResult, error) {
@@ -510,12 +509,12 @@ func (c *Client) SendRawTransaction(ctx context.Context, signedTx []byte) (commo
 
 // CallMsg represents a call message
 type CallMsg struct {
-	From     common.Address `json:"from"`
+	From     common.Address  `json:"from"`
 	To       *common.Address `json:"to"`
-	Gas      hexutil.Uint64 `json:"gas"`
-	GasPrice hexutil.Bytes `json:"gasPrice"`
-	Value   hexutil.Bytes `json:"value"`
-	Data    hexutil.Bytes `json:"data"`
+	Gas      hexutil.Uint64  `json:"gas"`
+	GasPrice hexutil.Bytes   `json:"gasPrice"`
+	Value    hexutil.Bytes   `json:"value"`
+	Data     hexutil.Bytes   `json:"data"`
 }
 
 // Call executes a call without creating a transaction
@@ -541,13 +540,12 @@ func (c *Client) EstimateGas(ctx context.Context, msg CallMsg) (hexutil.Uint64, 
 		return 0, err
 	}
 
-	var result string
-	err = pool.client.CallContext(ctx, &result, "eth_estimateGas", msg)
-	if err != nil {
+	var result hexutil.Uint64
+	if err := pool.client.CallContext(ctx, &result, "eth_estimateGas", msg); err != nil {
 		return 0, err
 	}
 
-	return hexutil.DecodeUint64(result)
+	return result, nil
 }
 
 // ============================================================================
@@ -558,9 +556,9 @@ func (c *Client) EstimateGas(ctx context.Context, msg CallMsg) (hexutil.Uint64, 
 type LogFilter struct {
 	FromBlock string   `json:"fromBlock,omitempty"`
 	ToBlock   string   `json:"toBlock,omitempty"`
-	Address  string   `json:"address,omitempty"`
-	Topics   []string `json:"topics,omitempty"`
-	BlockHash string  `json:"blockHash,omitempty"`
+	Address   string   `json:"address,omitempty"`
+	Topics    []string `json:"topics,omitempty"`
+	BlockHash string   `json:"blockHash,omitempty"`
 }
 
 // GetLogs returns logs matching the filter
@@ -584,7 +582,7 @@ func (c *Client) GetLogsByBlockRange(ctx context.Context, fromBlock, toBlock uin
 	filter := LogFilter{
 		FromBlock: hexutil.EncodeUint64(fromBlock),
 		ToBlock:   hexutil.EncodeUint64(toBlock),
-		Address:  address.Hex(),
+		Address:   address.Hex(),
 	}
 
 	if len(topics) > 0 {
@@ -604,31 +602,31 @@ func (c *Client) GetLogsByBlockRange(ctx context.Context, fromBlock, toBlock uin
 
 // TraceConfig represents trace configuration
 type TraceConfig struct {
-	Tracer         string `json:"tracer"`
-	Timeout       string `json:"timeout,omitempty"`
-	RevertTrace    bool   `json:"revertTrace,omitempty"`
+	Tracer      string `json:"tracer"`
+	Timeout     string `json:"timeout,omitempty"`
+	RevertTrace bool   `json:"revertTrace,omitempty"`
 }
 
 // TraceAction represents trace action
 type TraceAction struct {
-	From     common.Address `json:"from"`
-	To       common.Address `json:"to"`
-	Input    string        `json:"input"`
-	Output   string        `json:"output"`
-	Value   string        `json:"value"`
-	Gas      string        `json:"gas"`
-	Type    string        `json:"type"`
+	From   common.Address `json:"from"`
+	To     common.Address `json:"to"`
+	Input  string         `json:"input"`
+	Output string         `json:"output"`
+	Value  string         `json:"value"`
+	Gas    string         `json:"gas"`
+	Type   string         `json:"type"`
 }
 
 // TraceResult represents trace result
 type TraceResult struct {
 	Action      TraceAction `json:"action"`
-	BlockHash  common.Hash `json:"blockHash"`
-	BlockNumber uint64     `json:"blockNumber"`
-	Result     interface{} `json:"result"`
-	Error      string      `json:"error,omitempty"`
-	TxHash     common.Hash `json:"transactionHash"`
-	Type       string     `json:"type"`
+	BlockHash   common.Hash `json:"blockHash"`
+	BlockNumber uint64      `json:"blockNumber"`
+	Result      interface{} `json:"result"`
+	Error       string      `json:"error,omitempty"`
+	TxHash      common.Hash `json:"transactionHash"`
+	Type        string      `json:"type"`
 }
 
 // TraceBlock returns traces for a block
@@ -685,31 +683,31 @@ func (c *Client) ReplayTransaction(ctx context.Context, txHash common.Hash, trac
 
 // DebugTraceConfig represents debug trace config
 type DebugTraceConfig struct {
-	Tracer         string `json:"tracer"`
-	Timeout       string `json:"timeout,omitempty"`
-	RevertTrace   bool   `json:"revertTrace,omitempty"`
-	DisableStack bool   `json:"disableStack,omitempty"`
-	DisableStorage bool `json:"disableStorage,omitempty"`
-	DisableMemory bool   `json:"disableMemory,omitempty"`
-	DisableReturnData bool `json:"disableReturnData,omitempty"`
+	Tracer            string `json:"tracer"`
+	Timeout           string `json:"timeout,omitempty"`
+	RevertTrace       bool   `json:"revertTrace,omitempty"`
+	DisableStack      bool   `json:"disableStack,omitempty"`
+	DisableStorage    bool   `json:"disableStorage,omitempty"`
+	DisableMemory     bool   `json:"disableMemory,omitempty"`
+	DisableReturnData bool   `json:"disableReturnData,omitempty"`
 }
 
 // DebugTraceResult represents debug trace result
 type DebugTraceResult struct {
-	Gas         int    `json:"gas"`
-	Failed      bool   `json:"failed"`
-	ReturnValue string  `json:"returnValue"`
-	StructLogs []StructLog `json:"structLogs"`
+	Gas         int         `json:"gas"`
+	Failed      bool        `json:"failed"`
+	ReturnValue string      `json:"returnValue"`
+	StructLogs  []StructLog `json:"structLogs"`
 }
 
 type StructLog struct {
-	PC      uint64  `json:"pc"`
-	Op      string `json:"op"`
-	Gas     uint64 `json:"gas"`
-	Cost    uint64 `json:"cost"`
-	Depth   int    `json:"depth"`
-	Stack   []string `json:"stack"`
-	Memory  []string `json:"memory"`
+	PC      uint64            `json:"pc"`
+	Op      string            `json:"op"`
+	Gas     uint64            `json:"gas"`
+	Cost    uint64            `json:"cost"`
+	Depth   int               `json:"depth"`
+	Stack   []string          `json:"stack"`
+	Memory  []string          `json:"memory"`
 	Storage map[string]string `json:"storage"`
 }
 
@@ -836,13 +834,13 @@ func (c *Client) GetTransactionCountAt(ctx context.Context, addr common.Address,
 // NewHeadsSubscription returns new block headers
 type NewHead struct {
 	Number     hexutil.Uint64 `json:"number"`
-	Hash      common.Hash   `json:"hash"`
-	ParentHash common.Hash   `json:"parentHash"`
-	Timestamp hexutil.Uint64 `json:"timestamp"`
+	Hash       common.Hash    `json:"hash"`
+	ParentHash common.Hash    `json:"parentHash"`
+	Timestamp  hexutil.Uint64 `json:"timestamp"`
 }
 
 // SubscribeNewHeads subscribes to new block headers
-func (c *Client) SubscribeNewHeads(ctx context.Context, ch chan<- NewHead) (rpc.Subscription, error) {
+func (c *Client) SubscribeNewHeads(ctx context.Context, ch chan<- NewHead) (*rpc.ClientSubscription, error) {
 	if len(c.wsPools) == 0 {
 		return nil, fmt.Errorf("no WebSocket endpoints configured")
 	}
@@ -857,7 +855,7 @@ type PendingTx struct {
 }
 
 // SubscribePendingTransactions subscribes to pending transactions
-func (c *Client) SubscribePendingTransactions(ctx context.Context, ch chan<- PendingTx) (rpc.Subscription, error) {
+func (c *Client) SubscribePendingTransactions(ctx context.Context, ch chan<- PendingTx) (*rpc.ClientSubscription, error) {
 	if len(c.wsPools) == 0 {
 		return nil, fmt.Errorf("no WebSocket endpoints configured")
 	}
@@ -869,12 +867,12 @@ func (c *Client) SubscribePendingTransactions(ctx context.Context, ch chan<- Pen
 // LogsSubscription returns logs
 type LogsSub struct {
 	Address common.Address `json:"address"`
-	Topics  []common.Hash `json:"topics"`
-	Data    hexutil.Bytes `json:"data"`
+	Topics  []common.Hash  `json:"topics"`
+	Data    hexutil.Bytes  `json:"data"`
 }
 
 // SubscribeLogs subscribes to logs
-func (c *Client) SubscribeLogs(ctx context.Context, ch chan<- types.Log, filter LogFilter) (rpc.Subscription, error) {
+func (c *Client) SubscribeLogs(ctx context.Context, ch chan<- types.Log, filter LogFilter) (*rpc.ClientSubscription, error) {
 	if len(c.wsPools) == 0 {
 		return nil, fmt.Errorf("no WebSocket endpoints configured")
 	}
@@ -889,11 +887,11 @@ func (c *Client) SubscribeLogs(ctx context.Context, ch chan<- types.Log, filter 
 
 // InternalTransaction represents an internal transaction
 type InternalTransaction struct {
-	From common.Address `json:"from"`
-	To   common.Address `json:"to"`
-	Value *big.Int    `json:"value"`
-	Gas  uint64      `json:"gas"`
-	Type string      `json:"type"`
+	From  common.Address `json:"from"`
+	To    common.Address `json:"to"`
+	Value *big.Int       `json:"value"`
+	Gas   uint64         `json:"gas"`
+	Type  string         `json:"type"`
 }
 
 // GetInternalTransactions returns internal transactions for a tx
@@ -914,11 +912,11 @@ func (c *Client) GetInternalTransactions(ctx context.Context, txHash common.Hash
 			gas, _ := hexutil.DecodeUint64(trace.Action.Gas)
 
 			internals = append(internals, InternalTransaction{
-				From: trace.Action.From,
-				To:   trace.Action.To,
+				From:  trace.Action.From,
+				To:    trace.Action.To,
 				Value: value,
-				Gas:  gas,
-				Type: trace.Type,
+				Gas:   gas,
+				Type:  trace.Type,
 			})
 		}
 	}
@@ -1003,12 +1001,12 @@ func (c *Client) GetMetrics() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"requests":          c.metrics.Requests,
-		"successes":        c.metrics.Successes,
-		"failures":         c.metrics.Failures,
-		"avg_latency":       avgLatency.String(),
-		"cache_hit_rate":   hitRate,
-		"active_conns":     c.metrics.ActiveConns,
+		"requests":        c.metrics.Requests,
+		"successes":       c.metrics.Successes,
+		"failures":        c.metrics.Failures,
+		"avg_latency":     avgLatency.String(),
+		"cache_hit_rate":  hitRate,
+		"active_conns":    c.metrics.ActiveConns,
 		"archive_queries": c.metrics.ArchiveQueries,
 	}
 }
@@ -1052,5 +1050,9 @@ func parseUint256(s string) (*big.Int, error) {
 	if s == "" {
 		return big.NewInt(0), nil
 	}
-	return new(big.Int).SetString(s, 16)
+	n, ok := new(big.Int).SetString(s, 16)
+	if !ok {
+		return nil, fmt.Errorf("invalid hex integer %q", s)
+	}
+	return n, nil
 }

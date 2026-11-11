@@ -58,10 +58,10 @@ func NewCacheService(config *RedisConfig) (*CacheService, error) {
 // =============================================================================
 
 const (
-	blockCacheTTL       = 5 * time.Minute
-	blockCachePrefix     = "block:"
-	latestBlockKey      = "latest:block"
-	blockCountKey       = "blocks:count"
+	blockCacheTTL    = 5 * time.Minute
+	blockCachePrefix = "block:"
+	latestBlockKey   = "latest:block"
+	blockCountKey    = "blocks:count"
 )
 
 // CacheBlock caches a block.
@@ -100,9 +100,9 @@ func (c *CacheService) GetLatestBlock() (uint64, error) {
 // =============================================================================
 
 const (
-	txCacheTTL       = 10 * time.Minute
-	txCachePrefix     = "tx:"
-	txCountKey       = "txs:count"
+	txCacheTTL    = 10 * time.Minute
+	txCachePrefix = "tx:"
+	txCountKey    = "txs:count"
 )
 
 // CacheTransaction caches a transaction.
@@ -130,8 +130,8 @@ func (c *CacheService) GetCachedTransaction(txHash string, result interface{}) e
 // =============================================================================
 
 const (
-	addrCacheTTL     = 15 * time.Minute
-	addrCachePrefix  = "addr:"
+	addrCacheTTL      = 15 * time.Minute
+	addrCachePrefix   = "addr:"
 	addrBalancePrefix = "balance:"
 )
 
@@ -172,8 +172,8 @@ func (c *CacheService) GetCachedBalance(addr string) (string, error) {
 // =============================================================================
 
 const (
-	tokenCacheTTL     = 30 * time.Minute
-	tokenCachePrefix = "token:"
+	tokenCacheTTL      = 30 * time.Minute
+	tokenCachePrefix   = "token:"
 	tokenHoldersPrefix = "holders:"
 )
 
@@ -251,7 +251,7 @@ func (c *CacheService) GetGasPrice() (uint64, error) {
 
 const (
 	rateLimitPrefix = "ratelimit:"
-	rateLimitTTL   = 60 * time.Second
+	rateLimitTTL    = 60 * time.Second
 )
 
 // CheckRateLimit checks if the request should be rate limited.

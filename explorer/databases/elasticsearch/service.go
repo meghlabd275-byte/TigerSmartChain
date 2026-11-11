@@ -4,7 +4,6 @@ package databases
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -112,18 +111,18 @@ func (es *ElasticsearchService) makeRequest(method, path string, body interface{
 var blocksMapping = map[string]interface{}{
 	"mappings": map[string]interface{}{
 		"properties": map[string]interface{}{
-			"number":        map[string]string{"type": "long"},
-			"hash":          map[string]string{"type": "keyword"},
-			"parentHash":    map[string]string{"type": "keyword"},
-			"timestamp":    map[string]string{"type": "date"},
-			"miner":         map[string]string{"type": "keyword"},
-			"gasUsed":      map[string]string{"type": "long"},
-			"gasLimit":     map[string]string{"type": "long"},
-			"difficulty":  map[string]string{"type": "long"},
+			"number":          map[string]string{"type": "long"},
+			"hash":            map[string]string{"type": "keyword"},
+			"parentHash":      map[string]string{"type": "keyword"},
+			"timestamp":       map[string]string{"type": "date"},
+			"miner":           map[string]string{"type": "keyword"},
+			"gasUsed":         map[string]string{"type": "long"},
+			"gasLimit":        map[string]string{"type": "long"},
+			"difficulty":      map[string]string{"type": "long"},
 			"totalDifficulty": map[string]string{"type": "long"},
-			"size":         map[string]string{"type": "long"},
-			"txCount":      map[string]string{"type": "integer"},
-			"uncleCount":   map[string]string{"type": "integer"},
+			"size":            map[string]string{"type": "long"},
+			"txCount":         map[string]string{"type": "integer"},
+			"uncleCount":      map[string]string{"type": "integer"},
 		},
 	},
 }
@@ -131,18 +130,18 @@ var blocksMapping = map[string]interface{}{
 var transactionsMapping = map[string]interface{}{
 	"mappings": map[string]interface{}{
 		"properties": map[string]interface{}{
-			"hash":         map[string]string{"type": "keyword"},
-			"blockNumber":  map[string]string{"type": "long"},
-			"blockHash":    map[string]string{"type": "keyword"},
+			"hash":        map[string]string{"type": "keyword"},
+			"blockNumber": map[string]string{"type": "long"},
+			"blockHash":   map[string]string{"type": "keyword"},
 			"timestamp":   map[string]string{"type": "date"},
-			"from":         map[string]string{"type": "keyword"},
-			"to":           map[string]string{"type": "keyword"},
-			"value":        map[string]string{"type": "keyword"},
-			"gasPrice":     map[string]string{"type": "keyword"},
-			"gasUsed":      map[string]string{"type": "long"},
-			"status":       map[string]string{"type": "integer"},
-			"input":        map[string]string{"type": "text"},
-			"logs":         map[string]string{"type": "object"},
+			"from":        map[string]string{"type": "keyword"},
+			"to":          map[string]string{"type": "keyword"},
+			"value":       map[string]string{"type": "keyword"},
+			"gasPrice":    map[string]string{"type": "keyword"},
+			"gasUsed":     map[string]string{"type": "long"},
+			"status":      map[string]string{"type": "integer"},
+			"input":       map[string]string{"type": "text"},
+			"logs":        map[string]string{"type": "object"},
 		},
 	},
 }
@@ -150,15 +149,15 @@ var transactionsMapping = map[string]interface{}{
 var tokensMapping = map[string]interface{}{
 	"mappings": map[string]interface{}{
 		"properties": map[string]interface{}{
-			"address":      map[string]string{"type": "keyword"},
-			"name":         map[string]string{"type": "text"},
+			"address":     map[string]string{"type": "keyword"},
+			"name":        map[string]string{"type": "text"},
 			"symbol":      map[string]string{"type": "keyword"},
 			"decimals":    map[string]string{"type": "integer"},
 			"totalSupply": map[string]string{"type": "keyword"},
 			"type":        map[string]string{"type": "keyword"},
-			"holders":    map[string]string{"type": "integer"},
+			"holders":     map[string]string{"type": "integer"},
 			"transfers":   map[string]string{"type": "long"},
-			"timestamp":  map[string]string{"type": "date"},
+			"timestamp":   map[string]string{"type": "date"},
 		},
 	},
 }
@@ -254,18 +253,18 @@ func (es *ElasticsearchService) ExecuteBulk(br *BulkRequest) error {
 
 // SearchRequest represents a search request.
 type SearchRequest struct {
-	Index       string
-	Query       map[string]interface{}
-	From       int
-	Size       int
-	Sort       []map[string]interface{}
+	Index        string
+	Query        map[string]interface{}
+	From         int
+	Size         int
+	Sort         []map[string]interface{}
 	Aggregations map[string]interface{}
 }
 
 // SearchResult represents a search result.
 type SearchResult struct {
-	Total    int64
-	Hits    []json.RawMessage
+	Total        int64
+	Hits         []json.RawMessage
 	Aggregations map[string]interface{}
 }
 
@@ -273,8 +272,8 @@ type SearchResult struct {
 func (es *ElasticsearchService) Search(req *SearchRequest) (*SearchResult, error) {
 	body := map[string]interface{}{
 		"query": req.Query,
-		"from": req.From,
-		"size": req.Size,
+		"from":  req.From,
+		"size":  req.Size,
 	}
 
 	if len(req.Sort) > 0 {
@@ -307,7 +306,7 @@ func (es *ElasticsearchService) Search(req *SearchRequest) (*SearchResult, error
 	}
 
 	searchResult := &SearchResult{
-		Total:    result.Hits.Total.Value,
+		Total:        result.Hits.Total.Value,
 		Aggregations: result.Aggregations,
 	}
 
@@ -323,8 +322,8 @@ func (es *ElasticsearchService) SearchBlocks(query map[string]interface{}, from,
 	return es.Search(&SearchRequest{
 		Index: "blocks",
 		Query: query,
-		From: from,
-		Size: size,
+		From:  from,
+		Size:  size,
 	})
 }
 
@@ -333,8 +332,8 @@ func (es *ElasticsearchService) SearchTransactions(query map[string]interface{},
 	return es.Search(&SearchRequest{
 		Index: "transactions",
 		Query: query,
-		From: from,
-		Size: size,
+		From:  from,
+		Size:  size,
 	})
 }
 
@@ -343,8 +342,8 @@ func (es *ElasticsearchService) SearchTokens(query map[string]interface{}, from,
 	return es.Search(&SearchRequest{
 		Index: "tokens",
 		Query: query,
-		From: from,
-		Size: size,
+		From:  from,
+		Size:  size,
 	})
 }
 
@@ -379,10 +378,10 @@ func (es *ElasticsearchService) GetTopMiners(from, size int, timeRange string) (
 	}
 
 	return es.Search(&SearchRequest{
-		Index:       "blocks",
-		Query:      query,
-		From:       from,
-		Size:       0,
+		Index:        "blocks",
+		Query:        query,
+		From:         from,
+		Size:         0,
 		Aggregations: aggs,
 	})
 }
@@ -414,10 +413,10 @@ func (es *ElasticsearchService) GetTopTokens(from, size int, timeRange string) (
 	}
 
 	return es.Search(&SearchRequest{
-		Index:       "transactions",
-		Query:      query,
-		From:       from,
-		Size:       0,
+		Index:        "transactions",
+		Query:        query,
+		From:         from,
+		Size:         0,
 		Aggregations: aggs,
 	})
 }
@@ -439,7 +438,7 @@ func (es *ElasticsearchService) GetTransactionVolume(timeRange string, interval 
 	aggs := map[string]interface{}{
 		"volume_over_time": map[string]interface{}{
 			"date_histogram": map[string]interface{}{
-				"field":    "timestamp",
+				"field":             "timestamp",
 				"calendar_interval": interval,
 			},
 			"aggs": map[string]interface{}{
@@ -458,10 +457,10 @@ func (es *ElasticsearchService) GetTransactionVolume(timeRange string, interval 
 	}
 
 	return es.Search(&SearchRequest{
-		Index:       "transactions",
-		Query:      query,
-		From:       0,
-		Size:       0,
+		Index:        "transactions",
+		Query:        query,
+		From:         0,
+		Size:         0,
 		Aggregations: aggs,
 	})
 }

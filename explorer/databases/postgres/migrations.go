@@ -15,11 +15,11 @@ import (
 
 // Migration represents a database migration
 type Migration struct {
-	Version     int64
-	Name        string
-	UpSQL       string
-	DownSQL     string
-	AppliedAt   *time.Time
+	Version   int64
+	Name      string
+	UpSQL     string
+	DownSQL   string
+	AppliedAt *time.Time
 }
 
 // =============================================================================

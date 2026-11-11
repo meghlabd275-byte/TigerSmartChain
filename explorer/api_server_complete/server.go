@@ -33,8 +33,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 	"golang.org/x/time/rate"
 )
 
@@ -74,15 +73,15 @@ func (c *cell) Scan(src interface{}) error {
 }
 
 type Config struct {
-	Server      ServerConfig      `json:"server"`
-	Database    DatabaseConfig  `json:"database"`
-	Redis       RedisConfig    `json:"redis"`
-	Security    SecurityConfig `json:"security"`
-	RateLimit   RateLimitConfig `json:"rate_limit"`
-	Webhook    WebhookConfig  `json:"webhook"`
-	JWT        JWTConfig     `json:"jwt"`
+	Server     ServerConfig     `json:"server"`
+	Database   DatabaseConfig   `json:"database"`
+	Redis      RedisConfig      `json:"redis"`
+	Security   SecurityConfig   `json:"security"`
+	RateLimit  RateLimitConfig  `json:"rate_limit"`
+	Webhook    WebhookConfig    `json:"webhook"`
+	JWT        JWTConfig        `json:"jwt"`
 	Encryption EncryptionConfig `json:"encryption"`
-	RPC        RPCConfig     `json:"rpc"`
+	RPC        RPCConfig        `json:"rpc"`
 }
 
 type RPCConfig struct {
@@ -94,9 +93,9 @@ type ServerConfig struct {
 	Host            string `json:"host"`
 	Port            int    `json:"port"`
 	ReadTimeout     int    `json:"read_timeout"`
-	WriteTimeout   int    `json:"write_timeout"`
-	MaxHeaderBytes int    `json:"max_header_bytes"`
-	ShutdownTimeout int   `json:"shutdown_timeout"`
+	WriteTimeout    int    `json:"write_timeout"`
+	MaxHeaderBytes  int    `json:"max_header_bytes"`
+	ShutdownTimeout int    `json:"shutdown_timeout"`
 }
 
 type DatabaseConfig struct {
@@ -118,20 +117,20 @@ type RedisConfig struct {
 }
 
 type SecurityConfig struct {
-	APIKeys          []string `json:"api_keys"`
-	JWTSecret        string   `json:"jwt_secret"`
-	EncryptionKey  string   `json:"encryption_key"`
-	CorsOrigins     []string `json:"cors_origins"`
-	AllowedIPs      []string `json:"allowed_ips"`
-	EnableIPBan     bool     `json:"enable_ip_ban"`
-	BanDuration    int     `json:"ban_duration"`
-	MaxRequestsPerMinute int `json:"max_requests_per_minute"`
+	APIKeys              []string `json:"api_keys"`
+	JWTSecret            string   `json:"jwt_secret"`
+	EncryptionKey        string   `json:"encryption_key"`
+	CorsOrigins          []string `json:"cors_origins"`
+	AllowedIPs           []string `json:"allowed_ips"`
+	EnableIPBan          bool     `json:"enable_ip_ban"`
+	BanDuration          int      `json:"ban_duration"`
+	MaxRequestsPerMinute int      `json:"max_requests_per_minute"`
 }
 
 type RateLimitConfig struct {
-	RequestsPerSecond int `json:"requests_per_second"`
-	Burst           int `json:"burst"`
-	Enabled         bool `json:"enabled"`
+	RequestsPerSecond int  `json:"requests_per_second"`
+	Burst             int  `json:"burst"`
+	Enabled           bool `json:"enabled"`
 }
 
 type WebhookConfig struct {
@@ -140,8 +139,8 @@ type WebhookConfig struct {
 }
 
 type JWTConfig struct {
-	Secret     string `json:"secret"`
-	ExpireHours int   `json:"expire_hours"`
+	Secret      string `json:"secret"`
+	ExpireHours int    `json:"expire_hours"`
 }
 
 type EncryptionConfig struct {
@@ -211,7 +210,7 @@ type ClientLimiter struct {
 
 func NewRateLimiter(config RateLimitConfig) *RateLimiter {
 	return &RateLimiter{
-		store: make(map[string]*ClientLimiter),
+		store:  make(map[string]*ClientLimiter),
 		global: rate.NewLimiter(rate.Limit(config.RequestsPerSecond), config.Burst),
 		config: config,
 	}
@@ -282,15 +281,15 @@ type APIKeyManager struct {
 }
 
 type APIKey struct {
-	Key         string
-	Name        string
-	Scopes      []string
-	RateLimit   int
-	Requests    uint64
-	CreatedAt   time.Time
-	LastUsed    time.Time
-	ExpiresAt   *time.Time
-	Disabled    bool
+	Key       string
+	Name      string
+	Scopes    []string
+	RateLimit int
+	Requests  uint64
+	CreatedAt time.Time
+	LastUsed  time.Time
+	ExpiresAt *time.Time
+	Disabled  bool
 }
 
 func NewAPIKeyManager() *APIKeyManager {
@@ -357,18 +356,18 @@ func (m *APIKeyManager) Increment(key string) {
 // ============================================================================
 
 type WebhookManager struct {
-	mu        sync.RWMutex
+	mu       sync.RWMutex
 	webhooks map[string]*Webhook
 	queue    chan *WebhookEvent
 }
 
 type Webhook struct {
-	ID        string
-	URL      string
-	Events   []string
-	Secret   string
-	Active   bool
-	Retries  int
+	ID      string
+	URL     string
+	Events  []string
+	Secret  string
+	Active  bool
+	Retries int
 }
 
 type WebhookEvent struct {
@@ -381,7 +380,7 @@ type WebhookEvent struct {
 func NewWebhookManager() *WebhookManager {
 	m := &WebhookManager{
 		webhooks: make(map[string]*Webhook),
-		queue:   make(chan *WebhookEvent, 10000),
+		queue:    make(chan *WebhookEvent, 10000),
 	}
 
 	go m.worker()
@@ -509,10 +508,10 @@ func (e *Encryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 // ============================================================================
 
 type Handler struct {
-	db            *DB
-	rateLimiter   *RateLimiter
-	apiKeyMgr    *APIKeyManager
-	webhookMgr   *WebhookManager
+	db          *DB
+	rateLimiter *RateLimiter
+	apiKeyMgr   *APIKeyManager
+	webhookMgr  *WebhookManager
 	encryptor   *Encryptor
 	config      *Config
 }
@@ -530,7 +529,7 @@ func NewHandler(db *DB, config *Config) *Handler {
 		apiKeyMgr:   apiKeyMgr,
 		webhookMgr:  webhookMgr,
 		encryptor:   encryptor,
-		config:    config,
+		config:      config,
 	}
 }
 
@@ -909,11 +908,11 @@ func (h *Handler) GetTokenPrice(c *gin.Context) {
 	address := c.Param("address")
 
 	var price struct {
-		PriceUSD     float64   `json:"price_usd"`
-		Change24h   float64   `json:"change_24h"`
-		Volume24h   float64   `json:"volume_24h"`
-		MarketCap  float64   `json:"market_cap"`
-		Timestamp int64    `json:"timestamp"`
+		PriceUSD  float64 `json:"price_usd"`
+		Change24h float64 `json:"change_24h"`
+		Volume24h float64 `json:"volume_24h"`
+		MarketCap float64 `json:"market_cap"`
+		Timestamp int64   `json:"timestamp"`
 	}
 
 	err := h.db.QueryRowContext(c.Request.Context(),
@@ -1036,12 +1035,12 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	if err != nil {
 		// Account not found, return empty
 		account = map[string]interface{}{
-			"address":            address,
-			"balance":           "0",
-			"nonce":            0,
-			"is_contract":      false,
+			"address":             address,
+			"balance":             "0",
+			"nonce":               0,
+			"is_contract":         false,
 			"token_balance_count": 0,
-			"nft_balance_count": 0,
+			"nft_balance_count":   0,
 		}
 	}
 
@@ -1210,7 +1209,7 @@ func (h *Handler) ReadContract(c *gin.Context) {
 	address := c.Param("address")
 
 	var body struct {
-		Method string `json:"method"`
+		Method string   `json:"method"`
 		Params []string `json:"params"`
 	}
 
@@ -1303,9 +1302,9 @@ func (h *Handler) WriteContract(c *gin.Context) {
 	}
 
 	var body struct {
-		Method string `json:"method"`
+		Method string   `json:"method"`
 		Params []string `json:"params"`
-		Signed string `json:"signed"`
+		Signed string   `json:"signed"`
 	}
 
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -1477,12 +1476,12 @@ func (h *Handler) Search(c *gin.Context) {
 
 func (h *Handler) GetStats(c *gin.Context) {
 	var stats struct {
-		TotalBlocks      uint64 `json:"total_blocks"`
+		TotalBlocks       uint64 `json:"total_blocks"`
 		TotalTransactions uint64 `json:"total_transactions"`
-		TotalTokens     uint64 `json:"total_tokens"`
-		TotalAccounts   uint64 `json:"total_accounts"`
-		TotalContracts  uint64 `json:"total_contracts"`
-		LastBlock      uint64 `json:"last_block"`
+		TotalTokens       uint64 `json:"total_tokens"`
+		TotalAccounts     uint64 `json:"total_accounts"`
+		TotalContracts    uint64 `json:"total_contracts"`
+		LastBlock         uint64 `json:"last_block"`
 	}
 
 	h.db.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM blocks").Scan(&stats.TotalBlocks)
@@ -1497,7 +1496,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 
 func (h *Handler) GetGasTracker(c *gin.Context) {
 	var gas struct {
-		GasPrice     int64 `json:"gas_price"`
+		GasPrice    int64 `json:"gas_price"`
 		BaseFee     int64 `json:"base_fee"`
 		PriorityFee int64 `json:"priority_fee"`
 		Timestamp   int64 `json:"timestamp"`
@@ -1517,6 +1516,101 @@ func (h *Handler) GetGasTracker(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gas)
+}
+
+// ============================================================================
+// Event Logs
+// ============================================================================
+
+// GetLogs returns event logs, optionally filtered by emitting address, block
+// range and first topic.
+func (h *Handler) GetLogs(c *gin.Context) {
+	page := c.DefaultQuery("page", "1")
+	limit := c.DefaultQuery("limit", "25")
+
+	pageNum, err := strconv.Atoi(page)
+	if err != nil || pageNum < 1 {
+		pageNum = 1
+	}
+	limitNum, err := strconv.Atoi(limit)
+	if err != nil || limitNum < 1 || limitNum > 100 {
+		limitNum = 25
+	}
+
+	where := []string{"1=1"}
+	args := []interface{}{}
+	argN := 1
+
+	if address := c.Query("address"); address != "" {
+		if !hexAddress.MatchString(address) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid address"})
+			return
+		}
+		where = append(where, fmt.Sprintf("address = $%d", argN))
+		args = append(args, address)
+		argN++
+	}
+	if from := c.Query("from_block"); from != "" {
+		n, err := strconv.ParseUint(from, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid from_block"})
+			return
+		}
+		where = append(where, fmt.Sprintf("block_number >= $%d", argN))
+		args = append(args, n)
+		argN++
+	}
+	if to := c.Query("to_block"); to != "" {
+		n, err := strconv.ParseUint(to, 10, 64)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid to_block"})
+			return
+		}
+		where = append(where, fmt.Sprintf("block_number <= $%d", argN))
+		args = append(args, n)
+		argN++
+	}
+	if topic := c.Query("topic0"); topic != "" {
+		if !hexWord.MatchString(topic) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "topic0 must be a 32-byte hex value"})
+			return
+		}
+		where = append(where, fmt.Sprintf("topics->>0 = $%d", argN))
+		args = append(args, strings.ToLower(topic))
+		argN++
+	}
+
+	offset := (pageNum - 1) * limitNum
+	query := fmt.Sprintf(
+		`SELECT transaction_hash, block_number, address, topics, data, log_index, timestamp
+		 FROM logs WHERE %s
+		 ORDER BY block_number DESC, log_index DESC LIMIT $%d OFFSET $%d`,
+		strings.Join(where, " AND "), argN, argN+1)
+	args = append(args, limitNum, offset)
+
+	rows, err := h.db.QueryContext(c.Request.Context(), query, args...)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var logs []map[string]interface{}
+	for rows.Next() {
+		l := map[string]interface{}{}
+		if err := rows.Scan(&cell{l, "transaction_hash"}, &cell{l, "block_number"}, &cell{l, "address"},
+			&cell{l, "topics"}, &cell{l, "data"}, &cell{l, "log_index"}, &cell{l, "timestamp"}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		logs = append(logs, l)
+	}
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"logs": logs, "page": pageNum, "limit": limitNum})
 }
 
 // ============================================================================
@@ -1603,7 +1697,7 @@ func main() {
 			Port:            8080,
 			ReadTimeout:     30,
 			WriteTimeout:    30,
-			MaxHeaderBytes: 1048576,
+			MaxHeaderBytes:  1048576,
 			ShutdownTimeout: 30,
 		},
 		Database: DatabaseConfig{
@@ -1626,8 +1720,8 @@ func main() {
 		},
 		RateLimit: RateLimitConfig{
 			RequestsPerSecond: 1000,
-			Burst:            2000,
-			Enabled:          true,
+			Burst:             2000,
+			Enabled:           true,
 		},
 	}
 
@@ -1701,6 +1795,9 @@ func main() {
 
 		// Search
 		api.GET("/search", handler.Search)
+
+		// Event logs
+		api.GET("/logs", handler.GetLogs)
 
 		// Stats
 		api.GET("/stats", handler.GetStats)

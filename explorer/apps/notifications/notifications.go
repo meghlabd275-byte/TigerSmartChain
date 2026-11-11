@@ -44,7 +44,7 @@ func (s *Server) SetDB(db Database) {
 }
 
 func (s *Server) HandleGetNotifications(w http.ResponseWriter, r *http.Request) {
-	userID := r.URL.Query()..Get("user_id")
+	userID := r.URL.Query().Get("user_id")
 	if userID == "" {
 		http.Error(w, "missing user_id", http.StatusBadRequest)
 		return

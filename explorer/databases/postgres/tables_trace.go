@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -18,158 +19,158 @@ import (
 
 // Trace represents an EVM trace entry
 type Trace struct {
-	ID           uint64     `json:"id"`
-	BlockNumber  uint64    `json:"block_number"`
-	BlockHash   string    `json:"block_hash"`
-	TransactionHash string `json:"transaction_hash"`
-	TransactionIndex uint32 `json:"transaction_index"`
-	FromAddress string   `json:"from_address"`
-	ToAddress   string   `json:"to_address"`
-	Value      string    `json:"value"`
-	Gas        uint64    `json:"gas"`
-	GasUsed    uint64    `json:"gas_used"`
-	Input      string    `json:"input"`
-	Output     string    `json:"output"`
-	CallType   string    `json:"call_type"`
-	Error      string    `json:"error,omitempty"`
-	Depth      int      `json:"depth"`
-	Index      uint64    `json:"index"`
-	ParentIndex uint64  `json:"parent_index"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID               uint64    `json:"id"`
+	BlockNumber      uint64    `json:"block_number"`
+	BlockHash        string    `json:"block_hash"`
+	TransactionHash  string    `json:"transaction_hash"`
+	TransactionIndex uint32    `json:"transaction_index"`
+	FromAddress      string    `json:"from_address"`
+	ToAddress        string    `json:"to_address"`
+	Value            string    `json:"value"`
+	Gas              uint64    `json:"gas"`
+	GasUsed          uint64    `json:"gas_used"`
+	Input            string    `json:"input"`
+	Output           string    `json:"output"`
+	CallType         string    `json:"call_type"`
+	Error            string    `json:"error,omitempty"`
+	Depth            int       `json:"depth"`
+	Index            uint64    `json:"index"`
+	ParentIndex      uint64    `json:"parent_index"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // Uncle represents an ommer block
 type Uncle struct {
-	Number       uint64    `json:"number"`
-	Hash         string   `json:"hash"`
-	ParentHash   string   `json:"parent_hash"`
-	Sha3Uncles   string   `json:"sha3_uncles"`
-	Miner        string   `json:"miner"`
-	Difficulty   string   `json:"difficulty"`
-	TotalDifficulty string `json:"total_difficulty"`
-	Size        uint64    `json:"size"`
-	GasLimit    uint64    `json:"gas_limit"`
-	GasUsed     uint64    `json:"gas_used"`
-	Timestamp   uint64    `json:"timestamp"`
-	ExtraData   string   `json:"extra_data"`
-	MixHash     string   `json:"mix_hash"`
-	Nonce      string   `json:"nonce"`
-	BaseFee    string   `json:"base_fee,omitempty"`
-	Reward     string   `json:"reward"`
-	OmmerHashes string  `json:"ommer_hashes"`
-	TxHashes   string   `json:"tx_hashes"`
-	CreatedAt  time.Time `json:"created_at"`
+	Number          uint64    `json:"number"`
+	Hash            string    `json:"hash"`
+	ParentHash      string    `json:"parent_hash"`
+	Sha3Uncles      string    `json:"sha3_uncles"`
+	Miner           string    `json:"miner"`
+	Difficulty      string    `json:"difficulty"`
+	TotalDifficulty string    `json:"total_difficulty"`
+	Size            uint64    `json:"size"`
+	GasLimit        uint64    `json:"gas_limit"`
+	GasUsed         uint64    `json:"gas_used"`
+	Timestamp       uint64    `json:"timestamp"`
+	ExtraData       string    `json:"extra_data"`
+	MixHash         string    `json:"mix_hash"`
+	Nonce           string    `json:"nonce"`
+	BaseFee         string    `json:"base_fee,omitempty"`
+	Reward          string    `json:"reward"`
+	OmmerHashes     string    `json:"ommer_hashes"`
+	TxHashes        string    `json:"tx_hashes"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // BlockReward represents validator block rewards
 type BlockReward struct {
-	BlockNumber   uint64    `json:"block_number"`
-	BlockHash   string   `json:"block_hash"`
-	Validator   string   `json:"validator"`
-	BlockReward string   `json:"block_reward"`
-	TxFees    string   `json:"tx_fees"`
-	TotalReward string   `json:"total_reward"`
-	TokenPrice string   `json:"token_price"`
-	UsdValue  string   `json:"usd_value"`
-	CreatedAt  time.Time `json:"created_at"`
+	BlockNumber uint64    `json:"block_number"`
+	BlockHash   string    `json:"block_hash"`
+	Validator   string    `json:"validator"`
+	BlockReward string    `json:"block_reward"`
+	TxFees      string    `json:"tx_fees"`
+	TotalReward string    `json:"total_reward"`
+	TokenPrice  string    `json:"token_price"`
+	UsdValue    string    `json:"usd_value"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // TokenApproval represents a token approval
 type TokenApproval struct {
-	ID             uint64    `json:"id"`
-	BlockNumber    uint64    `json:"block_number"`
-	BlockHash     string   `json:"block_hash"`
-	TransactionHash string `json:"transaction_hash"`
-	TransactionIndex uint32 `json:"transaction_index"`
-	LogIndex      uint32   `json:"log_index"`
-	TokenAddress string   `json:"token_address"`
-	Owner        string   `json:"owner"`
-	Spender       string   `json:"spender"`
-	Value        string   `json:"value"`
-	Approved     bool     `json:"approved"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID               uint64    `json:"id"`
+	BlockNumber      uint64    `json:"block_number"`
+	BlockHash        string    `json:"block_hash"`
+	TransactionHash  string    `json:"transaction_hash"`
+	TransactionIndex uint32    `json:"transaction_index"`
+	LogIndex         uint32    `json:"log_index"`
+	TokenAddress     string    `json:"token_address"`
+	Owner            string    `json:"owner"`
+	Spender          string    `json:"spender"`
+	Value            string    `json:"value"`
+	Approved         bool      `json:"approved"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // NFTApproval represents an NFT approval
 type NFTApproval struct {
-	ID             uint64    `json:"id"`
-	BlockNumber    uint64    `json:"block_number"`
-	BlockHash     string   `json:"block_hash"`
-	TransactionHash string `json:"transaction_hash"`
-	TransactionIndex uint32 `json:"transaction_index"`
-	LogIndex      uint32   `json:"log_index"`
-	TokenAddress string   `json:"token_address"`
-	Owner        string   `json:"owner"`
-	Operator    string   `json:"operator"`
-	TokenID     string   `json:"token_id"`
-	Approved   bool     `json:"approved"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID               uint64    `json:"id"`
+	BlockNumber      uint64    `json:"block_number"`
+	BlockHash        string    `json:"block_hash"`
+	TransactionHash  string    `json:"transaction_hash"`
+	TransactionIndex uint32    `json:"transaction_index"`
+	LogIndex         uint32    `json:"log_index"`
+	TokenAddress     string    `json:"token_address"`
+	Owner            string    `json:"owner"`
+	Operator         string    `json:"operator"`
+	TokenID          string    `json:"token_id"`
+	Approved         bool      `json:"approved"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // StateAccount represents account state at a block
 type StateAccount struct {
-	Address      string   `json:"address"`
-	BlockNumber uint64   `json:"block_number"`
-	BlockHash   string   `json:"block_hash"`
-	Balance     string   `json:"balance"`
-	Nonce      uint64   `json:"nonce"`
-	CodeHash    string   `json:"code_hash"`
-	StorageRoot string   `json:"storage_root"`
-	Code       string   `json:"code,omitempty"`
+	Address     string    `json:"address"`
+	BlockNumber uint64    `json:"block_number"`
+	BlockHash   string    `json:"block_hash"`
+	Balance     string    `json:"balance"`
+	Nonce       uint64    `json:"nonce"`
+	CodeHash    string    `json:"code_hash"`
+	StorageRoot string    `json:"storage_root"`
+	Code        string    `json:"code,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
 // ContractMetadata represents contract metadata
 type ContractMetadata struct {
-	Address         string   `json:"address"`
-	ContractName   string   `json:"contract_name"`
-	CompilerVersion string  `json:"compiler_version"`
-	Optimizer     bool     `json:"optimizer"`
-	OptimizerRuns uint32   `json:"optimizer_runs"`
-	EvmVersion    string   `json:"evm_version"`
-	License      string   `json:"license"`
-	SourceCode   string   `json:"source_code"`
-	Abi         string   `json:"abi"`
-	ConstructorArgs string  `json:"constructor_args"`
-	VerifiedAt  time.Time `json:"verified_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Address         string    `json:"address"`
+	ContractName    string    `json:"contract_name"`
+	CompilerVersion string    `json:"compiler_version"`
+	Optimizer       bool      `json:"optimizer"`
+	OptimizerRuns   uint32    `json:"optimizer_runs"`
+	EvmVersion      string    `json:"evm_version"`
+	License         string    `json:"license"`
+	SourceCode      string    `json:"source_code"`
+	Abi             string    `json:"abi"`
+	ConstructorArgs string    `json:"constructor_args"`
+	VerifiedAt      time.Time `json:"verified_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // VerifiedSource represents verified source file
 type VerifiedSource struct {
-	ID           uint64    `json:"id"`
-	Address     string    `json:"address"`
-	FileName    string    `json:"file_name"`
-	SourceCode string   `json:"source_code"`
-	Language   string   `json:"language"`
-	CompilerVersion string `json:"compiler_version"`
-	Abi        string   `json:"abi"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID              uint64    `json:"id"`
+	Address         string    `json:"address"`
+	FileName        string    `json:"file_name"`
+	SourceCode      string    `json:"source_code"`
+	Language        string    `json:"language"`
+	CompilerVersion string    `json:"compiler_version"`
+	Abi             string    `json:"abi"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // SourcifyMetadata represents Sourcify metadata
 type SourcifyMetadata struct {
-	Address       string   `json:"address"`
-	ChainID      string   `json:"chain_id"`
-	MatchType    string   `json:"match_type"`
-	MetadataURL string   `json:"metadata_url"`
+	Address     string    `json:"address"`
+	ChainID     string    `json:"chain_id"`
+	MatchType   string    `json:"match_type"`
+	MetadataURL string    `json:"metadata_url"`
 	VerifiedAt  time.Time `json:"verified_at"`
 }
 
 // ContractCreation represents a contract creation
 type ContractCreation struct {
-	ID              uint64    `json:"id"`
-	BlockNumber    uint64    `json:"block_number"`
-	BlockHash     string   `json:"block_hash"`
-	TransactionHash string `json:"transaction_hash"`
-	Creator      string   `json:"creator"`
-	Contract     string   `json:"contract"`
-	BlockNumberCreated uint64 `json:"block_number_created"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                 uint64    `json:"id"`
+	BlockNumber        uint64    `json:"block_number"`
+	BlockHash          string    `json:"block_hash"`
+	TransactionHash    string    `json:"transaction_hash"`
+	Creator            string    `json:"creator"`
+	Contract           string    `json:"contract"`
+	BlockNumberCreated uint64    `json:"block_number_created"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
-// DB is the database interface
-type DB interface {
+// SQLExecutor is the database interface shared by every store in this package.
+type SQLExecutor interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
@@ -394,7 +395,7 @@ func (s *TraceStore) InitSchema(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_contract_creations_contract ON contract_creations(contract_address);
 	CREATE INDEX IF NOT EXISTS idx_contract_creations_block ON contract_creations(block_number);
 	`
-	
+
 	_, err := s.db.ExecContext(ctx, schema)
 	return err
 }
@@ -603,7 +604,7 @@ func (s *TraceStore) GetTracesByTransaction(ctx context.Context, txHash string) 
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var traces []*Trace
 	for rows.Next() {
 		var t Trace
@@ -635,7 +636,7 @@ func (s *TraceStore) GetTokenApprovals(ctx context.Context, token string, owner 
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var approvals []*TokenApproval
 	for rows.Next() {
 		var a TokenApproval
@@ -689,13 +690,13 @@ func (s *TraceStore) BatchInsertTraces(ctx context.Context, traces []*Trace) err
 	if len(traces) == 0 {
 		return nil
 	}
-	
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	
+
 	stmt, err := tx.PrepareContext(ctx, pq.CopyIn(
 		"traces",
 		"block_number", "block_hash", "transaction_hash", "transaction_index",
@@ -706,7 +707,7 @@ func (s *TraceStore) BatchInsertTraces(ctx context.Context, traces []*Trace) err
 		return err
 	}
 	defer stmt.Close()
-	
+
 	for _, trace := range traces {
 		_, err = stmt.ExecContext(ctx,
 			trace.BlockNumber, trace.BlockHash, trace.TransactionHash, trace.TransactionIndex,
@@ -717,12 +718,12 @@ func (s *TraceStore) BatchInsertTraces(ctx context.Context, traces []*Trace) err
 			return err
 		}
 	}
-	
+
 	_, err = stmt.ExecContext(ctx)
 	if err != nil {
 		return err
 	}
-	
+
 	return tx.Commit()
 }
 
@@ -782,7 +783,7 @@ func (s *TraceStore) GetVerifiedSources(ctx context.Context, address string) ([]
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var sources []*VerifiedSource
 	for rows.Next() {
 		var source VerifiedSource
@@ -811,7 +812,7 @@ func (s *TraceStore) GetBlockRewards(ctx context.Context, fromBlock, toBlock uin
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	var rewards []*BlockReward
 	for rows.Next() {
 		var reward BlockReward

@@ -5,19 +5,20 @@ package websocket_service
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -27,92 +28,122 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
 	"golang.org/x/time/rate"
 )
+
+// allowedOrigins is the process-wide origin allow-list used by the upgrader.
+var allowedOrigins []string
 
 var (
 	// Upgrader configures WebSocket upgrade
 	upgrader = websocket.Upgrader{
-		ReadBufferSize:  4096,
-		WriteBufferSize: 4096,
-		CheckOrigin: func(r *http.Request) bool {
-			return true // In production, implement proper CORS
-		},
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
+		CheckOrigin:      checkOrigin,
 		HandshakeTimeout: 10 * time.Second,
 	}
 )
 
+// checkOrigin rejects cross-site WebSocket upgrades. Only the configured
+// allowed origins, or a same-origin request, may open a socket, so a hostile
+// page cannot drive a user's authenticated connection.
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser clients such as indexers and the CLI send no Origin.
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(u.Host, r.Host) {
+		return true
+	}
+	for _, allowed := range allowedOrigins {
+		if strings.EqualFold(allowed, origin) {
+			return true
+		}
+	}
+	return false
+}
+
 // Config holds WebSocket service configuration
 type Config struct {
 	// Server settings
-	ListenAddr      string        `json:"listen_addr"`
-	Port           int           `json:"port"`
-	ReadTimeout    time.Duration `json:"read_timeout"`
-	WriteTimeout   time.Duration `json:"write_timeout"`
+	ListenAddr    string        `json:"listen_addr"`
+	Port          int           `json:"port"`
+	ReadTimeout   time.Duration `json:"read_timeout"`
+	WriteTimeout  time.Duration `json:"write_timeout"`
 	MaxMsgSize    int64         `json:"max_msg_size"`
 	MaxConns      int           `json:"max_conns"`
 	MaxConnsPerIP int           `json:"max_conns_per_ip"`
-	
+
 	// TLS settings
-	UseTLS           bool   `json:"use_tls"`
-	CertFile         string `json:"cert_file"`
-	KeyFile          string `json:"key_file"`
-	ClientCertFile   string `json:"client_cert_file"`
-	
+	UseTLS         bool   `json:"use_tls"`
+	CertFile       string `json:"cert_file"`
+	KeyFile        string `json:"key_file"`
+	ClientCertFile string `json:"client_cert_file"`
+
+	// AllowedOrigins lists the origins permitted to open a WebSocket.
+	// Same-origin requests are always permitted.
+	AllowedOrigins []string `json:"allowed_origins"`
+
 	// Authentication
-	RequireAuth     bool   `json:"require_auth"`
-	APIKeyHeader   string `json:"api_key_header"`
-	JWTKey        string `json:"jwt_key"`
-	AllowedIPs    []string `json:"allowed_ips"`
-	
+	RequireAuth  bool     `json:"require_auth"`
+	APIKeyHeader string   `json:"api_key_header"`
+	JWTKey       string   `json:"jwt_key"`
+	AllowedIPs   []string `json:"allowed_ips"`
+
 	// Rate limiting
-	RateLimit      int           `json:"rate_limit"` // messages per second
-	RateLimitBurst int           `json:"rate_limit_burst"`
-	
+	RateLimit      int `json:"rate_limit"` // messages per second
+	RateLimitBurst int `json:"rate_limit_burst"`
+
 	// Subscription settings
-	MaxSubscriptions int           `json:"max_subscriptions"`
-	MaxSubscriptionsPerConn int `json:"max_subscriptions_per_conn"`
-	SubscriptionTimeout    time.Duration `json:"subscription_timeout"`
-	
+	MaxSubscriptions        int           `json:"max_subscriptions"`
+	MaxSubscriptionsPerConn int           `json:"max_subscriptions_per_conn"`
+	SubscriptionTimeout     time.Duration `json:"subscription_timeout"`
+
 	// Message queue settings
-	QueueSize      int           `json:"queue_size"`
+	QueueSize     int           `json:"queue_size"`
 	QueueFlushInt time.Duration `json:"queue_flush_int"`
-	
+
 	// Encryption
 	EnableEncryption bool   `json:"enable_encryption"`
-	EncryptionKey   []byte `json:"-"`
-	
+	EncryptionKey    []byte `json:"-"`
+
 	// Logging
-	LogFile      string `json:"log_file"`
-	AccessLog   string `json:"access_log"`
-	Verbose    bool   `json:"verbose"`
-	
+	LogFile   string `json:"log_file"`
+	AccessLog string `json:"access_log"`
+	Verbose   bool   `json:"verbose"`
+
 	// Performance
-	WorkerPoolSize int           `json:"worker_pool_size"`
-	GOMAXPROCS   int           `json:"gomaxprocs"`
+	WorkerPoolSize int `json:"worker_pool_size"`
+	GOMAXPROCS     int `json:"gomaxprocs"`
 }
 
 // Client represents a connected WebSocket client
 type Client struct {
-	ID             string
-	IP             string
-	UserAgent      string
+	ID            string
+	IP            string
+	UserAgent     string
 	Auth          *AuthInfo
 	Subscriptions map[string]*Subscription
 	connectedAt   time.Time
 	lastActivity  time.Time
 	sendMu        sync.Mutex
 	rateLimiter   *rate.Limiter
-	encoder      *Encoder
-	closed       atomic.Bool
+	encoder       *Encoder
+	conn          *websocket.Conn
+	closed        atomic.Bool
 }
 
 // AuthInfo holds client authentication info
 type AuthInfo struct {
 	APIKey    string
 	JWTClaims *JWTClaims
-	Roles    []string
+	Roles     []string
 }
 
 // JWTClaims holds JWT claims
@@ -126,7 +157,7 @@ type JWTClaims struct {
 
 // Subscription represents a subscription
 type Subscription struct {
-	ID       string
+	ID      string
 	Type    string
 	Filter  *SubscriptionFilter
 	Chan    chan []byte
@@ -136,11 +167,11 @@ type Subscription struct {
 
 // SubscriptionFilter holds subscription filters
 type SubscriptionFilter struct {
-	Address  []string `json:"address,omitempty"`
-	Topics   []string `json:"topics,omitempty"`
-	FromBlock uint64 `json:"from_block,omitempty"`
-	ToBlock uint64   `json:"to_block,omitempty"`
-	BlockHash string `json:"block_hash,omitempty"`
+	Address   []string `json:"address,omitempty"`
+	Topics    []string `json:"topics,omitempty"`
+	FromBlock uint64   `json:"from_block,omitempty"`
+	ToBlock   uint64   `json:"to_block,omitempty"`
+	BlockHash string   `json:"block_hash,omitempty"`
 }
 
 // Encoder handles message encoding
@@ -155,28 +186,28 @@ type Message struct {
 	Channel   string          `json:"channel,omitempty"`
 	ID        string          `json:"id,omitempty"`
 	Payload   json.RawMessage `json:"payload"`
-	Timestamp time.Time      `json:"timestamp"`
+	Timestamp time.Time       `json:"timestamp"`
 }
 
 // Server is the WebSocket server
 type Server struct {
-	config     *Config
-	router     *mux.Router
-	server    *http.Server
-	clients   *ClientManager
+	config      *Config
+	router      *mux.Router
+	server      *http.Server
+	clients     *ClientManager
 	broadcaster *Broadcaster
-	metrics   *Metrics
-	workerPool *WorkerPool
-	encryptor *Encryptor
-	limiter   *IPRateLimiter
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	metrics     *Metrics
+	workerPool  *WorkerPool
+	encryptor   *Encryptor
+	limiter     *IPRateLimiter
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 // ClientManager manages connected clients
 type ClientManager struct {
-	mu       sync.RWMutex
+	mu      sync.RWMutex
 	clients map[string]*Client
 	byIP    map[string]map[string]bool // clientID -> true
 }
@@ -184,7 +215,7 @@ type ClientManager struct {
 func (cm *ClientManager) Add(client *Client) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	
+
 	cm.clients[client.ID] = client
 	if client.IP != "" {
 		if cm.byIP[client.IP] == nil {
@@ -197,7 +228,7 @@ func (cm *ClientManager) Add(client *Client) {
 func (cm *ClientManager) Remove(clientID string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	
+
 	if client, ok := cm.clients[clientID]; ok {
 		if client.IP != "" && cm.byIP[client.IP] != nil {
 			delete(cm.byIP[client.IP], clientID)
@@ -212,7 +243,7 @@ func (cm *ClientManager) Remove(clientID string) {
 func (cm *ClientManager) Get(clientID string) (*Client, bool) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	
+
 	client, ok := cm.clients[clientID]
 	return client, ok
 }
@@ -220,14 +251,14 @@ func (cm *ClientManager) Get(clientID string) (*Client, bool) {
 func (cm *ClientManager) Count() int {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	
+
 	return len(cm.clients)
 }
 
 func (cm *ClientManager) CountByIP(ip string) int {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
-	
+
 	if ips := cm.byIP[ip]; ips != nil {
 		return len(ips)
 	}
@@ -238,30 +269,30 @@ func (cm *ClientManager) CountByIP(ip string) int {
 type Broadcaster struct {
 	mu          sync.RWMutex
 	subscribers map[string]map[string]*Client // channel -> clientID -> client
-	queues     map[string]chan []byte
-	workerPool *WorkerPool
+	queues      map[string]chan []byte
+	workerPool  *WorkerPool
 }
 
 func (b *Broadcaster) Subscribe(channel string, client *Client) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	
+
 	if b.subscribers == nil {
 		b.subscribers = make(map[string]map[string]*Client)
 	}
-	
+
 	if b.subscribers[channel] == nil {
 		b.subscribers[channel] = make(map[string]*Client)
 		b.queues[channel] = make(chan []byte, 10000)
 	}
-	
+
 	b.subscribers[channel][client.ID] = client
 }
 
 func (b *Broadcaster) Unsubscribe(channel string, clientID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	
+
 	if b.subscribers[channel] != nil {
 		delete(b.subscribers[channel], clientID)
 		if len(b.subscribers[channel]) == 0 {
@@ -273,11 +304,15 @@ func (b *Broadcaster) Unsubscribe(channel string, clientID string) {
 func (b *Broadcaster) Broadcast(channel string, message []byte) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	
+
 	if subscribers := b.subscribers[channel]; subscribers != nil {
 		for _, client := range subscribers {
+			sub := client.Subscriptions[channel]
+			if sub == nil {
+				continue
+			}
 			select {
-			case client.Subscriptions[channel].Chan <- message:
+			case sub.Chan <- message:
 			default:
 				// Queue full, skip
 			}
@@ -287,20 +322,20 @@ func (b *Broadcaster) Broadcast(channel string, message []byte) {
 
 // Metrics holds server metrics
 type Metrics struct {
-	mu             sync.RWMutex
-	Connections    uint64
-	Messages      uint64
-	BytesSent     uint64
-	BytesRecv     uint64
+	mu           sync.RWMutex
+	Connections  uint64
+	Messages     uint64
+	BytesSent    uint64
+	BytesRecv    uint64
 	Errors       uint64
-	LatencySum    time.Duration
-	LatencyCount  uint64
+	LatencySum   time.Duration
+	LatencyCount uint64
 }
 
 func (m *Metrics) RecordLatency(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	m.LatencySum += d
 	m.LatencyCount++
 }
@@ -308,43 +343,43 @@ func (m *Metrics) RecordLatency(d time.Duration) {
 func (m *Metrics) Get() map[string]interface{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
 	avgLatency := time.Duration(0)
 	if m.LatencyCount > 0 {
 		avgLatency = m.LatencySum / time.Duration(m.LatencyCount)
 	}
-	
+
 	return map[string]interface{}{
-		"connections":   atomic.LoadUint64(&m.Connections),
-		"messages":     atomic.LoadUint64(&m.Messages),
-		"bytes_sent":   atomic.LoadUint64(&m.BytesSent),
-		"bytes_recv":   atomic.LoadUint64(&m.BytesRecv),
-		"errors":       atomic.LoadUint64(&m.Errors),
-		"avg_latency":  avgLatency.String(),
+		"connections": atomic.LoadUint64(&m.Connections),
+		"messages":    atomic.LoadUint64(&m.Messages),
+		"bytes_sent":  atomic.LoadUint64(&m.BytesSent),
+		"bytes_recv":  atomic.LoadUint64(&m.BytesRecv),
+		"errors":      atomic.LoadUint64(&m.Errors),
+		"avg_latency": avgLatency.String(),
 	}
 }
 
 // WorkerPool is a pool of workers for message processing
 type WorkerPool struct {
-	mu       sync.Mutex
-	workers  []*Worker
-	tasks    chan func()
-	stopCh   chan struct{}
-}
-
-type Worker struct {
-	id      int
+	mu      sync.Mutex
+	workers []*Worker
 	tasks   chan func()
 	stopCh  chan struct{}
 }
 
+type Worker struct {
+	id     int
+	tasks  chan func()
+	stopCh chan struct{}
+}
+
 // IPRateLimiter limits requests by IP
 type IPRateLimiter struct {
-	mu      sync.Mutex
+	mu       sync.Mutex
 	limiters map[string]*rate.Limiter
-	ips     map[string]time.Time
-	limit   int
-	burst   int
+	ips      map[string]time.Time
+	limit    int
+	burst    int
 }
 
 // Encryptor handles encryption
@@ -357,7 +392,7 @@ func NewServer(config *Config) (*Server, error) {
 	if config == nil {
 		config = &Config{}
 	}
-	
+
 	// Set defaults
 	if config.Port == 0 {
 		config.Port = 8546
@@ -404,12 +439,12 @@ func NewServer(config *Config) (*Server, error) {
 	if config.GOMAXPROCS == 0 {
 		config.GOMAXPROCS = runtime.NumCPU()
 	}
-	
+
 	// Set GOMAXPROCS
 	runtime.GOMAXPROCS(config.GOMAXPROCS)
-	
+
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	server := &Server{
 		config: config,
 		router: mux.NewRouter(),
@@ -419,47 +454,47 @@ func NewServer(config *Config) (*Server, error) {
 		},
 		broadcaster: &Broadcaster{
 			subscribers: make(map[string]map[string]*Client),
-			queues:    make(map[string]chan []byte),
+			queues:      make(map[string]chan []byte),
 		},
-		metrics:   &Metrics{},
+		metrics: &Metrics{},
 		limiter: &IPRateLimiter{
 			limiters: make(map[string]*rate.Limiter),
-			ips:     make(map[string]time.Time),
-			limit:   config.RateLimit,
-			burst:   config.RateLimitBurst,
+			ips:      make(map[string]time.Time),
+			limit:    config.RateLimit,
+			burst:    config.RateLimitBurst,
 		},
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	
+
 	// Initialize worker pool
 	server.workerPool = NewWorkerPool(config.WorkerPoolSize)
-	
+
 	// Initialize encryptor
 	if config.EnableEncryption && len(config.EncryptionKey) == 32 {
 		key := (*[32]byte)(config.EncryptionKey[:32])
 		server.encryptor = &Encryptor{key: key}
 	}
-	
+
 	return server, nil
 }
 
 // NewWorkerPool creates a new worker pool
-func NewWorkerPool(size int) *wp *WorkerPool {
+func NewWorkerPool(size int) *WorkerPool {
 	wp := &WorkerPool{
 		workers: make([]*Worker, size),
 		tasks:   make(chan func(), 10000),
 		stopCh:  make(chan struct{}),
 	}
-	
+
 	for i := 0; i < size; i++ {
 		wp.workers[i] = &Worker{
-			id:    i,
-			tasks: make(chan func(), 100),
+			id:     i,
+			tasks:  make(chan func(), 100),
 			stopCh: make(chan struct{}),
 		}
 	}
-	
+
 	return wp
 }
 
@@ -495,22 +530,22 @@ func (wp *WorkerPool) Stop() {
 func (s *Server) Start() error {
 	// Start worker pool
 	s.workerPool.Start()
-	
+
 	// Create HTTP server
 	s.server = &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", s.config.ListenAddr, s.config.Port),
-		Handler:      s.router,
-		ReadTimeout:  s.config.ReadTimeout,
-		WriteTimeout: s.config.WriteTimeout,
+		Addr:           fmt.Sprintf("%s:%d", s.config.ListenAddr, s.config.Port),
+		Handler:        s.router,
+		ReadTimeout:    s.config.ReadTimeout,
+		WriteTimeout:   s.config.WriteTimeout,
 		MaxHeaderBytes: 1 << 10,
 	}
-	
+
 	// Setup routes
 	s.setupRoutes()
-	
+
 	// Setup middleware
 	s.setupMiddleware()
-	
+
 	// Start server
 	go func() {
 		var err error
@@ -523,10 +558,10 @@ func (s *Server) Start() error {
 			fmt.Printf("Server error: %v\n", err)
 		}
 	}()
-	
+
 	// Start background tasks
 	s.startBackgroundTasks()
-	
+
 	return nil
 }
 
@@ -534,15 +569,15 @@ func (s *Server) Start() error {
 func (s *Server) setupRoutes() {
 	// WebSocket endpoint
 	s.router.HandleFunc("/ws", s.handleWebSocket)
-	
+
 	// API endpoints
 	s.router.HandleFunc("/api/v1/subscribe", s.handleSubscribe)
 	s.router.HandleFunc("/api/v1/unsubscribe", s.handleUnsubscribe)
 	s.router.HandleFunc("/api/v1/channels", s.handleChannels)
-	
+
 	// Metrics endpoint
 	s.router.HandleFunc("/api/v1/metrics", s.handleMetrics)
-	
+
 	// Health check
 	s.router.HandleFunc("/health", s.handleHealth)
 }
@@ -559,13 +594,13 @@ func (s *Server) setupMiddleware() {
 		handlers.AllowCredentials(),
 	}
 	s.router.Use(handlers.CORS(corsOpts...))
-	
+
 	// Rate limiting
 	s.router.Use(s.rateLimitMiddleware)
-	
+
 	// Request ID
 	s.router.Use(s.requestIDMiddleware)
-	
+
 	// Logging
 	if s.config.Verbose {
 		s.router.Use(s.loggingMiddleware)
@@ -579,7 +614,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Too many connections", http.StatusServiceUnavailable)
 		return
 	}
-	
+
 	// Check IP limit
 	if s.config.MaxConnsPerIP > 0 {
 		ip := getIP(r)
@@ -588,13 +623,13 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	
+
 	// Check rate limit
 	if !s.limiter.Allow(r.RemoteAddr) {
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
-	
+
 	// Authenticate
 	var auth *AuthInfo
 	if s.config.RequireAuth {
@@ -604,31 +639,32 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	
+
 	// Upgrade to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.metrics.Errors++
 		return
 	}
-	
+
 	// Create client
 	client := &Client{
 		ID:            generateID(),
 		IP:            getIP(r),
 		UserAgent:     r.UserAgent(),
-		Auth:         auth,
+		Auth:          auth,
 		Subscriptions: make(map[string]*Subscription),
 		connectedAt:   time.Now(),
-		lastActivity: time.Now(),
-		rateLimiter:   rate.New(s.config.RateLimitBurst, s.config.RateLimit),
-		encoder:      &Encoder{enable: s.config.EnableEncryption, key: (*[32]byte)(s.config.EncryptionKey[:32])},
+		lastActivity:  time.Now(),
+		rateLimiter:   rate.NewLimiter(rate.Limit(s.config.RateLimit), s.config.RateLimitBurst),
+		encoder:       &Encoder{enable: s.config.EnableEncryption, key: (*[32]byte)(s.config.EncryptionKey[:32])},
+		conn:          conn,
 	}
-	
+
 	// Add client
 	s.clients.Add(client)
 	atomic.AddUint64(&s.metrics.Connections, 1)
-	
+
 	// Handle connection
 	go s.handleClient(client, conn)
 }
@@ -640,16 +676,16 @@ func (s *Server) handleClient(client *Client, conn *websocket.Conn) {
 		conn.Close()
 		atomic.AddUint64(&s.metrics.Connections, ^uint64(0))
 	}()
-	
+
 	// Set read limit
 	conn.SetReadLimit(s.config.MaxMsgSize)
-	
+
 	// Set read deadline
 	conn.SetReadDeadline(time.Now().Add(s.config.ReadTimeout))
-	
+
 	// Set write deadline
 	conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
-	
+
 	// Handle messages
 	for {
 		select {
@@ -657,7 +693,7 @@ func (s *Server) handleClient(client *Client, conn *websocket.Conn) {
 			return
 		default:
 		}
-		
+
 		typ, msg, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -665,14 +701,14 @@ func (s *Server) handleClient(client *Client, conn *websocket.Conn) {
 			}
 			return
 		}
-		
+
 		atomic.AddUint64(&s.metrics.BytesRecv, uint64(len(msg)))
-		
+
 		// Rate limit
 		if !client.rateLimiter.Allow() {
 			continue
 		}
-		
+
 		// Process message
 		start := time.Now()
 		s.processMessage(client, msg, typ)
@@ -687,7 +723,7 @@ func (s *Server) processMessage(client *Client, msg []byte, typ int) {
 		s.sendError(client, "invalid message format")
 		return
 	}
-	
+
 	switch m.Type {
 	case "subscribe":
 		s.handleSubscribeMsg(client, m)
@@ -706,40 +742,40 @@ func (s *Server) handleSubscribeMsg(client *Client, m Message) {
 		s.sendError(client, "max subscriptions reached")
 		return
 	}
-	
+
 	var sub struct {
-		Channel string            `json:"channel"`
+		Channel string              `json:"channel"`
 		Filter  *SubscriptionFilter `json:"filter,omitempty"`
 	}
 	if err := json.Unmarshal(m.Payload, &sub); err != nil {
 		s.sendError(client, "invalid subscription format")
 		return
 	}
-	
+
 	// Create subscription
 	subChan := make(chan []byte, s.config.QueueSize)
 	subID := generateID()
 	subscription := &Subscription{
-		ID:       subID,
-		Type:    sub.Channel,
-		Filter:  sub.Filter,
-		Chan:    subChan,
-		Active:  atomic.Bool{},
+		ID:     subID,
+		Type:   sub.Channel,
+		Filter: sub.Filter,
+		Chan:   subChan,
+		Active: atomic.Bool{},
 	}
 	subscription.Active.Store(true)
 	client.Subscriptions[sub.Channel] = subscription
-	
+
 	// Subscribe to broadcaster
 	s.broadcaster.Subscribe(sub.Channel, client)
-	
+
 	// Send confirmation
 	s.sendMessage(client, Message{
 		Type:      "subscribed",
-		Channel:  sub.Channel,
-		ID:       subID,
+		Channel:   sub.Channel,
+		ID:        subID,
 		Timestamp: time.Now(),
 	})
-	
+
 	// Forward messages
 	go func() {
 		for {
@@ -765,17 +801,17 @@ func (s *Server) handleUnsubscribeMsg(client *Client, m Message) {
 		s.sendError(client, "invalid unsubscription format")
 		return
 	}
-	
-	if sub, ok := client.Subscriptions[sub.Channel]; ok {
-		sub.Active.Store(false)
-		close(sub.Chan)
+
+	if existing, ok := client.Subscriptions[sub.Channel]; ok {
+		existing.Active.Store(false)
+		close(existing.Chan)
 		delete(client.Subscriptions, sub.Channel)
 		s.broadcaster.Unsubscribe(sub.Channel, client.ID)
 	}
-	
+
 	s.sendMessage(client, Message{
 		Type:      "unsubscribed",
-		Channel:  sub.Channel,
+		Channel:   sub.Channel,
 		Timestamp: time.Now(),
 	})
 }
@@ -786,16 +822,16 @@ func (s *Server) sendMessage(client *Client, m Message) {
 	if err != nil {
 		return
 	}
-	
+
 	client.sendMu.Lock()
 	defer client.sendMu.Unlock()
-	
+
 	err = client.conn.WriteMessage(websocket.TextMessage, data)
 	if err != nil {
 		s.metrics.Errors++
 		return
 	}
-	
+
 	atomic.AddUint64(&s.metrics.Messages, 1)
 	atomic.AddUint64(&s.metrics.BytesSent, uint64(len(data)))
 }
@@ -804,9 +840,9 @@ func (s *Server) sendMessage(client *Client, m Message) {
 func (s *Server) sendRaw(client *Client, data []byte) {
 	client.sendMu.Lock()
 	defer client.sendMu.Unlock()
-	
+
 	client.conn.WriteMessage(websocket.BinaryMessage, data)
-	
+
 	atomic.AddUint64(&s.metrics.Messages, 1)
 	atomic.AddUint64(&s.metrics.BytesSent, uint64(len(data)))
 }
@@ -815,7 +851,7 @@ func (s *Server) sendRaw(client *Client, data []byte) {
 func (s *Server) sendError(client *Client, errMsg string) {
 	s.sendMessage(client, Message{
 		Type:      "error",
-		Payload:  json.RawMessage(fmt.Sprintf(`{"error":%q}`, errMsg)),
+		Payload:   json.RawMessage(fmt.Sprintf(`{"error":%q}`, errMsg)),
 		Timestamp: time.Now(),
 	})
 }
@@ -837,7 +873,7 @@ func (s *Server) authenticate(r *http.Request) *AuthInfo {
 			return &AuthInfo{APIKey: apiKey}
 		}
 	}
-	
+
 	// Check JWT
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
@@ -847,7 +883,7 @@ func (s *Server) authenticate(r *http.Request) *AuthInfo {
 			return &AuthInfo{JWTClaims: claims}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -909,7 +945,7 @@ func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
 		"new_tokens",
 		"new_nfts",
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(channels)
 }
@@ -934,7 +970,7 @@ func (s *Server) startBackgroundTasks() {
 		defer s.wg.Done()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ticker.C:
@@ -944,14 +980,14 @@ func (s *Server) startBackgroundTasks() {
 			}
 		}
 	}()
-	
+
 	// Metrics cleanup
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ticker.C:
@@ -967,7 +1003,7 @@ func (s *Server) startBackgroundTasks() {
 func (s *Server) cleanupConnections() {
 	s.clients.mu.RLock()
 	defer s.clients.mu.RUnlock()
-	
+
 	for id, client := range s.clients.clients {
 		if time.Since(client.lastActivity) > 5*time.Minute {
 			s.clients.Remove(id)
@@ -979,7 +1015,7 @@ func (s *Server) cleanupConnections() {
 func (s *Server) cleanupMetrics() {
 	s.limiter.mu.Lock()
 	defer s.limiter.mu.Unlock()
-	
+
 	now := time.Now()
 	for ip, t := range s.limiter.ips {
 		if now.Sub(t) > 5*time.Minute {
@@ -995,18 +1031,18 @@ func (l *IPRateLimiter) Allow(remoteAddr string) bool {
 	if ip == "" {
 		ip = remoteAddr
 	}
-	
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	
+
 	limiter, ok := l.limiters[ip]
 	if !ok {
-		limiter = rate.New(l.burst, l.limit)
+		limiter = rate.NewLimiter(rate.Limit(l.limit), l.burst)
 		l.limiters[ip] = limiter
 		l.ips[ip] = time.Now()
 		return true
 	}
-	
+
 	return limiter.Allow()
 }
 
@@ -1014,10 +1050,10 @@ func (l *IPRateLimiter) Allow(remoteAddr string) bool {
 func (s *Server) Stop() error {
 	s.cancel()
 	s.wg.Wait()
-	
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	
+
 	return s.server.Shutdown(ctx)
 }
 
@@ -1032,7 +1068,7 @@ func getIP(r *http.Request) string {
 	if xff != "" {
 		return strings.Split(xff, ",")[0]
 	}
-	
+
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return ip
 }
@@ -1048,17 +1084,18 @@ func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
 	if e.key == nil {
 		return plaintext, nil
 	}
-	
+
 	nonce := make([]byte, 12)
 	rand.Read(nonce)
-	
-	aead, err := chacha20poly1305.NewX(e.key)
+
+	aead, err := chacha20poly1305.NewX(e.key[:])
 	if err != nil {
 		return nil, err
 	}
-	
-	ciphertext := aead.Seal(nonce, nonce, plaintext, nil)
-	return append(nonce, ciphertext...), nil
+
+	// Seal appends the ciphertext to nonce, so the nonce is already the prefix of
+	// the returned slice; appending it again would corrupt the message.
+	return aead.Seal(nonce, nonce, plaintext, nil), nil
 }
 
 // Decrypt decrypts data
@@ -1066,19 +1103,19 @@ func (e *Encryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 	if e.key == nil {
 		return ciphertext, nil
 	}
-	
+
 	if len(ciphertext) < 12 {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
-	
-	aead, err := chacha20poly1305.NewX(e.key)
+
+	aead, err := chacha20poly1305.NewX(e.key[:])
 	if err != nil {
 		return nil, err
 	}
-	
+
 	nonce := ciphertext[:12]
 	ciphertext = ciphertext[12:]
-	
+
 	return aead.Open(nil, nonce, ciphertext, nil)
 }
 
@@ -1098,49 +1135,50 @@ func SignChallenge(challenge []byte, privKey *ecdsa.PrivateKey) ([]byte, error) 
 // VerifyChallenge verifies a challenge response
 func VerifyChallenge(challenge []byte, signature []byte, pubKey *ecdsa.PublicKey) bool {
 	hash := sha256.Sum256(challenge)
-	return ecdsa.VerifyASN1(pubKey, hash[:], signature) == nil
+	return ecdsa.VerifyASN1(pubKey, hash[:], signature)
 }
 
-// GenerateKeyPair generates a new key pair for encryption
-func GenerateKeyPair() ( *[32]byte, error) {
-	pub, priv, err := curve25519.GenerateKey(rand.Reader)
+// GenerateKeyPair generates a new X25519 key pair and returns the private key
+// as 32 raw bytes.
+func GenerateKeyPair() (*[32]byte, error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var key [32]byte
-	copy(key[:], priv)
+	copy(key[:], priv.Bytes())
 	return &key, nil
 }
 
 // RunMain is the main entry point
 func RunMain() {
 	config := &Config{
-		Port:        8546,
-		UseTLS:      false,
-		RequireAuth: false,
-		MaxConns:    10000,
+		Port:           8546,
+		UseTLS:         false,
+		RequireAuth:    false,
+		MaxConns:       10000,
 		WorkerPoolSize: runtime.NumCPU(),
 	}
-	
+
 	server, err := NewServer(config)
 	if err != nil {
 		fmt.Printf("Failed to create server: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	if err := server.Start(); err != nil {
 		fmt.Printf("Failed to start server: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	fmt.Printf("WebSocket server listening on :%d\n", config.Port)
-	
+
 	// Wait for signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	
+
 	fmt.Println("Shutting down...")
 	server.Stop()
 }

@@ -10,12 +10,9 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math/big"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,7 +20,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/sha3"
@@ -101,7 +97,7 @@ type Subscription struct {
 	ID       string
 	Type    string
 	Channel chan interface{}
-	Cancel  context.CancelFunc
+	sub     *rpc.ClientSubscription
 }
 
 // Metrics tracks client metrics
@@ -278,7 +274,7 @@ func (c *Client) createRPCClient(url string) (*rpc.Client, error) {
 			// Security: disable weak ciphers
 			TLSClientConfig: &tls.Config{
 				MinVersion:         tls.VersionTLS12,
-				CurvePreferences: [] elliptic.Curve{elliptic.P256(), elliptic.P384()},
+				CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 				CipherSuites: []uint16{
 					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -298,7 +294,7 @@ func (c *Client) createRPCClient(url string) (*rpc.Client, error) {
 
 	// Add authentication header if API key provided
 	if c.config.APIKey != "" {
-		opts = append(opts, rpc.WithHTTPHeaders(http.Header{
+		opts = append(opts, rpc.WithHeaders(http.Header{
 			"Authorization": []string{c.config.APIKey},
 		}))
 	}
@@ -418,7 +414,7 @@ func (c *Client) GetBlockByHash(ctx context.Context, hash common.Hash) (*types.B
 	start := time.Now()
 	defer func() {
 		c.metrics.mu.Lock()
-		c.metrics.LatencySum += timeSince(start)
+		c.metrics.LatencySum += time.Since(start)
 		c.metrics.LatencyCount++
 		c.metrics.mu.Unlock()
 	}()
@@ -477,7 +473,7 @@ func (c *Client) GetTransactionByHash(ctx context.Context, hash common.Hash) (*t
 	start := time.Now()
 	defer func() {
 		c.metrics.mu.Lock()
-		c.metrics.LatencySum += timeSince(start)
+		c.metrics.LatencySum += time.Since(start)
 		c.metrics.LatencyCount++
 		c.metrics.mu.Unlock()
 	}()
@@ -535,7 +531,7 @@ func (c *Client) GetTransactionReceipt(ctx context.Context, hash common.Hash) (*
 	start := time.Now()
 	defer func() {
 		c.metrics.mu.Lock()
-		c.metrics.LatencySum += timeSince(start)
+		c.metrics.LatencySum += time.Since(start)
 		c.metrics.LatencyCount++
 		c.metrics.mu.Unlock()
 	}()
@@ -568,7 +564,7 @@ func (c *Client) GetCode(ctx context.Context, addr common.Address) ([]byte, erro
 	start := time.Now()
 	defer func() {
 		c.metrics.mu.Lock()
-		c.metrics.LatencySum += timeSince(start)
+		c.metrics.LatencySum += time.Since(start)
 		c.metrics.LatencyCount++
 		c.metrics.mu.Unlock()
 	}()
@@ -596,7 +592,7 @@ func (c *Client) GetBalance(ctx context.Context, addr common.Address) (*big.Int,
 	start := time.Now()
 	defer func() {
 		c.metrics.mu.Lock()
-		c.metrics.LatencySum += timeSince(start)
+		c.metrics.LatencySum += time.Since(start)
 		c.metrics.LatencyCount++
 		c.metrics.mu.Unlock()
 	}()
@@ -684,12 +680,12 @@ func (c *Client) Subscribe(eventType string, channel chan interface{}) (string, 
 		return "", err
 	}
 
-	subID := sub.String()
+	subID := string(rpc.NewID())
 	pool.subs[subID] = &Subscription{
 		ID:       subID,
-		Type:    eventType,
-		Channel: channel,
-		Cancel:  sub.Cancel,
+		Type:     eventType,
+		Channel:  channel,
+		sub:      sub,
 	}
 
 	// Start forwarding messages
@@ -718,7 +714,7 @@ func (c *Client) Unsubscribe(subID string) error {
 	defer pool.mu.Unlock()
 
 	if sub, ok := pool.subs[subID]; ok {
-		sub.Cancel()
+		sub.sub.Unsubscribe()
 		delete(pool.subs, subID)
 	}
 
@@ -844,7 +840,7 @@ func (r *RateLimiter) acquire(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(waitTime):
+		case <-time.After(time.Duration(waitTime * float64(time.Second))):
 			continue
 		}
 	}
@@ -930,7 +926,11 @@ func parseUint256(s string) (*big.Int, error) {
 	if s == "" {
 		return big.NewInt(0), nil
 	}
-	return new(big.Int).SetString(s, 16)
+	n, ok := new(big.Int).SetString(s, 16)
+	if !ok {
+		return nil, fmt.Errorf("invalid uint256 value: %q", s)
+	}
+	return n, nil
 }
 
 // Encrypt encrypts data using ChaCha20-Poly1305
@@ -944,7 +944,7 @@ func (e *Encryptor) Encrypt(plaintext []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	aead, err := chacha20poly1305.NewX(e.key)
+	aead, err := chacha20poly1305.NewX(e.key[:])
 	if err != nil {
 		return nil, err
 	}
@@ -963,7 +963,7 @@ func (e *Encryptor) Decrypt(ciphertext []byte) ([]byte, error) {
 		return nil, fmt.Errorf("ciphertext too short")
 	}
 
-	aead, err := chacha20poly1305.NewX(e.key)
+	aead, err := chacha20poly1305.NewX(e.key[:])
 	if err != nil {
 		return nil, err
 	}
@@ -1000,7 +1000,7 @@ func SignData(data []byte, privKey *ecdsa.PrivateKey) ([]byte, error) {
 // VerifySignature verifies an ECDSA signature
 func VerifySignature(data []byte, signature []byte, pubKey *ecdsa.PublicKey) bool {
 	hash := HashData(data)
-	return ecdsa.VerifyASN1(pubKey, hash, signature) == nil
+	return ecdsa.VerifyASN1(pubKey, hash, signature)
 }
 
 // HealthCheck performs health check on all endpoints

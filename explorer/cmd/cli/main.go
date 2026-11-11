@@ -7,57 +7,53 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"time"
-
-	"github.com/tigersmartchain/tigersmartchain/explorer/services/sdk"
 )
 
 // CLI represents the command line interface
 type CLI struct {
 	config *Config
-	sdk    *sdk.SDKClient
+	client *Client
 }
 
 // Config represents CLI configuration
 type Config struct {
-	APIKey   string
-	BaseURL  string
-	ChainID  uint64
-	Output   string
-	Verbose  bool
+	APIKey  string
+	BaseURL string
+	ChainID uint64
+	Output  string
+	Verbose bool
 }
 
 // Commands
 var (
 	commands = map[string]func(*CLI, []string) error{
-		"block":        cmdBlock,
-		"tx":           cmdTransaction,
-		"account":      cmdAccount,
-		"token":        cmdToken,
-		"search":       cmdSearch,
-		"logs":         cmdLogs,
-		"balance":      cmdBalance,
-		"transfers":    cmdTransfers,
-		"contract":     cmdContract,
-		"read":         cmdReadContract,
-		"write":        cmdWriteContract,
-		"gas":          cmdGasPrice,
-		"blocknumber":  cmdBlockNumber,
-		"nfts":         cmdNFTs,
-		"internal":      cmdInternalTx,
-		"receipt":      cmdReceipt,
+		"block":       cmdBlock,
+		"tx":          cmdTransaction,
+		"account":     cmdAccount,
+		"token":       cmdToken,
+		"search":      cmdSearch,
+		"logs":        cmdLogs,
+		"balance":     cmdBalance,
+		"transfers":   cmdTransfers,
+		"contract":    cmdContract,
+		"read":        cmdReadContract,
+		"write":       cmdWriteContract,
+		"gas":         cmdGasPrice,
+		"blocknumber": cmdBlockNumber,
+		"nfts":        cmdNFTs,
+		"internal":    cmdInternalTx,
+		"receipt":     cmdReceipt,
 	}
 )
 
-	cfg = &Config{}
-)
+var cfg = &Config{}
 
 func main() {
 	// Parse global flags
 	flag.StringVar(&cfg.APIKey, "api-key", "", "API key for authentication")
 	flag.StringVar(&cfg.BaseURL, "url", "https://api.tigersmartchain.io", "API base URL")
-	flag.StringVar(&cfg.ChainID, "chain", "1", "Chain ID (1=ETH, 56=BSC, 137=Polygon)")
+	flag.Uint64Var(&cfg.ChainID, "chain", DefaultChainID, "Chain ID (TigerSmartChain is 6666)")
 	flag.StringVar(&cfg.Output, "output", "json", "Output format (json, text)")
 	flag.BoolVar(&cfg.Verbose, "v", false, "Verbose output")
 	flag.Parse()
@@ -72,12 +68,11 @@ func main() {
 	command := args[0]
 	args = args[1:]
 
-	// Initialize SDK client
-	sdkClient := sdk.InitSDK(cfg.APIKey, cfg.BaseID, 1) // Would use cfg.ChainID
+	client := NewClient(cfg.BaseURL, cfg.APIKey, cfg.ChainID)
 
 	cli := &CLI{
 		config: cfg,
-		sdk:    sdkClient,
+		client: client,
 	}
 
 	// Execute command
@@ -102,7 +97,7 @@ Usage: tigersmartchain [global options] <command> [command options]
 Global Options:
   --api-key string    API key for authentication
   --url string        API base URL (default: https://api.tigersmartchain.io)
-  --chain string     Chain ID (1=ETH, 56=BSC, 137=Polygon)
+  --chain uint       Chain ID (default: 6666, TigerSmartChain)
   --output string    Output format (json, text)
   -v                 Verbose output
 
@@ -117,7 +112,7 @@ Commands:
   transfers <address>       Get token transfers
   contract <address>        Get contract information
   read <address> <method>   Read from contract
-  write <address> <method>  Write to contract
+  write <address> <method> <rawTx>  Broadcast a signed transaction
   gas                       Get current gas prices
   blocknumber                Get current block number
   nfts <address>            Get NFTs for address
@@ -144,7 +139,7 @@ func cmdBlock(cli *CLI, args []string) error {
 
 	blockNumOrHash := args[0]
 
-	block, err := cli.sdk.GetBlock(blockNumOrHash)
+	block, err := cli.client.GetBlock(blockNumOrHash)
 	if err != nil {
 		return fmt.Errorf("failed to get block: %w", err)
 	}
@@ -159,7 +154,7 @@ func cmdTransaction(cli *CLI, args []string) error {
 
 	txHash := args[0]
 
-	tx, err := cli.sdk.GetTransaction(txHash)
+	tx, err := cli.client.GetTransaction(txHash)
 	if err != nil {
 		return fmt.Errorf("failed to get transaction: %w", err)
 	}
@@ -174,7 +169,7 @@ func cmdAccount(cli *CLI, args []string) error {
 
 	address := args[0]
 
-	account, err := cli.sdk.GetAccount(address)
+	account, err := cli.client.GetAccount(address)
 	if err != nil {
 		return fmt.Errorf("failed to get account: %w", err)
 	}
@@ -189,7 +184,7 @@ func cmdToken(cli *CLI, args []string) error {
 
 	address := args[0]
 
-	token, err := cli.sdk.GetToken(address)
+	token, err := cli.client.GetToken(address)
 	if err != nil {
 		return fmt.Errorf("failed to get token: %w", err)
 	}
@@ -204,7 +199,7 @@ func cmdSearch(cli *CLI, args []string) error {
 
 	query := args[0]
 
-	result, err := cli.sdk.Search(query)
+	result, err := cli.client.Search(query)
 	if err != nil {
 		return fmt.Errorf("search failed: %w", err)
 	}
@@ -213,7 +208,7 @@ func cmdSearch(cli *CLI, args []string) error {
 }
 
 func cmdLogs(cli *CLI, args []string) error {
-	opts := &sdk.LogQueryOpts{}
+	opts := &LogQueryOpts{}
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -235,7 +230,7 @@ func cmdLogs(cli *CLI, args []string) error {
 		}
 	}
 
-	logs, err := cli.sdk.GetLogs(opts)
+	logs, err := cli.client.GetLogs(opts)
 	if err != nil {
 		return fmt.Errorf("failed to get logs: %w", err)
 	}
@@ -250,7 +245,7 @@ func cmdBalance(cli *CLI, args []string) error {
 
 	address := args[0]
 
-	account, err := cli.sdk.GetAccount(address)
+	account, err := cli.client.GetAccount(address)
 	if err != nil {
 		return fmt.Errorf("failed to get balance: %w", err)
 	}
@@ -266,7 +261,7 @@ func cmdTransfers(cli *CLI, args []string) error {
 
 	address := args[0]
 
-	transfers, err := cli.sdk.GetTokenTransfers(address, nil)
+	transfers, err := cli.client.GetTokenTransfers(address, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get transfers: %w", err)
 	}
@@ -281,7 +276,7 @@ func cmdContract(cli *CLI, args []string) error {
 
 	address := args[0]
 
-	token, err := cli.sdk.GetToken(address)
+	token, err := cli.client.GetToken(address)
 	if err != nil {
 		return fmt.Errorf("failed to get contract: %w", err)
 	}
@@ -297,7 +292,7 @@ func cmdReadContract(cli *CLI, args []string) error {
 	address := args[0]
 	method := args[1]
 
-	result, err := cli.sdk.ReadContract(address, method, nil)
+	result, err := cli.client.ReadContract(address, method, nil)
 	if err != nil {
 		return fmt.Errorf("failed to read contract: %w", err)
 	}
@@ -306,14 +301,15 @@ func cmdReadContract(cli *CLI, args []string) error {
 }
 
 func cmdWriteContract(cli *CLI, args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("contract address and method required")
+	if len(args) < 3 {
+		return fmt.Errorf("contract address, method and signed raw transaction required")
 	}
 
 	address := args[0]
 	method := args[1]
+	rawTx := args[2]
 
-	result, err := cli.sdk.WriteContract(address, method, nil, nil)
+	result, err := cli.client.WriteContract(address, method, nil, rawTx)
 	if err != nil {
 		return fmt.Errorf("failed to write contract: %w", err)
 	}
@@ -323,7 +319,7 @@ func cmdWriteContract(cli *CLI, args []string) error {
 }
 
 func cmdGasPrice(cli *CLI, args []string) error {
-	gasPrice, err := cli.sdk.GetGasPrice()
+	gasPrice, err := cli.client.GetGasPrice()
 	if err != nil {
 		return fmt.Errorf("failed to get gas price: %w", err)
 	}
@@ -332,7 +328,7 @@ func cmdGasPrice(cli *CLI, args []string) error {
 }
 
 func cmdBlockNumber(cli *CLI, args []string) error {
-	blockNum, err := cli.sdk.GetBlockNumber()
+	blockNum, err := cli.client.GetBlockNumber()
 	if err != nil {
 		return fmt.Errorf("failed to get block number: %w", err)
 	}
@@ -348,7 +344,7 @@ func cmdNFTs(cli *CLI, args []string) error {
 
 	address := args[0]
 
-	nfts, err := cli.sdk.GetNFTs(address, nil)
+	nfts, err := cli.client.GetNFTs(address, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get NFTs: %w", err)
 	}
@@ -363,7 +359,7 @@ func cmdInternalTx(cli *CLI, args []string) error {
 
 	txHash := args[0]
 
-	txs, err := cli.sdk.GetInternalTransactions(txHash)
+	txs, err := cli.client.GetInternalTransactions(txHash)
 	if err != nil {
 		return fmt.Errorf("failed to get internal transactions: %w", err)
 	}
@@ -378,7 +374,7 @@ func cmdReceipt(cli *CLI, args []string) error {
 
 	txHash := args[0]
 
-	receipt, err := cli.sdk.GetTxReceipt(txHash)
+	receipt, err := cli.client.GetTxReceipt(txHash)
 	if err != nil {
 		return fmt.Errorf("failed to get receipt: %w", err)
 	}
@@ -404,49 +400,28 @@ func printOutput(format string, v interface{}) error {
 
 func printText(v interface{}) {
 	switch t := v.(type) {
-	case *sdk.Block:
+	case *Block:
 		fmt.Printf("Block #%d\n", t.Number)
 		fmt.Printf("  Hash: %s\n", t.Hash)
 		fmt.Printf("  Timestamp: %d\n", t.Timestamp)
 		fmt.Printf("  Transactions: %d\n", len(t.Transactions))
-	case *sdk.Transaction:
+	case *Transaction:
 		fmt.Printf("Transaction: %s\n", t.Hash)
 		fmt.Printf("  From: %s\n", t.From)
 		fmt.Printf("  To: %s\n", t.To)
 		fmt.Printf("  Value: %s\n", t.Value)
 		fmt.Printf("  Block: %d\n", t.BlockNumber)
-	case *sdk.Account:
+	case *Account:
 		fmt.Printf("Address: %s\n", t.Address)
 		fmt.Printf("  Balance: %s\n", t.Balance)
 		fmt.Printf("  Nonce: %d\n", t.Nonce)
-	case *sdk.Token:
+	case *Token:
 		fmt.Printf("Token: %s (%s)\n", t.Name, t.Symbol)
 		fmt.Printf("  Decimals: %d\n", t.Decimals)
 		fmt.Printf("  Total Supply: %s\n", t.TotalSupply)
 	default:
 		fmt.Printf("%+v\n", v)
 	}
-}
-
-// Chain ID mapping
-var chainIDs = map[string]uint64{
-	"eth":    1,
-	"ethereum": 1,
-	"bsc":     56,
-	"binance": 56,
-	"polygon": 137,
-	"matic":  137,
-	"avax":    43114,
-	"arbitrum": 42161,
-	"optimism": 10,
-	"base":    8453,
-}
-
-func parseChainID(s string) uint64 {
-	if id, ok := chainIDs[strings.ToLower(s)]; ok {
-		return id
-	}
-	return 1
 }
 
 // Context with timeout

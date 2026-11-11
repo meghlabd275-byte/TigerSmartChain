@@ -12,9 +12,6 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx/v5"
 	
-	"tigersmartchain/explorer/services/analytics"
-	"tigersmartchain/explorer/services/tokens"
-	"tigersmartchain/explorer/services/priceoracle"
 )
 
 // Config holds the graph API configuration
@@ -30,9 +27,6 @@ type GraphService struct {
 	config      *Config
 	db          *pgx.Conn
 	redis       *redis.Client
-	analyticsSvc *analytics.AnalyticsService
-	tokenSvc   *tokens.TokenService
-	priceSvc   *priceoracle.PriceOracle
 }
 
 // NewGraphService creates a new graph service
@@ -56,13 +50,6 @@ func NewGraphService(config *Config) (*GraphService, error) {
 		db:       db,
 		redis:    redisClient,
 	}, nil
-}
-
-// SetServices sets the backend services
-func (s *GraphService) SetServices(analyticsSvc *analytics.AnalyticsService, tokenSvc *tokens.TokenService, priceSvc *priceoracle.PriceOracle) {
-	s.analyticsSvc = analyticsSvc
-	s.tokenSvc = tokenSvc
-	s.priceSvc = priceSvc
 }
 
 // ChartDataPoint represents a single data point on a chart

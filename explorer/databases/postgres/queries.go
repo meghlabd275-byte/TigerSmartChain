@@ -5,7 +5,6 @@ package postgres
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -18,8 +17,8 @@ import (
 
 // Config holds database configuration
 type Config struct {
-	Host            string
-	Port            int
+	Host           string
+	Port           int
 	User           string
 	Password       string
 	Database       string
@@ -75,27 +74,27 @@ func (db *DB) Close() {
 
 // Block represents a blockchain block
 type Block struct {
-	ID              int64     `json:"id"`
-	Number         int64     `json:"number"`
-	Hash           string   `json:"hash"`
-	ParentHash     string   `json:"parentHash"`
-	Nonce          string   `json:"nonce,omitempty"`
-	SHA3Uncles     string   `json:"sha3Uncles,omitempty"`
-	LogsBloom      string   `json:"logsBloom,omitempty"`
-	TransactionsRoot string `json:"transactionsRoot,omitempty"`
-	StateRoot      string   `json:"stateRoot,omitempty"`
-	ReceiptsRoot   string   `json:"receiptsRoot,omitempty"`
-	Miner          string   `json:"miner"`
-	Difficulty     string   `json:"difficulty,omitempty"`
-	TotalDifficulty string `json:"totalDifficulty,omitempty"`
-	Size           int64    `json:"size,omitempty"`
-	GasLimit       int64    `json:"gasLimit"`
-	GasUsed        int64    `json:"gasUsed"`
-	Timestamp      int64    `json:"timestamp"`
-	ExtraData      string   `json:"extraData,omitempty"`
-	BaseFeePerGas  int64    `json:"baseFeePerGas,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	ID               int64     `json:"id"`
+	Number           int64     `json:"number"`
+	Hash             string    `json:"hash"`
+	ParentHash       string    `json:"parentHash"`
+	Nonce            string    `json:"nonce,omitempty"`
+	SHA3Uncles       string    `json:"sha3Uncles,omitempty"`
+	LogsBloom        string    `json:"logsBloom,omitempty"`
+	TransactionsRoot string    `json:"transactionsRoot,omitempty"`
+	StateRoot        string    `json:"stateRoot,omitempty"`
+	ReceiptsRoot     string    `json:"receiptsRoot,omitempty"`
+	Miner            string    `json:"miner"`
+	Difficulty       string    `json:"difficulty,omitempty"`
+	TotalDifficulty  string    `json:"totalDifficulty,omitempty"`
+	Size             int64     `json:"size,omitempty"`
+	GasLimit         int64     `json:"gasLimit"`
+	GasUsed          int64     `json:"gasUsed"`
+	Timestamp        int64     `json:"timestamp"`
+	ExtraData        string    `json:"extraData,omitempty"`
+	BaseFeePerGas    int64     `json:"baseFeePerGas,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 // InsertBlock inserts a new block
@@ -238,25 +237,25 @@ func (db *DB) GetBlocks(ctx context.Context, limit, offset int) ([]*Block, error
 
 // Transaction represents a blockchain transaction
 type Transaction struct {
-	ID              int64     `json:"id"`
-	Hash           string    `json:"hash"`
-	BlockNumber    *int64    `json:"blockNumber,omitempty"`
-	BlockHash     *string   `json:"blockHash,omitempty"`
-	TransactionIndex *int64  `json:"transactionIndex,omitempty"`
-	FromAddress  string    `json:"fromAddress"`
-	ToAddress    *string   `json:"toAddress,omitempty"`
-	Value        string    `json:"value"`
-	GasPrice     int64     `json:"gasPrice"`
-	GasLimit     int64     `json:"gasLimit"`
-	GasUsed      *int64   `json:"gasUsed,omitempty"`
-	Nonce        int64     `json:"nonce"`
-	InputData    *string  `json:"inputData,omitempty"`
-	V            *int64    `json:"v,omitempty"`
-	R            *string   `json:"r,omitempty"`
-	S            *string   `json:"s,omitempty"`
-	Status      int       `json:"status"`
-	Timestamp   *int64   `json:"timestamp,omitempty"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID               int64     `json:"id"`
+	Hash             string    `json:"hash"`
+	BlockNumber      *int64    `json:"blockNumber,omitempty"`
+	BlockHash        *string   `json:"blockHash,omitempty"`
+	TransactionIndex *int64    `json:"transactionIndex,omitempty"`
+	FromAddress      string    `json:"fromAddress"`
+	ToAddress        *string   `json:"toAddress,omitempty"`
+	Value            string    `json:"value"`
+	GasPrice         int64     `json:"gasPrice"`
+	GasLimit         int64     `json:"gasLimit"`
+	GasUsed          *int64    `json:"gasUsed,omitempty"`
+	Nonce            int64     `json:"nonce"`
+	InputData        *string   `json:"inputData,omitempty"`
+	V                *int64    `json:"v,omitempty"`
+	R                *string   `json:"r,omitempty"`
+	S                *string   `json:"s,omitempty"`
+	Status           int       `json:"status"`
+	Timestamp        *int64    `json:"timestamp,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
 }
 
 // InsertTransaction inserts a new transaction
@@ -396,19 +395,19 @@ func (db *DB) GetPendingTransactions(ctx context.Context, limit int) ([]*Transac
 
 // Account represents an account
 type Account struct {
-	ID                int64     `json:"id"`
-	Address           string    `json:"address"`
+	ID               int64     `json:"id"`
+	Address          string    `json:"address"`
 	Balance          string    `json:"balance"`
 	Nonce            int       `json:"nonce"`
 	CodeHash         *string   `json:"codeHash,omitempty"`
-	CodeLength      int       `json:"codeLength"`
+	CodeLength       int       `json:"codeLength"`
 	IsContract       bool      `json:"isContract"`
-	IsVerified      bool      `json:"isVerified"`
+	IsVerified       bool      `json:"isVerified"`
 	IsSelfDestructed bool      `json:"isSelfDestructed"`
 	FirstBlockNumber *int64    `json:"firstBlockNumber,omitempty"`
 	LastBlockNumber  *int64    `json:"lastBlockNumber,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 // InsertAccount inserts or updates an account
@@ -494,26 +493,26 @@ func (db *DB) GetAccountTransactions(ctx context.Context, address string, limit,
 
 // Token represents a TEP20 token
 type Token struct {
-	ID              int64     `json:"id"`
-	Address         string    `json:"address"`
+	ID             int64     `json:"id"`
+	Address        string    `json:"address"`
 	Name           string    `json:"name"`
 	Symbol         string    `json:"symbol"`
 	Decimals       int       `json:"decimals"`
 	TotalSupply    string    `json:"totalSupply"`
 	HoldersCount   int       `json:"holdersCount"`
 	TransfersCount int       `json:"transfersCount"`
-	Creator       *string   `json:"creator,omitempty"`
-	ContractType  string    `json:"contractType"`
-	IsVerified    bool      `json:"isVerified"`
-	IsActive      bool      `json:"isActive"`
-	Price         *string   `json:"price,omitempty"`
-	MarketCap     *string   `json:"marketCap,omitempty"`
-	Volume24h     *string   `json:"volume24h,omitempty"`
-	PriceChange24h *string  `json:"priceChange24h,omitempty"`
-	TxHash        *string   `json:"txHash,omitempty"`
-	BlockNumber   *int64    `json:"blockNumber,omitempty"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
+	Creator        *string   `json:"creator,omitempty"`
+	ContractType   string    `json:"contractType"`
+	IsVerified     bool      `json:"isVerified"`
+	IsActive       bool      `json:"isActive"`
+	Price          *string   `json:"price,omitempty"`
+	MarketCap      *string   `json:"marketCap,omitempty"`
+	Volume24h      *string   `json:"volume24h,omitempty"`
+	PriceChange24h *string   `json:"priceChange24h,omitempty"`
+	TxHash         *string   `json:"txHash,omitempty"`
+	BlockNumber    *int64    `json:"blockNumber,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 // InsertToken inserts or updates a token
@@ -607,8 +606,8 @@ func (db *DB) GetTokens(ctx context.Context, limit, offset int) ([]*Token, error
 
 // TokenHolder represents a token holder
 type TokenHolder struct {
-	ID            int64     `json:"id"`
-	TokenAddress  string    `json:"tokenAddress"`
+	ID           int64     `json:"id"`
+	TokenAddress string    `json:"tokenAddress"`
 	Address      string    `json:"address"`
 	Balance      string    `json:"balance"`
 	Percent      float64   `json:"percent"`
@@ -667,17 +666,17 @@ func (db *DB) GetTokenHolders(ctx context.Context, tokenAddress string, limit, o
 
 // TokenTransfer represents a token transfer
 type TokenTransfer struct {
-	ID            int64     `json:"id"`
-	TokenAddress  string    `json:"tokenAddress"`
-	Hash         string    `json:"hash"`
-	BlockNumber  int64     `json:"blockNumber"`
-	TransactionHash string  `json:"transactionHash"`
-	FromAddress string    `json:"fromAddress"`
-	ToAddress   string    `json:"toAddress"`
-	Value      string    `json:"value"`
-	LogIndex   *int64    `json:"logIndex,omitempty"`
-	Timestamp  int64     `json:"timestamp"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID              int64     `json:"id"`
+	TokenAddress    string    `json:"tokenAddress"`
+	Hash            string    `json:"hash"`
+	BlockNumber     int64     `json:"blockNumber"`
+	TransactionHash string    `json:"transactionHash"`
+	FromAddress     string    `json:"fromAddress"`
+	ToAddress       string    `json:"toAddress"`
+	Value           string    `json:"value"`
+	LogIndex        *int64    `json:"logIndex,omitempty"`
+	Timestamp       int64     `json:"timestamp"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 // InsertTokenTransfer inserts a token transfer
@@ -732,27 +731,27 @@ func (db *DB) GetTokenTransfers(ctx context.Context, tokenAddress string, limit,
 
 // NFTCollection represents an NFT collection
 type NFTCollection struct {
-	ID            int64     `json:"id"`
-	Address       string    `json:"address"`
-	Name          string    `json:"name"`
-	Symbol        *string   `json:"symbol,omitempty"`
+	ID           int64     `json:"id"`
+	Address      string    `json:"address"`
+	Name         string    `json:"name"`
+	Symbol       *string   `json:"symbol,omitempty"`
 	Description  *string   `json:"description,omitempty"`
 	ImageURL     *string   `json:"imageURL,omitempty"`
 	ExternalURL  *string   `json:"externalURL,omitempty"`
-	ContractType string   `json:"contractType"`
-	TotalSupply int64     `json:"totalSupply"`
-	OwnersCount int64     `json:"ownersCount"`
-	NFTsCount   int64     `json:"nftsCount"`
-	FloorPrice  *string   `json:"floorPrice,omitempty"`
-	Volume24h   *string   `json:"volume24h,omitempty"`
-	VolumeTotal *string   `json:"volumeTotal,omitempty"`
-	Creator     *string   `json:"creator,omitempty"`
+	ContractType string    `json:"contractType"`
+	TotalSupply  int64     `json:"totalSupply"`
+	OwnersCount  int64     `json:"ownersCount"`
+	NFTsCount    int64     `json:"nftsCount"`
+	FloorPrice   *string   `json:"floorPrice,omitempty"`
+	Volume24h    *string   `json:"volume24h,omitempty"`
+	VolumeTotal  *string   `json:"volumeTotal,omitempty"`
+	Creator      *string   `json:"creator,omitempty"`
 	IsVerified   bool      `json:"isVerified"`
-	IsActive    bool      `json:"isActive"`
-	TxHash      *string   `json:"txHash,omitempty"`
-	BlockNumber *int64    `json:"blockNumber,omitempty"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	IsActive     bool      `json:"isActive"`
+	TxHash       *string   `json:"txHash,omitempty"`
+	BlockNumber  *int64    `json:"blockNumber,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 // InsertCollection inserts or updates an NFT collection
@@ -847,26 +846,26 @@ func (db *DB) GetCollections(ctx context.Context, limit, offset int) ([]*NFTColl
 
 // NFTToken represents an NFT
 type NFTToken struct {
-	ID              int64     `json:"id"`
-	Address         string    `json:"address"`
-	TokenID         string    `json:"tokenId"`
-	Owner           string    `json:"owner"`
-	Creator        *string   `json:"creator,omitempty"`
-	Name           *string   `json:"name,omitempty"`
-	Description    *string   `json:"description,omitempty"`
-	ImageURL       *string   `json:"imageURL,omitempty"`
-	AnimationURL   *string   `json:"animationURL,omitempty"`
-	ExternalURL    *string   `json:"externalURL,omitempty"`
-	Attributes     *string   `json:"attributes,omitempty"`
-	ContractType   string    `json:"contractType"`
-	TokenURI       *string   `json:"tokenURI,omitempty"`
-	CollectionAddress *string `json:"collectionAddress,omitempty"`
-	BlockNumber    *int64    `json:"blockNumber,omitempty"`
-	BlockHash      *string   `json:"blockHash,omitempty"`
-	TransactionHash *string  `json:"transactionHash,omitempty"`
-	Timestamp      *int64    `json:"timestamp,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	ID                int64     `json:"id"`
+	Address           string    `json:"address"`
+	TokenID           string    `json:"tokenId"`
+	Owner             string    `json:"owner"`
+	Creator           *string   `json:"creator,omitempty"`
+	Name              *string   `json:"name,omitempty"`
+	Description       *string   `json:"description,omitempty"`
+	ImageURL          *string   `json:"imageURL,omitempty"`
+	AnimationURL      *string   `json:"animationURL,omitempty"`
+	ExternalURL       *string   `json:"externalURL,omitempty"`
+	Attributes        *string   `json:"attributes,omitempty"`
+	ContractType      string    `json:"contractType"`
+	TokenURI          *string   `json:"tokenURI,omitempty"`
+	CollectionAddress *string   `json:"collectionAddress,omitempty"`
+	BlockNumber       *int64    `json:"blockNumber,omitempty"`
+	BlockHash         *string   `json:"blockHash,omitempty"`
+	TransactionHash   *string   `json:"transactionHash,omitempty"`
+	Timestamp         *int64    `json:"timestamp,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
 }
 
 // InsertNFT inserts or updates an NFT
@@ -959,30 +958,30 @@ func (db *DB) GetNFTsByCollection(ctx context.Context, address string, limit, of
 
 // Contract represents a verified smart contract
 type Contract struct {
-	ID                  int64     `json:"id"`
-	Address            string    `json:"address"`
-	Name               string    `json:"name"`
-	Compiler           string    `json:"compiler"`
-	Version            string    `json:"version"`
-	OptimizationEnabled bool     `json:"optimizationEnabled"`
-	OptimizationRuns  int       `json:"optimizationRuns"`
-	SourceCode         string    `json:"sourceCode"`
-	ABI                *string   `json:"abi,omitempty"`
-	Bytecode           *string   `json:"bytecode,omitempty"`
-	ConstructorArgs   *string   `json:"constructorArgs,omitempty"`
-	EVMVersion        *string   `json:"evmVersion,omitempty"`
-	LibraryRefs       *string   `json:"libraryRefs,omitempty"`
-	IsVerified        bool      `json:"isVerified"`
-	VerificationDate *time.Time `json:"verificationDate,omitempty"`
-	VerifiedBy       *string   `json:"verifiedBy,omitempty"`
-	IsProxy           bool      `json:"isProxy"`
-	ProxyImplementation *string `json:"proxyImplementation,omitempty"`
-	IsUpgradable      bool      `json:"isUpgradable"`
-	License           *string   `json:"license,omitempty"`
-	ExternalLibs      *string   `json:"externalLibs,omitempty"`
-	HitsCount         int       `json:"hitsCount"`
-	CreatedAt         time.Time `json:"createdAt"`
-	UpdatedAt         time.Time `json:"updatedAt"`
+	ID                  int64      `json:"id"`
+	Address             string     `json:"address"`
+	Name                string     `json:"name"`
+	Compiler            string     `json:"compiler"`
+	Version             string     `json:"version"`
+	OptimizationEnabled bool       `json:"optimizationEnabled"`
+	OptimizationRuns    int        `json:"optimizationRuns"`
+	SourceCode          string     `json:"sourceCode"`
+	ABI                 *string    `json:"abi,omitempty"`
+	Bytecode            *string    `json:"bytecode,omitempty"`
+	ConstructorArgs     *string    `json:"constructorArgs,omitempty"`
+	EVMVersion          *string    `json:"evmVersion,omitempty"`
+	LibraryRefs         *string    `json:"libraryRefs,omitempty"`
+	IsVerified          bool       `json:"isVerified"`
+	VerificationDate    *time.Time `json:"verificationDate,omitempty"`
+	VerifiedBy          *string    `json:"verifiedBy,omitempty"`
+	IsProxy             bool       `json:"isProxy"`
+	ProxyImplementation *string    `json:"proxyImplementation,omitempty"`
+	IsUpgradable        bool       `json:"isUpgradable"`
+	License             *string    `json:"license,omitempty"`
+	ExternalLibs        *string    `json:"externalLibs,omitempty"`
+	HitsCount           int        `json:"hitsCount"`
+	CreatedAt           time.Time  `json:"createdAt"`
+	UpdatedAt           time.Time  `json:"updatedAt"`
 }
 
 // InsertContract inserts or updates a contract
@@ -1084,15 +1083,15 @@ func (db *DB) GetVerifiedContracts(ctx context.Context, limit, offset int) ([]*C
 
 // Log represents an EVM event log
 type Log struct {
-	ID            int64     `json:"id"`
-	TransactionHash string  `json:"transactionHash"`
-	BlockNumber  int64     `json:"blockNumber"`
-	Address      string    `json:"address"`
-	Topics       string    `json:"topics"`
-	Data         string    `json:"data"`
-	LogIndex     int64     `json:"logIndex"`
-	Timestamp    int64     `json:"timestamp"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID              int64     `json:"id"`
+	TransactionHash string    `json:"transactionHash"`
+	BlockNumber     int64     `json:"blockNumber"`
+	Address         string    `json:"address"`
+	Topics          string    `json:"topics"`
+	Data            string    `json:"data"`
+	LogIndex        int64     `json:"logIndex"`
+	Timestamp       int64     `json:"timestamp"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 // InsertLog inserts a log
@@ -1142,14 +1141,14 @@ func (db *DB) GetLogsByTransaction(ctx context.Context, txHash string) ([]*Log, 
 
 // GasPrice represents gas price data
 type GasPrice struct {
-	ID              int64     `json:"id"`
-	BlockNumber     int64     `json:"blockNumber"`
-	SlowGasPrice    int64     `json:"slowGasPrice"`
-	AvgGasPrice     int64     `json:"avgGasPrice"`
-	FastGasPrice   int64     `json:"fastGasPrice"`
-	BaseFeePerGas  *int64    `json:"baseFeePerGas,omitempty"`
-	Timestamp      int64     `json:"timestamp"`
-	CreatedAt      time.Time `json:"createdAt"`
+	ID            int64     `json:"id"`
+	BlockNumber   int64     `json:"blockNumber"`
+	SlowGasPrice  int64     `json:"slowGasPrice"`
+	AvgGasPrice   int64     `json:"avgGasPrice"`
+	FastGasPrice  int64     `json:"fastGasPrice"`
+	BaseFeePerGas *int64    `json:"baseFeePerGas,omitempty"`
+	Timestamp     int64     `json:"timestamp"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // InsertGasPrice inserts gas price data
@@ -1220,22 +1219,22 @@ type Validator struct {
 	Address         string    `json:"address"`
 	Name            *string   `json:"name,omitempty"`
 	Website         *string   `json:"website,omitempty"`
-	Email          *string   `json:"email,omitempty"`
-	Description    *string   `json:"description,omitempty"`
-	LogoURL        *string   `json:"logoURL,omitempty"`
-	CommissionRate float64   `json:"commissionRate"`
-	TotalStake     *string   `json:"totalStake,omitempty"`
-	SelfStake      *string   `json:"selfStake,omitempty"`
-	DelegatorsCount int      `json:"delegatorsCount"`
-	BlocksProposed int      `json:"blocksProposed"`
-	BlocksMissed   int      `json:"blocksMissed"`
-	Uptime         float64   `json:"uptime"`
-	IsActive       bool      `json:"isActive"`
-	IsJailed       bool      `json:"isJailed"`
-	JailReason    *string   `json:"jailReason,omitempty"`
-	JailedUntil   *int64    `json:"jailedUntil,omitempty"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	Email           *string   `json:"email,omitempty"`
+	Description     *string   `json:"description,omitempty"`
+	LogoURL         *string   `json:"logoURL,omitempty"`
+	CommissionRate  float64   `json:"commissionRate"`
+	TotalStake      *string   `json:"totalStake,omitempty"`
+	SelfStake       *string   `json:"selfStake,omitempty"`
+	DelegatorsCount int       `json:"delegatorsCount"`
+	BlocksProposed  int       `json:"blocksProposed"`
+	BlocksMissed    int       `json:"blocksMissed"`
+	Uptime          float64   `json:"uptime"`
+	IsActive        bool      `json:"isActive"`
+	IsJailed        bool      `json:"isJailed"`
+	JailReason      *string   `json:"jailReason,omitempty"`
+	JailedUntil     *int64    `json:"jailedUntil,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
 }
 
 // InsertValidator inserts or updates a validator
@@ -1310,10 +1309,10 @@ func (db *DB) GetValidators(ctx context.Context, limit, offset int) ([]*Validato
 
 // SearchResult represents a search result
 type SearchResult struct {
-	Type      string          `json:"type"`
-	ID       string          `json:"id"`
-	Data     json.RawMessage `json:"data"`
-	Rank     float64         `json:"rank"`
+	Type string          `json:"type"`
+	ID   string          `json:"id"`
+	Data json.RawMessage `json:"data"`
+	Rank float64         `json:"rank"`
 }
 
 // Search searches the explorer
@@ -1390,14 +1389,14 @@ func (db *DB) Search(ctx context.Context, query string, limit int) ([]*SearchRes
 
 // NetworkStats represents network statistics
 type NetworkStats struct {
-	TotalBlocks      int64   `json:"totalBlocks"`
-	TotalTransactions int64   `json:"totalTransactions"`
-	UniqueSenders    int64   `json:"uniqueSenders"`
-	TotalTokens     int64   `json:"totalTokens"`
-	TotalCollections int64   `json:"totalCollections"`
-	TotalNFTs       int64   `json:"totalNFTs"`
-	TotalGasUsed    int64   `json:"totalGasUsed"`
-	CurrentGasPrice int64   `json:"currentGasPrice"`
+	TotalBlocks       int64 `json:"totalBlocks"`
+	TotalTransactions int64 `json:"totalTransactions"`
+	UniqueSenders     int64 `json:"uniqueSenders"`
+	TotalTokens       int64 `json:"totalTokens"`
+	TotalCollections  int64 `json:"totalCollections"`
+	TotalNFTs         int64 `json:"totalNFTs"`
+	TotalGasUsed      int64 `json:"totalGasUsed"`
+	CurrentGasPrice   int64 `json:"currentGasPrice"`
 }
 
 // GetNetworkStats retrieves network statistics
@@ -1480,9 +1479,8 @@ func (db *DB) BatchInsertBlocks(ctx context.Context, blocks []*Block) error {
 	br := db.pool.SendBatch(ctx, batch)
 	defer br.Close()
 
-	for _, block := range blocks {
-		_, err := br.Exec()
-		if err != nil {
+	for range blocks {
+		if _, err := br.Exec(); err != nil {
 			return err
 		}
 	}
@@ -1519,9 +1517,8 @@ func (db *DB) BatchInsertTransactions(ctx context.Context, txs []*Transaction) e
 	br := db.pool.SendBatch(ctx, batch)
 	defer br.Close()
 
-	for _, tx := range txs {
-		_, err := br.Exec()
-		if err != nil {
+	for range txs {
+		if _, err := br.Exec(); err != nil {
 			return err
 		}
 	}
@@ -1584,16 +1581,15 @@ func ValidateHash(hash string) bool {
 	return true
 }
 
-// HexToBigInt converts a hex string to big int
-func HexToBigInt(hex string) string {
-	if strings.HasPrefix(hex, "0x") {
-		hex = hex[2:]
-	}
-	if hex == "" {
+// HexToBigInt converts a hex quantity to its decimal representation. It returns
+// "0" for empty or malformed input so callers always receive a usable value.
+func HexToBigInt(hexStr string) string {
+	hexStr = strings.TrimPrefix(strings.TrimPrefix(hexStr, "0x"), "0X")
+	if hexStr == "" {
 		return "0"
 	}
-	val, err := new(big.Int).SetString(hex, 16)
-	if err != nil {
+	val, ok := new(big.Int).SetString(hexStr, 16)
+	if !ok {
 		return "0"
 	}
 	return val.String()

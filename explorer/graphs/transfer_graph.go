@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -25,13 +26,22 @@ import (
 // =============================================================================
 
 type Config struct {
-	DB              *sql.DB
+	DB               *sql.DB
 	Redis            *redis.Client
 	MaxNodes         int
 	MaxLinks         int
-	CacheTTL        time.Duration
+	CacheTTL         time.Duration
 	EnableClustering bool
 	ClusterThreshold float64
+	// PriceURL is a CoinGecko-compatible simple-price endpoint used to value
+	// transfers in USD. When empty, USD enrichment is skipped.
+	PriceURL string
+	// PriceAsset is the asset id requested from PriceURL (for example
+	// "ethereum" or "tiger-smart-chain").
+	PriceAsset string
+	// HTTPClient is reused for price lookups. A default client is installed
+	// when nil.
+	HTTPClient *http.Client
 }
 
 // =============================================================================
@@ -40,48 +50,48 @@ type Config struct {
 
 // TransferNode represents a node in the transfer graph
 type TransferNode struct {
-	ID          string  `json:"id"`
-	Address     string  `json:"address"`
-	Type       string  `json:"type"` // "address", "contract", "token"
-	Label      string  `json:"label"`
-	Value       float64 `json:"value"`
-	ValueUSD   float64 `json:"valueUsd"`
-	TxCount    int     `json:"txCount"`
-	InDegree   int     `json:"inDegree"`
-	OutDegree  int     `json:"outDegree"`
-	X          float64 `json:"x,omitempty"`
-	Y          float64 `json:"y,omitempty"`
-	Fx         float64 `json:"fx,omitempty"`
-	Fy         float64 `json:"fy,omitempty"`
+	ID        string  `json:"id"`
+	Address   string  `json:"address"`
+	Type      string  `json:"type"` // "address", "contract", "token"
+	Label     string  `json:"label"`
+	Value     float64 `json:"value"`
+	ValueUSD  float64 `json:"valueUsd"`
+	TxCount   int     `json:"txCount"`
+	InDegree  int     `json:"inDegree"`
+	OutDegree int     `json:"outDegree"`
+	X         float64 `json:"x,omitempty"`
+	Y         float64 `json:"y,omitempty"`
+	Fx        float64 `json:"fx,omitempty"`
+	Fy        float64 `json:"fy,omitempty"`
 }
 
 // TransferLink represents an edge in the transfer graph
 type TransferLink struct {
-	Source         string  `json:"source"`
-	Target        string  `json:"target"`
-	Value         float64 `json:"value"`
-	ValueUSD      float64 `json:"valueUsd"`
-	TokenAddress  string  `json:"tokenAddress"`
-	TransactionHash string `json:"transactionHash"`
-	Timestamp    int64   `json:"timestamp"`
-	Type         string  `json:"type"` // "transfer", "swap", "mint", "burn"
+	Source          string  `json:"source"`
+	Target          string  `json:"target"`
+	Value           float64 `json:"value"`
+	ValueUSD        float64 `json:"valueUsd"`
+	TokenAddress    string  `json:"tokenAddress"`
+	TransactionHash string  `json:"transactionHash"`
+	Timestamp       int64   `json:"timestamp"`
+	Type            string  `json:"type"` // "transfer", "swap", "mint", "burn"
 }
 
 // TransferGraphResponse represents the API response
 type TransferGraphResponse struct {
 	Nodes []TransferNode `json:"nodes"`
 	Links []TransferLink `json:"links"`
-	Meta  GraphMeta   `json:"meta"`
+	Meta  GraphMeta      `json:"meta"`
 }
 
 // GraphMeta contains metadata about the graph
 type GraphMeta struct {
 	TotalValue    float64 `json:"totalValue"`
 	TotalValueUSD float64 `json:"totalValueUsd"`
-	TotalNodes   int     `json:"totalNodes"`
-	TotalLinks   int     `json:"totalLinks"`
-	TimeRange   string  `json:"timeRange"`
-	TokenAddress string  `json:"tokenAddress,omitempty"`
+	TotalNodes    int     `json:"totalNodes"`
+	TotalLinks    int     `json:"totalLinks"`
+	TimeRange     string  `json:"timeRange"`
+	TokenAddress  string  `json:"tokenAddress,omitempty"`
 }
 
 // =============================================================================
@@ -90,8 +100,9 @@ type GraphMeta struct {
 
 type Server struct {
 	cfg    *Config
-	mu    sync.RWMutex
-	cache map[string]*CacheEntry
+	mu     sync.RWMutex
+	cache  map[string]*CacheEntry
+	client *http.Client
 }
 
 type CacheEntry struct {
@@ -104,8 +115,12 @@ func NewServer(cfg *Config) *Server {
 	if cfg == nil {
 		cfg = &Config{}
 	}
-	
+
 	// Set defaults
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
+	}
+
 	if cfg.MaxNodes == 0 {
 		cfg.MaxNodes = 500
 	}
@@ -118,9 +133,9 @@ func NewServer(cfg *Config) *Server {
 	if cfg.ClusterThreshold == 0 {
 		cfg.ClusterThreshold = 100000 // $100k threshold
 	}
-	
+
 	return &Server{
-		cfg:    cfg,
+		cfg:   cfg,
 		cache: make(map[string]*CacheEntry),
 	}
 }
@@ -132,13 +147,13 @@ func NewServer(cfg *Config) *Server {
 // GetTransferGraph handles GET /api/v1/graphs/transfers
 func (s *Server) GetTransferGraph(c *gin.Context) {
 	ctx := c.Request.Context()
-	
+
 	// Parse query parameters
 	tokenAddress := c.Query("token")
 	address := c.Query("address")
 	timeRange := c.DefaultQuery("time_range", "24h")
 	limitStr := c.DefaultQuery("limit", "100")
-	
+
 	limit, err := strconv.Atoi(limitStr)
 	if err != nil || limit <= 0 {
 		limit = 100
@@ -146,22 +161,22 @@ func (s *Server) GetTransferGraph(c *gin.Context) {
 	if limit > s.cfg.MaxNodes {
 		limit = s.cfg.MaxNodes
 	}
-	
+
 	// Generate cache key
 	cacheKey := fmt.Sprintf("transfer_graph:%s:%s:%s:%d", tokenAddress, address, timeRange, limit)
-	
+
 	// Check cache first
 	if entry := s.getCacheEntry(cacheKey); entry != nil {
 		c.JSON(http.StatusOK, entry.Data)
 		return
 	}
-	
+
 	// Calculate time range
 	startTime := s.parseTimeRange(timeRange)
 	if startTime.IsZero() {
 		startTime = time.Now().Add(-24 * time.Hour)
 	}
-	
+
 	// Fetch graph data from database
 	graph, err := s.fetchTransferGraph(ctx, tokenAddress, address, startTime, limit)
 	if err != nil {
@@ -170,18 +185,18 @@ func (s *Server) GetTransferGraph(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// Enrich with USD values
 	if err := s.enrichWithUSDValues(ctx, graph); err != nil {
 		// Continue even if enrichment fails
 		fmt.Printf("Warning: Failed to enrich USD values: %v\n", err)
 	}
-	
+
 	// Apply clustering if enabled
 	if s.cfg.EnableClustering {
 		s.applyClustering(graph)
 	}
-	
+
 	// Build response
 	response := &TransferGraphResponse{
 		Nodes: graph.Nodes,
@@ -189,29 +204,29 @@ func (s *Server) GetTransferGraph(c *gin.Context) {
 		Meta: GraphMeta{
 			TotalValue:    calculateTotalValue(graph.Nodes),
 			TotalValueUSD: calculateTotalUSD(graph.Nodes),
-			TotalNodes:  len(graph.Nodes),
-			TotalLinks:  len(graph.Links),
-			TimeRange:   timeRange,
-			TokenAddress: tokenAddress,
+			TotalNodes:    len(graph.Nodes),
+			TotalLinks:    len(graph.Links),
+			TimeRange:     timeRange,
+			TokenAddress:  tokenAddress,
 		},
 	}
-	
+
 	// Cache response
 	s.setCacheEntry(cacheKey, response)
-	
+
 	c.JSON(http.StatusOK, response)
 }
 
 // GetTokenTransfers handles GET /api/v1/graphs/token-transfers
 func (s *Server) GetTokenTransfers(c *gin.Context) {
 	ctx := c.Request.Context()
-	
+
 	tokenAddress := c.Param("address")
 	if tokenAddress == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Token address required"})
 		return
 	}
-	
+
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
@@ -219,14 +234,14 @@ func (s *Server) GetTokenTransfers(c *gin.Context) {
 		limit = 50
 	}
 	offset := (page - 1) * limit
-	
+
 	// Get time range
 	timeRange := c.DefaultQuery("time_range", "24h")
 	startTime := s.parseTimeRange(timeRange)
 	if startTime.IsZero() {
 		startTime = time.Now().Add(-24 * time.Hour)
 	}
-	
+
 	// Fetch transfers
 	transfers, total, err := s.fetchTokenTransfers(ctx, tokenAddress, startTime, limit, offset)
 	if err != nil {
@@ -235,7 +250,7 @@ func (s *Server) GetTokenTransfers(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"transfers": transfers,
 		"pagination": gin.H{
@@ -263,10 +278,10 @@ func (s *Server) fetchTransferGraph(
 		Nodes: make([]TransferNode, 0, limit),
 		Links: make([]TransferLink, 0, limit*2),
 	}
-	
+
 	nodeMap := make(map[string]*TransferNode)
 	linkMap := make(map[string]*TransferLink)
-	
+
 	// Query token transfers
 	query := `
 		SELECT 
@@ -285,40 +300,40 @@ func (s *Server) fetchTransferGraph(
 	`
 	args := []interface{}{startTime.Unix()}
 	argIdx := 2
-	
+
 	if tokenAddress != "" {
 		query += fmt.Sprintf(" AND tt.token_address = $%d", argIdx)
 		args = append(args, tokenAddress)
 		argIdx++
 	}
-	
+
 	if address != "" {
 		query += fmt.Sprintf(" AND (tt.from_address = $%d OR tt.to_address = $%d)", argIdx, argIdx)
 		args = append(args, address, address)
 		argIdx++
 	}
-	
+
 	query += fmt.Sprintf(" ORDER BY b.timestamp DESC LIMIT $%d", argIdx)
 	args = append(args, limit*10)
-	
+
 	rows, err := s.cfg.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	
+
 	for rows.Next() {
 		var fromAddr, toAddr, txHash string
 		var value, tokenPrice float64
 		var blockNum, logIndex int64
 		var timestamp int64
-		
+
 		if err := rows.Scan(&fromAddr, &toAddr, &value, &txHash, &blockNum, &logIndex, &timestamp, &tokenPrice); err != nil {
 			continue
 		}
-		
+
 		valueUSD := value * tokenPrice
-		
+
 		// Add or update from node
 		if node, ok := nodeMap[fromAddr]; ok {
 			node.Value += value
@@ -327,17 +342,17 @@ func (s *Server) fetchTransferGraph(
 			node.OutDegree++
 		} else {
 			nodeMap[fromAddr] = &TransferNode{
-				ID:         fromAddr,
-				Address:    fromAddr,
-				Type:       "address",
+				ID:        fromAddr,
+				Address:   fromAddr,
+				Type:      "address",
 				Label:     shortenAddress(fromAddr),
-				Value:      value,
-				ValueUSD:   valueUSD,
+				Value:     value,
+				ValueUSD:  valueUSD,
 				TxCount:   1,
 				OutDegree: 1,
 			}
 		}
-		
+
 		// Add or update to node
 		if node, ok := nodeMap[toAddr]; ok {
 			node.Value += value
@@ -346,17 +361,17 @@ func (s *Server) fetchTransferGraph(
 			node.InDegree++
 		} else {
 			nodeMap[toAddr] = &TransferNode{
-				ID:        toAddr,
-				Address:   toAddr,
-				Type:      "address",
+				ID:       toAddr,
+				Address:  toAddr,
+				Type:     "address",
 				Label:    shortenAddress(toAddr),
-				Value:     value,
-				ValueUSD:  valueUSD,
+				Value:    value,
+				ValueUSD: valueUSD,
 				TxCount:  1,
 				InDegree: 1,
 			}
 		}
-		
+
 		// Add link
 		linkKey := fmt.Sprintf("%s->%s", fromAddr, toAddr)
 		if link, ok := linkMap[linkKey]; ok {
@@ -364,42 +379,42 @@ func (s *Server) fetchTransferGraph(
 			link.ValueUSD += valueUSD
 		} else {
 			linkMap[linkKey] = &TransferLink{
-				Source:         fromAddr,
-				Target:        toAddr,
-				Value:         value,
-				ValueUSD:      valueUSD,
-				TokenAddress:  tokenAddress,
+				Source:          fromAddr,
+				Target:          toAddr,
+				Value:           value,
+				ValueUSD:        valueUSD,
+				TokenAddress:    tokenAddress,
 				TransactionHash: txHash,
-				Timestamp:    timestamp,
-				Type:         "transfer",
+				Timestamp:       timestamp,
+				Type:            "transfer",
 			}
 		}
 	}
-	
+
 	// Convert maps to slices
 	for _, node := range nodeMap {
 		graph.Nodes = append(graph.Nodes, *node)
 	}
-	
+
 	// Sort by value USD descending
 	sort.Slice(graph.Nodes, func(i, j int) bool {
 		return graph.Nodes[i].ValueUSD > graph.Nodes[j].ValueUSD
 	})
-	
+
 	// Limit nodes
 	if len(graph.Nodes) > limit {
 		graph.Nodes = graph.Nodes[:limit]
 	}
-	
+
 	for _, link := range linkMap {
 		graph.Links = append(graph.Links, *link)
 	}
-	
+
 	// Limit links
 	if len(graph.Links) > limit*2 {
 		graph.Links = graph.Links[:limit*2]
 	}
-	
+
 	return graph, nil
 }
 
@@ -421,7 +436,7 @@ func (s *Server) fetchTokenTransfers(
 	if err := s.cfg.DB.QueryRowContext(ctx, countQuery, tokenAddress, startTime.Unix()).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	
+
 	// Get transfers
 	query := `
 		SELECT 
@@ -439,35 +454,35 @@ func (s *Server) fetchTokenTransfers(
 		ORDER BY b.timestamp DESC
 		LIMIT $3 OFFSET $4
 	`
-	
+
 	rows, err := s.cfg.DB.QueryContext(ctx, query, tokenAddress, startTime.Unix(), limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
-	
+
 	transfers := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var fromAddr, toAddr, txHash string
 		var value, tokenPrice float64
 		var blockNum, timestamp int64
-		
+
 		if err := rows.Scan(&fromAddr, &toAddr, &value, &txHash, &blockNum, &timestamp, &tokenPrice); err != nil {
 			continue
 		}
-		
+
 		transfers = append(transfers, map[string]interface{}{
-			"from":           fromAddr,
-			"to":             toAddr,
-			"value":          fmt.Sprintf("%.0f", value),
-			"valueUsd":       value * tokenPrice,
-			"transaction":    txHash,
-			"blockNumber":    blockNum,
-			"timestamp":     timestamp,
-			"tokenAddress":  tokenAddress,
+			"from":         fromAddr,
+			"to":           toAddr,
+			"value":        fmt.Sprintf("%.0f", value),
+			"valueUsd":     value * tokenPrice,
+			"transaction":  txHash,
+			"blockNumber":  blockNum,
+			"timestamp":    timestamp,
+			"tokenAddress": tokenAddress,
 		})
 	}
-	
+
 	return transfers, total, nil
 }
 
@@ -478,7 +493,7 @@ func (s *Server) fetchTokenTransfers(
 // parseTimeRange parses time range string to start time
 func (s *Server) parseTimeRange(timeRange string) time.Time {
 	now := time.Now()
-	
+
 	switch strings.ToLower(timeRange) {
 	case "1h":
 		return now.Add(-1 * time.Hour)
@@ -497,96 +512,123 @@ func (s *Server) parseTimeRange(timeRange string) time.Time {
 
 // enrichWithUSDValues enriches nodes with USD values
 func (s *Server) enrichWithUSDValues(ctx context.Context, graph *TransferGraphResponse) error {
-	if s.cfg.Redis == nil || len(graph.Nodes) == 0 {
+	if len(graph.Nodes) == 0 {
 		return nil
 	}
-	
+
 	// Get ETH price from cache
 	ethPrice, err := s.getETHPrice(ctx)
 	if err != nil {
 		return err
 	}
-	
+
 	// Calculate USD values for each node
 	for i := range graph.Nodes {
 		// Assuming value is in wei, convert to ETH then USD
 		graph.Nodes[i].ValueUSD = graph.Nodes[i].Value * ethPrice
 	}
-	
+
 	for i := range graph.Links {
 		graph.Links[i].ValueUSD = graph.Links[i].Value * ethPrice
 	}
-	
+
 	return nil
 }
 
-// getETHPrice gets current ETH price from Redis or API
+// getETHPrice returns the current native-coin price in USD. A cached value is
+// preferred; otherwise the configured price endpoint is queried.
 func (s *Server) getETHPrice(ctx context.Context) (float64, error) {
-	// Try Redis first
 	if s.cfg.Redis != nil {
 		price, err := s.cfg.Redis.Get(ctx, "eth_price").Float64()
-		if err == nil {
+		if err == nil && price > 0 {
 			return price, nil
 		}
 	}
-	
-	// Default price (in production, fetch from price API)
-	return 3000.0, nil
+
+	if s.cfg.PriceURL == "" {
+		return 0, fmt.Errorf("no price source configured")
+	}
+
+	asset := s.cfg.PriceAsset
+	if asset == "" {
+		asset = "ethereum"
+	}
+
+	endpoint := fmt.Sprintf("%s?ids=%s&vs_currencies=usd", strings.TrimRight(s.cfg.PriceURL, "/"), asset)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	resp, err := s.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("price endpoint returned %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, err
+	}
+
+	var payload map[string]map[string]float64
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, err
+	}
+
+	price, ok := payload[asset]["usd"]
+	if !ok || price <= 0 {
+		return 0, fmt.Errorf("price endpoint returned no usd price for %q", asset)
+	}
+
+	if s.cfg.Redis != nil {
+		s.cfg.Redis.Set(ctx, "eth_price", price, time.Minute)
+	}
+
+	return price, nil
 }
 
-// applyClustering applies clustering to the graph
+// applyClustering trims the graph to MaxNodes by keeping the highest-value
+// nodes and dropping the links that reference removed nodes.
 func (s *Server) applyClustering(graph *TransferGraphResponse) {
 	if len(graph.Nodes) <= s.cfg.MaxNodes {
 		return
 	}
-	
-	// Group small nodes into clusters
-	smallNodes := make([]*TransferNode, 0)
-	largeNodes := make([]*TransferNode, 0)
-	
-	for i := range graph.Nodes {
-		node := &graph.Nodes[i]
-		if node.ValueUSD < s.cfg.ClusterThreshold {
-			smallNodes = append(smallNodes, node)
-		} else {
-			largeNodes = append(largeNodes, node)
-		}
-	}
-	
-	// If we have too many nodes, cluster the small ones
-	if len(graph.Nodes) > s.cfg.MaxNodes {
-		// Keep top nodes and cluster the rest
-		graph.Nodes = largeNodes
-		if len(graph.Nodes) < s.cfg.MaxNodes {
-			graph.Nodes = append(graph.Nodes, smallNodes[:s.cfg.MaxNodes-len(graph.Nodes)]...)
-		}
-	}
-	
-	// Remove links connected to removed nodes
-	nodeSet := make(map[string]bool)
+
+	sort.SliceStable(graph.Nodes, func(i, j int) bool {
+		return graph.Nodes[i].ValueUSD > graph.Nodes[j].ValueUSD
+	})
+	graph.Nodes = graph.Nodes[:s.cfg.MaxNodes]
+
+	nodeSet := make(map[string]bool, len(graph.Nodes))
 	for _, node := range graph.Nodes {
 		nodeSet[node.Address] = true
 	}
-	
-	filteredLinks := make([]TransferLink, 0)
+
+	filteredLinks := make([]TransferLink, 0, len(graph.Links))
 	for _, link := range graph.Links {
 		if nodeSet[link.Source] && nodeSet[link.Target] {
 			filteredLinks = append(filteredLinks, link)
 		}
 	}
 	graph.Links = filteredLinks
+	graph.Meta.TotalNodes = len(graph.Nodes)
+	graph.Meta.TotalLinks = len(graph.Links)
 }
 
-// getCacheEntry gets a cached entry
 func (s *Server) getCacheEntry(key string) *CacheEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	entry, ok := s.cache[key]
 	if !ok || time.Now().After(entry.ExpiresAt) {
 		return nil
 	}
-	
+
 	return entry
 }
 
@@ -594,7 +636,7 @@ func (s *Server) getCacheEntry(key string) *CacheEntry {
 func (s *Server) setCacheEntry(key string, data *TransferGraphResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	s.cache[key] = &CacheEntry{
 		Data:      data,
 		ExpiresAt: time.Now().Add(s.cfg.CacheTTL),
@@ -650,12 +692,12 @@ func CORS() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Authorization")
-		
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
-		
+
 		c.Next()
 	}
 }
@@ -667,12 +709,12 @@ func CORS() gin.HandlerFunc {
 // HealthCheck handles GET /health
 func (s *Server) HealthCheck(c *gin.Context) {
 	ctx := c.Request.Context()
-	
+
 	health := gin.H{
-		"status": "healthy",
+		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
 	}
-	
+
 	// Check database
 	if err := s.cfg.DB.PingContext(ctx); err != nil {
 		health["database"] = "unhealthy"
@@ -680,7 +722,7 @@ func (s *Server) HealthCheck(c *gin.Context) {
 	} else {
 		health["database"] = "healthy"
 	}
-	
+
 	// Check Redis
 	if s.cfg.Redis != nil {
 		if err := s.cfg.Redis.Ping(ctx).Err(); err != nil {
@@ -690,6 +732,6 @@ func (s *Server) HealthCheck(c *gin.Context) {
 			health["redis"] = "healthy"
 		}
 	}
-	
+
 	c.JSON(http.StatusOK, health)
 }

@@ -17,9 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/lib/pq"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -47,7 +44,7 @@ func DefaultConfig() *Config {
 		Host:            getEnv("POSTGRES_HOST", "localhost"),
 		Port:            getEnvInt("POSTGRES_PORT", 5432),
 		User:            getEnv("POSTGRES_USER", "tigerscan"),
-		Password:       getEnv("POSTGRES_PASSWORD", ""),
+		Password:        getEnv("POSTGRES_PASSWORD", ""),
 		Database:        getEnv("POSTGRES_DB", "tigerscan"),
 		MaxOpenConns:    getEnvInt("POSTGRES_MAX_OPEN_CONNS", 100),
 		MaxIdleConns:    getEnvInt("POSTGRES_MAX_IDLE_CONNS", 10),
@@ -285,23 +282,23 @@ type BlockData struct {
 	Number           uint64
 	Hash             string
 	ParentHash       string
-	Nonce           string
-	Sha3Uncles      string
-	LogsBloom       string
+	Nonce            string
+	Sha3Uncles       string
+	LogsBloom        string
 	TransactionsRoot string
-	StateRoot       string
-	ReceiptsRoot    string
-	Miner          string
-	Difficulty     string
-	TotalDifficulty string
-	GasLimit       uint64
-	GasUsed        uint64
-	Timestamp      uint64
-	Size           int64
-	ExtraData      string
-	BaseFeePerGas  uint64
-	TxCount       int
-	Reward        string
+	StateRoot        string
+	ReceiptsRoot     string
+	Miner            string
+	Difficulty       string
+	TotalDifficulty  string
+	GasLimit         uint64
+	GasUsed          uint64
+	Timestamp        uint64
+	Size             int64
+	ExtraData        string
+	BaseFeePerGas    uint64
+	TxCount          int
+	Reward           string
 }
 
 // GetBlockByNumber retrieves a block by number
@@ -503,27 +500,27 @@ func (d *DB) InsertTransaction(ctx context.Context, tx *TransactionData) error {
 
 // TransactionData represents transaction data
 type TransactionData struct {
-	Hash                string
-	BlockNumber         uint64
-	BlockHash           string
-	TransactionIndex    int
-	From               string
-	To                 string
-	Value              string
-	GasPrice            uint64
-	GasLimit           uint64
-	GasUsed            uint64
-	Nonce              uint64
-	InputData          string
-	Signature         string
-	V                 int64
-	R                 string
-	S                 string
-	Status            bool
-	TransactionType   int
-	MaxFeePerGas      uint64
+	Hash                 string
+	BlockNumber          uint64
+	BlockHash            string
+	TransactionIndex     int
+	From                 string
+	To                   string
+	Value                string
+	GasPrice             uint64
+	GasLimit             uint64
+	GasUsed              uint64
+	Nonce                uint64
+	InputData            string
+	Signature            string
+	V                    int64
+	R                    string
+	S                    string
+	Status               bool
+	TransactionType      int
+	MaxFeePerGas         uint64
 	MaxPriorityFeePerGas uint64
-	TxFee            string
+	TxFee                string
 }
 
 // GetTransactionByHash retrieves a transaction by hash
@@ -659,9 +656,9 @@ func (d *DB) GetTransactions(ctx context.Context, filters TransactionFilters, li
 type TransactionFilters struct {
 	Address     string
 	BlockNumber uint64
-	Status     *bool
-	FromBlock  uint64
-	ToBlock    uint64
+	Status      *bool
+	FromBlock   uint64
+	ToBlock     uint64
 }
 
 // =============================================================================
@@ -700,13 +697,13 @@ func (d *DB) InsertAccount(ctx context.Context, acc *AccountData) error {
 // AccountData represents account data
 type AccountData struct {
 	Address          string
-	Balance         string
-	Nonce           uint64
-	CodeHash        string
-	IsContract      bool
-	IsVerified     bool
+	Balance          string
+	Nonce            uint64
+	CodeHash         string
+	IsContract       bool
+	IsVerified       bool
 	FirstBlockNumber uint64
-	LastBlockNumber uint64
+	LastBlockNumber  uint64
 }
 
 // GetAccount retrieves an account by address
@@ -771,8 +768,8 @@ func (d *DB) GetAccountBalanceHistory(ctx context.Context, address string, limit
 // BalanceHistory represents balance at a block
 type BalanceHistory struct {
 	BlockNumber uint64
-	Balance    string
-	Timestamp  uint64
+	Balance     string
+	Timestamp   uint64
 }
 
 // =============================================================================
@@ -823,14 +820,14 @@ type TokenData struct {
 	Symbol            string
 	Decimals          uint8
 	TotalSupply       string
-	Type             string
-	IsVerified       bool
-	HolderCount      int64
-	TransferCount   int64
-	PriceUSD        float64
+	Type              string
+	IsVerified        bool
+	HolderCount       int64
+	TransferCount     int64
+	PriceUSD          float64
 	PriceUSDChange24h float64
-	MarketCapUSD    float64
-	Volume24hUSD   float64
+	MarketCapUSD      float64
+	Volume24hUSD      float64
 }
 
 // GetToken retrieves a token by address
@@ -940,7 +937,7 @@ func (d *DB) GetTokens(ctx context.Context, filters TokenFilters, limit, offset 
 type TokenFilters struct {
 	Type         string
 	VerifiedOnly bool
-	SortBy      string
+	SortBy       string
 }
 
 // InsertTokenHolder inserts or updates a token holder
@@ -966,10 +963,10 @@ func (d *DB) InsertTokenHolder(ctx context.Context, holder *TokenHolderData) err
 
 // TokenHolderData represents token holder data
 type TokenHolderData struct {
-	TokenAddress     string
+	TokenAddress    string
 	HolderAddress   string
 	Balance         string
-	LastUpdateBlock  uint64
+	LastUpdateBlock uint64
 }
 
 // GetTokenHolders retrieves token holders
@@ -1031,12 +1028,12 @@ func (d *DB) InsertTokenTransfer(ctx context.Context, transfer *TokenTransferDat
 // TokenTransferData represents token transfer data
 type TokenTransferData struct {
 	TransactionHash string
-	BlockNumber    uint64
-	LogIndex       int
-	TokenAddress  string
-	FromAddress  string
-	ToAddress    string
-	Value       string
+	BlockNumber     uint64
+	LogIndex        int
+	TokenAddress    string
+	FromAddress     string
+	ToAddress       string
+	Value           string
 }
 
 // GetTokenTransfers retrieves token transfers
@@ -1099,7 +1096,7 @@ func (d *DB) GetTokenTransfers(ctx context.Context, filters TokenTransferFilters
 
 // TokenTransferFilters represents transfer query filters
 type TokenTransferFilters struct {
-	TokenAddress  string
+	TokenAddress string
 	FromAddress  string
 	ToAddress    string
 }
@@ -1145,17 +1142,17 @@ func (d *DB) InsertNFTCollection(ctx context.Context, collection *NFTCollectionD
 
 // NFTCollectionData represents NFT collection data
 type NFTCollectionData struct {
-	Address        string
+	Address       string
 	Name          string
 	Symbol        string
 	Type          string
-	TotalSupply  int64
-	HolderCount  int64
+	TotalSupply   int64
+	HolderCount   int64
 	TransferCount int64
-	FloorPrice   float64
-	Volume24h   float64
-	Sales24h     int64
-	IsVerified   bool
+	FloorPrice    float64
+	Volume24h     float64
+	Sales24h      int64
+	IsVerified    bool
 }
 
 // GetNFTCollection retrieves an NFT collection
@@ -1229,14 +1226,14 @@ func (d *DB) InsertNFT(ctx context.Context, nft *NFTData) error {
 // NFTData represents NFT data
 type NFTData struct {
 	CollectionAddress string
-	TokenID        string
-	Owner          string
-	Name           string
-	Description   string
-	ImageURL       string
-	Metadata      map[string]interface{}
-	Attributes    map[string]interface{}
-	TransferCount int64
+	TokenID           string
+	Owner             string
+	Name              string
+	Description       string
+	ImageURL          string
+	Metadata          map[string]interface{}
+	Attributes        map[string]interface{}
+	TransferCount     int64
 }
 
 // GetNFT retrieves an NFT
@@ -1319,17 +1316,17 @@ func (d *DB) InsertValidator(ctx context.Context, val *ValidatorData) error {
 // ValidatorData represents validator data
 type ValidatorData struct {
 	Address            string
-	Name              string
-	TotalStake        string
-	SelfStake        string
-	DelegatorCount   int64
-	CommissionRate  int64
-	Uptime          float64
-	BlocksSigned    int64
-	BlocksMissed    int64
-	BlocksProposed  int64
+	Name               string
+	TotalStake         string
+	SelfStake          string
+	DelegatorCount     int64
+	CommissionRate     int64
+	Uptime             float64
+	BlocksSigned       int64
+	BlocksMissed       int64
+	BlocksProposed     int64
 	RewardsAccumulated string
-	IsActive        bool
+	IsActive           bool
 }
 
 // GetValidator retrieves a validator
@@ -1502,15 +1499,15 @@ func (d *DB) InsertNetworkStats(ctx context.Context, stats *NetworkStatsData) er
 type NetworkStatsData struct {
 	TotalBlocks       uint64
 	TotalTransactions uint64
-	TotalAddresses   uint64
-	TotalTokens      uint64
-	TotalContracts   uint64
-	TPS             float64
-	AvgBlockTime     float64
-	AvgGasPrice     uint64
-	AvgGasLimit     uint64
-	Difficulty      string
-	Timestamp      uint64
+	TotalAddresses    uint64
+	TotalTokens       uint64
+	TotalContracts    uint64
+	TPS               float64
+	AvgBlockTime      float64
+	AvgGasPrice       uint64
+	AvgGasLimit       uint64
+	Difficulty        string
+	Timestamp         uint64
 }
 
 // GetNetworkStats retrieves current network statistics
@@ -1596,18 +1593,18 @@ func (d *DB) InsertContractSource(ctx context.Context, cs *ContractSourceData) e
 // ContractSourceData represents contract source
 type ContractSourceData struct {
 	Address             string
-	Name               string
-	CompilerVersion    string
+	Name                string
+	CompilerVersion     string
 	OptimizationEnabled bool
-	OptimizationRuns   int
-	SourceCode        string
-	ABI              []interface{}
-	Bytecode          string
-	DeployedBytecode  string
-	ConstructorArgs  string
-	EVMVersion       string
-	LicenseType      string
-	IsProxy          bool
+	OptimizationRuns    int
+	SourceCode          string
+	ABI                 []interface{}
+	Bytecode            string
+	DeployedBytecode    string
+	ConstructorArgs     string
+	EVMVersion          string
+	LicenseType         string
+	IsProxy             bool
 	ProxyImplementation string
 }
 
@@ -1687,17 +1684,17 @@ func (d *DB) InsertInternalTransaction(ctx context.Context, it *InternalTransact
 // InternalTransactionData represents internal transaction
 type InternalTransactionData struct {
 	TransactionHash  string
-	BlockNumber     uint64
-	TraceAddress    string
+	BlockNumber      uint64
+	TraceAddress     string
 	TransactionIndex int
-	FromAddress    string
-	ToAddress      string
-	Value         string
-	InputData     string
-	CallType      string
-	Gas          uint64
-	Depth         int
-	Result        string
+	FromAddress      string
+	ToAddress        string
+	Value            string
+	InputData        string
+	CallType         string
+	Gas              uint64
+	Depth            int
+	Result           string
 }
 
 // GetInternalTransactions retrieves internal transactions
@@ -1774,12 +1771,12 @@ func (d *DB) InsertLog(ctx context.Context, log *LogData) error {
 // LogData represents event log
 type LogData struct {
 	TransactionHash string
-	BlockNumber    uint64
-	LogIndex       int
-	Address        string
-	Topics        []string
-	Data          string
-	Removed       bool
+	BlockNumber     uint64
+	LogIndex        int
+	Address         string
+	Topics          []string
+	Data            string
+	Removed         bool
 }
 
 // GetLogs retrieves logs
@@ -1845,7 +1842,7 @@ func (d *DB) GetLogs(ctx context.Context, filters LogFilters, limit, offset int)
 // LogFilters represents log query filters
 type LogFilters struct {
 	Address     string
-	Topics     []string
+	Topics      []string
 	BlockNumber uint64
 }
 
@@ -1958,16 +1955,16 @@ type APIKeyStats struct {
 
 // RateLimiter provides rate limiting functionality
 type RateLimiter struct {
-	mu           sync.RWMutex
-	requests     map[string]*ClientLimiter
-	maxRequests  int
+	mu          sync.RWMutex
+	requests    map[string]*ClientLimiter
+	maxRequests int
 	windowSize  time.Duration
-	burst      int
+	burst       int
 }
 
 // ClientLimiter tracks client requests
 type ClientLimiter struct {
-	requests    []time.Time
+	requests   []time.Time
 	blocked    bool
 	blockUntil time.Time
 }
@@ -1978,7 +1975,7 @@ func NewRateLimiter(maxRequests int, windowSize time.Duration, burst int) *RateL
 		requests:    make(map[string]*ClientLimiter),
 		maxRequests: maxRequests,
 		windowSize:  windowSize,
-		burst:      burst,
+		burst:       burst,
 	}
 }
 
@@ -2081,10 +2078,10 @@ type AuditLogData struct {
 	UserID       string
 	Action       string
 	ResourceType string
-	ResourceID  string
-	IPAddress   string
-	UserAgent   string
-	RequestData map[string]interface{}
+	ResourceID   string
+	IPAddress    string
+	UserAgent    string
+	RequestData  map[string]interface{}
 	ResponseCode int
 }
 
@@ -2182,10 +2179,10 @@ func (d *DB) Search(ctx context.Context, query string, limit int) ([]SearchResul
 // SearchResult represents search result
 type SearchResult struct {
 	Type        string
-	Address    string
-	Hash       string
-	Number     *int64
-	Name       string
+	Address     string
+	Hash        string
+	Number      *int64
+	Name        string
 	Description string
 }
 
@@ -2214,10 +2211,10 @@ func (d *DB) IndexSearch(ctx context.Context, data *SearchIndexData) error {
 // SearchIndexData represents search index data
 type SearchIndexData struct {
 	Type        string
-	Address    string
-	Hash       string
-	Number     int64
-	Name       string
+	Address     string
+	Hash        string
+	Number      int64
+	Name        string
 	Description string
 }
 
@@ -2233,7 +2230,7 @@ func (d *DB) HealthCheck(ctx context.Context) error {
 
 	// Check table sizes
 	var tableCount int
-	err := d.db.QueryRowContext(ctx, 
+	err := d.db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'",
 	).Scan(&tableCount)
 	if err != nil {
@@ -2263,7 +2260,7 @@ func (d *DB) GetStats(ctx context.Context) (map[string]interface{}, error) {
 
 	// Database size
 	var dbSize string
-	err := d.db.QueryRowContext(ctx, 
+	err := d.db.QueryRowContext(ctx,
 		"SELECT pg_size_pretty(pg_database_size(current_database()))",
 	).Scan(&dbSize)
 	if err == nil {
@@ -2343,7 +2340,7 @@ func FormatAddress(addr string) string {
 	// Convert to checksum address
 	addr = strings.ToLower(addr[2:])
 	hash := HashData([]byte(addr))
-	
+
 	result := "0x"
 	for i, c := range addr {
 		if c >= '0' && c <= '9' {
@@ -2363,54 +2360,56 @@ func FormatAddress(addr string) string {
 // FormatValue formats Wei value to human readable
 func FormatValue(wei *big.Int, decimals int) string {
 	div := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
-	
+
 	// Whole part
 	whole := new(big.Int).Div(wei, div)
-	
+
 	// Fractional part
 	fraction := new(big.Int).Mod(wei, div)
-	
+
 	// Format fraction with leading zeros
 	fractionStr := fraction.String()
-	fractionStr = strings.Repeat(decimals-len(fractionStr)) + fractionStr
-	
+	if pad := decimals - len(fractionStr); pad > 0 {
+		fractionStr = strings.Repeat("0", pad) + fractionStr
+	}
+
 	// Trim trailing zeros
 	fractionStr = strings.TrimRight(fractionStr, "0")
 	if fractionStr == "" {
 		return whole.String()
 	}
-	
+
 	return fmt.Sprintf("%s.%s", whole.String(), fractionStr)
 }
 
 // ParseValue parses human readable value to Wei
 func ParseValue(value string, decimals int) (*big.Int, error) {
 	value = strings.TrimSpace(value)
-	
+
 	var wei big.Int
-	
+
 	// Handle decimal point
 	if strings.Contains(value, ".") {
 		parts := strings.Split(value, ".")
 		whole := parts[0]
 		fraction := parts[1]
-		
+
 		// Pad fraction to decimals
 		if len(fraction) < decimals {
 			fraction = fraction + strings.Repeat("0", decimals-len(fraction))
 		} else if len(fraction) > decimals {
 			fraction = fraction[:decimals]
 		}
-		
+
 		value = whole + fraction
 	} else {
 		value = value + strings.Repeat("0", decimals)
 	}
-	
+
 	_, ok := wei.SetString(value, 10)
 	if !ok {
 		return nil, fmt.Errorf("invalid value: %s", value)
 	}
-	
+
 	return &wei, nil
 }
