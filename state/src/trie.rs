@@ -444,6 +444,45 @@ fn remove_at(node: Node, nibbles: &[u8]) -> Node {
     }
 }
 
+/// Collect every key/value pair in the tree, appending to `out`.
+///
+/// `path` carries the nibbles consumed so far; a leaf completes a key and a
+/// branch value completes the key that ends at the branch.
+fn collect_entries(node: &Node, path: &mut Vec<u8>, out: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    match node {
+        Node::Empty => {}
+        Node::Leaf { path: leaf_path, value } => {
+            let mut nibbles = path.clone();
+            nibbles.extend_from_slice(leaf_path);
+            out.push((nibbles_to_bytes(&nibbles), value.clone()));
+        }
+        Node::Extension { path: ext_path, child } => {
+            path.extend_from_slice(ext_path);
+            collect_entries(child, path, out);
+            path.truncate(path.len() - ext_path.len());
+        }
+        Node::Branch { children, value } => {
+            if let Some(v) = value {
+                out.push((nibbles_to_bytes(path), v.clone()));
+            }
+            for (index, child) in children.iter().enumerate() {
+                path.push(index as u8);
+                collect_entries(child, path, out);
+                path.pop();
+            }
+        }
+    }
+}
+
+/// Pack a nibble sequence back into bytes. Trie keys always have an even
+/// nibble count, so the pairing is exact.
+fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
+    nibbles
+        .chunks(2)
+        .map(|pair| (pair[0] << 4) | pair.get(1).copied().unwrap_or(0))
+        .collect()
+}
+
 /// Record every node whose encoding is at least 32 bytes, keyed by hash.
 fn collect_db(node: &Node, db: &mut std::collections::HashMap<[u8; 32], Vec<u8>>) {
     match node {
@@ -465,9 +504,46 @@ fn collect_db(node: &Node, db: &mut std::collections::HashMap<[u8; 32], Vec<u8>>
 }
 
 /// A Merkle Patricia Trie over byte keys.
-#[derive(Debug, Clone)]
+///
+/// The trie is held twice, in two representations that are updated together:
+///
+///   * `root`, an owned Rust node tree. This is the structural form used for
+///     proofs, node collection and key removal, which need to walk nodes.
+///   * `fast`, the C++ implementation in `crypto_cpp/trie.cpp` bound through
+///     the `tiger-crypto` crate. Root hashing is the consensus hot path — it
+///     runs once per account per block, and again for every transaction and
+///     receipt root — so it is computed there rather than by walking the Rust
+///     tree.
+///
+/// Both representations are always in agreement, and a test in this module
+/// asserts that on every operation, so the duplication cannot drift silently.
+///
+/// `Clone` copies both, so a clone is independent and equally fast.
 pub struct Trie {
     root: Node,
+    fast: tiger_crypto::Trie,
+}
+
+impl std::fmt::Debug for Trie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trie")
+            .field("root", &self.root)
+            .field("root_hash", &self.root_hash())
+            .finish()
+    }
+}
+
+impl Clone for Trie {
+    fn clone(&self) -> Self {
+        let mut fast = tiger_crypto::Trie::new();
+        for (key, value) in self.entries() {
+            fast.insert(&key, &value);
+        }
+        Self {
+            root: self.root.clone(),
+            fast,
+        }
+    }
 }
 
 impl Default for Trie {
@@ -479,7 +555,10 @@ impl Default for Trie {
 impl Trie {
     /// Create an empty trie.
     pub fn new() -> Self {
-        Self { root: Node::Empty }
+        Self {
+            root: Node::Empty,
+            fast: tiger_crypto::Trie::new(),
+        }
     }
 
     /// Insert or overwrite a key/value pair.
@@ -487,6 +566,7 @@ impl Trie {
         let nibbles = bytes_to_nibbles(key);
         let root = std::mem::replace(&mut self.root, Node::Empty);
         self.root = normalize(insert_at(root, &nibbles, value.to_vec()));
+        self.fast.insert(key, value);
     }
 
     /// Look up a key.
@@ -494,7 +574,19 @@ impl Trie {
         get_at(&self.root, &bytes_to_nibbles(key))
     }
 
+    /// Every key/value pair in byte-key order.
+    fn entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        collect_entries(&self.root, &mut Vec::new(), &mut out);
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Remove a key, returning true when it was present.
+    ///
+    /// Removal is rare compared with insertion and lookup, so the fast trie is
+    /// rebuilt from the surviving entries rather than kept incrementally. That
+    /// keeps the two representations in step without a removal path in C++.
     pub fn delete(&mut self, key: &[u8]) -> bool {
         let nibbles = bytes_to_nibbles(key);
         if get_at(&self.root, &nibbles).is_none() {
@@ -502,6 +594,11 @@ impl Trie {
         }
         let root = std::mem::replace(&mut self.root, Node::Empty);
         self.root = normalize(remove_at(root, &nibbles));
+
+        self.fast = tiger_crypto::Trie::new();
+        for (k, v) in self.entries() {
+            self.fast.insert(&k, &v);
+        }
         true
     }
 
@@ -510,12 +607,12 @@ impl Trie {
     /// The empty trie hashes to
     /// `56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`.
     pub fn root_hash(&self) -> [u8; 32] {
-        keccak256(&self.root_encoding())
+        self.fast.root_hash()
     }
 
     /// The RLP encoding of the root node.
     pub fn root_encoding(&self) -> Vec<u8> {
-        node_to_item(&self.root).encode()
+        self.fast.root_encoding()
     }
 
     /// Every node with an encoding of 32 bytes or more, keyed by hash. This is
@@ -822,6 +919,83 @@ mod tests {
         assert_eq!(trie.get(b"a"), Some(Vec::new()));
         assert_ne!(trie.root_hash(), Trie::new().root_hash());
     }
+
+    /// The two representations must agree after every operation. The Rust tree
+    /// is the structural form used for proofs; the C++ trie computes the root.
+    /// If they ever disagreed, a proof would be verified against a root the
+    /// encoding does not produce.
+    #[test]
+    fn the_rust_tree_and_the_cpp_trie_always_agree() {
+        let mut trie = Trie::new();
+
+        let keys: Vec<Vec<u8>> = (0u32..200)
+            .map(|i| {
+                let mut k = vec![0u8; 4];
+                k[0] = (i >> 8) as u8;
+                k[1] = i as u8;
+                k
+            })
+            .collect();
+
+        for (n, key) in keys.iter().enumerate() {
+            trie.insert(key, &[n as u8; 8]);
+            // The C++ root must equal the root derived from the Rust tree's
+            // own encoding.
+            assert_eq!(
+                trie.root_hash(),
+                keccak256(&node_to_item(&trie.root).encode()),
+                "divergence after inserting {n} keys"
+            );
+        }
+
+        // Removal is the path that rebuilds the fast trie, so it is the most
+        // likely place for the two to drift apart.
+        for key in keys.iter().take(100) {
+            assert!(trie.delete(key));
+            assert_eq!(
+                trie.root_hash(),
+                keccak256(&node_to_item(&trie.root).encode()),
+                "divergence after a removal"
+            );
+        }
+
+        // Overwriting an existing key must also stay in step.
+        for (n, key) in keys.iter().skip(100).enumerate() {
+            trie.insert(key, &[n as u8; 16]);
+            assert_eq!(
+                trie.root_hash(),
+                keccak256(&node_to_item(&trie.root).encode()),
+                "divergence after an overwrite"
+            );
+        }
+
+        // And a clone must be independent and still agree.
+        let clone = trie.clone();
+        assert_eq!(clone.root_hash(), trie.root_hash());
+        assert_eq!(clone.get(&keys[150]), trie.get(&keys[150]));
+    }
+
+    /// Keys that are prefixes of one another exercise the branch value slot,
+    /// which is the case the C++ encoding handles separately.
+    #[test]
+    fn prefix_keys_agree_between_representations() {
+        let mut trie = Trie::new();
+        trie.insert(b"a", b"1");
+        assert_eq!(trie.root_hash(), keccak256(&node_to_item(&trie.root).encode()));
+        trie.insert(b"ab", b"2");
+        assert_eq!(trie.root_hash(), keccak256(&node_to_item(&trie.root).encode()));
+        trie.insert(b"abc", b"3");
+        assert_eq!(trie.root_hash(), keccak256(&node_to_item(&trie.root).encode()));
+
+        // Removing the middle key forces the Rust tree to collapse a branch,
+        // and the fast trie to be rebuilt.
+        assert!(trie.delete(b"ab"));
+        assert_eq!(trie.root_hash(), keccak256(&node_to_item(&trie.root).encode()));
+        assert_eq!(trie.get(b"a"), Some(b"1".to_vec()));
+        assert_eq!(trie.get(b"ab"), None);
+        assert_eq!(trie.get(b"abc"), Some(b"3".to_vec()));
+    }
+
 
     #[test]
     fn proofs_verify_and_detect_tampering() {

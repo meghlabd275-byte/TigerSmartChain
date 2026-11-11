@@ -40,6 +40,35 @@ extern "C" {
         sig_out: *mut u8,
         recovery_id_out: *mut u8,
     ) -> i32;
+
+    // Merkle Patricia Trie. The handle is opaque on the C++ side, so no layout
+    // is assumed across the boundary.
+    #[link_name = "tiger_trie_new"]
+    fn c_trie_new() -> *mut core::ffi::c_void;
+    #[link_name = "tiger_trie_free"]
+    fn c_trie_free(trie: *mut core::ffi::c_void);
+    #[link_name = "tiger_trie_insert"]
+    fn c_trie_insert(
+        trie: *mut core::ffi::c_void,
+        key: *const u8,
+        key_len: usize,
+        value: *const u8,
+        value_len: usize,
+    );
+    #[link_name = "tiger_trie_root"]
+    fn c_trie_root(trie: *mut core::ffi::c_void, out: *mut u8);
+    #[link_name = "tiger_trie_root_encoding"]
+    fn c_trie_root_encoding(trie: *mut core::ffi::c_void, out: *mut u8, out_cap: usize) -> usize;
+    #[link_name = "tiger_trie_len"]
+    fn c_trie_len(trie: *mut core::ffi::c_void) -> usize;
+    #[link_name = "tiger_trie_get"]
+    fn c_trie_get(
+        trie: *mut core::ffi::c_void,
+        key: *const u8,
+        key_len: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> usize;
 }
 
 /// Errors surfaced by the cryptographic primitives.
@@ -269,6 +298,122 @@ pub fn recover_sender(
     pubkey_to_address(&pubkey)
 }
 
+/// A Merkle Patricia Trie, as specified by the Ethereum Yellow Paper
+/// Appendix D.
+///
+/// This wraps the C++ implementation in `crypto_cpp/trie.cpp`. That code is
+/// the same one used on the consensus hot path, so a state root computed here
+/// is byte-identical to the one the chain commits to.
+///
+/// The C++ object is heap-allocated and freed when this value is dropped, so
+/// there is no way to leak or double-free it from Rust. The type is not `Sync`
+/// or `Send`: a trie handle is single-threaded by design, and sharing one
+/// across threads would race on the underlying `std::map`.
+pub struct Trie {
+    handle: *mut core::ffi::c_void,
+}
+
+impl Trie {
+    /// Create an empty trie.
+    pub fn new() -> Self {
+        // Safety: the constructor takes no arguments and returns an owned
+        // handle (or null, which every other call tolerates).
+        let handle = unsafe { c_trie_new() };
+        Self { handle }
+    }
+
+    /// Insert or overwrite `value` at `key`.
+    ///
+    /// Keys are used as given. The Ethereum state trie is keyed by
+    /// `keccak256(address)`; callers hash the key themselves, exactly as the
+    /// reference implementations do.
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) {
+        // Safety: `handle` is owned by this value and the slices are valid for
+        // their stated lengths.
+        unsafe {
+            c_trie_insert(
+                self.handle,
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len(),
+            );
+        }
+    }
+
+    /// Number of stored entries.
+    pub fn len(&self) -> usize {
+        // Safety: `handle` is owned by this value.
+        unsafe { c_trie_len(self.handle) }
+    }
+
+    /// Whether the trie holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The keccak256 hash of the RLP-encoded root node.
+    ///
+    /// The empty trie hashes to
+    /// `56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`.
+    pub fn root_hash(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        // Safety: `out` is a distinct 32-byte buffer.
+        unsafe { c_trie_root(self.handle, out.as_mut_ptr()) };
+        out
+    }
+
+    /// The RLP encoding of the root node. The empty trie encodes to `0x80`.
+    pub fn root_encoding(&self) -> Vec<u8> {
+        // Safety: a null output pointer with capacity 0 asks the C++ side for
+        // the required length without writing anything.
+        let len = unsafe { c_trie_root_encoding(self.handle, core::ptr::null_mut(), 0) };
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![0u8; len];
+        let written =
+            unsafe { c_trie_root_encoding(self.handle, out.as_mut_ptr(), out.len()) };
+        debug_assert_eq!(written, len);
+        out
+    }
+
+    /// Look up `key`, returning `None` when it is absent.
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        // Safety: a null output pointer with capacity 0 asks the C++ side for
+        // the required length without writing anything.
+        let len = unsafe { c_trie_get(self.handle, key.as_ptr(), key.len(), core::ptr::null_mut(), 0) };
+        if len == usize::MAX {
+            return None;
+        }
+        let mut out = vec![0u8; len];
+        let written = unsafe {
+            c_trie_get(
+                self.handle,
+                key.as_ptr(),
+                key.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        debug_assert_eq!(written, len);
+        Some(out)
+    }
+}
+
+impl Default for Trie {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Trie {
+    fn drop(&mut self) {
+        // Safety: `handle` came from `c_trie_new` and is freed exactly once.
+        unsafe { c_trie_free(self.handle) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +575,204 @@ mod tests {
         bad[0] ^= 1;
         assert!(!verify_ecdsa(&bad, &sig, &pubkey).unwrap());
     }
+
+    // ---- Merkle Patricia Trie ----
+
+    fn root_hex(trie: &Trie) -> String {
+        trie.root_hash().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn empty_trie_has_the_canonical_root() {
+        let trie = Trie::new();
+        assert!(trie.is_empty());
+        assert_eq!(trie.len(), 0);
+        assert_eq!(
+            root_hex(&trie),
+            "56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+        );
+        assert_eq!(trie.root_encoding(), vec![0x80]);
+    }
+
+    /// The canonical example from the Ethereum wiki's trie page, cross-checked
+    /// against ethereum/py-trie.
+    #[test]
+    fn wiki_example_matches_the_reference_root() {
+        let mut trie = Trie::new();
+        trie.insert(b"do", b"verb");
+        trie.insert(b"dog", b"puppy");
+        trie.insert(b"doge", b"coin");
+        trie.insert(b"horse", b"stallion");
+        assert_eq!(
+            root_hex(&trie),
+            "5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84"
+        );
+    }
+
+    /// 256 keys exercising branch and extension splits at depth, cross-checked
+    /// against ethereum/py-trie.
+    #[test]
+    fn large_keyset_matches_the_reference_root() {
+        let mut trie = Trie::new();
+        for i in 0..256u32 {
+            let mut key = [0u8; 32];
+            let mut value = [0u8; 32];
+            key[28..].copy_from_slice(&i.to_be_bytes());
+            value[28..].copy_from_slice(&(i * 7 + 1).to_be_bytes());
+            trie.insert(&key, &value);
+        }
+        assert_eq!(
+            root_hex(&trie),
+            "5643a50bb43d87e2552644da07ccf5f8f63b657eb244f7a94f67cfde62771fb3"
+        );
+    }
+
+    #[test]
+    fn insert_and_get_round_trip() {
+        let mut trie = Trie::new();
+        trie.insert(b"do", b"verb");
+        trie.insert(b"dog", b"puppy");
+        trie.insert(b"doge", b"coin");
+        trie.insert(b"horse", b"stallion");
+
+        assert_eq!(trie.len(), 4);
+        assert_eq!(trie.get(b"do").as_deref(), Some(&b"verb"[..]));
+        assert_eq!(trie.get(b"dog").as_deref(), Some(&b"puppy"[..]));
+        assert_eq!(trie.get(b"doge").as_deref(), Some(&b"coin"[..]));
+        assert_eq!(trie.get(b"horse").as_deref(), Some(&b"stallion"[..]));
+        assert_eq!(trie.get(b"d"), None);
+        assert_eq!(trie.get(b"zebra"), None);
+    }
+
+    #[test]
+    fn overwrite_replaces_the_value_and_the_root() {
+        let mut trie = Trie::new();
+        trie.insert(b"dog", b"puppy");
+        let before = root_hex(&trie);
+        trie.insert(b"dog", b"cat");
+        assert_eq!(trie.get(b"dog").as_deref(), Some(&b"cat"[..]));
+        assert_eq!(trie.len(), 1);
+        assert_ne!(root_hex(&trie), before);
+    }
+
+    /// A key that is a strict prefix of another stores its value in the
+    /// branch's seventeenth slot. This is the case that separates a correct
+    /// branch encoding from one that drops the value.
+    #[test]
+    fn a_prefix_key_keeps_its_value() {
+        let mut trie = Trie::new();
+        trie.insert(b"a", b"1");
+        trie.insert(b"ab", b"2");
+        assert_eq!(trie.get(b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(trie.get(b"ab").as_deref(), Some(&b"2"[..]));
+
+        let mut longer_only = Trie::new();
+        longer_only.insert(b"ab", b"2");
+        assert_ne!(root_hex(&trie), root_hex(&longer_only));
+    }
+
+    /// An empty value is legal and must still create the key.
+    #[test]
+    fn an_empty_value_still_contributes_to_the_root() {
+        let mut with_empty = Trie::new();
+        with_empty.insert(b"b1", b"");
+        with_empty.insert(b"b2", &[0x14u8; 48]);
+
+        let mut without = Trie::new();
+        without.insert(b"b2", &[0x14u8; 48]);
+
+        assert_ne!(root_hex(&with_empty), root_hex(&without));
+        assert_eq!(with_empty.get(b"b1"), Some(Vec::new()));
+        assert_eq!(with_empty.len(), 2);
+    }
+
+    #[test]
+    fn the_root_does_not_depend_on_insertion_order() {
+        let mut forward = Trie::new();
+        forward.insert(b"do", b"verb");
+        forward.insert(b"dog", b"puppy");
+        forward.insert(b"doge", b"coin");
+        forward.insert(b"horse", b"stallion");
+
+        let mut reverse = Trie::new();
+        reverse.insert(b"horse", b"stallion");
+        reverse.insert(b"doge", b"coin");
+        reverse.insert(b"dog", b"puppy");
+        reverse.insert(b"do", b"verb");
+
+        assert_eq!(root_hex(&forward), root_hex(&reverse));
+    }
+
+    /// The Ethereum state trie is keyed by the keccak256 of the address, so a
+    /// realistic keyset exercises the hashing and the trie together.
+    #[test]
+    fn a_keccak_keyed_state_trie_is_deterministic() {
+        let mut trie = Trie::new();
+        for i in 0..500u32 {
+            let mut addr = [0u8; 20];
+            addr[16..].copy_from_slice(&i.to_be_bytes());
+            let key = keccak256(&addr);
+            let mut account = Vec::new();
+            account.extend_from_slice(&(i as u64).to_be_bytes());
+            account.extend_from_slice(&keccak256(&addr));
+            trie.insert(&key, &account);
+        }
+
+        let first = root_hex(&trie);
+
+        let mut again = Trie::new();
+        for i in (0..500u32).rev() {
+            let mut addr = [0u8; 20];
+            addr[16..].copy_from_slice(&i.to_be_bytes());
+            let key = keccak256(&addr);
+            let mut account = Vec::new();
+            account.extend_from_slice(&(i as u64).to_be_bytes());
+            account.extend_from_slice(&keccak256(&addr));
+            again.insert(&key, &account);
+        }
+
+        assert_eq!(first, root_hex(&again));
+        assert_eq!(trie.len(), 500);
+
+        // Every key must read back.
+        for i in 0..500u32 {
+            let mut addr = [0u8; 20];
+            addr[16..].copy_from_slice(&i.to_be_bytes());
+            assert!(trie.get(&keccak256(&addr)).is_some());
+        }
+    }
+
+    #[test]
+    fn root_encoding_is_the_hash_preimage() {
+        let mut trie = Trie::new();
+        trie.insert(b"do", b"verb");
+        trie.insert(b"dog", b"puppy");
+        assert_eq!(keccak256(&trie.root_encoding()), trie.root_hash());
+    }
+
+    /// A large, deeply shared prefix forces an extension chain; the leaves
+    /// behind it must still be reachable.
+    #[test]
+    fn deep_extension_chain_is_traversable() {
+        let mut trie = Trie::new();
+        let shared = [0xaau8; 40];
+        for i in 0..64u8 {
+            let mut key = shared.to_vec();
+            key.push(i);
+            trie.insert(&key, &[i, i, i]);
+        }
+        for i in 0..64u8 {
+            let mut key = shared.to_vec();
+            key.push(i);
+            assert_eq!(trie.get(&key), Some(vec![i, i, i]));
+        }
+        // A key that follows the shared prefix but diverges at the last nibble
+        // must be absent.
+        let mut absent = shared.to_vec();
+        absent.push(0xff);
+        assert_eq!(trie.get(&absent), None);
+    }
+
 
     #[test]
     fn rejects_malformed_inputs() {
