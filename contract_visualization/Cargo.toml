@@ -13,9 +13,6 @@ lazy_static = "1.4"
 [dev-dependencies]
 criterion = "0.5"
 
-[[bench]]
-name = "benchmarks"
-harness = false
 
 [lib]
 name = "contract_visualization"

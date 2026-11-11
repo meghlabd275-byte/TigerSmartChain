@@ -12,27 +12,24 @@ serde_json = "1.0"
 log = "0.4"
 
 # Cryptographic libraries
-aes = "0.8"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-poly1305 = "0.7"
 sha2 = "0.10"
 hmac = "0.12"
-ecdh = "0.10"
-k256 = { version = "0.13", features = ["ecdsa", "std"] }
+hkdf = "0.12"
+# `ecdh` enables k256::ecdh; the standalone `ecdh` crate is unrelated and has
+# no 0.10 release, which is why this crate previously failed to resolve.
+k256 = { version = "0.13", features = ["ecdsa", "std", "ecdh"] }
 rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.21"
 hex = "0.4"
 zeroize = { version = "1.7", features = ["derive"] }
 thiserror = "1.0"
-rustls = "0.21"
 
 [dev-dependencies]
 criterion = "0.5"
 
-[[bench]]
-name = "encryption"
-harness = false
 
 [profile.release]
 opt-level = 3

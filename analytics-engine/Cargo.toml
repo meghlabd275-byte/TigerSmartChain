@@ -17,7 +17,7 @@ name = "tigersmartchain_analytics"
 path = "src/lib.rs"
 
 [features]
-default = ["full"]
+default = []
 
 [profile.release]
 opt-level = 3
