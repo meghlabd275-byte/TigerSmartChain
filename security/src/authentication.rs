@@ -14,7 +14,13 @@ use uuid::Uuid;
 // CONSTANTS
 // =============================================================================
 
-pub const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
+// The signing key is a random 64-byte secret generated in-process, so the
+// algorithm must be symmetric. RS256 was declared here while the key was raw
+// random bytes, so every `encode`/`decode` failed at key parsing and no token
+// could ever be issued. HS256 is the algorithm that matches this key type.
+// Deployments that need asymmetric tokens should load an RSA key pair and
+// switch this constant and the key loading together.
+pub const JWT_ALGORITHM: Algorithm = Algorithm::HS256;
 pub const DEFAULT_ACCESS_EXPIRY: i64 = 15; // minutes
 pub const DEFAULT_REFRESH_EXPIRY: i64 = 7; // days
 
@@ -155,8 +161,7 @@ impl Authenticator {
         let access_token = encode(
             &Header::new(JWT_ALGORITHM),
             &access_claims,
-            &EncodingKey::from_rsa_pem(&self.jwt_secret)
-                .map_err(|e| format!("Failed to create encoding key: {}", e))?,
+            &EncodingKey::from_secret(&self.jwt_secret),
         )
         .map_err(|e| format!("Failed to encode access token: {}", e))?;
         
@@ -175,8 +180,7 @@ impl Authenticator {
         let refresh_token = encode(
             &Header::new(JWT_ALGORITHM),
             &refresh_claims,
-            &EncodingKey::from_rsa_pem(&self.jwt_secret)
-                .map_err(|e| format!("Failed to create encoding key: {}", e))?,
+            &EncodingKey::from_secret(&self.jwt_secret),
         )
         .map_err(|e| format!("Failed to encode refresh token: {}", e))?;
         
@@ -208,13 +212,12 @@ impl Authenticator {
             }
         }
         
-        let validation = Validation::new(JWT_ALGORITHM);
+        let mut validation = Validation::new(JWT_ALGORITHM);
         validation.set_issuer(&[&self.jwt_issuer]);
         
         let token_data: TokenData<Claims> = decode(
             token,
-            &DecodingKey::from_rsa_pem(&self.jwt_secret)
-                .map_err(|e| format!("Failed to create decoding key: {}", e))?,
+            &DecodingKey::from_secret(&self.jwt_secret),
             &validation,
         )
         .map_err(|e| format!("Invalid token: {}", e))?;
@@ -337,11 +340,10 @@ impl Authenticator {
         
         // Update last login
         let now = Utc::now().timestamp();
-        if let Some(u) = self.users.write()
-            .ok()?
-            .get_mut(&user.id) 
-        {
-            u.last_login = Some(now);
+        if let Some(mut users) = self.users.write().ok() {
+            if let Some(u) = users.get_mut(&user.id) {
+                u.last_login = Some(now);
+            }
         }
         
         self.generate_tokens(&user)

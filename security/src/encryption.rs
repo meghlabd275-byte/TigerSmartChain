@@ -136,55 +136,23 @@ impl Encryptor {
 // KEY DERIVATION
 // =============================================================================
 
-/// Derive a key from password using PBKDF2
+/// Derive a 32-byte key from a password with PBKDF2-HMAC-SHA-256.
+///
+/// The salt is the caller's responsibility and must be unique per password.
+/// `iterations` is a work factor: too few iterations makes the derivation
+/// cheap to brute force.
+///
+/// This used to fold the iteration output into a single accumulating buffer,
+/// so the XOR step for block *i* also mixed into every earlier block. That is
+/// not PBKDF2 and does not agree with any other implementation.
 pub fn derive_key(password: &str, salt: &[u8], iterations: u32) -> Result<[u8; 32]> {
-    use std::num::NonZeroU32;
-    
-    let password_bytes = password.as_bytes();
-    
-    // Use SHA-256 for key derivation (simplified PBKDF2)
-    let mut result = Vec::new();
-    let mut block = Vec::new();
-    
-    let num_blocks = (AES_256_KEY_SIZE + 31) / 32;
-    
-    for block_num in 1..=num_blocks {
-        block.clear();
-        
-        // INT(i)
-        block.extend_from_slices(&[
-            ((block_num >> 24) & 0xff) as u8,
-            ((block_num >> 16) & 0xff) as u8,
-            ((block_num >> 8) & 0xff) as u8,
-            (block_num & 0xff) as u8,
-        ]);
-        
-        // U1 = PRF(Password, Salt || INT(i))
-        let mut mac: Hmac<Sha256> = Mac::new_from_slice(password_bytes)
-            .map_err(|e| SecurityError::HashError(e.to_string()))?;
-        mac.update(salt);
-        mac.update(&block);
-        let mut u = mac.finalize().into_bytes().to_vec();
-        result.extend_from_slice(&u);
-        
-        // U2..Uc
-        for _ in 1..iterations {
-            mac = Hmac::<Sha256>::new_from_slice(password_bytes)
-                .map_err(|e| SecurityError::HashError(e.to_string()))?;
-            mac.update(&u);
-            u = mac.finalize().into_bytes().to_vec();
-            
-            // XOR
-            for (i, byte) in result.iter_mut().enumerate() {
-                if i < u.len() {
-                    *byte ^= u[i];
-                }
-            }
-        }
-    }
-    
+    let iterations = std::num::NonZeroU32::new(iterations).ok_or_else(|| {
+        SecurityError::InvalidData("PBKDF2 iterations must be greater than zero".to_string())
+    })?;
+
     let mut key = [0u8; AES_256_KEY_SIZE];
-    key.copy_from_slice(&result[..AES_256_KEY_SIZE]);
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, iterations.get(), &mut key);
+
     Ok(key)
 }
 
@@ -260,7 +228,7 @@ impl PasswordHasher {
 
 /// Compute HMAC-SHA256
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
         .expect("HMAC can take key of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
@@ -268,7 +236,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Compute HMAC-SHA512
 pub fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = Hmac::<Sha512>::new_from_slice(key)
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key)
         .expect("HMAC can take key of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()

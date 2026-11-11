@@ -192,7 +192,7 @@ impl Validator {
         result = iframe_re.replace_all(&result, "").to_string();
         
         // Remove event handlers
-        let event_re = Regex::new(r"(?i)\s+on[a-z]+=\"[^\"]*\"").unwrap();
+        let event_re = Regex::new(r#"(?i)\s+on[a-z]+="[^"]*""#).unwrap();
         result = event_re.replace_all(&result, "").to_string();
         
         // Remove javascript: URLs
@@ -373,8 +373,16 @@ mod tests {
     fn test_tx_hash() {
         let v = Validator::new();
         
-        let hash = "0x5c504ed1a82b1c5d8d9a3b0c9f0c5a1d6e3a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5";
+        // 0x plus 64 hex digits.
+        let hash = "0x5c504ed1a82b1c5d8d9a3b0c9f0c5a1d6e3a1b2c3d4e5f6a7b8c9d0e1f2a3b4c";
+        assert_eq!(hash.len(), 66);
         assert!(v.validate_tx_hash(hash));
+
+        // A hash of the wrong length must be rejected.
+        assert!(!v.validate_tx_hash("0x5c504ed1"));
+        assert!(!v.validate_tx_hash(
+            "0x5c504ed1a82b1c5d8d9a3b0c9f0c5a1d6e3a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5"
+        ));
     }
 
     #[test]

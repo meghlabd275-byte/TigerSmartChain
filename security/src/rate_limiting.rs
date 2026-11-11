@@ -134,9 +134,11 @@ impl RateLimiter {
     pub fn allow_with_tier(&self, client_id: &str, tier: &str) -> bool {
         let tier_limits = self.get_tier_limits(tier);
         
+        // Failing closed: a poisoned lock means the limiter state cannot be
+        // trusted, and admitting the request would remove the limit entirely.
         let mut buckets = match self.buckets.write() {
             Ok(b) => b,
-            Err(_) => return true,
+            Err(_) => return false,
         };
         
         let bucket = buckets
@@ -268,11 +270,29 @@ impl TokenBucket {
 // DISTRIBUTED RATE LIMITER (REDIS)
 // =============================================================================
 
-/// Redis-based distributed rate limiter
+/// Redis-based distributed rate limiter.
+///
+/// Each client and tier gets a counter key. The counter is incremented and
+/// given a TTL atomically by a small Lua script, so two nodes sharing one
+/// Redis instance cannot each grant a full burst.
 pub struct DistributedRateLimiter {
     redis_url: String,
     key_prefix: String,
+    tiers: Vec<TierLimits>,
+    window_secs: u64,
 }
+
+/// Increment a counter and set its expiry on first use, returning the counter
+/// and its remaining TTL. Doing both in one round trip keeps the counter and
+/// the window from drifting apart.
+const RATE_LIMIT_SCRIPT: &str = r"
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+local ttl = redis.call('TTL', KEYS[1])
+return {current, ttl}
+";
 
 impl DistributedRateLimiter {
     /// Create a new distributed rate limiter
@@ -280,38 +300,102 @@ impl DistributedRateLimiter {
         Self {
             redis_url: redis_url.to_string(),
             key_prefix: "tigerscan:ratelimit:".to_string(),
+            tiers: RateLimiter::new().get_tiers(),
+            window_secs: 60,
         }
     }
 
-    /// Check rate limit with Redis
+    /// The counter key for a client on a tier.
+    fn key(&self, client_id: &str, tier: &str) -> String {
+        format!("{}{}:{}", self.key_prefix, tier, client_id)
+    }
+
+    fn limit_for(&self, tier: &str) -> u32 {
+        self.tiers
+            .iter()
+            .find(|t| t.tier == tier)
+            .map(|t| t.requests_per_minute)
+            .unwrap_or(DEFAULT_RATE_LIMIT)
+    }
+
+    async fn connection(&self) -> Result<redis::aio::MultiplexedConnection, String> {
+        let client =
+            redis::Client::open(self.redis_url.clone()).map_err(|e| format!("redis url: {e}"))?;
+        client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| format!("redis connect: {e}"))
+    }
+
+    /// Check and consume one request for a client.
+    ///
+    /// Returns `Err` when Redis is unreachable. This never reports
+    /// `allowed: true` for a request it could not actually count, so a caller
+    /// that propagates the error cannot be tricked into admitting unlimited
+    /// traffic during an outage.
     pub async fn check_rate_limit(
         &self,
         client_id: &str,
         tier: &str,
     ) -> Result<RateLimitResult, String> {
-        // Note: In production, use redis crate
-        // This is a placeholder implementation
-        
-        let key = format!("{}{}:{}", self.key_prefix, tier, client_id);
-        
-        // Simulated response
+        let mut conn = self.connection().await?;
+        let key = self.key(client_id, tier);
+
+        let (current, ttl): (i64, i64) = redis::cmd("EVAL")
+            .arg(RATE_LIMIT_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .arg(self.window_secs)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| format!("redis eval: {e}"))?;
+
+        let limit = self.limit_for(tier);
+        let used = current.max(0) as u32;
+        // A TTL of -1 means the key somehow has no expiry. Report the full
+        // window rather than a negative reset time.
+        let reset_in = if ttl > 0 { ttl as u64 } else { self.window_secs };
+
         Ok(RateLimitResult {
-            allowed: true,
-            remaining: 50,
-            reset_in: 60,
+            allowed: used <= limit,
+            remaining: limit.saturating_sub(used),
+            reset_in,
+            limit,
             tier: tier.to_string(),
         })
     }
 
-    /// Record request
-    pub async fn record_request(
-        &self,
-        client_id: &str,
-        tier: &str,
-    ) -> Result<(), String> {
-        let key = format!("{}{}:{}", self.key_prefix, tier, client_id);
-        
-        // In production: redis.incr(key) and set expiry
+    /// Count a request without checking it.
+    ///
+    /// Use this when the decision was already made elsewhere, for example by
+    /// the in-process limiter, and the distributed counter still needs to see
+    /// the traffic.
+    pub async fn record_request(&self, client_id: &str, tier: &str) -> Result<(), String> {
+        let mut conn = self.connection().await?;
+        let key = self.key(client_id, tier);
+
+        redis::cmd("EVAL")
+            .arg(RATE_LIMIT_SCRIPT)
+            .arg(1)
+            .arg(&key)
+            .arg(self.window_secs)
+            .query_async::<_, (i64, i64)>(&mut conn)
+            .await
+            .map_err(|e| format!("redis eval: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Reset a client's counter, for example after a plan change.
+    pub async fn reset(&self, client_id: &str, tier: &str) -> Result<(), String> {
+        let mut conn = self.connection().await?;
+
+        redis::cmd("DEL")
+            .arg(self.key(client_id, tier))
+            .query_async::<_, i64>(&mut conn)
+            .await
+            .map_err(|e| format!("redis del: {e}"))?;
+
         Ok(())
     }
 }
@@ -322,6 +406,8 @@ pub struct RateLimitResult {
     pub allowed: bool,
     pub remaining: u32,
     pub reset_in: u64,
+    /// The ceiling the tier allows per window.
+    pub limit: u32,
     pub tier: String,
 }
 
@@ -334,7 +420,7 @@ pub fn add_rate_limit_headers(
     headers: &mut HashMap<String, String>,
     result: &RateLimitResult,
 ) {
-    headers.insert("X-RateLimit-Limit".to_string(), result.tier.clone());
+    headers.insert("X-RateLimit-Limit".to_string(), result.limit.to_string());
     headers.insert(
         "X-RateLimit-Remaining".to_string(),
         result.remaining.to_string(),
@@ -387,5 +473,33 @@ mod tests {
         
         // Should be limited now
         assert!(!limiter.allow("burst_client"));
+    }
+
+    #[tokio::test]
+    async fn distributed_limiter_errors_when_redis_is_unreachable() {
+        // Port 1 is not a Redis server. The limiter must report the failure
+        // rather than admitting the request, so callers can fail closed.
+        let limiter = DistributedRateLimiter::new("redis://127.0.0.1:1");
+        let result = limiter.check_rate_limit("client", "free").await;
+        assert!(result.is_err(), "an unreachable backend must not allow requests");
+    }
+
+    #[test]
+    fn the_limit_header_reports_the_ceiling_not_the_tier_name() {
+        let mut headers = HashMap::new();
+        add_rate_limit_headers(
+            &mut headers,
+            &RateLimitResult {
+                allowed: true,
+                remaining: 42,
+                reset_in: 30,
+                limit: 60,
+                tier: "free".to_string(),
+            },
+        );
+
+        assert_eq!(headers.get("X-RateLimit-Limit").unwrap(), "60");
+        assert_eq!(headers.get("X-RateLimit-Remaining").unwrap(), "42");
+        assert_eq!(headers.get("X-RateLimit-Reset").unwrap(), "30");
     }
 }

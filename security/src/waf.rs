@@ -135,109 +135,116 @@ impl Waf {
             // SQL Injection
             WafRule::new(
                 "SQL001", "SQL Injection UNION",
-                r"(?i)(union\s+select|union\s+all\s+select)",
+                r#"(?i)(union\s+select|union\s+all\s+select)"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::SqlInjection,
             ),
             WafRule::new(
                 "SQL002", "SQL Injection OR",
-                r"(?i)(\bor\b.*\b=\b|\b'\b|\b\"\b)",
+                // The previous pattern wrapped a quote in word boundaries:
+                // `\b'\b`. A quote is not a word character, so those
+                // boundaries can never both hold and the alternation never
+                // matched a bare quote. `' OR '1'='1` was therefore allowed
+                // through. Match the quote directly instead.
+                r#"(?i)('\s*(or|and)\s)|(\bor\b\s*['"\d])|(--\s)|(;\s*drop\s)"#,
                 WafAction::Block, WafSeverity::High, WafCategory::SqlInjection,
             ),
             WafRule::new(
                 "SQL003", "SQL Injection DROP",
-                r"(?i)(drop\s+table|drop\s+database|delete\s+from)",
+                r#"(?i)(drop\s+table|drop\s+database|delete\s+from)"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::SqlInjection,
             ),
             WafRule::new(
                 "SQL004", "SQL Injection EXEC",
-                r"(?i)(exec\s*\(|xp_cmdshell|sp_executesql)",
+                r#"(?i)(exec\s*\(|xp_cmdshell|sp_executesql)"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::SqlInjection,
             ),
             
             // XSS
             WafRule::new(
                 "XSS001", "XSS Script Tag",
-                r"(?i)<script[^>]*>.*?</script>",
+                // Matching only the complete `<script>...</script>` pair let a
+                // lone opening tag through. Block the opening tag on its own.
+                r#"(?i)<\s*script\b"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::Xss,
             ),
             WafRule::new(
                 "XSS002", "XSS JavaScript",
-                r"(?i)javascript:",
+                r#"(?i)javascript:"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::Xss,
             ),
             WafRule::new(
                 "XSS003", "XSS Event Handler",
-                r"(?i)on\w+\s*=",
+                r#"(?i)on\w+\s*="#,
                 WafAction::Block, WafSeverity::High, WafCategory::Xss,
             ),
             WafRule::new(
                 "XSS004", "XSS Object Tag",
-                r"(?i)<object[^>]*>",
+                r#"(?i)<object[^>]*>"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::Xss,
             ),
             WafRule::new(
                 "XSS005", "XSS Iframe",
-                r"(?i)<iframe[^>]*>",
+                r#"(?i)<iframe[^>]*>"#,
                 WafAction::Block, WafSeverity::High, WafCategory::Xss,
             ),
             WafRule::new(
                 "XSS006", "XSS Embed",
-                r"(?i)<embed[^>]*>",
+                r#"(?i)<embed[^>]*>"#,
                 WafAction::Block, WafSeverity::High, WafCategory::Xss,
             ),
             
             // Path Traversal
             WafRule::new(
                 "PT001", "Path Traversal",
-                r"(\.\./|\.\.\\|%2e%2e)",
+                r#"(\.\./|\.\.\\|%2e%2e)"#,
                 WafAction::Block, WafSeverity::High, WafCategory::PathTraversal,
             ),
             WafRule::new(
                 "PT002", "Absolute Path",
-                r"(?i)/etc/passwd|/windows/system32",
+                r#"(?i)/etc/passwd|/windows/system32"#,
                 WafAction::Block, WafSeverity::High, WafCategory::PathTraversal,
             ),
             
             // Command Injection
             WafRule::new(
                 "CMD001", "Command Injection",
-                r"(?i)(;\s*rm\s|;\s*ls\s|;\s*cat\s|;\s*wget\s|;\s*curl\s)",
+                r#"(?i)(;\s*rm\s|;\s*ls\s|;\s*cat\s|;\s*wget\s|;\s*curl\s)"#,
                 WafAction::Block, WafSeverity::Critical, WafCategory::CommandInjection,
             ),
             WafRule::new(
                 "CMD002", "Pipe Command",
-                r"(?i)\|\s*\w+",
+                r#"(?i)\|\s*\w+"#,
                 WafAction::Block, WafSeverity::High, WafCategory::CommandInjection,
             ),
             WafRule::new(
                 "CMD003", "Backtick",
-                r"`.*`",
+                r#"`.*`"#,
                 WafAction::Block, WafSeverity::High, WafCategory::CommandInjection,
             ),
             
             // LDAP Injection
             WafRule::new(
                 "LDAP001", "LDAP Injection",
-                r"(?i)(\*\)|\)\(|\(objectClass=)",
+                r#"(?i)(\*\)|\)\(|\(objectClass=)"#,
                 WafAction::Block, WafSeverity::High, WafCategory::LdapInjection,
             ),
             
             // XML Injection
             WafRule::new(
                 "XML001", "XML Injection",
-                r"(?i)<!\[CDATA\[|<!ENTITY",
+                r#"(?i)<!\[CDATA\[|<!ENTITY"#,
                 WafAction::Block, WafSeverity::High, WafCategory::XmlInjection,
             ),
             
             // Generic
             WafRule::new(
                 "GEN001", "Null Byte",
-                r"\x00",
+                r#"\x00"#,
                 WafAction::Block, WafSeverity::High, WafCategory::Generic,
             ),
             WafRule::new(
                 "GEN002", "Double Encoding",
-                r"%25",
+                r#"%25"#,
                 WafAction::Log, WafSeverity::Medium, WafCategory::Generic,
             ),
         ];
@@ -346,7 +353,7 @@ impl Waf {
         let mut by_category: HashMap<String, usize> = HashMap::new();
         let mut by_severity: HashMap<String, usize> = HashMap::new();
         
-        for entry in &log {
+        for entry in log.iter() {
             *by_category.entry(format!("{:?}", entry.category)).or_insert(0) += 1;
             *by_severity.entry(format!("{:?}", entry.severity)).or_insert(0) += 1;
         }
@@ -509,5 +516,48 @@ mod tests {
         let stats = waf.get_stats();
         
         assert!(stats.total_logs >= 2);
+    }
+
+    #[test]
+    fn sql_injection_variants_are_blocked() {
+        let waf = Waf::new();
+
+        // The quote-based forms are the ones the old rule missed.
+        for payload in [
+            "' OR '1'='1",
+            "admin' OR '1'='1' --",
+            "' or ''='",
+            "1 OR 1=1",
+            "'; DROP TABLE users; --",
+            "' AND 1=1",
+        ] {
+            let result = waf.check_request(payload);
+            assert!(!result.allowed, "payload was allowed through: {payload}");
+        }
+    }
+
+    #[test]
+    fn a_lone_script_opening_tag_is_blocked() {
+        let waf = Waf::new();
+
+        for payload in ["<script>", "<script>alert(1)", "<SCRIPT src=x>", "< script >"] {
+            let result = waf.check_request(payload);
+            assert!(!result.allowed, "payload was allowed through: {payload}");
+        }
+    }
+
+    #[test]
+    fn ordinary_text_is_allowed() {
+        let waf = Waf::new();
+
+        for payload in [
+            "hello world",
+            "a normal search query",
+            "user@example.com",
+            "TGR-12345",
+        ] {
+            let result = waf.check_request(payload);
+            assert!(result.allowed, "ordinary text was blocked: {payload}");
+        }
     }
 }

@@ -98,7 +98,7 @@ impl SecurityHeaders {
         headers
     }
 
-    /// Apply to response (mock implementation)
+    /// Merge these headers into a response header map.
     pub fn apply(&self, response: &mut HashMap<String, String>) {
         for (key, value) in self.get_headers() {
             response.insert(key, value);
@@ -110,7 +110,7 @@ impl SecurityHeaders {
 // X-FRAME-OPTIONS
 // =============================================================================
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XFrameOption {
     Deny,
     SameOrigin,
