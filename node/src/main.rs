@@ -8,7 +8,6 @@ use clap::Parser;
 use log::info;
 use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::RwLock;
 
 mod config;
 mod debug_rpc;

@@ -114,6 +114,9 @@ pub struct TransitionOutcome {
     pub output: Vec<u8>,
     /// Address of a newly created contract, if this was a creation.
     pub contract_address: Option<[u8; 20]>,
+    /// Logs the transaction emitted, in the order they were emitted. Empty for
+    /// a transaction that reverted, since a revert discards its logs.
+    pub logs: Vec<crate::types::Log>,
 }
 
 /// The intrinsic gas cost of a transaction: the base charge plus the per-byte
@@ -429,6 +432,14 @@ pub fn apply_transaction_traced(
         diffs = TraceDiffs::default();
     }
 
+    // Logs follow the same rule as the other state writes: a revert discards
+    // them, so a failed transaction contributes no logs to its receipt.
+    let logs = if result.success {
+        result.logs.clone()
+    } else {
+        Vec::new()
+    };
+
     // 8. Gas accounting. Execution has the intrinsic cost removed from its
     //    budget so the total never falls below the intrinsic charge.
     let gas_used_by_evm = result.gas_used.min(tx.gas_limit - intrinsic);
@@ -461,6 +472,7 @@ pub fn apply_transaction_traced(
                 gas_used,
                 output: result.output,
                 contract_address: None,
+                logs,
             },
             diffs,
         ));
@@ -473,6 +485,7 @@ pub fn apply_transaction_traced(
                 gas_used,
                 output: result.output,
                 contract_address: None,
+                logs: Vec::new(),
             },
             TraceDiffs::default(),
         ));
@@ -484,6 +497,7 @@ pub fn apply_transaction_traced(
             gas_used,
             output: result.output,
             contract_address,
+            logs,
         },
         diffs,
     ))

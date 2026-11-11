@@ -636,10 +636,8 @@ pub fn produce_block(
     chain_id: u64,
 ) -> Result<String, String> {
     use tiger_blockchain::types::{Block, BlockHeader};
-    use tiger_blockchain::{block_hash, transactions_root, EMPTY_TRIE_ROOT};
-    use tiger_evm::transition::{
-        apply_transaction, BlockContext, TransactionRequest,
-    };
+    use tiger_blockchain::{block_hash, transactions_root};
+    use tiger_evm::transition::{apply_transaction, BlockContext};
 
     let parent_block = chain_manager
         .chain()
@@ -692,12 +690,30 @@ pub fn produce_block(
     }
 
     // Apply each transaction to the world state. Gas actually consumed is
-    // summed, not the gas limits the transactions declared.
+    // summed, not the gas limits the transactions declared. Each transaction's
+    // logs are collected into a receipt, because the block header commits to
+    // the receipts root and the logs bloom and the node must be able to answer
+    // `eth_getTransactionReceipt` from the block it produced.
     let mut gas_used: u64 = 0;
+    let mut receipts: Vec<tiger_blockchain::BlockReceipt> = Vec::with_capacity(included.len());
     for (tx, request) in included.iter().zip(requests.iter()) {
         match apply_transaction(world_state, request, &block_ctx) {
             Ok(outcome) => {
                 gas_used = gas_used.saturating_add(outcome.gas_used);
+                receipts.push(tiger_blockchain::BlockReceipt {
+                    status: outcome.success,
+                    cumulative_gas_used: gas_used,
+                    gas_used: outcome.gas_used,
+                    logs: outcome
+                        .logs
+                        .iter()
+                        .map(|log| tiger_blockchain::ReceiptLog {
+                            address: log.address.0,
+                            topics: log.topics.iter().map(|t| t.0).collect(),
+                            data: log.data.clone(),
+                        })
+                        .collect(),
+                });
                 if !outcome.success {
                     info!("transaction {} reverted, gas used {}", tx.hash, outcome.gas_used);
                 }
@@ -715,6 +731,11 @@ pub fn produce_block(
     // The state root reflects the world state after applying the block.
     let state_root = world_state.state_root();
 
+    // The receipts root and logs bloom commit to the receipts the block's
+    // transactions actually produced.
+    let receipts_root = tiger_blockchain::receipts_root(&receipts);
+    let logs_bloom = tiger_blockchain::logs_bloom(&receipts);
+
     let header = BlockHeader {
         parent_hash,
         sha3_uncles: format!(
@@ -724,10 +745,8 @@ pub fn produce_block(
         miner: miner.to_string(),
         state_root: format!("0x{}", tiger_blockchain::hex_encode(&state_root)),
         transactions_root: format!("0x{}", tiger_blockchain::hex_encode(&tx_root)),
-        // Receipts are not produced by this node yet, so the root of the empty
-        // trie is used rather than a zero placeholder.
-        receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&EMPTY_TRIE_ROOT)),
-        logs_bloom: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 256])),
+        receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&receipts_root)),
+        logs_bloom: format!("0x{}", tiger_blockchain::hex_encode(&logs_bloom)),
         difficulty: "0".to_string(),
         number: block_number,
         gas_limit: BLOCK_GAS_LIMIT,
@@ -756,8 +775,11 @@ pub fn produce_block(
         uncles: vec![],
     };
 
+    // Insert with receipts so the header's commitments are verified against
+    // the receipts before the block is accepted, and so receipts are
+    // retrievable afterwards.
     chain_manager
-        .process_block(block)
+        .process_block_with_receipts(block, receipts)
         .map_err(|e| format!("failed to process block: {e}"))?;
 
     Ok(block_hash)
@@ -845,6 +867,7 @@ mod tests {
     use tiger_blockchain::types::Transaction;
     use tiger_blockchain::{block_hash, sign_transaction, transactions_root};
     use tiger_consensus::posa::MIN_STAKE;
+    use crate::rpc_server::{topics_match, TopicFilter};
     use tiger_state::account::{u256_from_u64, WorldState};
 
     #[tokio::test]
@@ -1031,5 +1054,159 @@ mod tests {
         assert!(block.transactions.is_empty());
         assert_eq!(block.header.gas_used, 0);
         assert_eq!(world.balance(&[0x22u8; 20]), [0u8; 32]);
+    }
+
+    #[test]
+    fn a_transfer_produces_a_stored_receipt_with_a_matching_root() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+
+        let key = [0x46u8; 32];
+        let sender = tiger_crypto::private_key_to_address(&key).unwrap();
+        world.set_balance(&sender, u256_from_u64(10_000_000));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        produce_block(
+            &mut cm,
+            &mut world,
+            &[signed_transfer(key, 0, [0x22u8; 20], 1234)],
+            1,
+            &miner,
+            6666,
+        )
+        .unwrap();
+
+        let receipts = cm.chain().receipts(1).expect("receipts must be stored");
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].status, "a plain transfer succeeds");
+        assert_eq!(receipts[0].gas_used, 21_000);
+        assert_eq!(receipts[0].cumulative_gas_used, 21_000);
+        assert!(receipts[0].logs.is_empty(), "a transfer emits no logs");
+
+        // The header must commit to exactly these receipts.
+        let block = cm.chain().get_block(1).unwrap();
+        assert_eq!(
+            block.header.receipts_root.to_lowercase(),
+            hex32(&tiger_blockchain::receipts_root(receipts))
+        );
+        assert_eq!(
+            block.header.logs_bloom.to_lowercase(),
+            format!(
+                "0x{}",
+                tiger_blockchain::hex_encode(&tiger_blockchain::logs_bloom(receipts))
+            )
+        );
+    }
+
+    #[test]
+    fn a_block_whose_declared_receipts_root_is_wrong_is_rejected() {
+        // Build a real block, then tamper with the declared receipts root.
+        // Accepting it would mean the node does not verify what it commits to.
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        let key = [0x46u8; 32];
+        let sender = tiger_crypto::private_key_to_address(&key).unwrap();
+        world.set_balance(&sender, u256_from_u64(10_000_000));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+        produce_block(
+            &mut cm,
+            &mut world,
+            &[signed_transfer(key, 0, [0x22u8; 20], 1)],
+            1,
+            &miner,
+            6666,
+        )
+        .unwrap();
+
+        let receipts = cm.chain().receipts(1).unwrap().to_vec();
+        let mut block = cm.chain().get_block(1).unwrap().clone();
+        block.header.receipts_root = hex32(&[0x11u8; 32]);
+
+        let mut fresh = chain_manager();
+        fresh
+            .process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+        let err = fresh.process_block_with_receipts(block, receipts).unwrap_err();
+        assert!(
+            matches!(err, tiger_blockchain::ValidationError::ReceiptsRootMismatch { .. }),
+            "expected a receipts-root mismatch, got {err}"
+        );
+        // The tampered block must not have been inserted.
+        assert_eq!(fresh.chain().height(), 0);
+    }
+
+    #[test]
+    fn contract_logs_are_captured_and_filterable() {
+        use tiger_evm::transition::BlockContext;
+
+        // A contract that emits LOG1 with one topic: PUSH1 0x07 (topic),
+        // PUSH1 0x00 PUSH1 0x00 (offset, length), LOG1, then STOP.
+        // Bytecode: 60 07 60 00 60 00 a1 00
+        let code = vec![0x60, 0x07, 0x60, 0x00, 0x60, 0x00, 0xa1, 0x00];
+        let contract = [0x33u8; 20];
+
+        let mut world = WorldState::new();
+        world.set_code(&contract, code);
+
+        let block_ctx = BlockContext {
+            chain_id: 6666,
+            number: 1,
+            timestamp: 1_700_000_000,
+            gas_limit: 30_000_000,
+            coinbase: [0xaa; 20],
+            base_fee: 0,
+        };
+
+        // Call the contract with no calldata; the call itself is the
+        // transaction, so the caller needs a balance to pay gas.
+        let caller = [0x44u8; 20];
+        world.set_balance(&caller, u256_from_u64(10_000_000));
+        let request = tiger_evm::transition::TransactionRequest {
+            nonce: 0,
+            gas_price: tiger_evm::transition::wei(1),
+            gas_limit: 100_000,
+            to: Some(contract),
+            value: [0u8; 32],
+            data: vec![],
+            sender: caller,
+        };
+
+        let outcome =
+            tiger_evm::transition::apply_transaction(&mut world, &request, &block_ctx).unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.logs.len(), 1, "LOG1 must produce exactly one log");
+        let log = &outcome.logs[0];
+        assert_eq!(log.address.0, contract);
+        assert_eq!(log.topics.len(), 1);
+        assert_eq!(log.topics[0].0[31], 0x07);
+
+        // The receipt the node builds from this outcome carries the log, and
+        // the filter logic matches it.
+        let receipt = tiger_blockchain::BlockReceipt {
+            status: true,
+            cumulative_gas_used: outcome.gas_used,
+            gas_used: outcome.gas_used,
+            logs: vec![tiger_blockchain::ReceiptLog {
+                address: contract,
+                topics: log.topics.iter().map(|t| t.0).collect(),
+                data: log.data.clone(),
+            }],
+        };
+        assert_eq!(receipt.logs.len(), 1);
+
+        // A topic filter matching the emitted topic must match, and one
+        // naming a different topic must not.
+        let matching: TopicFilter = vec![Some(vec![log.topics[0].0])];
+        assert!(topics_match(&matching, &[log.topics[0].0]));
+        let non_matching: TopicFilter = vec![Some(vec![[0x99u8; 32]])];
+        assert!(!topics_match(&non_matching, &[log.topics[0].0]));
+
+        // A filter longer than the log's topics can never match.
+        let too_long: TopicFilter = vec![None, None];
+        assert!(!topics_match(&too_long, &[log.topics[0].0]));
     }
 }

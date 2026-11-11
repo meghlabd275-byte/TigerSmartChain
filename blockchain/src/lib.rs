@@ -3,6 +3,7 @@
 pub mod block;
 pub mod chain;
 pub mod mempool;
+pub mod receipt;
 pub mod types;
 
 pub use block::{
@@ -12,4 +13,7 @@ pub use block::{
 };
 pub use chain::*;
 pub use mempool::*;
+pub use receipt::{
+    bloom_hex, logs_bloom, receipts_root, validate_bloom, Receipt as BlockReceipt, ReceiptLog,
+};
 pub use types::*;

@@ -35,6 +35,10 @@ pub enum ValidationError {
     TransactionsRootMismatch { expected: String, found: String },
     /// A transaction in the block has no hash.
     TransactionMissingHash(usize),
+    /// The declared receipts root does not match the block's receipts.
+    ReceiptsRootMismatch { expected: String, found: String },
+    /// The declared logs bloom does not match the block's receipts.
+    LogsBloomMismatch,
 }
 
 impl std::fmt::Display for ValidationError {
@@ -66,6 +70,13 @@ impl std::fmt::Display for ValidationError {
             ),
             ValidationError::TransactionMissingHash(index) => {
                 write!(f, "transaction at index {index} has no hash")
+            }
+            ValidationError::ReceiptsRootMismatch { expected, found } => write!(
+                f,
+                "receipts root mismatch: expected {expected}, found {found}"
+            ),
+            ValidationError::LogsBloomMismatch => {
+                write!(f, "logs bloom does not match the block's receipts")
             }
         }
     }

@@ -275,14 +275,17 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
                 Some(tag) => tag,
                 None => return RpcResponse::error(INVALID_PARAMS, "missing block tag", id),
             };
+            let full = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
             let manager = node.get_chain_manager().await;
-            let height = manager.chain().height();
-            let number = match parse_block_tag(&tag, height) {
+            let chain = manager.chain();
+            let number = match parse_block_tag(&tag, chain.height()) {
                 Some(number) => number,
                 None => return RpcResponse::success(Value::Null, id),
             };
-            match manager.chain().get_block(number) {
-                Some(block) => RpcResponse::success(block_to_json(block), id),
+            match chain.get_block(number) {
+                Some(block) => {
+                    RpcResponse::success(block_to_json_with_receipts(block, full), id)
+                }
                 None => RpcResponse::success(Value::Null, id),
             }
         }
@@ -291,12 +294,158 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
                 Some(hash) => hash,
                 None => return RpcResponse::error(INVALID_PARAMS, "missing block hash", id),
             };
+            let full = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
             let manager = node.get_chain_manager().await;
             match manager.chain().get_block_by_hash(&hash) {
-                Some(block) => RpcResponse::success(block_to_json(block), id),
+                Some(block) => RpcResponse::success(block_to_json_with_receipts(block, full), id),
                 None => RpcResponse::success(Value::Null, id),
             }
         }
+        "eth_getTransactionByHash" => {
+            let hash = match string_param(params, 0) {
+                Some(hash) => hash,
+                None => return RpcResponse::error(INVALID_PARAMS, "missing transaction hash", id),
+            };
+            let manager = node.get_chain_manager().await;
+            match manager.chain().find_transaction(&hash) {
+                Some((block, index, block_hash)) => RpcResponse::success(
+                    transaction_to_json(block, index, &block_hash),
+                    id,
+                ),
+                None => RpcResponse::success(Value::Null, id),
+            }
+        }
+        "eth_getTransactionByBlockNumberAndIndex" => {
+            let tag = match string_param(params, 0) {
+                Some(tag) => tag,
+                None => return RpcResponse::error(INVALID_PARAMS, "missing block tag", id),
+            };
+            let index = match string_param(params, 1).and_then(|s| parse_u64_hex(&s)) {
+                Some(index) => index,
+                None => return RpcResponse::error(INVALID_PARAMS, "invalid transaction index", id),
+            };
+            let manager = node.get_chain_manager().await;
+            let chain = manager.chain();
+            let number = match parse_block_tag(&tag, chain.height()) {
+                Some(number) => number,
+                None => return RpcResponse::success(Value::Null, id),
+            };
+            match chain.get_block(number) {
+                Some(block) => match block.transactions.get(index as usize) {
+                    Some(_) => {
+                        let block_hash = tiger_blockchain::block_hash(&block.header)
+                            .unwrap_or_else(|_| format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])));
+                        RpcResponse::success(transaction_to_json(block, index as usize, &block_hash), id)
+                    }
+                    None => RpcResponse::success(Value::Null, id),
+                },
+                None => RpcResponse::success(Value::Null, id),
+            }
+        }
+        "eth_getTransactionByBlockHashAndIndex" => {
+            let hash = match string_param(params, 0) {
+                Some(hash) => hash,
+                None => return RpcResponse::error(INVALID_PARAMS, "missing block hash", id),
+            };
+            let index = match string_param(params, 1).and_then(|s| parse_u64_hex(&s)) {
+                Some(index) => index,
+                None => return RpcResponse::error(INVALID_PARAMS, "invalid transaction index", id),
+            };
+            let manager = node.get_chain_manager().await;
+            let chain = manager.chain();
+            match chain.get_block_by_hash(&hash) {
+                Some(block) => match block.transactions.get(index as usize) {
+                    Some(_) => RpcResponse::success(transaction_to_json(block, index as usize, &hash), id),
+                    None => RpcResponse::success(Value::Null, id),
+                },
+                None => RpcResponse::success(Value::Null, id),
+            }
+        }
+        "eth_getTransactionReceipt" => {
+            let hash = match string_param(params, 0) {
+                Some(hash) => hash,
+                None => return RpcResponse::error(INVALID_PARAMS, "missing transaction hash", id),
+            };
+            let manager = node.get_chain_manager().await;
+            let chain = manager.chain();
+            match chain.find_transaction(&hash) {
+                Some((block, index, block_hash)) => {
+                    match receipt_to_json(chain, block, index, &block_hash) {
+                        Some(value) => RpcResponse::success(value, id),
+                        None => RpcResponse::success(Value::Null, id),
+                    }
+                }
+                None => RpcResponse::success(Value::Null, id),
+            }
+        }
+        "eth_getBlockTransactionCountByNumber" => {
+            let tag = match string_param(params, 0) {
+                Some(tag) => tag,
+                None => return RpcResponse::error(INVALID_PARAMS, "missing block tag", id),
+            };
+            let manager = node.get_chain_manager().await;
+            let chain = manager.chain();
+            let number = match parse_block_tag(&tag, chain.height()) {
+                Some(number) => number,
+                None => return RpcResponse::success(Value::Null, id),
+            };
+            match chain.get_block(number) {
+                Some(block) => RpcResponse::success(hex_u64(block.transactions.len() as u64), id),
+                None => RpcResponse::success(Value::Null, id),
+            }
+        }
+        "eth_getBlockTransactionCountByHash" => {
+            let hash = match string_param(params, 0) {
+                Some(hash) => hash,
+                None => return RpcResponse::error(INVALID_PARAMS, "missing block hash", id),
+            };
+            let manager = node.get_chain_manager().await;
+            match manager.chain().get_block_by_hash(&hash) {
+                Some(block) => RpcResponse::success(hex_u64(block.transactions.len() as u64), id),
+                None => RpcResponse::success(Value::Null, id),
+            }
+        }
+        "eth_getUncleCountByBlockNumber" | "eth_getUncleCountByBlockHash" => {
+            // TigerSmartChain is a PoSA chain with no uncles, so the count is
+            // zero for every block; report it rather than refusing the method.
+            RpcResponse::success(hex_u64(0), id)
+        }
+        "eth_syncing" => {
+            let status = node.get_sync_status().read().await;
+            if status.syncing {
+                RpcResponse::success(
+                    json!({
+                        "startingBlock": hex_u64_str(status.starting_block),
+                        "currentBlock": hex_u64_str(status.current_block),
+                        "highestBlock": hex_u64_str(status.highest_block),
+                        "pulledStates": hex_u64_str(status.pulled_states),
+                        "knownStates": hex_u64_str(status.known_states),
+                    }),
+                    id,
+                )
+            } else {
+                RpcResponse::success(json!(false), id)
+            }
+        }
+        "eth_maxPriorityFeePerGas" => {
+            // The minimum tip this node will accept, taken from configuration.
+            RpcResponse::success(hex_u64(node.config().min_gas_price), id)
+        }
+        "eth_feeHistory" => match fee_history(node, params).await {
+            Ok(value) => RpcResponse::success(value, id),
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_getLogs" => match get_logs(node, params).await {
+            Ok(value) => RpcResponse::success(Value::Array(value), id),
+            Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+        },
+        "eth_accounts" => {
+            // This node holds no wallet keys, so it controls no accounts.
+            // Reporting an empty list is the truthful answer, and it is what
+            // a non-custodial node returns.
+            RpcResponse::success(json!([]), id)
+        }
+        "eth_protocolVersion" => RpcResponse::success(json!("0x41"), id),
         "eth_gasPrice" => {
             // The price of the last block's transactions, or a floor when the
             // chain is empty. Reported from state rather than a constant.
@@ -472,7 +621,6 @@ async fn call_contract(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<u8>,
 /// mempool. A transaction whose signature cannot be recovered is rejected
 /// here, so nothing unauthenticated ever reaches block production.
 async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<String, String> {
-    use tiger_blockchain::types::Transaction;
     use tiger_blockchain::{recover_transaction_sender, transaction_hash};
 
     let bytes = decode_hex(raw)?;
@@ -492,7 +640,9 @@ async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<Stri
 
     {
         let mut mempool = node.get_mempool().await;
-        mempool.add(tx);
+        mempool
+            .add(tx)
+            .map_err(|e| format!("mempool rejected transaction: {e}"))?;
     }
     log::info!("accepted transaction {hash}");
     Ok(hash)
@@ -594,33 +744,43 @@ fn as_bytes(item: &tiger_state::rlp::RlpItem) -> Vec<u8> {
 }
 
 /// Render a block as the JSON object `eth_getBlockBy*` returns.
-fn block_to_json(block: &tiger_blockchain::types::Block) -> Value {
+///
+/// When `full_transactions` is false the `transactions` array holds hashes;
+/// when it is true it holds full transaction objects. That distinction is part
+/// of the JSON-RPC contract and clients depend on it.
+fn block_to_json_with_receipts(
+    block: &tiger_blockchain::types::Block,
+    full_transactions: bool,
+) -> Value {
     use tiger_blockchain::{block_hash, hex_encode};
 
     let header = &block.header;
     let hash = block_hash(header).unwrap_or_else(|_| format!("0x{}", hex_encode(&[0u8; 32])));
 
-    let transactions: Vec<Value> = block
-        .transactions
-        .iter()
-        .map(|tx| {
-            json!({
-                "hash": tx.hash,
-                "nonce": hex_u64_str(tx.nonce),
-                "blockHash": hash,
-                "blockNumber": hex_u64_str(header.number),
-                "from": tx.from,
-                "to": tx.to,
-                "value": tx.value,
-                "gasPrice": hex_u64_str(tx.gas_price),
-                "gas": hex_u64_str(tx.gas),
-                "input": tx.input,
-                "v": tx.v,
-                "r": tx.r,
-                "s": tx.s,
-            })
-        })
-        .collect();
+    let transactions: Vec<Value> = if full_transactions {
+        block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(index, _tx)| transaction_to_json(block, index, &hash))
+            .collect()
+    } else {
+        block
+            .transactions
+            .iter()
+            .map(|tx| Value::String(tx.hash.clone()))
+            .collect()
+    };
+
+    // `size` is the RLP length of the block, which clients display. It is
+    // computed from the real encoding rather than estimated.
+    let size = block_rlp_len(block);
+
+    // `totalDifficulty` is the sum of the difficulty of every block up to and
+    // including this one. TigerSmartChain's difficulty is a fixed constant per
+    // block, so the total is that constant times the height plus one.
+    let per_block_difficulty: u128 = header.difficulty.parse().unwrap_or(0);
+    let total_difficulty = per_block_difficulty.saturating_mul(header.number as u128 + 1);
 
     json!({
         "number": hex_u64_str(header.number),
@@ -633,6 +793,7 @@ fn block_to_json(block: &tiger_blockchain::types::Block) -> Value {
         "receiptsRoot": header.receipts_root,
         "logsBloom": header.logs_bloom,
         "difficulty": header.difficulty,
+        "totalDifficulty": format!("0x{total_difficulty:x}"),
         "gasLimit": hex_u64_str(header.gas_limit),
         "gasUsed": hex_u64_str(header.gas_used),
         "timestamp": hex_u64_str(header.timestamp),
@@ -640,9 +801,413 @@ fn block_to_json(block: &tiger_blockchain::types::Block) -> Value {
         "mixHash": header.mix_hash,
         "nonce": header.nonce,
         "baseFeePerGas": header.base_fee_per_gas.map(hex_u64_str),
+        "size": hex_u64_str(size),
         "transactions": transactions,
         "uncles": [],
     })
+}
+
+/// RLP length of a block: `len(rlp([header, transactions, uncles]))`.
+fn block_rlp_len(block: &tiger_blockchain::types::Block) -> u64 {
+    use tiger_state::rlp::RlpItem;
+    let header = match tiger_blockchain::encode_header(&block.header) {
+        Ok(encoded) => encoded,
+        Err(_) => return 0,
+    };
+    let txs: Vec<RlpItem> = block
+        .transactions
+        .iter()
+        .filter_map(|tx| tiger_blockchain::encode_legacy_transaction(tx).ok())
+        .map(RlpItem::bytes)
+        .collect();
+    let uncles: Vec<RlpItem> = block
+        .uncles
+        .iter()
+        .map(|u| RlpItem::bytes(decode_hex(u).unwrap_or_default()))
+        .collect();
+    RlpItem::list(vec![
+        RlpItem::bytes(header),
+        RlpItem::list(txs),
+        RlpItem::list(uncles),
+    ])
+    .encode()
+    .len() as u64
+}
+
+/// Render one transaction of a block as the object `eth_getTransactionBy*`
+/// returns.
+fn transaction_to_json(
+    block: &tiger_blockchain::types::Block,
+    index: usize,
+    block_hash: &str,
+) -> Value {
+    let tx = &block.transactions[index];
+    json!({
+        "hash": tx.hash,
+        "nonce": hex_u64_str(tx.nonce),
+        "blockHash": block_hash,
+        "blockNumber": hex_u64_str(block.header.number),
+        "transactionIndex": hex_u64_str(index as u64),
+        "from": tx.from,
+        "to": tx.to,
+        "value": tx.value,
+        "gasPrice": hex_u64_str(tx.gas_price),
+        "gas": hex_u64_str(tx.gas),
+        "input": tx.input,
+        "v": tx.v,
+        "r": tx.r,
+        "s": tx.s,
+        "type": "0x0",
+    })
+}
+
+/// Render the receipt for transaction `index` of `block`.
+///
+/// Returns `None` when the block has no stored receipt for that index, which
+/// would mean the node accepted a block without its receipts; in that case the
+/// caller reports `null` rather than inventing a receipt.
+fn receipt_to_json(
+    chain: &tiger_blockchain::Blockchain,
+    block: &tiger_blockchain::types::Block,
+    index: usize,
+    block_hash: &str,
+) -> Option<Value> {
+    let receipts = chain.receipts(block.header.number)?;
+    let receipt = receipts.get(index)?;
+    let tx = block.transactions.get(index)?;
+
+    // Log indices are continuous across the whole block, not per transaction,
+    // so a log's `logIndex` counts every log emitted earlier in the block.
+    let mut log_index: u64 = receipts
+        .iter()
+        .take(index)
+        .map(|r| r.logs.len() as u64)
+        .sum();
+
+    let logs: Vec<Value> = receipt
+        .logs
+        .iter()
+        .map(|log| {
+            let value = json!({
+                "address": format!("0x{}", tiger_blockchain::hex_encode(&log.address)),
+                "topics": log
+                    .topics
+                    .iter()
+                    .map(|t| format!("0x{}", tiger_blockchain::hex_encode(t)))
+                    .collect::<Vec<_>>(),
+                "data": format!("0x{}", tiger_blockchain::hex_encode(&log.data)),
+                "blockNumber": hex_u64_str(block.header.number),
+                "blockHash": block_hash,
+                "transactionHash": tx.hash,
+                "transactionIndex": hex_u64_str(index as u64),
+                "logIndex": hex_u64_str(log_index),
+                "removed": false,
+            });
+            log_index += 1;
+            value
+        })
+        .collect();
+
+    // `contractAddress` is the address a creation deployed to, and is null for
+    // every other transaction. The address is `keccak256(rlp([sender, nonce]))`
+    // with the sender's nonce at the time of the creation, which is the
+    // transaction's own nonce because a creation always consumes it.
+    let contract_address = match &tx.to {
+        Some(_) => Value::Null,
+        None => {
+            let sender = decode_hex(&tx.from).ok().and_then(|bytes| {
+                if bytes.len() == 20 {
+                    let mut address = [0u8; 20];
+                    address.copy_from_slice(&bytes);
+                    Some(address)
+                } else {
+                    None
+                }
+            });
+            match sender {
+                Some(sender) if receipt.status => {
+                    let created = tiger_evm::transition::create_address(&sender, tx.nonce);
+                    Value::String(format!(
+                        "0x{}",
+                        tiger_blockchain::hex_encode(&created)
+                    ))
+                }
+                // A creation that failed deployed nothing.
+                _ => Value::Null,
+            }
+        }
+    };
+
+    Some(json!({
+        "transactionHash": tx.hash,
+        "transactionIndex": hex_u64_str(index as u64),
+        "blockHash": block_hash,
+        "blockNumber": hex_u64_str(block.header.number),
+        "from": tx.from,
+        "to": tx.to,
+        "cumulativeGasUsed": hex_u64_str(receipt.cumulative_gas_used),
+        "gasUsed": hex_u64_str(receipt.gas_used),
+        "effectiveGasPrice": hex_u64_str(tx.gas_price),
+        "contractAddress": contract_address,
+        "logs": logs,
+        "logsBloom": tiger_blockchain::bloom_hex(&receipt.bloom()),
+        "status": if receipt.status { "0x1" } else { "0x0" },
+        "type": "0x0",
+    }))
+}
+
+/// `eth_feeHistory`: a window of base-fee and gas-usage history.
+///
+/// TigerSmartChain has no EIP-1559 base-fee mechanism (base fee is zero), so
+/// the honest answer reports the real gas usage of each block in the window
+/// with a zero base fee, rather than fabricating fee data.
+async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, String> {
+    let count = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(parse_u64_hex)
+        .ok_or_else(|| "invalid block count".to_string())?;
+    let newest_tag = params
+        .get(1)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing newest block".to_string())?;
+
+    let manager = node.get_chain_manager().await;
+    let chain = manager.chain();
+    let height = chain.height();
+    let newest = parse_block_tag(newest_tag, height)
+        .ok_or_else(|| "invalid newest block".to_string())?;
+
+    // The window never reaches below genesis.
+    let count = count.min(newest + 1);
+    let oldest = newest + 1 - count;
+
+    let mut base_fees: Vec<Value> = Vec::with_capacity(count as usize + 1);
+    let mut gas_used_ratios: Vec<Value> = Vec::with_capacity(count as usize);
+    let mut rewards: Vec<Value> = Vec::with_capacity(count as usize);
+
+    for number in oldest..=newest {
+        match chain.get_block(number) {
+            Some(block) => {
+                let base_fee = block.header.base_fee_per_gas.unwrap_or(0);
+                base_fees.push(Value::String(hex_u64_str(base_fee)));
+                let ratio = if block.header.gas_limit == 0 {
+                    0.0
+                } else {
+                    block.header.gas_used as f64 / block.header.gas_limit as f64
+                };
+                gas_used_ratios.push(json!(ratio));
+                // One reward entry per transaction, at that transaction's
+                // effective gas price.
+                rewards.push(Value::Array(
+                    block
+                        .transactions
+                        .iter()
+                        .map(|tx| Value::String(hex_u64_str(tx.gas_price)))
+                        .collect(),
+                ));
+            }
+            None => {
+                base_fees.push(Value::String(hex_u64_str(0)));
+                gas_used_ratios.push(json!(0.0));
+                rewards.push(Value::Array(vec![]));
+            }
+        }
+    }
+
+    // The oldest block's base fee is prepended to the window.
+    let oldest_base_fee = chain
+        .get_block(oldest)
+        .and_then(|b| b.header.base_fee_per_gas)
+        .unwrap_or(0);
+    base_fees.insert(0, Value::String(hex_u64_str(oldest_base_fee)));
+
+    Ok(json!({
+        "oldestBlock": hex_u64_str(oldest),
+        "baseFeePerGas": base_fees,
+        "gasUsedRatio": gas_used_ratios,
+        "reward": rewards,
+    }))
+}
+
+/// `eth_getLogs`: match logs from a block range against a filter.
+///
+/// The filter supports `fromBlock`, `toBlock`, `address` (a string or an
+/// array), `blockHash`, and `topics` (with `null` wildcards and nested arrays
+/// for OR-matching), which is the full shape clients send.
+async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, String> {
+    let filter = params.get(0).ok_or_else(|| "missing filter".to_string())?;
+
+    let manager = node.get_chain_manager().await;
+    let chain = manager.chain();
+    let height = chain.height();
+
+    // A `blockHash` filter pins the search to one block and cannot be combined
+    // with a range.
+    let numbers: Vec<u64> = if let Some(block_hash) = filter.get("blockHash").and_then(|v| v.as_str())
+    {
+        match chain.get_block_by_hash(block_hash) {
+            Some(block) => vec![block.header.number],
+            None => return Ok(Vec::new()),
+        }
+    } else {
+        let from = match filter.get("fromBlock").and_then(|v| v.as_str()) {
+            Some(tag) => parse_block_tag(tag, height).ok_or_else(|| "invalid fromBlock".to_string())?,
+            None => 0,
+        };
+        let to = match filter.get("toBlock").and_then(|v| v.as_str()) {
+            Some(tag) => parse_block_tag(tag, height).ok_or_else(|| "invalid toBlock".to_string())?,
+            None => height,
+        };
+        if from > to {
+            return Ok(Vec::new());
+        }
+        // A block tag of `pending` can exceed the current height; clamp so the
+        // scan stays within the chain.
+        (from..=to.min(height)).collect()
+    };
+
+    let address_filter = parse_address_filter(filter.get("address"))?;
+    let topic_filter = parse_topic_filter(filter.get("topics"))?;
+
+    let mut out = Vec::new();
+    for number in numbers {
+        let block = match chain.get_block(number) {
+            Some(block) => block,
+            None => continue,
+        };
+        let receipts = match chain.receipts(number) {
+            Some(receipts) => receipts,
+            None => continue,
+        };
+        let block_hash = tiger_blockchain::block_hash(&block.header)
+            .unwrap_or_else(|_| format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])));
+
+        let mut log_index: u64 = 0;
+        for (tx_index, receipt) in receipts.iter().enumerate() {
+            let tx = match block.transactions.get(tx_index) {
+                Some(tx) => tx,
+                None => continue,
+            };
+            for log in &receipt.logs {
+                let matches_address = address_filter
+                    .as_ref()
+                    .map(|set| set.contains(&log.address))
+                    .unwrap_or(true);
+                let matches_topics = topic_filter
+                    .as_ref()
+                    .map(|f| topics_match(f, &log.topics))
+                    .unwrap_or(true);
+                if matches_address && matches_topics {
+                    out.push(json!({
+                        "address": format!("0x{}", tiger_blockchain::hex_encode(&log.address)),
+                        "topics": log
+                            .topics
+                            .iter()
+                            .map(|t| format!("0x{}", tiger_blockchain::hex_encode(t)))
+                            .collect::<Vec<_>>(),
+                        "data": format!("0x{}", tiger_blockchain::hex_encode(&log.data)),
+                        "blockNumber": hex_u64_str(number),
+                        "blockHash": block_hash,
+                        "transactionHash": tx.hash,
+                        "transactionIndex": hex_u64_str(tx_index as u64),
+                        "logIndex": hex_u64_str(log_index),
+                        "removed": false,
+                    }));
+                }
+                log_index += 1;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Parse the `address` field of a log filter: a single address or a list.
+fn parse_address_filter(value: Option<&Value>) -> Result<Option<Vec<[u8; 20]>>, String> {
+    let value = match value {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(None),
+    };
+    let mut out = Vec::new();
+    match value {
+        Value::String(s) => out.push(parse_address(s)?),
+        Value::Array(items) => {
+            for item in items {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| "address filter entries must be strings".to_string())?;
+                out.push(parse_address(s)?);
+            }
+        }
+        _ => return Err("address filter must be a string or array".to_string()),
+    }
+    if out.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+/// The `topics` field of a log filter: each position is either `null` (a
+/// wildcard), a single 32-byte topic, or an array of alternatives.
+pub(crate) type TopicFilter = Vec<Option<Vec<[u8; 32]>>>;
+
+fn parse_topic_filter(value: Option<&Value>) -> Result<Option<TopicFilter>, String> {
+    let value = match value {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(None),
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| "topics filter must be an array".to_string())?;
+
+    let mut out: TopicFilter = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Null => out.push(None),
+            Value::String(s) => out.push(Some(vec![parse_topic(s)?])),
+            Value::Array(alts) => {
+                let mut topics = Vec::with_capacity(alts.len());
+                for alt in alts {
+                    match alt {
+                        Value::Null => continue,
+                        Value::String(s) => topics.push(parse_topic(s)?),
+                        _ => return Err("topic alternatives must be strings".to_string()),
+                    }
+                }
+                out.push(Some(topics));
+            }
+            _ => return Err("topic filter entries must be null, a string or an array".to_string()),
+        }
+    }
+    Ok(Some(out))
+}
+
+fn parse_topic(value: &str) -> Result<[u8; 32], String> {
+    let bytes = decode_hex(value)?;
+    if bytes.len() != 32 {
+        return Err(format!("expected a 32-byte topic, got {} bytes", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Whether a log's topics satisfy a filter. The filter is positional: topic
+/// `i` of the log must match entry `i` of the filter, or the entry must be a
+/// wildcard. A filter longer than the log's topic list cannot match.
+pub(crate) fn topics_match(filter: &TopicFilter, topics: &[[u8; 32]]) -> bool {
+    if filter.len() > topics.len() {
+        return false;
+    }
+    for (index, entry) in filter.iter().enumerate() {
+        if let Some(alternatives) = entry {
+            if !alternatives.contains(&topics[index]) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Resolve a block tag to a number, or `None` when it cannot match a block.

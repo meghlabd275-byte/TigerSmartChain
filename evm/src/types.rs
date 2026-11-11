@@ -495,7 +495,7 @@ pub struct ExecutionResult {
 }
 
 /// Log
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Log {
     pub address: Address,
     pub topics: Vec<EvmWord>,

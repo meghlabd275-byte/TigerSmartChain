@@ -14,6 +14,10 @@ pub struct Blockchain {
     blocks: HashMap<u64, Block>,
     headers: HashMap<u64, BlockHeader>,
     genesis: Option<Genesis>,
+    /// Receipts per block, in transaction order. Kept alongside the block
+    /// because they are not part of the block body but are needed to answer
+    /// `eth_getTransactionReceipt` and `eth_getLogs`.
+    receipts: HashMap<u64, Vec<crate::receipt::Receipt>>,
 }
 
 impl Blockchain {
@@ -23,6 +27,7 @@ impl Blockchain {
             blocks: HashMap::new(),
             headers: HashMap::new(),
             genesis: None,
+            receipts: HashMap::new(),
         }
     }
 
@@ -63,6 +68,38 @@ impl Blockchain {
         let number = block.header.number;
         self.headers.insert(number, block.header.clone());
         self.blocks.insert(number, block);
+    }
+
+    /// Insert a block together with the receipts its transactions produced.
+    pub fn insert_block_with_receipts(
+        &mut self,
+        block: Block,
+        receipts: Vec<crate::receipt::Receipt>,
+    ) {
+        let number = block.header.number;
+        self.receipts.insert(number, receipts);
+        self.insert_block(block);
+    }
+
+    /// The receipts for a block, in transaction order.
+    pub fn receipts(&self, number: u64) -> Option<&[crate::receipt::Receipt]> {
+        self.receipts.get(&number).map(|r| r.as_slice())
+    }
+
+    /// Locate a transaction by hash: its block, its index in that block, and
+    /// the block hash. Used to serve `eth_getTransactionByHash`.
+    pub fn find_transaction(&self, hash: &str) -> Option<(&Block, usize, String)> {
+        for block in self.blocks.values() {
+            if let Some(index) = block
+                .transactions
+                .iter()
+                .position(|tx| tx.hash.eq_ignore_ascii_case(hash))
+            {
+                let block_hash = block_hash(&block.header).ok()?;
+                return Some((block, index, block_hash));
+            }
+        }
+        None
     }
 
     /// Get the current height.
@@ -136,6 +173,47 @@ impl ChainManager {
     pub fn process_block(&mut self, block: Block) -> Result<(), ValidationError> {
         self.validate_block(&block)?;
         self.chain.insert_block(block);
+        Ok(())
+    }
+
+    /// Validate and insert a block together with the receipts its execution
+    /// produced.
+    ///
+    /// The declared `receiptsRoot` and `logsBloom` are checked against the
+    /// receipts before insertion: a block whose header commits to different
+    /// receipts than the ones it actually produced is rejected, exactly as a
+    /// real client rejects it. This is what makes the receipts part of
+    /// consensus rather than a local annotation.
+    pub fn process_block_with_receipts(
+        &mut self,
+        block: Block,
+        receipts: Vec<crate::receipt::Receipt>,
+    ) -> Result<(), ValidationError> {
+        self.validate_block(&block)?;
+
+        if receipts.len() != block.transactions.len() {
+            return Err(ValidationError::ReceiptsRootMismatch {
+                expected: format!("{} receipts", block.transactions.len()),
+                found: format!("{}", receipts.len()),
+            });
+        }
+
+        let expected_root = crate::receipt::receipts_root(&receipts);
+        let declared_root = crate::block::decode_hex_field(&block.header.receipts_root, Some(32))?;
+        if declared_root != expected_root {
+            return Err(ValidationError::ReceiptsRootMismatch {
+                expected: crate::block::hex_encode(&expected_root),
+                found: block.header.receipts_root.trim_start_matches("0x").to_string(),
+            });
+        }
+
+        let expected_bloom = crate::receipt::logs_bloom(&receipts);
+        let declared_bloom = crate::block::decode_hex_field(&block.header.logs_bloom, Some(256))?;
+        if declared_bloom != expected_bloom {
+            return Err(ValidationError::LogsBloomMismatch);
+        }
+
+        self.chain.insert_block_with_receipts(block, receipts);
         Ok(())
     }
 }
