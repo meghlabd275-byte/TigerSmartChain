@@ -10,7 +10,7 @@ sha2 = "0.10"
 sha3 = "0.10"
 keccak-hash = "0.10"
 ecdsa = { version = "0.14", features = ["std"] }
-secp256k1 = { version = "0.24", features = ["std"] }
+secp256k1 = { version = "0.24", features = ["std", "recovery"] }
 hex = "0.4"
 rlp = "0.5"
 
@@ -35,11 +35,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 lazy_static = "1"
+html-escape = "0.2"
 
 [dev-dependencies]
 proptest = "1"
-criterion = "0.5"
 
-[[bench]]
-name = "crypto_benches"
-harness = false
+

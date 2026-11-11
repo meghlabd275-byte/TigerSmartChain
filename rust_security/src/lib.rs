@@ -1,12 +1,13 @@
 //! TigerSmartChain Security Module
-//! 
-//! This module provides security-critical functionality for the blockchain explorer:
-//! - Address validation and verification
-//! - Signature verification
-//! - Reentrancy protection
-//! - Rate limiting
-//! - Input sanitization
-//! - Honeypot detection
+//!
+//! Security-critical helpers for the explorer and its services:
+//!
+//! - [`address`] — address validation and EIP-55 checksum handling.
+//! - [`signature`] — EIP-191 and EIP-712 signature recovery and verification.
+//! - [`validation`] — strict input validation and a bytecode feature scanner.
+//! - [`rate_limiter`] — token-bucket and sliding-window rate limiting.
+//! - [`honeypot`] — reports contract capabilities that warrant review.
+//! - [`sanitize`] — output escaping for HTML and JavaScript contexts.
 
 pub mod address;
 pub mod signature;
