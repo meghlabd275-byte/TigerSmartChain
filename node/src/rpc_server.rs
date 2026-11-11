@@ -644,23 +644,16 @@ enum SubmitError {
 async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<String, SubmitError> {
     use SubmitError::{BadRequest, Internal};
 
-    use tiger_blockchain::{recover_transaction_sender, transaction_hash};
-
     let bytes = decode_hex(raw).map_err(BadRequest)?;
     let tx = decode_legacy_transaction(&bytes).map_err(BadRequest)?;
 
-    // Recovering the sender proves the signature is valid for this chain, and
-    // the recovered address is authoritative: the `from` field on the wire is
-    // not signed, so it is discarded and replaced rather than trusted.
+    // The signature is what authorises the transaction, so the sender is
+    // recovered from it and the wire's `from` field is discarded rather than
+    // trusted. The same helper validates a transaction that arrives from a
+    // peer, so both paths hold a transaction to one standard.
     let chain_id = node.config().chain_id;
-    let sender = recover_transaction_sender(&tx, chain_id)
-        .map_err(|e| BadRequest(format!("invalid transaction signature: {e}")))?;
-
-    let hash = transaction_hash(&tx)
-        .map_err(|e| Internal(format!("cannot hash transaction: {e}")))?;
-    let mut tx = tx;
-    tx.hash = hash.clone();
-    tx.from = format!("0x{}", tiger_blockchain::hex_encode(&sender));
+    let tx = crate::node::validate_transaction(&tx, chain_id).map_err(BadRequest)?;
+    let hash = tx.hash.clone();
 
     {
         let mut mempool = node.get_mempool().await;
@@ -674,6 +667,11 @@ async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<Stri
         }
     }
     log::info!("accepted transaction {hash}");
+    // Tell the peers, so a transaction submitted to any node reaches the
+    // validator that will include it.
+    if let Some(p2p) = node.p2p() {
+        p2p.announce_transaction(&hash).await;
+    }
     Ok(hash)
 }
 

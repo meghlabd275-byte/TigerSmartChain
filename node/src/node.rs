@@ -73,6 +73,10 @@ pub struct TigerNode {
     /// the directory could not be opened, in which case the node runs
     /// in memory and says so.
     storage: Option<crate::storage::Storage>,
+
+    /// The peer-to-peer service, once it is listening. `None` before startup
+    /// or when the listen address could not be bound.
+    p2p: std::sync::OnceLock<Arc<crate::p2p::P2pService>>,
 }
 
 impl TigerNode {
@@ -165,7 +169,19 @@ impl TigerNode {
             sync_status,
             tasks,
             storage,
+            p2p: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the peer-to-peer service so block production can announce
+    /// through it.
+    pub fn set_p2p(&self, service: Arc<crate::p2p::P2pService>) {
+        let _ = self.p2p.set(service);
+    }
+
+    /// The peer-to-peer service, if it is running.
+    pub fn p2p(&self) -> Option<&Arc<crate::p2p::P2pService>> {
+        self.p2p.get()
     }
 
     /// Restore the chain and world state from disk, if a snapshot exists.
@@ -246,6 +262,126 @@ impl TigerNode {
         };
         info!("Restored {block_count} block(s) from disk; chain height is {height}");
         Ok(block_count)
+    }
+
+    /// Import a block received from a peer.
+    ///
+    /// A block from the network is untrusted. It is accepted only after it
+    /// extends the current head, its header is internally consistent, and
+    /// re-executing its transactions against the current world state reproduces
+    /// the state root and gas usage it claims. The state produced by that
+    /// re-execution becomes the node's state, so the node never stores a state
+    /// it did not compute itself.
+    ///
+    /// Returns `Ok(true)` when the block was imported, `Ok(false)` when it was
+    /// already known, and `Err` when it is not a valid extension of this
+    /// chain.
+    pub async fn import_block(
+        &self,
+        block: tiger_blockchain::types::Block,
+    ) -> Result<bool> {
+        // Cheap checks first, against the current head.
+        let (head_number, head_hash, known) = {
+            let cm = self.chain_manager.lock().await;
+            let chain = cm.chain();
+            let head = chain.height();
+            let head_hash = chain
+                .get_block(head)
+                .and_then(|b| tiger_blockchain::block_hash(&b.header).ok())
+                .unwrap_or_default();
+            // `block_hash` already returns a 0x-prefixed string, the same form
+            // the chain indexes by.
+            let known = tiger_blockchain::block_hash(&block.header)
+                .ok()
+                .map(|hash| chain.get_block_by_hash(&hash).is_some())
+                .unwrap_or(false);
+            (head, head_hash, known)
+        };
+
+        if known {
+            return Ok(false);
+        }
+
+        if block.header.number != head_number + 1 {
+            return Err(anyhow::anyhow!(
+                "block {} does not extend the head at {}",
+                block.header.number,
+                head_number
+            ));
+        }
+
+        if block.header.parent_hash != head_hash {
+            return Err(anyhow::anyhow!(
+                "block {} names parent {} but the head is {}",
+                block.header.number,
+                block.header.parent_hash,
+                head_hash
+            ));
+        }
+
+        // The consensus engine decides whether the block's proposer was
+        // entitled to propose it. A block from an unauthorised proposer is
+        // rejected before any work is done on it.
+        //
+        // A node started without a validator list is a pure follower: it has no
+        // way to know the authority set in advance, so it adopts the set it
+        // observes, one proposer per block. That is bounded to the case where
+        // the operator configured no validators; a node given a validator list
+        // enforces exactly that list and learns nothing from the network.
+        {
+            let mut consensus = self.consensus.lock().await;
+            if !consensus.is_authorised_proposer(block.header.number, &block.header.miner) {
+                if self.config.validators.is_empty() {
+                    info!(
+                        "adopting {} as a validator, learned from block {}",
+                        block.header.miner, block.header.number
+                    );
+                    consensus.register_validator(
+                        block.header.miner.clone(),
+                        tiger_consensus::posa::MIN_STAKE,
+                    );
+                    // Registration only adds the authority; the epoch rotation
+                    // decides who proposes, so it is refreshed here too.
+                    consensus.update_epoch(block.header.number);
+                }
+                if !consensus.is_authorised_proposer(block.header.number, &block.header.miner) {
+                    return Err(anyhow::anyhow!(
+                        "block {} was proposed by {}, who is not the expected proposer",
+                        block.header.number,
+                        block.header.miner
+                    ));
+                }
+            }
+        }
+
+        // Re-execute against the current state. This is the check that makes
+        // the block trustworthy: the sender's numbers are reproduced, not
+        // believed.
+        let parent_state = self.world_state.lock().await.clone();
+        let (new_state, receipts) =
+            execute_block_transactions(&parent_state, &block, self.config.chain_id)
+                .map_err(|e| anyhow::anyhow!("block {} is invalid: {e}", block.header.number))?;
+
+        let declared_number = block.header.number;
+        let mut cm = self.chain_manager.lock().await;
+        cm.process_block_with_receipts(block.clone(), receipts)
+            .map_err(|e| anyhow::anyhow!("block {declared_number} rejected: {e}"))?;
+        drop(cm);
+
+        // Adopt the state the re-execution produced and verified.
+        *self.world_state.lock().await = new_state;
+
+        // Drop the transactions the block contained from the pool.
+        {
+            let mut mempool = self.mempool.lock().await;
+            for tx in &block.transactions {
+                mempool.remove(&tx.hash);
+            }
+        }
+
+        self.persist().await;
+        info!("Imported block #{} from the network", declared_number);
+        Ok(true)
     }
 
     /// Persist the current chain and world state.
@@ -462,6 +598,19 @@ impl TigerNode {
                                     // crash cannot lose a block the node has
                                     // already announced.
                                     node.persist().await;
+                                    // Announce only after the block is durable,
+                                    // so a peer that fetches it back from this
+                                    // node is not told about a block the node
+                                    // could still lose.
+                                    if let Some(p2p) = node.p2p() {
+                                        let produced = {
+                                            let cm = node.chain_manager.lock().await;
+                                            cm.chain().get_block(next_block).cloned()
+                                        };
+                                        if let Some(block) = produced {
+                                            p2p.announce_block(block).await;
+                                        }
+                                    }
                                     // Credit the proposer's pending reward.
                                     {
                                         let mut consensus = node.consensus.lock().await;
@@ -799,7 +948,19 @@ pub fn produce_block(
         None => format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
     };
 
-    let timestamp = chrono::Utc::now().timestamp() as u64;
+    // A block's timestamp must be strictly greater than its parent's, and
+    // block validation enforces that. Two blocks produced within the same
+    // second would otherwise share a timestamp and the second would be
+    // rejected by the producer's own validator, so the timestamp is advanced
+    // past the parent when the clock has not moved.
+    let parent_timestamp = parent_block.map(|block| block.header.timestamp).unwrap_or(0);
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let timestamp = if block_number == 0 {
+        now
+    } else {
+        now.max(parent_timestamp.saturating_add(1))
+    };
+
     let mut coinbase = [0u8; 20];
     if let Ok(addr) = parse_address(miner) {
         coinbase = addr;
@@ -951,8 +1112,141 @@ pub fn produce_block(
     Ok(block_hash)
 }
 
-/// Convert a node transaction into the form the transition function needs.
+/// Execute a block's transactions against a copy of the world state and return
+/// the receipts they produce.
 ///
+/// This is the same work [`produce_block`] does, so an imported block is
+/// verified by re-running it rather than by trusting the sender's claims. It
+/// returns `Err` when the block cannot be a valid extension of `parent_state`:
+/// a transaction whose signature does not recover, or whose declared hash does
+/// not match its contents, means the block is not executable.
+pub fn execute_block_transactions(
+    parent_state: &WorldState,
+    block: &tiger_blockchain::types::Block,
+    chain_id: u64,
+) -> Result<(WorldState, Vec<tiger_blockchain::BlockReceipt>), String> {
+    use tiger_evm::transition::{apply_transaction, BlockContext};
+
+    let mut state = parent_state.clone();
+    let coinbase = parse_address(&block.header.miner).unwrap_or([0u8; 20]);
+
+    let block_ctx = BlockContext {
+        chain_id,
+        number: block.header.number,
+        timestamp: block.header.timestamp,
+        gas_limit: block.header.gas_limit,
+        coinbase,
+        base_fee: block.header.base_fee_per_gas.unwrap_or(0),
+    };
+
+    let mut gas_used: u64 = 0;
+    let mut receipts = Vec::with_capacity(block.transactions.len());
+    for tx in &block.transactions {
+        let request = transaction_to_request(tx, chain_id).ok_or_else(|| {
+            format!(
+                "transaction {} in block {} has an unrecoverable signature",
+                tx.hash, block.header.number
+            )
+        })?;
+
+        // A transaction that declares a hash other than the one its contents
+        // produce is not the transaction the block committed to.
+        let expected_hash = tiger_blockchain::transaction_hash(tx)
+            .map_err(|e| format!("cannot hash transaction {}: {e}", tx.hash))?;
+        if expected_hash != tx.hash {
+            return Err(format!(
+                "transaction declares hash {} but its contents hash to {}",
+                tx.hash, expected_hash
+            ));
+        }
+
+        let outcome = match apply_transaction(&mut state, &request, &block_ctx) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // A transaction the block producer included but that cannot be
+                // applied makes the whole block invalid: unlike a revert, which
+                // is a legitimate outcome, a rejection means the producer built
+                // a block its own rules would not accept.
+                return Err(format!(
+                    "transaction {} in block {} cannot be applied: {e}",
+                    tx.hash, block.header.number
+                ));
+            }
+        };
+
+        gas_used = gas_used.saturating_add(outcome.gas_used);
+        receipts.push(tiger_blockchain::BlockReceipt {
+            status: outcome.success,
+            cumulative_gas_used: gas_used,
+            gas_used: outcome.gas_used,
+            logs: outcome
+                .logs
+                .iter()
+                .map(|log| tiger_blockchain::ReceiptLog {
+                    address: log.address.0,
+                    topics: log.topics.iter().map(|t| t.0).collect(),
+                    data: log.data.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    // The header's state root is a commitment to the result of executing the
+    // block. A block whose transactions produce a different state than the one
+    // it claims is rejected, which is what stops a peer from sending a valid
+    // transaction list with a fabricated state.
+    let computed_root = state.state_root();
+    let declared_root = parse_u256(&block.header.state_root);
+    if computed_root != declared_root {
+        return Err(format!(
+            "block {} declares state root {} but executing it produces {}",
+            block.header.number,
+            block.header.state_root,
+            format!("0x{}", tiger_blockchain::hex_encode(&computed_root))
+        ));
+    }
+
+    if gas_used != block.header.gas_used {
+        return Err(format!(
+            "block {} declares {} gas used but executing it consumes {}",
+            block.header.number, block.header.gas_used, gas_used
+        ));
+    }
+
+    // The state the block produced is returned so the caller adopts exactly the
+    // state it verified, rather than executing the block a second time.
+    Ok((state, receipts))
+}
+
+/// Validate a transaction and normalise the fields that are derived rather
+/// than signed.
+///
+/// A transaction's signature is what authorises it, so the sender is recovered
+/// from the signature and the `from` field on the wire is discarded: a peer
+/// could otherwise claim any sender it liked. The hash is likewise recomputed
+/// from the contents, so the `hash` field cannot be spoofed.
+///
+/// This is the single place both the RPC path and the peer path validate a
+/// transaction, so a transaction accepted over the network is held to exactly
+/// the same standard as one submitted to the RPC endpoint.
+pub fn validate_transaction(
+    tx: &Transaction,
+    chain_id: u64,
+) -> Result<Transaction, String> {
+    use tiger_blockchain::{recover_transaction_sender, transaction_hash};
+
+    let sender = recover_transaction_sender(tx, chain_id)
+        .map_err(|e| format!("invalid transaction signature: {e}"))?;
+
+    let hash = transaction_hash(tx).map_err(|e| format!("cannot hash transaction: {e}"))?;
+
+    let mut normalised = tx.clone();
+    normalised.hash = hash;
+    normalised.from = format!("0x{}", tiger_blockchain::hex_encode(&sender));
+    Ok(normalised)
+}
+
+/// Convert a node transaction into the form the transition function needs.
 /// Returns `None` when the sender cannot be recovered, which means the
 /// transaction is not authorised and must not be applied.
 pub fn transaction_to_request(
@@ -1124,6 +1418,151 @@ mod tests {
 
     fn hex32(bytes: &[u8; 32]) -> String {
         format!("0x{}", tiger_blockchain::hex_encode(bytes))
+    }
+
+    /// A started node whose head is the genesis block, plus a producer that
+    /// shares its genesis allocation.
+    ///
+    /// The producer is a separate chain built from the same genesis, so a block
+    /// it produces is exactly what a peer running the same chain would send.
+    async fn node_and_producer() -> (
+        Arc<TigerNode>,
+        ChainManager,
+        WorldState,
+        String,
+    ) {
+        // Each test gets its own data directory: a shared one would let a
+        // chain written by another test be restored here, which is exactly the
+        // cross-test interference this avoids.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let data_dir = std::env::temp_dir()
+            .join(format!("tiger-node-test-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let genesis = create_genesis_block(6666);
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .expect("node must initialize"),
+        );
+        // `start` is what installs the genesis block, so it must run before a
+        // block can be imported.
+        node.start().await.expect("node must start");
+
+        let mut producer_cm = chain_manager();
+        producer_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let producer_world = state_from_genesis(&genesis);
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        (node, producer_cm, producer_world, miner)
+    }
+
+    /// Build the block a validator would propose at `number`.
+    fn build_block(
+        cm: &mut ChainManager,
+        world: &mut WorldState,
+        number: u64,
+        miner: &str,
+        txs: &[Transaction],
+    ) -> tiger_blockchain::types::Block {
+        produce_block(cm, world, txs, number, miner, 6666).unwrap();
+        cm.chain().get_block(number).cloned().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_block_extending_the_head_is_imported_and_its_state_adopted() {
+        let (node, mut producer_cm, mut producer_world, miner) = node_and_producer().await;
+        let block = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[]);
+
+        // The producer's own state root is what the block commits to.
+        let expected_root = block.header.state_root.clone();
+
+        assert!(
+            node.import_block(block).await.unwrap(),
+            "a block extending the head must be imported"
+        );
+
+        let cm = node.get_chain_manager().await;
+        assert_eq!(cm.chain().height(), 1);
+        let imported = cm.chain().get_block(1).unwrap();
+        assert_eq!(imported.header.state_root, expected_root);
+
+        // The node's own world state must now be the state the block produced,
+        // not the one it started from.
+        drop(cm);
+        let world = node.world_state().lock().await;
+        assert_eq!(
+            hex32(&world.state_root()),
+            expected_root,
+            "the node must adopt the state the block produced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_that_does_not_extend_the_head_is_rejected() {
+        let (node, mut producer_cm, mut producer_world, miner) = node_and_producer().await;
+        // Produce block 1 on the producer, but give the node only block 2, so
+        // the node sees a block whose parent it does not have.
+        let _block1 = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[]);
+        let block = build_block(&mut producer_cm, &mut producer_world, 2, &miner, &[]);
+
+        let error = node.import_block(block).await.unwrap_err().to_string();
+        assert!(
+            error.contains("does not extend the head"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_with_a_fabricated_state_root_is_rejected() {
+        let (node, mut producer_cm, mut producer_world, miner) = node_and_producer().await;
+        let mut block = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[]);
+
+        // Claim a different state than the one the block's transactions produce.
+        block.header.state_root = hex32(&[0x11u8; 32]);
+
+        let error = node.import_block(block).await.unwrap_err().to_string();
+        assert!(
+            error.contains("declares state root"),
+            "a fabricated state root must be caught, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_block_with_a_forged_transaction_hash_is_rejected() {
+        let (node, mut producer_cm, mut producer_world, miner) = node_and_producer().await;
+
+        // Fund the sender in both states, so the transaction is applicable and
+        // the block is otherwise valid. Only the declared hash is wrong.
+        let key = [0x11u8; 32];
+        let tx = signed_transfer(key, 0, [0x22u8; 20], 1_000);
+        let sender = tiger_blockchain::recover_transaction_sender(&tx, 6666)
+            .expect("the transaction is signed");
+        let balance = u256_from_u64(1_000_000_000_000_000_000);
+        producer_world.set_balance(&sender, balance);
+        {
+            let mut world = node.world_state().lock().await;
+            world.set_balance(&sender, balance);
+        }
+
+        let mut block = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[tx]);
+        assert_eq!(block.transactions.len(), 1, "the transfer must be included");
+
+        block.transactions[0].hash = hex32(&[0x99u8; 32]);
+
+        let error = node.import_block(block).await.unwrap_err().to_string();
+        assert!(
+            error.contains("declares hash") || error.contains("unrecoverable"),
+            "a forged transaction hash must be caught, got: {error}"
+        );
     }
 
     #[test]

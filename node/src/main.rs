@@ -12,6 +12,7 @@ use tokio::signal;
 mod config;
 mod debug_rpc;
 mod node;
+mod p2p;
 mod rpc_server;
 mod storage;
 
@@ -192,8 +193,19 @@ async fn main() -> Result<()> {
     // Start the node
     node.start().await.context("Failed to start node")?;
 
+    // Bring up the peer-to-peer service. A node that cannot bind its listen
+    // address still runs: it can follow the chain over RPC and serve clients,
+    // which is better than refusing to start.
+    match crate::p2p::P2pService::start(Arc::clone(&node)).await {
+        Ok(Some(service)) => {
+            node.set_p2p(service);
+            info!("P2P listening on: {}", listen_addr);
+        }
+        Ok(None) => log::warn!("P2P is disabled: the listen address could not be bound"),
+        Err(e) => log::warn!("P2P failed to start: {e}"),
+    }
+
     info!("TigerSmartChain node started successfully");
-    info!("P2P listening on: {}", listen_addr);
     
     if args.rpc_enabled {
         info!("RPC server listening on: {}", rpc_addr);

@@ -160,6 +160,19 @@ impl PoSA {
         &self.validators
     }
 
+    /// Whether `proposer` is the validator entitled to propose
+    /// `block_number`.
+    ///
+    /// Addresses are compared without regard to case, because they arrive from
+    /// headers, the command line and the registry in different forms and a
+    /// case difference must not decide whether a block is accepted.
+    pub fn is_authorised_proposer(&self, block_number: u64, proposer: &str) -> bool {
+        match self.get_proposer(block_number) {
+            Some(expected) => expected.eq_ignore_ascii_case(proposer),
+            None => false,
+        }
+    }
+
     /// Check if an address is an active validator
     pub fn is_validator(&self, address: &str) -> bool {
         self.validators.iter().any(|v| v == address)
