@@ -119,6 +119,90 @@ pub fn account_hash(account: &Account) -> [u8; 32] {
     keccak256(&encode_account(account))
 }
 
+/// Decode an account from its canonical RLP encoding.
+///
+/// The inverse of [`encode_account`]. Returns `None` when the bytes are not a
+/// well-formed `[nonce, balance, storageRoot, codeHash]` list, so a corrupt
+/// record is reported rather than silently read as an empty account.
+pub fn decode_account(encoded: &[u8]) -> Option<Account> {
+    let item = crate::rlp::decode(encoded).ok()?;
+    let items = match item {
+        RlpItem::List(items) => items,
+        _ => return None,
+    };
+    if items.len() != 4 {
+        return None;
+    }
+
+    let nonce = match &items[0] {
+        RlpItem::Bytes(b) => {
+            if b.len() > 8 {
+                return None;
+            }
+            let mut value = 0u64;
+            for &byte in b {
+                value = (value << 8) | byte as u64;
+            }
+            value
+        }
+        _ => return None,
+    };
+
+    let mut balance = [0u8; 32];
+    match &items[1] {
+        RlpItem::Bytes(b) => {
+            if b.len() > 32 {
+                return None;
+            }
+            balance[32 - b.len()..].copy_from_slice(b);
+        }
+        _ => return None,
+    }
+
+    let storage_root: [u8; 32] = match &items[2] {
+        RlpItem::Bytes(b) if b.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(b);
+            out
+        }
+        _ => return None,
+    };
+
+    let code_hash: [u8; 32] = match &items[3] {
+        RlpItem::Bytes(b) if b.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(b);
+            out
+        }
+        _ => return None,
+    };
+
+    Some(Account {
+        nonce,
+        balance,
+        storage_root,
+        code_hash,
+        code: Vec::new(),
+        storage: HashMap::new(),
+    })
+}
+
+/// Decode a storage slot value from the trie's RLP string form.
+///
+/// Values are stored as RLP strings with leading zeros stripped, so this pads
+/// back to the canonical 32-byte big-endian form. A value longer than 32 bytes
+/// cannot be a slot, and is reported as zero rather than truncated.
+pub fn decode_storage_value(encoded: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    match crate::rlp::decode(encoded) {
+        Ok(RlpItem::Bytes(b)) if b.len() <= 32 => {
+            out[32 - b.len()..].copy_from_slice(&b);
+        }
+        _ => {}
+    }
+    out
+}
+
 /// A mutable world state backed by a Merkle Patricia Trie.
 ///
 /// Mutations are journaled so they can be committed (producing a new state

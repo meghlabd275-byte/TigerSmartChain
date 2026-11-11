@@ -9,8 +9,9 @@ pub mod trie;
 pub mod types;
 
 pub use account::{
-    account_hash, encode_account, is_empty_account, storage_root, Account as StateAccount,
-    Address as StateAddress, WorldState, EMPTY_CODE_HASH, EMPTY_STATE_ROOT,
+    account_hash, decode_account, decode_storage_value, encode_account, is_empty_account,
+    storage_root, Account as StateAccount, Address as StateAddress, WorldState,
+    EMPTY_CODE_HASH, EMPTY_STATE_ROOT,
 };
 pub use rlp::{RlpError, RlpItem};
 pub use trie::{Node, Trie};

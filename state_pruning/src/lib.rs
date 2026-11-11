@@ -6,21 +6,19 @@
 //! - Multiple pruning strategies
 //! - State proof generation
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::path::PathBuf;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn, error, debug};
+use tracing::{info, debug};
 
 // Re-export types
-pub mod types;
 pub mod storage;
 pub mod proof;
 pub mod strategy;
 
-pub use types::*;
 pub use storage::*;
 pub use proof::*;
 pub use strategy::*;
@@ -51,17 +49,8 @@ pub enum PruningError {
 // Constants
 // =============================================================================
 
-/// Maximum number of blocks to keep in memory
-const MAX_MEMORY_BLOCKS: u64 = 128;
-
 /// Default pruning interval in blocks
 const DEFAULT_PRUNING_INTERVAL: u64 = 10000;
-
-/// Minimum blocks to keep for historical queries
-const MIN_HISTORICAL_BLOCKS: u64 = 90000;
-
-/// State trie node size estimate
-const AVG_NODE_SIZE: usize = 100;
 
 // =============================================================================
 // Configuration
@@ -346,21 +335,18 @@ impl StatePruner {
     fn prune_interval(&mut self) -> Result<(), PruningError> {
         let prune_threshold = self.current_block.saturating_sub(self.config.full_blocks);
         
-        // Mark old state roots as pruned
-        let mut to_prune: Vec<u64> = Vec::new();
-        
-        for (idx, root_info) in self.state_roots.iter().enumerate() {
-            if root_info.block_number < prune_threshold {
-                to_prune.push(root_info.block_number);
-            }
-        }
-        
-        // Actually prune the state
-        for block in to_prune {
-            if let Some(root_info) = self.state_roots.iter().find(|r| r.block_number == block) {
-                self.prune_state_root(root_info.state_root)?;
-                self.pruned_roots.insert(block, root_info.state_root);
-            }
+        // Collect the roots to prune first, so the loop does not hold a
+        // borrow of `self` while pruning mutates it.
+        let to_prune: Vec<(u64, H256)> = self
+            .state_roots
+            .iter()
+            .filter(|root_info| root_info.block_number < prune_threshold)
+            .map(|root_info| (root_info.block_number, root_info.state_root))
+            .collect();
+
+        for (block, state_root) in to_prune {
+            self.prune_state_root(state_root)?;
+            self.pruned_roots.insert(block, state_root);
         }
         
         // Clean up state roots
@@ -384,17 +370,21 @@ impl StatePruner {
         let archive_threshold = self.current_block.saturating_sub(self.config.archive_blocks);
         let full_threshold = self.current_block.saturating_sub(self.config.full_blocks);
         
-        // Archive mode for old blocks
-        for root_info in self.state_roots.iter() {
-            if root_info.block_number < archive_threshold {
-                // Keep in archive mode (full state)
-                continue;
-            }
-            
-            if root_info.block_number < full_threshold {
-                // Prune intermediate blocks
-                self.prune_state_root(root_info.state_root)?;
-            }
+        // Blocks below the archive threshold keep their full state; blocks
+        // between the archive and full thresholds are pruned. Roots are
+        // collected first so the loop does not borrow `self`.
+        let to_prune: Vec<H256> = self
+            .state_roots
+            .iter()
+            .filter(|root_info| {
+                root_info.block_number >= archive_threshold
+                    && root_info.block_number < full_threshold
+            })
+            .map(|root_info| root_info.state_root)
+            .collect();
+
+        for state_root in to_prune {
+            self.prune_state_root(state_root)?;
         }
         
         Ok(())
@@ -443,9 +433,9 @@ impl StatePruner {
             .map(|r| r.state_root)
             .ok_or_else(|| PruningError::StateNotFound("Current state root".to_string()))?;
         
-        // Create snapshot
+        // Create snapshot: the trie nodes for this root are the snapshot.
         {
-            let mut storage = self.storage.write();
+            let storage = self.storage.read();
             storage.create_snapshot(self.current_block, current_root)?;
         }
         
@@ -457,16 +447,38 @@ impl StatePruner {
         Ok(())
     }
     
-    /// Get state at specific block
-    pub fn get_state_at(&self, address: Address, block: u64) -> Result<AccountState, PruningError> {
-        // Find nearest state root
+    /// Get state at specific block.
+    ///
+    /// Returns `None` when the account is absent at that block, which is a real
+    /// answer. The previous version returned a default `AccountState` for every
+    /// request, so a missing account and a zero-balance account were
+    /// indistinguishable.
+    pub fn get_state_at(
+        &self,
+        address: Address,
+        block: u64,
+    ) -> Result<Option<AccountState>, PruningError> {
         let state_root = self.find_state_root(block)?;
-        
-        // Get state from storage
+
         let storage = self.storage.read();
         storage.get_account_state(state_root, address)
     }
-    
+
+    /// Record a state root together with the trie that produced it, so the
+    /// pruner can delete the right nodes and serve real proofs.
+    pub fn put_state(
+        &mut self,
+        block: u64,
+        state_root: H256,
+        trie: &tiger_state::trie::Trie,
+    ) -> Result<(), PruningError> {
+        {
+            let mut storage = self.storage.write();
+            storage.put_trie(state_root, trie)?;
+        }
+        self.add_state_root(block, state_root, now_unix())
+    }
+
     /// Find state root for block
     fn find_state_root(&self, block: u64) -> Result<H256, PruningError> {
         // First check if we have it in memory
@@ -500,17 +512,42 @@ impl StatePruner {
         storage.generate_proof(state_root, address, slots)
     }
     
-    /// Get storage at specific block
+    /// Get a storage slot at a specific block.
+    ///
+    /// Returns `None` when the account or the slot is absent. The previous
+    /// version returned the account's storage *root* as if it were the slot
+    /// value, which is a different quantity entirely.
     pub fn get_storage_at(
         &self,
         address: Address,
         slot: H256,
         block: u64,
-    ) -> Result<H256, PruningError> {
-        let state = self.get_state_at(address, block)?;
-        Ok(state.storage_root)
+    ) -> Result<Option<H256>, PruningError> {
+        let state_root = self.find_state_root(block)?;
+
+        let account = {
+            let storage = self.storage.read();
+            match storage.get_account_state(state_root, address)? {
+                Some(account) => account,
+                None => return Ok(None),
+            }
+        };
+
+        // The slot lives in the account's own storage trie.
+        let storage = self.storage.read();
+        match storage.get_storage_slot(account.storage_root, slot) {
+            Ok(value) => Ok(value),
+            // A storage trie that was pruned is not a zero value; it is unknown.
+            Err(PruningError::StateNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
-    
+
+    /// State root for a block, if it is still held.
+    pub fn state_root_at(&self, block: u64) -> Result<H256, PruningError> {
+        self.find_state_root(block)
+    }
+
     /// Get current stats
     pub fn get_stats(&self) -> PruningStats {
         self.stats.clone()
@@ -615,6 +652,26 @@ impl U256 {
         result.0[0] = val;
         result
     }
+
+    /// From the canonical big-endian 32-byte form used on the wire.
+    pub fn from_be_bytes(bytes: [u8; 32]) -> Self {
+        let mut limbs = [0u64; 4];
+        for (i, limb) in limbs.iter_mut().enumerate() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            *limb = u64::from_be_bytes(chunk);
+        }
+        Self(limbs)
+    }
+
+    /// The canonical big-endian 32-byte form.
+    pub fn to_be_bytes(self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, limb) in self.0.iter().enumerate() {
+            out[i * 8..i * 8 + 8].copy_from_slice(&limb.to_be_bytes());
+        }
+        out
+    }
 }
 
 // =============================================================================
@@ -624,7 +681,6 @@ impl U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     
     #[test]
     fn test_pruning_config_default() {
@@ -639,9 +695,153 @@ mod tests {
         assert_eq!(addr.to_string(), "0x0000000000000000000000000000000000000000");
     }
     
+    fn state_account(nonce: u64, balance: u64) -> AccountState {
+        AccountState {
+            nonce,
+            balance: U256::from_u64(balance),
+            storage_root: H256(tiger_state::account::EMPTY_STATE_ROOT),
+            code_hash: H256(tiger_state::account::EMPTY_CODE_HASH),
+            code: None,
+        }
+    }
+
+    fn account_trie(entries: &[(Address, AccountState)]) -> tiger_state::trie::Trie {
+        let mut trie = tiger_state::trie::Trie::new();
+        for (addr, state) in entries {
+            let account = tiger_state::StateAccount {
+                nonce: state.nonce,
+                balance: state.balance.to_be_bytes(),
+                storage_root: state.storage_root.0,
+                code_hash: state.code_hash.0,
+                code: Vec::new(),
+                storage: Default::default(),
+            };
+            trie.insert(
+                &tiger_crypto::keccak256(addr.as_bytes()),
+                &tiger_state::account::encode_account(&account),
+            );
+        }
+        trie
+    }
+
+    #[test]
+    fn state_recorded_for_a_block_can_be_read_back() {
+        let mut pruner = StatePruner::new(
+            PruningConfig::default(),
+            PathBuf::from("/tmp/state_pruning_test_a"),
+        )
+        .unwrap();
+
+        let entries = vec![
+            (Address::from_slice(&[1u8; 20]), state_account(1, 1000)),
+            (Address::from_slice(&[2u8; 20]), state_account(2, 2000)),
+        ];
+        let trie = account_trie(&entries);
+        let root = H256(trie.root_hash());
+
+        pruner.put_state(1, root, &trie).unwrap();
+
+        let found = pruner
+            .get_state_at(Address::from_slice(&[1u8; 20]), 1)
+            .unwrap()
+            .expect("account 1 must be present");
+        assert_eq!(found.nonce, 1);
+        assert_eq!(found.balance.to_be_bytes(), U256::from_u64(1000).to_be_bytes());
+
+        // A missing account reads as absent, not as a zero-balance account.
+        assert!(pruner
+            .get_state_at(Address::from_slice(&[9u8; 20]), 1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_generated_proof_verifies_and_detects_tampering() {
+        let mut pruner = StatePruner::new(
+            PruningConfig::default(),
+            PathBuf::from("/tmp/state_pruning_test_b"),
+        )
+        .unwrap();
+
+        let addr = Address::from_slice(&[7u8; 20]);
+        let entries = vec![(addr, state_account(5, 5000))];
+        let trie = account_trie(&entries);
+        let root = H256(trie.root_hash());
+        pruner.put_state(10, root, &trie).unwrap();
+
+        let proof = pruner.generate_proof(addr, 10, vec![]).unwrap();
+        assert!(!proof.absent);
+        assert!(ProofVerifier::verify_state_proof(&proof).unwrap());
+
+        let mut tampered = proof.clone();
+        tampered.account_state.nonce = 999;
+        assert!(!ProofVerifier::verify_state_proof(&tampered).unwrap());
+    }
+
+    #[test]
+    fn a_root_that_was_never_recorded_is_reported_as_missing() {
+        let pruner = StatePruner::new(
+            PruningConfig::default(),
+            PathBuf::from("/tmp/state_pruning_test_c"),
+        )
+        .unwrap();
+
+        // No state at all was recorded, so there is no root to resolve.
+        assert!(pruner
+            .get_state_at(Address::from_slice(&[1u8; 20]), 1)
+            .is_err());
+    }
+
+    #[test]
+    fn pruning_removes_old_nodes_and_keeps_recent_ones() {
+        let mut config = PruningConfig::default();
+        config.full_blocks = 2;
+        config.pruning_interval = 0;
+        config.background_pruning = true;
+        config.snapshot_enabled = false;
+
+        let mut pruner =
+            StatePruner::new(config, PathBuf::from("/tmp/state_pruning_test_d")).unwrap();
+
+        let addr = Address::from_slice(&[3u8; 20]);
+        let mut roots = Vec::new();
+
+        // Record five blocks, each with its own trie.
+        for block in 1..=5u64 {
+            let entries = vec![(addr, state_account(block, block * 100))];
+            let trie = account_trie(&entries);
+            let root = H256(trie.root_hash());
+            roots.push(root);
+            pruner.put_state(block, root, &trie).unwrap();
+        }
+
+        // Blocks below `current - full_blocks` are pruned.
+        let old_root = roots[0];
+        {
+            let storage = pruner.storage.read();
+            let nodes = storage.get_state_nodes(old_root).unwrap();
+            assert!(nodes.is_empty(), "the oldest root's nodes must be pruned");
+        }
+
+        // The most recent block's state is still readable.
+        let recent = pruner
+            .get_state_at(addr, 5)
+            .unwrap()
+            .expect("the newest account must survive pruning");
+        assert_eq!(recent.nonce, 5);
+    }
+
     #[test]
     fn test_h256_display() {
         let hash = H256::zero();
         assert_eq!(hash.to_string(), "0x0000000000000000000000000000000000000000000000000000000000000000");
     }
+}
+
+/// Seconds since the Unix epoch.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

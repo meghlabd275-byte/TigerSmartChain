@@ -484,6 +484,97 @@ fn nibbles_to_bytes(nibbles: &[u8]) -> Vec<u8> {
 }
 
 /// Record every node whose encoding is at least 32 bytes, keyed by hash.
+/// Decode one RLP-encoded node, resolving child references through `db`.
+///
+/// A child reference is either inline (the child is encoded inside the parent,
+/// when its encoding is under 32 bytes) or a 32-byte hash pointing at another
+/// entry in `db`. Both forms are handled, and a hash reference is verified
+/// against the bytes it names.
+fn decode_node(
+    encoded: &[u8],
+    db: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+) -> Option<Node> {
+    let item = crate::rlp::decode(encoded).ok()?;
+    let items = match item {
+        RlpItem::List(items) => items,
+        // A bare byte string is not a node.
+        _ => return None,
+    };
+
+    match items.len() {
+        // Leaf or extension.
+        2 => {
+            let hp = match &items[0] {
+                RlpItem::Bytes(b) => b,
+                _ => return None,
+            };
+            let (path, leaf) = decode_hex_prefix(hp)?;
+
+            if leaf {
+                match &items[1] {
+                    RlpItem::Bytes(value) => Some(Node::Leaf {
+                        path,
+                        value: value.clone(),
+                    }),
+                    _ => None,
+                }
+            } else {
+                let child = decode_child(&items[1], db)?;
+                Some(Node::Extension {
+                    path,
+                    child: Box::new(child),
+                })
+            }
+        }
+        // Branch: sixteen children and an optional value.
+        17 => {
+            let mut children: [Node; BRANCH_FANOUT] = std::array::from_fn(|_| Node::Empty);
+            for (index, reference) in items[..16].iter().enumerate() {
+                children[index] = decode_child(reference, db)?;
+            }
+
+            let value = match &items[16] {
+                RlpItem::Bytes(b) if b.is_empty() => None,
+                RlpItem::Bytes(b) => Some(b.clone()),
+                _ => return None,
+            };
+
+            Some(Node::Branch {
+                children: Box::new(children),
+                value,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a child reference to a node.
+fn decode_child(
+    reference: &RlpItem,
+    db: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+) -> Option<Node> {
+    match reference {
+        // An empty reference is an empty child.
+        RlpItem::Bytes(b) if b.is_empty() => Some(Node::Empty),
+        // A 32-byte string is a hash of a node held in the database.
+        RlpItem::Bytes(b) if b.len() == 32 => {
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(b);
+            let encoded = db.get(&hash)?;
+            if keccak256(encoded) != hash {
+                return None;
+            }
+            decode_node(encoded, db)
+        }
+        // Anything else is an inline node.
+        RlpItem::Bytes(_) => None,
+        RlpItem::List(_) => {
+            let encoded = reference.encode();
+            decode_node(&encoded, db)
+        }
+    }
+}
+
 fn collect_db(node: &Node, db: &mut std::collections::HashMap<[u8; 32], Vec<u8>>) {
     match node {
         Node::Empty | Node::Leaf { .. } => {}
@@ -613,6 +704,46 @@ impl Trie {
     /// The RLP encoding of the root node.
     pub fn root_encoding(&self) -> Vec<u8> {
         self.fast.root_encoding()
+    }
+
+    /// Rebuild a trie from a persisted node database and a known root hash.
+    ///
+    /// The nodes are keyed by the keccak-256 of their encoding, so the trie is
+    /// reconstructed by resolving each child reference from the root downward.
+    /// This is the inverse of [`Trie::node_db`]: what a client wrote to disk can
+    /// be read back and queried, which is what makes a restart able to serve
+    /// state and proofs.
+    ///
+    /// Returns `None` when a referenced node is missing or does not hash to the
+    /// reference, so a truncated or tampered database is detected rather than
+    /// silently producing a different trie.
+    pub fn from_root(
+        db: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+        root: [u8; 32],
+    ) -> Option<Self> {
+        // The empty trie has no nodes to resolve.
+        if root == Trie::new().root_hash() {
+            return Some(Trie::new());
+        }
+
+        let encoded = db.get(&root)?;
+        if keccak256(encoded) != root {
+            return None;
+        }
+
+        let node = decode_node(encoded, db)?;
+        let mut trie = Trie::new();
+        trie.root = node;
+        trie.rebuild_fast();
+        Some(trie)
+    }
+
+    /// Rebuild the fast trie from the owned node tree.
+    fn rebuild_fast(&mut self) {
+        self.fast = tiger_crypto::Trie::new();
+        for (key, value) in self.entries() {
+            self.fast.insert(&key, &value);
+        }
     }
 
     /// Every node with an encoding of 32 bytes or more, keyed by hash. This is
@@ -795,6 +926,106 @@ mod tests {
         (0..s.len() / 2)
             .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn a_trie_rebuilt_from_its_node_db_answers_the_same_queries() {
+        let mut trie = Trie::new();
+        for i in 0..40u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            key[31] = i.wrapping_mul(7);
+            trie.insert(&key, format!("value-{i}").as_bytes());
+        }
+
+        let db = trie.node_db();
+        let root = trie.root_hash();
+        let restored = Trie::from_root(&db, root).expect("trie must rebuild from its nodes");
+
+        assert_eq!(restored.root_hash(), root);
+
+        for i in 0..40u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            key[31] = i.wrapping_mul(7);
+            assert_eq!(
+                restored.get(&key),
+                trie.get(&key),
+                "restored trie disagrees for key {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rebuilt_trie_produces_verifiable_proofs() {
+        let mut trie = Trie::new();
+        for i in 0..20u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            trie.insert(&key, b"payload");
+        }
+
+        let db = trie.node_db();
+        let root = trie.root_hash();
+        let restored = Trie::from_root(&db, root).unwrap();
+
+        let mut key = [0u8; 32];
+        key[0] = 7;
+        let proof = restored.prove(&key);
+        assert_eq!(
+            Trie::verify_proof(&root, &key, &proof),
+            Some(Some(b"payload".to_vec()))
+        );
+    }
+
+    #[test]
+    fn rebuilding_with_a_missing_node_is_rejected() {
+        let mut trie = Trie::new();
+        for i in 0..30u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            trie.insert(&key, b"value");
+        }
+
+        let mut db = trie.node_db();
+        let root = trie.root_hash();
+
+        // Drop one node the walk needs.
+        let victim = db.keys().next().copied().unwrap();
+        db.remove(&victim);
+
+        assert!(Trie::from_root(&db, root).is_none());
+    }
+
+    #[test]
+    fn rebuilding_with_a_tampered_node_is_rejected() {
+        let mut trie = Trie::new();
+        for i in 0..30u8 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            trie.insert(&key, b"value");
+        }
+
+        let mut db = trie.node_db();
+        let root = trie.root_hash();
+
+        // Corrupt the bytes of a node without changing its key.
+        let victim = db.keys().next().copied().unwrap();
+        let mut bytes = db.remove(&victim).unwrap();
+        bytes.push(0xff);
+        db.insert(victim, bytes);
+
+        // Either the hash check fails or the node no longer decodes.
+        assert!(Trie::from_root(&db, root).is_none());
+    }
+
+    #[test]
+    fn an_empty_trie_rebuilds_to_an_empty_trie() {
+        let trie = Trie::new();
+        let db = trie.node_db();
+        let restored = Trie::from_root(&db, trie.root_hash()).unwrap();
+        assert_eq!(restored.root_hash(), trie.root_hash());
+        assert!(restored.get(b"anything").is_none());
     }
 
     fn to_hex(bytes: &[u8]) -> String {
