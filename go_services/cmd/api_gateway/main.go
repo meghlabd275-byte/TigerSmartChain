@@ -23,14 +23,18 @@ func main() {
 	// Load configuration
 	config := gateway.LoadConfig()
 
-	// Initialize middleware
+	// Initialize middleware. The handler is attached before the router uses the
+	// middleware so a presented API key is validated and limited per key rather
+	// than falling back to the anonymous limit.
 	middleware := gateway.NewMiddleware(config)
 	router.Use(middleware.CORS())
-	router.Use(middleware.RateLimiter())
 	router.Use(middleware.RequestLogger())
 
 	// Initialize handlers
 	handler := gateway.NewHandler(config)
+	middleware.WithHandler(handler)
+
+	router.Use(middleware.RateLimiter())
 
 	// Setup routes
 	setupRoutes(router, handler)

@@ -604,22 +604,22 @@ func (h *Handler) dailyChart(c *gin.Context, metric string, days int) {
 	respondList(c, rows, len(rows))
 }
 
-func (h *Handler) GetDailyTxChart(c *gin.Context)        { h.dailyChart(c, "daily_tx", 30) }
-func (h *Handler) GetWeeklyTxChart(c *gin.Context)      { h.dailyChart(c, "weekly_tx", 90) }
-func (h *Handler) GetMonthlyTxChart(c *gin.Context)      { h.dailyChart(c, "monthly_tx", 365) }
-func (h *Handler) GetNewAddressesChart(c *gin.Context)   { h.dailyChart(c, "new_addresses", 30) }
+func (h *Handler) GetDailyTxChart(c *gin.Context)         { h.dailyChart(c, "daily_tx", 30) }
+func (h *Handler) GetWeeklyTxChart(c *gin.Context)        { h.dailyChart(c, "weekly_tx", 90) }
+func (h *Handler) GetMonthlyTxChart(c *gin.Context)       { h.dailyChart(c, "monthly_tx", 365) }
+func (h *Handler) GetNewAddressesChart(c *gin.Context)    { h.dailyChart(c, "new_addresses", 30) }
 func (h *Handler) GetActiveAddressesChart(c *gin.Context) { h.dailyChart(c, "active_addresses", 30) }
-func (h *Handler) GetTokenChart(c *gin.Context)          { h.dailyChart(c, "token_price", 30) }
-func (h *Handler) GetTokenVolumeChart(c *gin.Context)    { h.dailyChart(c, "token_volume", 30) }
-func (h *Handler) GetNFTChart(c *gin.Context)            { h.dailyChart(c, "nft_floor", 30) }
-func (h *Handler) GetNFTVolumeChart(c *gin.Context)      { h.dailyChart(c, "nft_volume", 30) }
+func (h *Handler) GetTokenChart(c *gin.Context)           { h.dailyChart(c, "token_price", 30) }
+func (h *Handler) GetTokenVolumeChart(c *gin.Context)     { h.dailyChart(c, "token_volume", 30) }
+func (h *Handler) GetNFTChart(c *gin.Context)             { h.dailyChart(c, "nft_floor", 30) }
+func (h *Handler) GetNFTVolumeChart(c *gin.Context)       { h.dailyChart(c, "nft_volume", 30) }
 func (h *Handler) GetGasChart(c *gin.Context)             { h.dailyChart(c, "gas_used", 30) }
-func (h *Handler) GetGasPriceChart(c *gin.Context)       { h.dailyChart(c, "gas_price", 30) }
-func (h *Handler) GetNetworkChart(c *gin.Context)        { h.dailyChart(c, "network_usage", 30) }
+func (h *Handler) GetGasPriceChart(c *gin.Context)        { h.dailyChart(c, "gas_price", 30) }
+func (h *Handler) GetNetworkChart(c *gin.Context)         { h.dailyChart(c, "network_usage", 30) }
 func (h *Handler) GetTPSChart(c *gin.Context)             { h.dailyChart(c, "tps", 30) }
 func (h *Handler) GetDifficultyChart(c *gin.Context)      { h.dailyChart(c, "difficulty", 30) }
-func (h *Handler) GetDexLiquidityChart(c *gin.Context)   { h.dailyChart(c, "dex_liquidity", 30) }
-func (h *Handler) GetDexVolumeChart(c *gin.Context)      { h.dailyChart(c, "dex_volume", 30) }
+func (h *Handler) GetDexLiquidityChart(c *gin.Context)    { h.dailyChart(c, "dex_liquidity", 30) }
+func (h *Handler) GetDexVolumeChart(c *gin.Context)       { h.dailyChart(c, "dex_volume", 30) }
 
 func (h *Handler) GetCustomChart(c *gin.Context) {
 	metric := c.Query("metric")

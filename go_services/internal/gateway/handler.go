@@ -508,7 +508,6 @@ func (h *Handler) GetDexPair(c *gin.Context) {
 // Governance endpoints
 // Governance endpoints
 
-
 // WebSocket handler
 func (h *Handler) HandleWebSocket(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -525,7 +524,7 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 		if err != nil {
 			break
 		}
-		
+
 		if messageType == websocket.TextMessage {
 			// Echo back for now
 			conn.WriteMessage(websocket.TextMessage, message)
@@ -553,4 +552,3 @@ func getEnv(key, defaultValue string) string {
 	}
 	return defaultValue
 }
-
