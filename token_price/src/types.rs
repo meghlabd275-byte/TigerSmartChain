@@ -1,6 +1,6 @@
 //! Token Price Types for TigerScan
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -181,8 +181,16 @@ pub struct TokenImage {
 pub struct TokenPriceConfig {
     /// CoinGecko API URL
     pub api_url: String,
+    /// CoinGecko platform id for the chain being priced, used to address
+    /// tokens by contract. `ethereum` is the default; a BSC deployment would
+    /// use `binance-smart-chain`, and so on.
+    pub platform: String,
     /// API key (optional)
     pub api_key: Option<String>,
+    /// How many contract addresses to send per request. The public CoinGecko
+    /// tier allows one; a paid plan allows more. Kept in config because it is a
+    /// property of the plan, not of the code.
+    pub max_addresses_per_request: u32,
     /// Cache duration in seconds
     pub cache_duration_secs: u64,
     /// Rate limit requests per minute
@@ -203,7 +211,9 @@ impl Default for TokenPriceConfig {
     fn default() -> Self {
         Self {
             api_url: "https://api.coingecko.com/api/v3".to_string(),
+            platform: "ethereum".to_string(),
             api_key: None,
+            max_addresses_per_request: 1,
             cache_duration_secs: 60, // 1 minute cache
             rate_limit_per_minute: 10,
             enable_history: true,
