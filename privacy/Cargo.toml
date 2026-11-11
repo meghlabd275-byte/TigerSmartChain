@@ -3,13 +3,15 @@ name = "tiger-privacy"
 version = "1.0.0"
 edition = "2021"
 authors = ["TigerScan Team"]
-description = "Privacy for TigerScan"
+description = "Shielded commitment pool with real Ristretto255 Pedersen commitments"
 license = "MIT"
 
 [dependencies]
+curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-log = "0.4"
 
 [profile.release]
 opt-level = 3
