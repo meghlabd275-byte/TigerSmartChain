@@ -1,136 +1,167 @@
-//! ENS Resolution Service Implementation
+//! ENS resolution against the on-chain registry, registry resolver lookup and
+//! resolver record calls.
 
+use crate::abi::{self, AbiValue};
 use crate::types::*;
 use chrono::Utc;
-use std::sync::Arc;
-use std::collections::HashMap;
-use tokio::sync::RwLock;
-use thiserror::Error;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
+use tokio::sync::RwLock;
 
-// =============================================================================
-// ERRORS
-// =============================================================================
-
+/// Errors returned by the resolver.
 #[derive(Error, Debug)]
 pub enum ENSError {
-    #[error("RPC error: {0}")]
-    RPCError(String),
-    #[error("Parse error: {0}")]
-    ParseError(String),
-    #[error("Not found: {0}")]
+    #[error("rpc error: {0}")]
+    Rpc(String),
+    #[error("malformed response: {0}")]
+    Malformed(String),
+    #[error("name is not registered: {0}")]
     NotFound(String),
-    #[error("Resolution failed: {0}")]
-    ResolutionFailed(String),
+    #[error("invalid name: {0}")]
+    InvalidName(String),
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
-// =============================================================================
-// SERVICE
-// =============================================================================
+const SELECTOR_ADDR: [u8; 4] = [0x3b, 0x3b, 0x57, 0xde];
+const SELECTOR_ADDR_COIN: [u8; 4] = [0xf1, 0xcb, 0x7e, 0x06];
+const SELECTOR_NAME: [u8; 4] = [0x69, 0x1f, 0x34, 0x31];
+const SELECTOR_TEXT: [u8; 4] = [0x59, 0xd1, 0xd4, 0x3c];
+const SELECTOR_CONTENTHASH: [u8; 4] = [0xbc, 0x1c, 0x58, 0xd1];
+const SELECTOR_RESOLVER: [u8; 4] = [0x01, 0x78, 0xb8, 0xbf];
+const SELECTOR_OWNER: [u8; 4] = [0x02, 0x57, 0x1b, 0xe3];
 
-/// ENS Resolution Service
+/// Text record keys queried by [`ENSService::resolve`].
+const TEXT_KEYS: [&str; 7] = [
+    "url",
+    "avatar",
+    "description",
+    "com.twitter",
+    "com.github",
+    "org.telegram",
+    "email",
+];
+
+/// ENS resolution service.
 pub struct ENSService {
     config: ENSConfig,
     client: Client,
-    cache: Arc<RwLock<HashMap<String, ENSRecord>>,
+    cache: Arc<RwLock<HashMap<String, CachedResolution>>>,
     stats: Arc<RwLock<ENSStats>>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedResolution {
+    resolution: ENSResolution,
+    cached_at: i64,
+}
+
 impl ENSService {
-    /// Create new ENS service
+    /// Create a service that talks to `rpc_url` using the default registry.
     pub fn new(rpc_url: &str) -> Self {
-        let config = ENSConfig {
+        Self::with_config(ENSConfig {
             rpc_url: rpc_url.to_string(),
             ..Default::default()
-        };
-        
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        
-        Self {
-            config: config.clone(),
-            client,
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            stats: Arc::new(RwLock::new(ENSStats::default())),
-        }
+        })
     }
 
-    /// Create with custom config
+    /// Create a service with an explicit configuration.
     pub fn with_config(config: ENSConfig) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(config.timeout_secs))
+            .timeout(Duration::from_secs(config.timeout_secs.max(1)))
             .build()
             .unwrap_or_else(|_| Client::new());
-        
+
         Self {
-            config: config.clone(),
+            config,
             client,
             cache: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(ENSStats::default())),
         }
     }
 
-    /// Resolve a .eth domain to an address
+    /// Resolve a name to its address and records.
     pub async fn resolve(&self, name: &str) -> Result<ENSResolution, ENSError> {
-        let name = name.trim_end_matches('.');
-        
-        // Check cache
-        if self.config.enable_cache {
-            let cache = self.cache.read().await;
-            if let Some(cached) = cache.get(name) {
-                let mut stats = self.stats.write().await;
-                stats.cache_hits += 1;
-                return Ok(ENSResolution {
-                    name: name.to_string(),
-                    address: cached.address.clone(),
-                    content_hash: cached.content_hash.clone(),
-                    texts: cached.text_records.clone(),
-                    coin_type: cached.coin_type.as_ref().map(|c| CoinTypeAddress {
-                        coin_type: c.coin_type.unwrap_or(60),
-                        address: c.address.clone(),
-                    }),
-                    expiration_date: None,
-                    is_wrapped: false,
-                    parent_owner: None,
-                });
-            }
+        let normalized = normalize_name(name)?;
+        let namehash = abi::namehash(&normalized);
+
+        if let Some(cached) = self.cache_get(&normalized).await {
+            return Ok(cached);
         }
 
-        // Update stats
         {
             let mut stats = self.stats.write().await;
             stats.lookups_total += 1;
         }
 
-        // Compute namehash
-        let namehash = self.compute_namehash(name);
+        let resolver = self.resolver_of(&namehash).await?;
+        let resolver = match resolver {
+            Some(addr) => addr,
+            None => {
+                self.record_failure().await;
+                return Err(ENSError::NotFound(normalized));
+            }
+        };
 
-        // Resolve address (ETH address)
-        let address = self.resolve_record(&namehash, "0x5b60f5").await?;
+        let address = match self.call_resolver(&resolver, &namehash, SELECTOR_ADDR, &[]).await {
+            Ok(data) => abi::decode_address(&data),
+            Err(_) => None,
+        };
 
-        // Resolve content hash
-        let content_hash = self.resolve_record(&namehash, "0xbc1c58d1").await.ok();
+        let content_hash = match self
+            .call_resolver(&resolver, &namehash, SELECTOR_CONTENTHASH, &[])
+            .await
+        {
+            Ok(data) => abi::decode_bytes32(&data).map(|h| abi::encode_hex(&h)),
+            Err(_) => None,
+        };
 
-        // Resolve text records
         let mut texts = HashMap::new();
-        for key in &["url", "avatar", "description", "com.twitter", "com.github", "org.telegram", "email"] {
-            if let Ok(text) = self.resolve_text_record(&namehash, key).await {
-                if !text.is_empty() {
-                    texts.insert(key.to_string(), text);
+        for key in TEXT_KEYS {
+            let args = [AbiValue::Str(key.to_string())];
+            if let Ok(data) = self
+                .call_resolver(&resolver, &namehash, SELECTOR_TEXT, &args)
+                .await
+            {
+                if let Some(value) = abi::decode_string(&data) {
+                    if !value.is_empty() {
+                        texts.insert(key.to_string(), value);
+                    }
                 }
             }
         }
 
-        // Resolve coin type (for multi-chain)
-        let coin_type = self.resolve_coin_type(&namehash).await.ok();
+        let coin_type = match self
+            .call_resolver(
+                &resolver,
+                &namehash,
+                SELECTOR_ADDR_COIN,
+                &[AbiValue::Uint(60)],
+            )
+            .await
+        {
+            Ok(data) => abi::decode_bytes(&data).and_then(|bytes| {
+                if bytes.len() == 20 {
+                    let mut addr = [0u8; 20];
+                    addr.copy_from_slice(&bytes);
+                    Some(CoinTypeAddress {
+                        coin_type: 60,
+                        address: abi::checksum_address(&addr),
+                    })
+                } else {
+                    None
+                }
+            }),
+            Err(_) => None,
+        };
 
-        let result = ENSResolution {
-            name: name.to_string(),
-            address,
+        let resolution = ENSResolution {
+            name: normalized.clone(),
+            address: address.map(|a| abi::checksum_address(&a)),
             content_hash,
             texts,
             coin_type,
@@ -139,209 +170,251 @@ impl ENSService {
             parent_owner: None,
         };
 
-        // Cache it
-        if self.config.enable_cache {
-            let mut cache = self.cache.write().await;
-            cache.insert(name.to_string(), ENSRecord {
-                name: name.to_string(),
-                address: result.address.clone().unwrap_or_default(),
-                resolver: String::new(),
-                ttl: 0,
-                address: result.address.clone(),
-                content_hash: result.content_hash.clone(),
-                text_records: result.texts.clone(),
-                abi: None,
-                coin_type: result.coin_type.as_ref().map(|c| c.address.clone()).map(|a| ()),
-                chain_id: result.coin_type.as_ref().map(|c| c.coin_type),
-                last_updated: Utc::now().timestamp(),
-            });
-        }
-
-        // Update stats
-        {
+        if resolution.address.is_some() {
             let mut stats = self.stats.write().await;
-            if result.address.is_some() {
-                stats.lookups_success += 1;
-            } else {
-                stats.lookups_failed += 1;
-            }
+            stats.lookups_success += 1;
             stats.last_update = Utc::now().timestamp();
+        } else {
+            self.record_failure().await;
         }
 
-        Ok(result)
+        self.cache_put(&normalized, resolution.clone()).await;
+        Ok(resolution)
     }
 
-    /// Resolve an address to a .eth domain (reverse resolution)
+    /// Resolve an address to its primary name using reverse resolution.
     pub async fn reverse_resolve(&self, address: &str) -> Result<ENSReverseResolution, ENSError> {
-        // Compute reverse namehash
-        let reverse_name = format!("{:}.addr.reverse", address.trim_start_matches("0x").to_lowercase());
-        let namehash = self.compute_namehash(&reverse_name);
+        let bytes = abi::decode_hex(address)
+            .map_err(|e| ENSError::InvalidName(format!("invalid address: {e}")))?;
+        if bytes.len() != 20 {
+            return Err(ENSError::InvalidName(format!(
+                "address must be 20 bytes, got {}",
+                bytes.len()
+            )));
+        }
 
-        // Resolve name
-        let name = self.resolve_record(&namehash, "0x691f3431").await.ok();
+        let mut address_bytes = [0u8; 20];
+        address_bytes.copy_from_slice(&bytes);
+        let reverse_name = format!("{}.addr.reverse", hex::encode(address_bytes));
+        let namehash = abi::namehash(&reverse_name);
+
+        let resolver = self.resolver_of(&namehash).await?;
+        let resolver = match resolver {
+            Some(addr) => addr,
+            None => {
+                return Ok(ENSReverseResolution {
+                    address: abi::checksum_address(&address_bytes),
+                    name: None,
+                    resolver: None,
+                })
+            }
+        };
+
+        let name = match self
+            .call_resolver(&resolver, &namehash, SELECTOR_NAME, &[])
+            .await
+        {
+            Ok(data) => abi::decode_string(&data).filter(|s| !s.is_empty()),
+            Err(_) => None,
+        };
 
         Ok(ENSReverseResolution {
-            address: address.to_string(),
+            address: abi::checksum_address(&address_bytes),
             name,
-            resolver: None,
+            resolver: Some(abi::checksum_address(&resolver)),
         })
     }
 
-    /// Resolve a record from the ENS resolver
-    async fn resolve_record(&self, namehash: &str, method: &str) -> Result<String, ENSError> {
+    /// Read the owner of a name from the registry.
+    pub async fn owner(&self, name: &str) -> Result<Option<String>, ENSError> {
+        let normalized = normalize_name(name)?;
+        let namehash = abi::namehash(&normalized);
+        let data = self
+            .eth_call(
+                &self.config.registry_address,
+                abi::encode_call(SELECTOR_OWNER, &[AbiValue::Bytes32(namehash)]),
+            )
+            .await?;
+
+        Ok(abi::decode_address(&data).map(|a| abi::checksum_address(&a)))
+    }
+
+    /// Read the resolver of a name from the registry, if one is set.
+    async fn resolver_of(&self, namehash: &[u8; 32]) -> Result<Option<[u8; 20]>, ENSError> {
+        let data = self
+            .eth_call(
+                &self.config.registry_address,
+                abi::encode_call(SELECTOR_RESOLVER, &[AbiValue::Bytes32(*namehash)]),
+            )
+            .await?;
+
+        Ok(abi::decode_address(&data))
+    }
+
+    /// Call a record getter on a resolver, appending `namehash` then `args`.
+    async fn call_resolver(
+        &self,
+        resolver: &[u8; 20],
+        namehash: &[u8; 32],
+        selector: [u8; 4],
+        args: &[AbiValue],
+    ) -> Result<Vec<u8>, ENSError> {
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(AbiValue::Bytes32(*namehash));
+        call_args.extend_from_slice(args);
+
+        self.eth_call(&abi::checksum_address(resolver), abi::encode_call(selector, &call_args))
+            .await
+    }
+
+    /// Perform `eth_call` and return the raw return data.
+    async fn eth_call(&self, to: &str, data: Vec<u8>) -> Result<Vec<u8>, ENSError> {
+        if self.config.rpc_url.is_empty() {
+            return Err(ENSError::Config("rpc_url is not set".to_string()));
+        }
+
         let request_body = json!({
             "jsonrpc": "2.0",
+            "id": 1,
             "method": "eth_call",
-            "params": [{
-                "to": self.config.resolver_address,
-                "data": format!("{}{}", method, namehash)
-            }, "latest"],
-            "id": 1
+            "params": [{ "to": to, "data": abi::encode_hex(&data) }, "latest"],
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&self.config.rpc_url)
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| ENSError::RPCError(e.to_string()))?
+            .map_err(|e| ENSError::Rpc(e.to_string()))?
             .json::<Value>()
             .await
-            .map_err(|e| ENSError::ParseError(e.to_string()))?;
+            .map_err(|e| ENSError::Malformed(e.to_string()))?;
 
         if let Some(error) = response.get("error") {
-            return Err(ENSError::ResolutionFailed(
-                error.get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error")
-                    .to_string()
-            ));
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown rpc error");
+            return Err(ENSError::Rpc(message.to_string()));
         }
 
-        let result = response.get("result")
+        let result = response
+            .get("result")
             .and_then(|v| v.as_str())
-            .map(|s| s.trim_start_matches("0x").to_string())
-            .unwrap_or_default();
+            .ok_or_else(|| ENSError::Malformed("response has no result".to_string()))?;
 
-        // Parse the return value (skip first 32 bytes for offset, next 32 for length)
-        if result.len() > 64 {
-            let offset = usize::from_str_radix(&result[0..64], 16).unwrap_or(0);
-            let length = usize::from_str_radix(&result[64..96], 16).unwrap_or(0);
-            
-            if length > 0 && offset + 96 <= result.len() {
-                let data_start = offset * 2 + 64;
-                let data_end = data_start + length * 2;
-                if data_end <= result.len() {
-                    let data = &result[data_start..data_end];
-                    // Convert hex to ASCII
-                    let bytes: Vec<u8> = (0..data.len())
-                        .step_by(2)
-                        .filter_map(|i| u8::from_str_radix(&data[i..i+2], 16).ok())
-                        .collect();
-                    return Ok(String::from_utf8_lossy(&bytes).to_string());
-                }
-            }
+        abi::decode_hex(result).map_err(|e| ENSError::Malformed(e.to_string()))
+    }
+
+    async fn cache_get(&self, name: &str) -> Option<ENSResolution> {
+        if !self.config.enable_cache {
+            return None;
         }
 
-        // For addresses, the return value is the address directly
-        if result.len() >= 40 {
-            return Ok(format!("0x{}", &result[result.len()-40..]));
+        let now = Utc::now().timestamp();
+        let cache = self.cache.read().await;
+        let entry = cache.get(name)?;
+
+        if now - entry.cached_at > self.config.cache_ttl_secs as i64 {
+            return None;
         }
 
-        Err(ENSError::NotFound("Record not found".to_string()))
+        let resolution = entry.resolution.clone();
+        drop(cache);
+
+        let mut stats = self.stats.write().await;
+        stats.cache_hits += 1;
+        Some(resolution)
     }
 
-    /// Resolve a text record
-    async fn resolve_text_record(&self, namehash: &str, key: &str) -> Result<String, ENSError> {
-        // Compute key hash
-        let key_hash = self.keccak256(key);
-        
-        let request_body = json!({
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [{
-                "to": self.config.resolver_address,
-                "data": format!("0x5f60f5{}00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000{}", key_hash)
-            }, "latest"],
-            "id": 1
-        });
-
-        let response = self.client
-            .post(&self.config.rpc_url)
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| ENSError::RPCError(e.to_string()))?
-            .json::<Value>()
-            .await
-            .map_err(|e| ENSError::ParseError(e.to_string()))?;
-
-        let result = response.get("result")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-
-        // Parse result similarly
-        if result.len() > 64 {
-            let offset = usize::from_str_radix(&result[0..64], 16).unwrap_or(0);
-            let length = usize::from_str_radix(&result[64..96], 16).unwrap_or(0);
-            
-            if length > 0 && offset + 96 <= result.len() {
-                let data_start = offset * 2 + 64;
-                let data_end = data_start + length * 2;
-                if data_end <= result.len() {
-                    let data = &result[data_start..data_end];
-                    let bytes: Vec<u8> = (0..data.len())
-                        .step_by(2)
-                        .filter_map(|i| u8::from_str_radix(&data[i..i+2], 16).ok())
-                        .collect();
-                    return Ok(String::from_utf8_lossy(&bytes).to_string());
-                }
-            }
+    async fn cache_put(&self, name: &str, resolution: ENSResolution) {
+        if !self.config.enable_cache {
+            return;
         }
 
-        Ok(String::new())
+        let mut cache = self.cache.write().await;
+        cache.insert(
+            name.to_string(),
+            CachedResolution {
+                resolution,
+                cached_at: Utc::now().timestamp(),
+            },
+        );
     }
 
-    /// Resolve coin type address
-    async fn resolve_coin_type(&self, namehash: &str) -> Result<CoinTypeAddress, ENSError> {
-        // Use addr method with coin type 60 (ETH)
-        let address = self.resolve_record(namehash, "0xf1cb7e06").await?;
-        
-        Ok(CoinTypeAddress {
-            coin_type: 60,
-            address,
-        })
+    async fn record_failure(&self) {
+        let mut stats = self.stats.write().await;
+        stats.lookups_failed += 1;
+        stats.last_update = Utc::now().timestamp();
     }
 
-    /// Compute namehash for ENS name
-    fn compute_namehash(&self, name: &str) -> String {
-        // This is a simplified namehash - in production, use proper DNS packet implementation
-        let labels: Vec<&str> = name.split('.').collect();
-        
-        let mut result = "0x0000000000000000000000000000000000000000000000000000000000000000".to_string();
-        
-        for label in labels.iter().rev() {
-            let label_hash = self.keccak256(label);
-            result = self.keccak256(&format!("{}{}", result.trim_start_matches("0x"), label_hash));
-        }
-        
-        result
-    }
-
-    /// Simple Keccak256 (placeholder - in production use proper library)
-    fn keccak256(&self, input: &str) -> String {
-        // This is a placeholder - in production, use a proper Keccak library
-        format!("{:0>64}", input.len())
-    }
-
-    /// Get service statistics
+    /// Snapshot of the service counters.
     pub async fn get_stats(&self) -> ENSStats {
         self.stats.read().await.clone()
     }
 
-    /// Clear cache
+    /// Drop every cached resolution.
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
+    }
+}
+
+/// Normalize a name: lowercase, trim, and reject labels that are not valid
+/// DNS labels. ENS names are case insensitive because namehash operates on the
+/// lowercased labels.
+pub fn normalize_name(name: &str) -> Result<String, ENSError> {
+    let trimmed = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err(ENSError::InvalidName("name is empty".to_string()));
+    }
+
+    for label in trimmed.split('.') {
+        if label.is_empty() {
+            return Err(ENSError::InvalidName(format!(
+                "name {name} contains an empty label"
+            )));
+        }
+        if label.len() > 63 {
+            return Err(ENSError::InvalidName(format!(
+                "label {label} exceeds 63 bytes"
+            )));
+        }
+        for byte in label.bytes() {
+            let allowed = byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+            if !allowed {
+                return Err(ENSError::InvalidName(format!(
+                    "label {label} contains an unsupported character"
+                )));
+            }
+        }
+    }
+
+    Ok(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_lowercases_and_strips_the_root_dot() {
+        assert_eq!(normalize_name("Foo.ETH.").unwrap(), "foo.eth");
+        assert_eq!(normalize_name("  tigerscan.eth ").unwrap(), "tigerscan.eth");
+    }
+
+    #[test]
+    fn normalize_rejects_empty_and_malformed_names() {
+        assert!(normalize_name("").is_err());
+        assert!(normalize_name(".").is_err());
+        assert!(normalize_name("foo..eth").is_err());
+        assert!(normalize_name("foo bar.eth").is_err());
+        assert!(normalize_name(&format!("{}.eth", "a".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn address_reverse_name_is_lowercase_hex() {
+        let name = format!("{}.addr.reverse", hex::encode([0xABu8; 20]));
+        assert_eq!(name, format!("{}.addr.reverse", "ab".repeat(20)));
     }
 }

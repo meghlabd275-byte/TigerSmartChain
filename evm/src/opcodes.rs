@@ -51,6 +51,7 @@ impl GasCost {
     pub const ORIGIN: u64 = 2;
     pub const CALLER: u64 = 2;
     pub const CALLVALUE: u64 = 2;
+    pub const CALLDATALOAD: u64 = 3;
     pub const CALLDATASIZE: u64 = 2;
     pub const CALLDATACOPY: u64 = 3;
     pub const CODESIZE: u64 = 2;
@@ -68,7 +69,10 @@ impl GasCost {
     pub const DIFFICULTY: u64 = 2;
     pub const GASLIMIT: u64 = 2;
     pub const CHAINID: u64 = 2;
+    pub const SELFBALANCE: u64 = 5;
     pub const BASEFEE: u64 = 2;
+    pub const BLOBHASH: u64 = 3;
+    pub const BLOBBASEFEE: u64 = 2;
     pub const POP: u64 = 2;
     pub const MLOAD: u64 = 3;
     pub const MSTORE: u64 = 3;
@@ -153,6 +157,7 @@ pub fn gas_cost(opcode: Opcode) -> u64 {
         ORIGIN => GasCost::ORIGIN,
         CALLER => GasCost::CALLER,
         CALLVALUE => GasCost::CALLVALUE,
+        CALLDATALOAD => GasCost::CALLDATALOAD,
         CALLDATASIZE => GasCost::CALLDATASIZE,
         CALLDATACOPY => GasCost::CALLDATACOPY,
         CODESIZE => GasCost::CODESIZE,
@@ -170,7 +175,10 @@ pub fn gas_cost(opcode: Opcode) -> u64 {
         DIFFICULTY => GasCost::DIFFICULTY,
         GASLIMIT => GasCost::GASLIMIT,
         CHAINID => GasCost::CHAINID,
+        SELFBALANCE => GasCost::SELFBALANCE,
         BASEFEE => GasCost::BASEFEE,
+        BLOBHASH => GasCost::BLOBHASH,
+        BLOBBASEFEE => GasCost::BLOBBASEFEE,
         POP => GasCost::POP,
         MLOAD => GasCost::MLOAD,
         MSTORE => GasCost::MSTORE,

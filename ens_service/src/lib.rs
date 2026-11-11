@@ -23,6 +23,7 @@
 //! let name = ens.reverse_resolve("0x...").await?;
 //! ```
 
+pub mod abi;
 pub mod service;
 pub mod types;
 

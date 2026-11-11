@@ -9,7 +9,6 @@
 use thiserror::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::collections::VecDeque;
 
 // =============================================================================
 // ERRORS

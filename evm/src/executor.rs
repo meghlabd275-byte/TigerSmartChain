@@ -4,6 +4,7 @@
 
 use crate::host::Host;
 use crate::opcodes::*;
+use crate::trace::{mnemonic, Step, StepTracer, TraceSummary};
 use crate::types::*;
 
 /// EVM Executor
@@ -42,6 +43,36 @@ impl Executor {
         ctx: &mut ExecutionContext,
         host: &mut dyn Host,
     ) -> ExecutionResult {
+        self.execute_traced_with_host(code, ctx, host, &mut NullTracer)
+    }
+
+    /// Execute code while reporting every opcode to `tracer`.
+    ///
+    /// This is the data source behind the `debug_traceTransaction` and
+    /// `debug_traceCall` APIs: the steps reported are exactly the opcodes the
+    /// interpreter executed, in order.
+    pub fn execute_traced(
+        &self,
+        code: &[u8],
+        ctx: &mut ExecutionContext,
+        tracer: &mut dyn StepTracer,
+    ) -> ExecutionResult {
+        let mut host = crate::host::MemoryHost::new();
+        host.set_code(&ctx.address, code.to_vec());
+        for (slot, value) in ctx.storage.entries() {
+            host.set_storage(&ctx.address, slot, value);
+        }
+        self.execute_traced_with_host(code, ctx, &mut host, tracer)
+    }
+
+    /// Execute code against a real host while reporting every opcode.
+    pub fn execute_traced_with_host(
+        &self,
+        code: &[u8],
+        ctx: &mut ExecutionContext,
+        host: &mut dyn Host,
+        tracer: &mut dyn StepTracer,
+    ) -> ExecutionResult {
         let mut pc = 0usize;
         let mut gas_used: u64 = 0;
         let mut success = true;
@@ -72,7 +103,18 @@ impl Executor {
             }};
         }
 
+        let mut pending: Option<Step> = None;
+        let mut step_count = 0usize;
+
         while pc < code.len() {
+            // Flush the opcode executed by the previous iteration now that its
+            // effects on the stack are visible.
+            if let Some(mut step) = pending.take() {
+                step.stack = ctx.stack.entries();
+                tracer.step(&step);
+                step_count += 1;
+            }
+
             let op_byte = code[pc];
             let opcode = match Opcode::from_u8(op_byte) {
                 Some(op) => op,
@@ -88,6 +130,18 @@ impl Executor {
                 success = false;
                 break;
             }
+
+            pending = Some(Step {
+                pc,
+                opcode: op_byte,
+                op: mnemonic(op_byte),
+                gas: ctx.gas.saturating_sub(gas_used),
+                gas_cost: cost,
+                depth: 1,
+                stack: Vec::new(),
+                error: None,
+            });
+
             gas_used += cost;
 
             match opcode {
@@ -158,6 +212,22 @@ impl Executor {
                 Opcode::ORIGIN => { ctx.stack.push(EvmWord::from_be_bytes(&ctx.origin.0)); }
                 Opcode::CALLER => { ctx.stack.push(EvmWord::from_be_bytes(&ctx.caller.0)); }
                 Opcode::CALLVALUE => { ctx.stack.push(EvmWord::from_u64(ctx.value)); }
+                Opcode::CALLDATALOAD => {
+                    // Calldata is right padded with zeroes beyond its end, so a
+                    // load past the end yields a word built from whatever bytes
+                    // are available.
+                    let offset = match ctx.stack.pop() {
+                        Some(v) => v.as_u64() as usize,
+                        None => { success = false; break; }
+                    };
+                    let mut word = [0u8; 32];
+                    if offset < ctx.data.len() {
+                        let avail = ctx.data.len() - offset;
+                        let take = avail.min(32);
+                        word[..take].copy_from_slice(&ctx.data[offset..offset + take]);
+                    }
+                    ctx.stack.push(EvmWord::from_be_bytes(&word));
+                }
                 Opcode::CALLDATASIZE => { ctx.stack.push(EvmWord::from_u64(ctx.data.len() as u64)); }
                 Opcode::CALLDATACOPY => {
                     let (dest_off, off, len) = pop3!();
@@ -262,7 +332,23 @@ impl Executor {
                 Opcode::DIFFICULTY => { ctx.stack.push(EvmWord::zero()); }
                 Opcode::GASLIMIT => { ctx.stack.push(EvmWord::from_u64(ctx.block_gas_limit)); }
                 Opcode::CHAINID => { ctx.stack.push(EvmWord::from_u64(ctx.chain_id)); }
+                Opcode::SELFBALANCE => {
+                    ctx.stack.push(host.balance(&ctx.address));
+                }
                 Opcode::BASEFEE => { ctx.stack.push(EvmWord::from_u64(ctx.block_basefee)); }
+                Opcode::BLOBHASH => {
+                    // No blob-carrying transactions are accepted, so every blob
+                    // hash index is out of range and yields zero.
+                    match ctx.stack.pop() {
+                        Some(_) => ctx.stack.push(EvmWord::zero()),
+                        None => { success = false; break; }
+                    }
+                }
+                Opcode::BLOBBASEFEE => {
+                    // TigerSmartChain does not schedule blobs, so the blob base
+                    // fee is the minimum 1 wei required by EIP-7516.
+                    ctx.stack.push(EvmWord::from_u64(1));
+                }
                 // --- 0x5x: Stack/memory/storage ---
                 Opcode::POP => { if ctx.stack.pop().is_none() { success = false; break; } }
                 Opcode::MLOAD => {
@@ -670,6 +756,23 @@ impl Executor {
             pc += 1;
         }
 
+        if let Some(mut step) = pending.take() {
+            step.stack = ctx.stack.entries();
+            tracer.step(&step);
+            step_count += 1;
+        }
+
+        let summary = TraceSummary {
+            success,
+            gas_used,
+            output: output.clone(),
+            address: ctx.address,
+            steps: step_count,
+        };
+
+        let logs = host.take_logs();
+        tracer.finish(&summary);
+
         // On failure the state changes are still applied by the caller, which
         // decides whether to commit or roll back the journal; logs are
         // returned as recorded so the caller can discard them on failure.
@@ -677,9 +780,17 @@ impl Executor {
             success,
             gas_used,
             output,
-            logs: host.take_logs(),
+            logs,
         }
     }
+}
+
+/// Tracer that discards every event, used when tracing is not requested.
+struct NullTracer;
+
+impl StepTracer for NullTracer {
+    fn step(&mut self, _step: &Step) {}
+    fn finish(&mut self, _summary: &TraceSummary) {}
 }
 
 /// Emit a log entry with up to `n_topics` topics popped from the stack.
@@ -1183,10 +1294,18 @@ mod tests {
 
     #[test]
     fn codecopy_is_decoded_and_copies_code() {
-        // Regression: opcode 0x39 (CODECOPY) was absent from the decoding
-        // table, so any contract copying its own code halted immediately.
+        // Regression: the decode table was shifted from 0x35 onwards, so
+        // CALLDATALOAD was unreachable and CALLDATASIZE/CALLDATACOPY/CODESIZE
+        // decoded to the wrong opcodes, making CODECOPY unreachable too.
+        assert_eq!(Opcode::from_u8(0x35), Some(Opcode::CALLDATALOAD));
+        assert_eq!(Opcode::from_u8(0x36), Some(Opcode::CALLDATASIZE));
+        assert_eq!(Opcode::from_u8(0x37), Some(Opcode::CALLDATACOPY));
+        assert_eq!(Opcode::from_u8(0x38), Some(Opcode::CODESIZE));
         assert_eq!(Opcode::from_u8(0x39), Some(Opcode::CODECOPY));
-        assert_eq!(Opcode::from_u8(0x38), Some(Opcode::CODECOPY));
+        assert_eq!(Opcode::from_u8(0x47), Some(Opcode::SELFBALANCE));
+        assert_eq!(Opcode::from_u8(0x48), Some(Opcode::BASEFEE));
+        assert_eq!(Opcode::from_u8(0x49), Some(Opcode::BLOBHASH));
+        assert_eq!(Opcode::from_u8(0x4a), Some(Opcode::BLOBBASEFEE));
 
         let mut ctx = ExecutionContext::new();
         ctx.gas = 100_000;

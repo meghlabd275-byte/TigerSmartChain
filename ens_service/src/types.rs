@@ -119,9 +119,9 @@ impl Default for ENSConfig {
     fn default() -> Self {
         Self {
             rpc_url: "http://localhost:8545".to_string(),
-            registry_address: "0x00000000000C2Ee743fDa4B8b2c6eA6F87C72b8C7D".to_string(),
-            resolver_address: "0x00000000000C2Ee743fDa4B8b2c6eA6F87C72b8C7D".to_string(),
-            reverse_resolver_address: "0x00000000000C2Ee743fDa4B8b2c6eA6F87C72b8C7D".to_string(),
+            registry_address: "0x00000000000C2Ee7A8B8b2C6Ea6F87c72b8C7d".to_string(),
+            resolver_address: String::new(),
+            reverse_resolver_address: String::new(),
             timeout_secs: 30,
             enable_cache: true,
             cache_ttl_secs: 3600,

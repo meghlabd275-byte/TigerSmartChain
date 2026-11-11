@@ -8,12 +8,14 @@
 pub mod executor;
 pub mod host;
 pub mod opcodes;
+pub mod trace;
 pub mod transition;
 pub mod types;
 
 pub use executor::Executor;
 pub use host::{Host, MemoryHost};
 pub use opcodes::*;
+pub use trace::{mnemonic, opcode_name, Step, StepTracer, StepTracerBuffer, TraceSummary};
 pub use transition::{
     apply_transaction, create_address, intrinsic_gas, BlockContext, StateHost,
     TransactionRequest, TransitionError, TransitionOutcome,

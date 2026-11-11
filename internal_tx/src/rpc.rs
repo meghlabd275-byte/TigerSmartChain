@@ -7,10 +7,11 @@
 //! - Retry logic
 //! - Connection pooling
 
-use thiserror::Error;
-use serde::{Serialize, Deserialize};
-use std::time::Duration;
+use crate::types::TransactionTrace;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use thiserror::Error;
 use tokio::time::timeout;
 
 // =============================================================================
@@ -21,16 +22,16 @@ use tokio::time::timeout;
 pub enum RpcError {
     #[error("Request failed: {0}")]
     RequestFailed(String),
-    
+
     #[error("Parse error: {0}")]
     ParseError(String),
-    
+
     #[error("Timeout")]
     Timeout,
-    
+
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
-    
+
     #[error("Connection error: {0}")]
     ConnectionError(String),
 }
@@ -55,7 +56,7 @@ impl TraceRpcClient {
             .pool_max_idle_per_host(10)
             .build()
             .map_err(|e| RpcError::ConnectionError(e.to_string()))?;
-        
+
         Ok(Self {
             client,
             rpc_url: rpc_url.to_string(),
@@ -63,44 +64,55 @@ impl TraceRpcClient {
             max_retries: 3,
         })
     }
-    
+
     /// Get current block number
     pub async fn get_block_number(&self) -> Result<u64, RpcError> {
         let request = RpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "eth_blockNumber".to_string(),
-            params: vec![],
+            params: serde_json::json!([]),
             id: 1,
         };
-        
+
         let response: RpcResponse = self.send_request(request).await?;
-        
+
         match response.result {
             Some(RpcResult::String(s)) => {
                 u64::from_str_radix(s.trim_start_matches("0x"), 16)
                     .map_err(|e| RpcError::ParseError(e.to_string()))
             }
             Some(RpcResult::Number(n)) => Ok(n),
+            Some(RpcResult::Value(value)) => value
+                .as_u64()
+                .ok_or_else(|| RpcError::InvalidResponse("block number is not an integer".to_string())),
             None => Err(RpcError::InvalidResponse("No result".to_string())),
         }
     }
-    
+
     /// Get block transactions
     pub async fn get_block_transactions(&self, block_number: u64) -> Result<Vec<String>, RpcError> {
         let block_hex = format!("0x{:x}", block_number);
-        
+
         let request = RpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "eth_getBlockByNumber".to_string(),
             params: serde_json::json!([block_hex, false]),
             id: 1,
         };
-        
+
         let response: RpcResponse = self.send_request(request).await?;
-        
-        let block: serde_json::Value = serde_json::from_value(response.result.unwrap_or_default())
-            .map_err(|e| RpcError::ParseError(e.to_string()))?;
-        
+
+        let block = match response.result {
+            Some(RpcResult::Value(value)) => value,
+            Some(other) => serde_json::to_value(other)
+                .map_err(|e| RpcError::ParseError(e.to_string()))?,
+            None => {
+                return Err(RpcError::InvalidResponse(
+                    "block response has no result".to_string(),
+                ))
+            }
+        };
+
         let transactions = block.get("transactions")
             .and_then(|t| t.as_array())
             .map(|arr| {
@@ -109,10 +121,10 @@ impl TraceRpcClient {
                     .collect()
             })
             .unwrap_or_default();
-        
+
         Ok(transactions)
     }
-    
+
     /// Execute trace transaction
     pub async fn trace_transaction(
         &self,
@@ -121,39 +133,38 @@ impl TraceRpcClient {
         enable_traces: bool,
         enable_state_diffs: bool,
     ) -> Result<TransactionTrace, RpcError> {
-        let mut tracer_config = vec![];
-        
+        // debug_traceTransaction takes the transaction hash and an options
+        // object. The enabled tracers are requested as a comma separated list.
+        let mut tracers = Vec::new();
         if enable_traces {
-            tracer_config.push("trace".to_string());
+            tracers.push("trace");
         }
-        
         if enable_state_diffs {
-            tracer_config.push("stateDiff".to_string());
+            tracers.push("stateDiff");
         }
-        
-        if tracer_config.is_empty() {
-            tracer_config.push("trace".to_string());
+        if tracers.is_empty() {
+            tracers.push("trace");
         }
-        
+
         let request = RpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "debug_traceTransaction".to_string(),
             params: serde_json::json!([
                 tx_hash,
-                tracer_config
+                { "tracer": "callTracer", "tracerConfig": { "withLog": true }, "enable": tracers }
             ]),
             id: 1,
         };
-        
+
         let response: RpcResponse = self.send_request(request).await?;
-        
+
         // Parse trace result
         let trace = self.parse_trace_result(tx_hash, block_number, response.result)?;
-        
+
         Ok(trace)
     }
-    
-    /// Parse trace result
+
+    /// Parse a `debug_traceTransaction` response into a [`TransactionTrace`].
     fn parse_trace_result(
         &self,
         tx_hash: &str,
@@ -165,155 +176,52 @@ impl TraceRpcClient {
             block_number,
             format!("0x{:x}", block_number),
         );
-        
-        let result_json = match result {
-            Some(RpcResult::Value(v)) => v,
-            _ => return Ok(trace),
+
+        let payload = match result {
+            Some(RpcResult::Value(value)) => value,
+            Some(RpcResult::String(text)) => serde_json::from_str(&text)
+                .map_err(|e| RpcError::ParseError(e.to_string()))?,
+            Some(RpcResult::Number(n)) => serde_json::json!(n),
+            None => return Ok(trace),
         };
-        
-        // Parse traces array
-        if let Some(traces) = result_json.get("trace").and_then(|t| t.as_array()) {
-            let mut trace_index = 0u32;
-            
-            for trace_obj in traces {
-                if let Some(internal_tx) = self.parse_trace_entry(trace_obj, tx_hash, block_number, trace_index) {
-                    trace.add_trace(internal_tx);
-                    trace_index += 1;
-                }
-            }
+
+        let parsed = crate::types::parse_trace_payload(tx_hash, block_number, &payload)
+            .map_err(|e| RpcError::ParseError(e.to_string()))?;
+
+        trace.traces = parsed.traces;
+        trace.state_changes = parsed.state_changes;
+        trace.success = parsed.success;
+        trace.error = parsed.error;
+        trace.output = trace.traces.first().and_then(|t| t.output.clone());
+        if let Some(gas_used) = parsed.gas_used {
+            trace.gas_used = gas_used;
         }
-        
-        // Parse state diffs
-        if let Some(state_diff) = result_json.get("stateDiff").and_then(|s| s.as_object()) {
-            for (address, changes) in state_diff {
-                // Parse balance changes
-                if let Some(balance) = changes.get("balance") {
-                    if let (Some(old_val), Some(new_val)) = (
-                        balance.get("from").and_then(|v| v.as_str()),
-                        balance.get("to").and_then(|v| v.as_str())
-                    ) {
-                        trace.add_state_change(StateChange::balance_change(
-                            block_number,
-                            tx_hash.to_string(),
-                            address.clone(),
-                            old_val.to_string(),
-                            new_val.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-        
+        trace.build_call_graph();
+
         Ok(trace)
     }
-    
-    /// Parse single trace entry
-    fn parse_trace_entry(
-        &self,
-        trace_obj: &serde_json::Value,
-        tx_hash: &str,
-        block_number: u64,
-        trace_index: u32,
-    ) -> Option<InternalTransaction> {
-        let mut internal_tx = InternalTransaction::new(
-            tx_hash.to_string(),
-            block_number,
-            trace_index,
-        );
-        
-        // Parse from
-        if let Some(from) = trace_obj.get("from").and_then(|f| f.as_str()) {
-            if self.is_valid_address(from) {
-                internal_tx.from = from.to_string();
-            }
-        }
-        
-        // Parse to
-        if let Some(to) = trace_obj.get("to").and_then(|t| t.as_str()) {
-            if self.is_valid_address(to) {
-                internal_tx.to = to.to_string();
-            }
-        }
-        
-        // Parse value
-        if let Some(value) = trace_obj.get("value").and_then(|v| v.as_str()) {
-            internal_tx.value = value.to_string();
-        }
-        
-        // Parse gas
-        if let Some(gas) = trace_obj.get("gas").and_then(|g| g.as_str()) {
-            internal_tx.gas = gas.to_string();
-        }
-        
-        // Parse gas used
-        if let Some(gas_used) = trace_obj.get("gasUsed").and_then(|g| g.as_str()) {
-            internal_tx.gas_used = Some(gas_used.to_string());
-        }
-        
-        // Parse input
-        if let Some(input) = trace_obj.get("input").and_then(|i| i.as_str()) {
-            internal_tx.input = input.to_string();
-        }
-        
-        // Parse output
-        if let Some(output) = trace_obj.get("output").and_then(|o| o.as_str()) {
-            internal_tx.output = Some(output.to_string());
-        }
-        
-        // Parse call type
-        if let Some(call_type) = trace_obj.get("type").and_then(|t| t.as_str()) {
-            internal_tx.call_type = CallType::from_str(call_type);
-        }
-        
-        // Parse depth
-        if let Some(depth) = trace_obj.get("depth").and_then(|d| d.as_u64()) {
-            internal_tx.depth = depth as u32;
-        }
-        
-        // Parse error
-        if let Some(error) = trace_obj.get("error").and_then(|e| e.as_str()) {
-            internal_tx.error = Some(error.to_string());
-            internal_tx.success = false;
-        }
-        
-        // Parse contract creation
-        if let Some(creates) = trace_obj.get("creates").and_then(|c| c.as_str()) {
-            internal_tx.creates = Some(creates.to_string());
-        }
-        
-        Some(internal_tx)
-    }
-    
-    /// Validate address
-    fn is_valid_address(&self, addr: &str) -> bool {
-        if !addr.starts_with("0x") || addr.len() != 42 {
-            return false;
-        }
-        
-        addr[2..].chars().all(|c| c.is_ascii_hexdigit())
-    }
-    
+
     /// Send RPC request
     async fn send_request(&self, request: RpcRequest) -> Result<RpcResponse, RpcError> {
         let mut last_error = None;
-        
+
         for attempt in 0..self.max_retries {
             let result = timeout(self.timeout, self.client.post(&self.rpc_url)
                 .header("Content-Type", "application/json")
                 .json(&request)
                 .send())
                 .await;
-            
+
             match result {
                 Ok(Ok(response)) => {
                     if response.status().is_success() {
                         let rpc_response: RpcResponse = response.json().await
                             .map_err(|e| RpcError::ParseError(e.to_string()))?;
-                        
+
                         if let Some(error) = rpc_response.error {
                             return Err(RpcError::RequestFailed(error.message));
                         }
-                        
+
                         return Ok(rpc_response);
                     } else {
                         last_error = Some(RpcError::RequestFailed(
@@ -328,13 +236,14 @@ impl TraceRpcClient {
                     last_error = Some(RpcError::Timeout);
                 }
             }
-            
-            // Wait before retry
+
+            // Exponential backoff between attempts.
             if attempt < self.max_retries - 1 {
-                tokio::time::sleep(Duration::from_millis(100 * (attempt + 1))).await;
+                let backoff_ms = 100u64 * u64::from(attempt + 1);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| RpcError::RequestFailed("Max retries".to_string())))
     }
 }
