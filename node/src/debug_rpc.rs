@@ -213,8 +213,6 @@ pub async fn debug_trace_transaction(
 
     let _ = tracer_name(trace_config);
 
-    let mut response = trace_response(&tracer)?;
-
     let (outcome, diffs) = outcome;
 
     let mut response = trace_response(&tracer)?;

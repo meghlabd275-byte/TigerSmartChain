@@ -1,0 +1,22 @@
+[package]
+name = "tiger-debug-trace"
+version = "1.0.0"
+edition = "2021"
+authors = ["TigerScan Team"]
+description = "EVM debug and trace service: real RPC tracing and local bytecode execution"
+license = "MIT"
+
+[dependencies]
+tiger-evm = { path = "../evm" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+hex = "0.4.3"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = true
