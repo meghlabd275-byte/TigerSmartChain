@@ -11,7 +11,7 @@ license = "MIT"
 tokio = { version = "1.35", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "rustls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }

@@ -38,7 +38,6 @@ anyhow = "1.0"
 metrics = "0.21"
 
 # Rate limiting
-tokio::sync = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] }

@@ -13,7 +13,7 @@ log = "0.4"
 thiserror = "1.0"
 tracing = "0.1"
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "time", "sync"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 sha3 = "0.10"
 futures-util = "0.3"
 hex = "0.4"

@@ -19,7 +19,7 @@ parking_lot = "0.12"
 
 [features]
 default = ["runtime-tokio"]
-runtime-tokio = ["tokio/rustls"]
+runtime-tokio = ["tokio/rt-multi-thread"]
 runtime-async = []
 
 [package.metadata]

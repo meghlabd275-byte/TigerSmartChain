@@ -19,7 +19,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 
 [features]
 default = ["runtime-tokio"]
-runtime-tokio = ["tokio/rustls"]
+runtime-tokio = ["tokio/rt-multi-thread"]
 runtime-async = []
 
 [package.metadata]

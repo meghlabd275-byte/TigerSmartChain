@@ -15,7 +15,7 @@ anyhow = "1.0"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1.0"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres"] }
 parking_lot = "0.12"
 once_cell = "1.0"
