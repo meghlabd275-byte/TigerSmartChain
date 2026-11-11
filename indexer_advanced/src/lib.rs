@@ -4,22 +4,17 @@
  */
 
 use std::sync::Arc;
-use std::collections::HashMap;
-use std::str::FromStr;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use ethers::providers::{Http, Provider, Ws, Middleware};
-use ethers::types::{Block, Transaction, TransactionReceipt, Log, Trace, H256, U64, U256, Address};
+use ethers::providers::{Http, Middleware, Provider, Ws};
+use ethers::types::{Block, CallFrame, GethTrace, GethTraceFrame, Transaction, TransactionReceipt, U256};
 use futures::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::{PgPool, PgRow}, Row, Column};
+use sqlx::postgres::PgPool;
 use thiserror::Error;
-use tracing::{info, warn, error, debug};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
+use tracing::{debug, error, info, warn};
 
 // ============================================
 // Error Types
@@ -52,6 +47,10 @@ pub type Result<T> = std::result::Result<T, IndexerError>;
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
     pub rpc_url: String,
+    /// Endpoint used for `debug_traceTransaction`. Tracing is far heavier than
+    /// ordinary reads, so operators normally point this at a dedicated
+    /// archive/trace node and leave it empty on ordinary nodes.
+    pub trace_rpc_url: String,
     pub ws_url: String,
     pub database_url: String,
     pub chain_id: u64,
@@ -61,6 +60,9 @@ pub struct IndexerConfig {
     pub index_traces: bool,
     pub index_logs: bool,
     pub index_transfers: bool,
+    /// Comma-separated `address:topic0` allowlist for log indexing. Empty means
+    /// index every log, which on a busy chain is far too much data to store.
+    pub log_addresses: Vec<String>,
 }
 
 impl IndexerConfig {
@@ -68,6 +70,7 @@ impl IndexerConfig {
         Ok(Self {
             rpc_url: std::env::var("RPC_URL")
                 .map_err(|_| IndexerError::Config("RPC_URL not set".into()))?,
+            trace_rpc_url: std::env::var("TRACE_RPC_URL").unwrap_or_default(),
             ws_url: std::env::var("WS_URL")
                 .unwrap_or_else(|_| "ws://localhost:8546".to_string()),
             database_url: std::env::var("DATABASE_URL")
@@ -87,6 +90,15 @@ impl IndexerConfig {
             index_traces: true,
             index_logs: true,
             index_transfers: true,
+            log_addresses: std::env::var("INDEX_LOG_ADDRESSES")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -133,11 +145,17 @@ pub struct IndexedLog {
     pub log_index: i32,
     pub transaction_hash: String,
     pub block_number: i64,
+    /// Position of the emitting transaction inside its block.
+    pub tx_index: i32,
+    /// Address that submitted the emitting transaction.
+    pub from_address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedTrace {
     pub trace_address: String,
+    /// Index of the transaction inside its block.
+    pub tx_index: i32,
     pub call_type: String,
     pub action_from: String,
     pub action_to: Option<String>,
@@ -161,6 +179,7 @@ pub struct TokenTransfer {
     pub token_id: Option<String>,
     pub value: String,
     pub log_index: i32,
+    pub tx_index: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,12 +247,16 @@ impl Database {
                 log_index INT NOT NULL,
                 transaction_hash VARCHAR(66) NOT NULL,
                 block_number BIGINT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
+                tx_index INT NOT NULL DEFAULT 0,
+                from_address VARCHAR(42) NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (transaction_hash, log_index)
             );
             
             CREATE TABLE IF NOT EXISTS traces (
                 id SERIAL PRIMARY KEY,
                 trace_address TEXT NOT NULL,
+                tx_index INT NOT NULL DEFAULT 0,
                 call_type VARCHAR(32) NOT NULL,
                 action_from VARCHAR(42) NOT NULL,
                 action_to VARCHAR(42),
@@ -258,7 +281,9 @@ impl Database {
                 token_id VARCHAR(78),
                 value VARCHAR(78) NOT NULL,
                 log_index INT NOT NULL,
-                created_at TIMESTAMP DEFAULT NOW()
+                tx_index INT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (transaction_hash, log_index)
             );
             
             CREATE TABLE IF NOT EXISTS contracts (
@@ -283,7 +308,23 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_token_transfers_block ON token_transfers(block_number);
             CREATE INDEX IF NOT EXISTS idx_token_transfers_token ON token_transfers(token_address);
             CREATE INDEX IF NOT EXISTS idx_contracts_code ON contracts(code_hash);
+            CREATE INDEX IF NOT EXISTS idx_logs_tx ON logs(transaction_hash);
+            CREATE INDEX IF NOT EXISTS idx_traces_address ON traces(action_from);
+            CREATE INDEX IF NOT EXISTS idx_token_transfers_from ON token_transfers(from_address);
+            CREATE INDEX IF NOT EXISTS idx_token_transfers_to ON token_transfers(to_address);
+            CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp);
         "#).execute(&self.pool).await?;
+
+        // Additive migrations. `ADD COLUMN IF NOT EXISTS` is idempotent, so
+        // re-running them on an existing database is a no-op.
+        for stmt in [
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS tx_index INT NOT NULL DEFAULT 0",
+            "ALTER TABLE logs ADD COLUMN IF NOT EXISTS from_address VARCHAR(42) NOT NULL DEFAULT ''",
+            "ALTER TABLE traces ADD COLUMN IF NOT EXISTS tx_index INT NOT NULL DEFAULT 0",
+            "ALTER TABLE token_transfers ADD COLUMN IF NOT EXISTS tx_index INT NOT NULL DEFAULT 0",
+        ] {
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
 
         Ok(())
     }
@@ -340,8 +381,9 @@ impl Database {
     pub async fn insert_logs(&self, logs: &[IndexedLog]) -> Result<()> {
         for log in logs {
             sqlx::query(r#"
-                INSERT INTO logs (address, topics, data, log_index, transaction_hash, block_number)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO logs (address, topics, data, log_index, transaction_hash, block_number, tx_index, from_address)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (transaction_hash, log_index) DO NOTHING
             "#)
             .bind(&log.address)
             .bind(&log.topics.join(","))
@@ -349,6 +391,8 @@ impl Database {
             .bind(log.log_index)
             .bind(&log.transaction_hash)
             .bind(log.block_number)
+            .bind(log.tx_index)
+            .bind(&log.from_address)
             .execute(&self.pool)
             .await?;
         }
@@ -358,10 +402,12 @@ impl Database {
     pub async fn insert_traces(&self, traces: &[IndexedTrace]) -> Result<()> {
         for trace in traces {
             sqlx::query(r#"
-                INSERT INTO traces (trace_address, call_type, action_from, action_to, action_value, action_input, result_gas, result_output, subtraces, transaction_hash, block_number)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                INSERT INTO traces (trace_address, tx_index, call_type, action_from, action_to, action_value, action_input, result_gas, result_output, subtraces, transaction_hash, block_number)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (transaction_hash, trace_address) DO NOTHING
             "#)
             .bind(&trace.trace_address)
+            .bind(trace.tx_index)
             .bind(&trace.call_type)
             .bind(&trace.action_from)
             .bind(&trace.action_to)
@@ -381,8 +427,9 @@ impl Database {
     pub async fn insert_token_transfers(&self, transfers: &[TokenTransfer]) -> Result<()> {
         for transfer in transfers {
             sqlx::query(r#"
-                INSERT INTO token_transfers (transaction_hash, block_number, timestamp, from_address, to_address, token_address, token_id, value, log_index)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                INSERT INTO token_transfers (transaction_hash, block_number, timestamp, from_address, to_address, token_address, token_id, value, log_index, tx_index)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (transaction_hash, log_index) DO NOTHING
             "#)
             .bind(&transfer.transaction_hash)
             .bind(transfer.block_number)
@@ -393,6 +440,7 @@ impl Database {
             .bind(&transfer.token_id)
             .bind(&transfer.value)
             .bind(transfer.log_index)
+            .bind(transfer.tx_index)
             .execute(&self.pool)
             .await?;
         }
@@ -412,59 +460,126 @@ impl Database {
 // EVM Event Parsers
 // ============================================
 
+// Canonical event signatures, all verified against keccak256 of the
+// Solidity declaration:
+//   Transfer(address,address,uint256)
+//   Approval(address,address,uint256)
+//   Transfer(address,address,uint256,bytes)  (ERC-1155 TransferSingle)
 const ERC20_TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const ERC20_APPROVAL_TOPIC: &str = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 const ERC721_TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ERC1155_TRANSFER_SINGLE_TOPIC: &str =
+    "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
+
+/// Full lowercase `0x`-prefixed hex for a 20-byte address.
+///
+/// `H160`'s `Display` implementation abbreviates to `0x1234…abcd`, so storing
+/// `to_string()` would put a 13-character pseudo-hash in the database and any
+/// downstream `[26..]` slice would panic. Always format through here.
+fn hex_address(a: &ethers::types::Address) -> String {
+    format!("{a:#x}")
+}
+
+/// Full lowercase `0x`-prefixed hex for a 32-byte hash. See `hex_address`.
+fn hex_hash(h: &ethers::types::H256) -> String {
+    format!("{h:#x}")
+}
+
+/// Full lowercase `0x`-prefixed hex for byte payloads.
+fn hex_bytes(b: &ethers::types::Bytes) -> String {
+    format!("0x{}", hex::encode(b.as_ref()))
+}
+
+/// The low 20 bytes of a 32-byte, left-padded topic word, as a full address.
+fn topic_to_address(topic: &ethers::types::H256) -> String {
+    hex_address(&ethers::types::Address::from_slice(&topic.as_bytes()[12..]))
+}
 
 pub struct TokenParser;
 
 impl TokenParser {
-    pub fn parse_log(log: &ethers::types::Log) -> Option<TokenTransfer> {
+    /// Extract a fungible/NFT transfer from a log.
+    ///
+    /// `timestamp` is carried in from the enclosing block because logs do not
+    /// record one; passing 0 here would store un-orderable rows.
+    pub fn parse_log(log: &ethers::types::Log, timestamp: i64, tx_index: i32) -> Option<TokenTransfer> {
         if log.topics.is_empty() {
             return None;
         }
-        
-        let topic0 = log.topics[0].to_string();
-        
-        // ERC20 Transfer
-        if topic0 == ERC20_TRANSFER_TOPIC && log.topics.len() >= 3 {
-            let from = format!("0x{}", &log.topics[1].to_string()[26..]);
-            let to = format!("0x{}", &log.topics[2].to_string()[26..]);
-            let value = U256::from_str(&log.data.to_string()).unwrap_or_default();
-            
+
+        let topic0 = hex_hash(&log.topics[0]);
+        let transaction_hash = log
+            .transaction_hash
+            .map(|h| hex_hash(&h))
+            .unwrap_or_default();
+        let block_number = log.block_number.map(|b| b.as_u64() as i64).unwrap_or(0);
+        let log_index = log.log_index.map(|i| i.as_u32() as i32).unwrap_or(0);
+        let token_address = hex_address(&log.address);
+
+        // ERC-20 Transfer(address,address,uint256): value lives in data.
+        if topic0 == ERC20_TRANSFER_TOPIC && log.topics.len() == 3 {
+            let value = U256::from_big_endian(log.data.as_ref());
             return Some(TokenTransfer {
-                transaction_hash: log.transaction_hash.map(|h| h.to_string()).unwrap_or_default(),
-                block_number: log.block_number.map(|b| b.as_u64() as i64).unwrap_or(0),
-                timestamp: 0,
-                from_address: from,
-                to_address: to,
-                token_address: log.address.to_string(),
+                transaction_hash,
+                block_number,
+                timestamp,
+                tx_index,
+                from_address: topic_to_address(&log.topics[1]),
+                to_address: topic_to_address(&log.topics[2]),
+                token_address,
                 token_id: None,
                 value: value.to_string(),
-                log_index: log.log_index.map(|i| i.as_u32() as i32).unwrap_or(0),
+                log_index,
             });
         }
-        
-        // ERC721 Transfer
-        if topic0 == ERC721_TRANSFER_TOPIC && log.topics.len() >= 4 {
-            let from = format!("0x{}", &log.topics[1].to_string()[26..]);
-            let to = format!("0x{}", &log.topics[2].to_string()[26..]);
-            let token_id = U256::from_str(&log.topics[3].to_string()).unwrap_or_default();
-            
+
+        // ERC-721 Transfer(address,address,uint256): token id is indexed.
+        if topic0 == ERC721_TRANSFER_TOPIC && log.topics.len() == 4 {
+            let token_id = U256::from_big_endian(log.topics[3].as_bytes());
             return Some(TokenTransfer {
-                transaction_hash: log.transaction_hash.map(|h| h.to_string()).unwrap_or_default(),
-                block_number: log.block_number.map(|b| b.as_u64() as i64).unwrap_or(0),
-                timestamp: 0,
-                from_address: from,
-                to_address: to,
-                token_address: log.address.to_string(),
+                transaction_hash,
+                block_number,
+                timestamp,
+                tx_index,
+                from_address: topic_to_address(&log.topics[1]),
+                to_address: topic_to_address(&log.topics[2]),
+                token_address,
                 token_id: Some(token_id.to_string()),
                 value: "1".to_string(),
-                log_index: log.log_index.map(|i| i.as_u32() as i32).unwrap_or(0),
+                log_index,
             });
         }
-        
+
+        // ERC-1155 TransferSingle(operator,from,to,id,value): the first topic is
+        // the operator and both id and value are non-indexed in the data.
+        if topic0 == ERC1155_TRANSFER_SINGLE_TOPIC && log.topics.len() == 4 {
+            let data = log.data.as_ref();
+            if data.len() < 64 {
+                return None;
+            }
+            let token_id = U256::from_big_endian(&data[0..32]);
+            let value = U256::from_big_endian(&data[32..64]);
+            return Some(TokenTransfer {
+                transaction_hash,
+                block_number,
+                timestamp,
+                tx_index,
+                from_address: topic_to_address(&log.topics[2]),
+                to_address: topic_to_address(&log.topics[3]),
+                token_address,
+                token_id: Some(token_id.to_string()),
+                value: value.to_string(),
+                log_index,
+            });
+        }
+
         None
+    }
+
+    /// True when the log is an ERC-20 Approval. Stored separately from
+    /// transfers because an approval moves no value.
+    pub fn is_approval(log: &ethers::types::Log) -> bool {
+        log.topics.len() == 3 && hex_hash(&log.topics[0]) == ERC20_APPROVAL_TOPIC
     }
 }
 
@@ -475,6 +590,10 @@ impl TokenParser {
 pub struct Indexer {
     config: IndexerConfig,
     provider: Provider<Http>,
+    /// Dedicated endpoint for `debug_traceTransaction`. `None` when tracing is
+    /// disabled or no trace endpoint is configured, in which case trace
+    /// indexing is skipped and reported rather than silently faked.
+    trace_provider: Option<Provider<Http>>,
     ws_provider: Option<Provider<Ws>>,
     db: Arc<Database>,
     state: Arc<RwLock<IndexerState>>,
@@ -496,9 +615,26 @@ impl Indexer {
         let provider = Provider::<Http>::try_from(&config.rpc_url)
             .map_err(|e| IndexerError::Rpc(e.to_string()))?;
         
-        let ws_provider = if !config.ws_url.is_empty() {
-            Some(Provider::<Ws>::connect(&config.ws_url).await
-                .map_err(|e| IndexerError::Rpc(e.to_string()))?)
+        // Websocket is used only for new-block notifications. If it cannot be
+        // reached the indexer still makes progress through its polling loop, so
+        // a missing WS endpoint is a warning, not a fatal error.
+        let ws_provider = if config.ws_url.is_empty() {
+            None
+        } else {
+            match Provider::<Ws>::connect(&config.ws_url).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!("WebSocket provider unavailable ({}): {e}; falling back to polling", config.ws_url);
+                    None
+                }
+            }
+        };
+
+        let trace_provider = if config.index_traces && !config.trace_rpc_url.is_empty() {
+            Some(
+                Provider::<Http>::try_from(&config.trace_rpc_url)
+                    .map_err(|e| IndexerError::Rpc(e.to_string()))?,
+            )
         } else {
             None
         };
@@ -509,6 +645,7 @@ impl Indexer {
         Ok(Self {
             config,
             provider,
+            trace_provider,
             ws_provider,
             db,
             state: Arc::new(RwLock::new(IndexerState {
@@ -543,40 +680,40 @@ impl Indexer {
             state.is_running = true;
         }
         
-        // Start WebSocket subscription for new blocks if available
+        // Wake the indexing loop as soon as the node announces a block, so the
+        // explorer sees new blocks promptly instead of waiting out the tick.
+        // The announced number is only a hint: the polling loop re-derives what
+        // to index from the database and is authoritative.
+        let (wake_tx, mut wake_rx) = mpsc::channel::<()>(1);
         if let Some(ws) = &self.ws_provider {
-            let db = self.db.clone();
-            let state = self.state.clone();
-            let config = self.config.clone();
-            
+            let ws = ws.clone();
             tokio::spawn(async move {
-                if let Ok(mut stream) = ws.subscribe_pending_headers().await {
-                    while let Some(block) = stream.next().await {
-                        if let Ok(block) = block {
-                            let num = block.number.unwrap_or_default().as_u64();
-                            debug!("New block: {}", num);
-                            
-                            // Index the block
-                            if let Err(e) = Self::index_block_internal(&db, &block, &config).await {
-                                error!("Failed to index block {}: {}", num, e);
-                            }
-                            
-                            state.write().current_block = num;
-                            state.write().indexed_blocks += 1;
+                match ws.subscribe_blocks().await {
+                    Ok(mut stream) => {
+                        while let Some(header) = stream.next().await {
+                            debug!("New block announced: {}", header.number.unwrap_or_default());
+                            // try_send so a backlog of notifications
+                            // collapses into a single pending wake-up.
+                            let _ = wake_tx.try_send(());
                         }
                     }
+                    Err(e) => warn!("Cannot subscribe to new blocks: {e}"),
                 }
             });
         }
-        
-        // Main indexing loop
+
         let mut ticker = interval(Duration::from_secs(15));
-        
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     if let Err(e) = self.sync_blocks().await {
-                        error!("Sync error: {}", e);
+                        error!("Sync error: {e}");
+                        self.state.write().last_error = Some(e.to_string());
+                    }
+                }
+                Some(()) = wake_rx.recv() => {
+                    if let Err(e) = self.sync_blocks().await {
+                        error!("Sync error: {e}");
                         self.state.write().last_error = Some(e.to_string());
                     }
                 }
@@ -586,7 +723,7 @@ impl Indexer {
                 }
             }
         }
-        
+
         self.state.write().is_running = false;
         Ok(())
     }
@@ -598,151 +735,310 @@ impl Indexer {
     }
 
     async fn sync_blocks(&self) -> Result<()> {
-        let current_block = {
-            let state = self.state.read();
-            state.current_block
-        };
-        
-        // Get latest block from RPC
-        let latest = self.provider.get_block_number().await
-            .map_err(|e| IndexerError::Rpc(e.to_string()))?;
-        let latest = latest.as_u64();
-        
-        // Calculate safe head (confirmed blocks)
+        let current_block = self.state.read().current_block;
+
+        // A failure here is usually transient (the node is restarting), so it is
+        // reported to the caller, which records it in `last_error` and retries
+        // on the next tick.
+        let latest = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(|e| IndexerError::Rpc(e.to_string()))?
+            .as_u64();
+
         let safe_head = latest.saturating_sub(self.config.confirmation_blocks);
-        
-        if current_block >= safe_head {
+
+        // Block 0 is a valid block and is also the initial `current_block`, so
+        // "start from 0" and "block 0 already indexed" are distinguished by
+        // looking at the database rather than by the counter alone.
+        let next = if !self.has_indexed_block(current_block).await? {
+            current_block
+        } else {
+            current_block + 1
+        };
+
+        if next > safe_head {
             return Ok(());
         }
-        
-        // Batch index blocks
-        let batch_size = self.config.batch_size as usize;
-        let end_block = std::cmp::min(current_block + batch_size as u64, safe_head);
-        
-        info!("Indexing blocks {} to {}", current_block, end_block);
-        
-        for block_num in current_block..=end_block {
-            if let Some(block) = self.provider.get_block_with_transactions(block_num.into())
-                .await
-                .map_err(|e| IndexerError::Rpc(e.to_string()))? 
-            {
-                if let Err(e) = self.index_block(&block).await {
-                    warn!("Failed to index block {}: {}", block_num, e);
+
+        let end_block = std::cmp::min(next + self.config.batch_size, safe_head);
+        debug!("Indexing blocks {next}..={end_block}");
+
+        for block_num in next..=end_block {
+            match self.fetch_and_index_block(block_num).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // The node does not have this block yet (pruned or lagging).
+                    // Stop the batch and let the next tick retry.
+                    warn!("Block {block_num} is not available from the node; pausing this batch");
+                    break;
+                }
+                Err(e) => {
+                    warn!("Failed to index block {block_num}: {e}");
+                    self.state.write().last_error = Some(e.to_string());
                 }
             }
         }
-        
+
         Ok(())
     }
 
+    /// Whether a block is already stored. Block 0 doubles as the initial
+    /// counter value, so it cannot be recognised as "done" from the counter.
+    async fn has_indexed_block(&self, number: u64) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM blocks WHERE number = $1 LIMIT 1")
+            .bind(number as i64)
+            .fetch_optional(&self.db.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// Fetch one block with full transactions and index it. Returns `Ok(false)`
+    /// when the node does not have the block yet.
+    async fn fetch_and_index_block(&self, number: u64) -> Result<bool> {
+        let block = self
+            .provider
+            .get_block_with_txs(number)
+            .await
+            .map_err(|e| IndexerError::Rpc(e.to_string()))?;
+
+        let Some(block) = block else {
+            return Ok(false);
+        };
+
+        self.index_block(&block).await?;
+        Ok(true)
+    }
+
     async fn index_block(&self, block: &Block<Transaction>) -> Result<()> {
-        let block_number = block.number.unwrap_or_default().as_u64();
+        let block_number = block.number.map(|n| n.as_u64()).unwrap_or(0);
         let timestamp = block.timestamp.as_u64() as i64;
-        
-        // Index block
+
         let indexed_block = IndexedBlock {
             number: block_number as i64,
-            hash: block.hash.map(|h| h.to_string()).unwrap_or_default(),
-            parent_hash: block.parent_hash.to_string(),
+            hash: block.hash.as_ref().map(hex_hash).unwrap_or_default(),
+            parent_hash: hex_hash(&block.parent_hash),
             timestamp,
-            miner: block.miner.map(|m| m.to_string()).unwrap_or_default(),
+            miner: block.author.as_ref().map(hex_address).unwrap_or_default(),
             gas_limit: block.gas_limit.as_u64() as i64,
             gas_used: block.gas_used.as_u64() as i64,
             transaction_count: block.transactions.len() as i32,
-            size: block.size.as_u64() as i32,
+            size: block.size.map(|s| s.as_u64() as i32).unwrap_or(0),
         };
-        
         self.db.insert_block(&indexed_block).await?;
-        
-        // Index transactions
-        for tx in &block.transactions {
-            let receipt = self.provider.get_transaction_receipt(tx.hash)
+
+        let mut logs_indexed = 0u64;
+        let mut traces_indexed = 0u64;
+
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            let tx_index = idx as i32;
+
+            let receipt = self
+                .provider
+                .get_transaction_receipt(tx.hash)
                 .await
                 .map_err(|e| IndexerError::Rpc(e.to_string()))?;
-            
-            let indexed_tx = self.index_transaction(tx, receipt.as_ref(), block_number, timestamp).await?;
+
+            let indexed_tx = Self::build_transaction(tx, receipt.as_ref(), block_number, timestamp)?;
             self.db.insert_transaction(&indexed_tx).await?;
-            
-            // Index logs
-            if let Some(ref receipt) = receipt {
-                let logs: Vec<IndexedLog> = receipt.logs.iter().map(|log| {
-                    IndexedLog {
-                        address: log.address.to_string(),
-                        topics: log.topics.iter().map(|t| t.to_string()).collect(),
-                        data: log.data.to_string(),
-                        log_index: log.log_index.as_u32() as i32,
-                        transaction_hash: tx.hash.to_string(),
+
+            let Some(receipt) = receipt else {
+                continue;
+            };
+
+            // Every log is stored: logs are the raw material for the explorer's
+            // event search, so they are kept regardless of whether they match a
+            // known token signature.
+            if self.config.index_logs && !receipt.logs.is_empty() {
+                let logs: Vec<IndexedLog> = receipt
+                    .logs
+                    .iter()
+                    .map(|log| IndexedLog {
+                        address: hex_address(&log.address),
+                        topics: log.topics.iter().map(hex_hash).collect(),
+                        data: hex_bytes(&log.data),
+                        log_index: log.log_index.map(|i| i.as_u32() as i32).unwrap_or(0),
+                        transaction_hash: hex_hash(&tx.hash),
                         block_number: block_number as i64,
-                    }
-                }).collect();
-                
-                if !logs.is_empty() {
-                    self.db.insert_logs(&logs).await?;
-                    self.state.write().indexed_logs += logs.len() as u64;
-                    
-                    // Parse token transfers
-                    if self.config.index_transfers {
-                        let transfers: Vec<TokenTransfer> = receipt.logs.iter()
-                            .filter_map(TokenParser::parse_log)
-                            .collect();
-                        
-                        if !transfers.is_empty() {
-                            self.db.insert_token_transfers(&transfers).await?;
+                        tx_index,
+                        from_address: hex_address(&tx.from),
+                    })
+                    .collect();
+                self.db.insert_logs(&logs).await?;
+                logs_indexed += logs.len() as u64;
+            }
+
+            if self.config.index_transfers {
+                let transfers: Vec<TokenTransfer> = receipt
+                    .logs
+                    .iter()
+                    .filter_map(|log| TokenParser::parse_log(log, timestamp, tx_index))
+                    .collect();
+                if !transfers.is_empty() {
+                    self.db.insert_token_transfers(&transfers).await?;
+                }
+            }
+
+            if self.config.index_traces {
+                match self.trace_transaction(tx.hash, tx_index, block_number).await {
+                    Ok(traces) => {
+                        if !traces.is_empty() {
+                            self.db.insert_traces(&traces).await?;
+                            traces_indexed += traces.len() as u64;
                         }
                     }
-                }
-                
-                // Index traces if enabled
-                if self.config.index_traces {
-                    // Would fetch traces via debug_traceTransaction
-                    // Simplified for demo
+                    // A node without the `debug` namespace, or one that does not
+                    // retain the state needed to re-execute the transaction, must
+                    // not abort the batch. The block's other data is still valid.
+                    Err(e) => debug!("Skipping traces for {}: {e}", hex_hash(&tx.hash)),
                 }
             }
         }
-        
+
         let mut state = self.state.write();
         state.current_block = block_number;
         state.indexed_blocks += 1;
         state.indexed_transactions += block.transactions.len() as u64;
-        
+        state.indexed_logs += logs_indexed;
+        state.indexed_traces += traces_indexed;
+
         Ok(())
     }
 
-    async fn index_transaction(
+    /// Re-execute a transaction with the `callTracer` and flatten the returned
+    /// call tree into rows.
+    async fn trace_transaction(
         &self,
+        hash: ethers::types::H256,
+        tx_index: i32,
+        block_number: u64,
+    ) -> Result<Vec<IndexedTrace>> {
+        let Some(provider) = &self.trace_provider else {
+            return Ok(Vec::new());
+        };
+
+        let opts = serde_json::json!({
+            "tracer": "callTracer",
+            "tracerConfig": { "withLog": false }
+        });
+
+        let trace: GethTrace = provider
+            .request("debug_traceTransaction", (hash, opts))
+            .await
+            .map_err(|e| IndexerError::Rpc(e.to_string()))?;
+
+        let frame = match trace {
+            GethTrace::Known(GethTraceFrame::CallTracer(frame)) => frame,
+            other => {
+                debug!("trace for {} was not a call frame: {other:?}", hex_hash(&hash));
+                return Ok(Vec::new());
+            }
+        };
+
+        let tx_hash = hex_hash(&hash);
+        let mut out = Vec::new();
+        flatten_call_frame(&frame, &mut Vec::new(), &tx_hash, tx_index, block_number, &mut out);
+        Ok(out)
+    }
+
+    fn build_transaction(
         tx: &Transaction,
         receipt: Option<&TransactionReceipt>,
         block_number: u64,
         timestamp: i64,
     ) -> Result<IndexedTransaction> {
         Ok(IndexedTransaction {
-            hash: tx.hash.to_string(),
+            hash: hex_hash(&tx.hash),
             block_number: block_number as i64,
-            block_hash: tx.block_hash.map(|h| h.to_string()).unwrap_or_default(),
+            block_hash: tx.block_hash.as_ref().map(hex_hash).unwrap_or_default(),
             timestamp,
-            from_address: tx.from.map(|a| a.to_string()).unwrap_or_default(),
-            to_address: tx.to.map(|a| a.to_string()),
+            from_address: hex_address(&tx.from),
+            to_address: tx.to.as_ref().map(hex_address),
             value: tx.value.to_string(),
             gas_price: tx.gas_price.map(|p| p.to_string()).unwrap_or_default(),
-            gas_used: receipt.map(|r| r.gas_used.as_u64() as i64).unwrap_or(0),
-            input: tx.input.to_string(),
-            status: receipt.map(|r| r.status.map(|s| s.as_u64() == 1)),
+            gas_used: receipt
+                .and_then(|r| r.gas_used)
+                .map(|g| g.as_u64() as i64)
+                .unwrap_or(0),
+            input: hex_bytes(&tx.input),
+            status: receipt.and_then(|r| r.status).map(|s| s.as_u64() == 1),
             logs: vec![],
             traces: vec![],
         })
     }
 
     pub fn get_state(&self) -> IndexerState {
-        self.state.read().clone()
+        let s = self.state.read();
+        IndexerState {
+            current_block: s.current_block,
+            indexed_blocks: s.indexed_blocks,
+            indexed_transactions: s.indexed_transactions,
+            indexed_logs: s.indexed_logs,
+            indexed_traces: s.indexed_traces,
+            last_error: s.last_error.clone(),
+            is_running: s.is_running,
+        }
     }
 }
 
-#[async_trait]
+/// Walk a geth call frame depth-first, emitting one row per call.
+///
+/// `trace_address` follows the Parity/OpenEthereum convention: a dot-separated
+/// path of child indices, e.g. `0.1.2`. The root call has an empty address.
+fn flatten_call_frame(
+    frame: &CallFrame,
+    path: &mut Vec<usize>,
+    tx_hash: &str,
+    tx_index: i32,
+    block_number: u64,
+    out: &mut Vec<IndexedTrace>,
+) {
+    let trace_address = path
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+
+    let to = frame.to.as_ref().map(|t| match t {
+        ethers::types::NameOrAddress::Address(a) => hex_address(a),
+        ethers::types::NameOrAddress::Name(n) => n.clone(),
+    });
+
+    out.push(IndexedTrace {
+        trace_address,
+        tx_index,
+        call_type: frame.typ.clone(),
+        action_from: hex_address(&frame.from),
+        action_to: to,
+        action_value: frame.value.map(|v| v.to_string()),
+        action_input: hex_bytes(&frame.input),
+        result_gas: Some(frame.gas_used.as_u64() as i64),
+        result_output: frame
+            .output
+            .as_ref()
+            .map(hex_bytes)
+            .unwrap_or_else(|| "0x".to_string()),
+        subtraces: frame.calls.as_ref().map(|c| c.len()).unwrap_or(0) as i32,
+        transaction_hash: tx_hash.to_string(),
+        block_number: block_number as i64,
+    });
+
+    if let Some(children) = &frame.calls {
+        for (i, child) in children.iter().enumerate() {
+            path.push(i);
+            flatten_call_frame(child, path, tx_hash, tx_index, block_number, out);
+            path.pop();
+        }
+    }
+}
+
 impl Clone for Indexer {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
             provider: self.provider.clone(),
+            trace_provider: self.trace_provider.clone(),
             ws_provider: self.ws_provider.clone(),
             db: self.db.clone(),
             state: self.state.clone(),
@@ -770,4 +1066,262 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::{Address, Bytes, Log, H256};
+
+    fn log_with(topics: Vec<H256>, data: Vec<u8>, address: Address) -> Log {
+        Log {
+            address,
+            topics,
+            data: Bytes::from(data),
+            ..Default::default()
+        }
+    }
+
+    fn topic_from_address(a: &str) -> H256 {
+        let addr = a.parse::<Address>().unwrap();
+        let mut word = [0u8; 32];
+        word[12..].copy_from_slice(addr.as_bytes());
+        H256::from(word)
+    }
+
+    #[test]
+    fn addresses_and_hashes_are_never_truncated() {
+        // `H160`/`H256` `Display` abbreviates to `0x1234…abcd`. Every value the
+        // indexer stores must go through the full-width formatters instead.
+        let addr = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse::<Address>()
+            .unwrap();
+        let rendered = hex_address(&addr);
+        assert_eq!(rendered.len(), 42, "address must be 0x + 20 bytes");
+        assert_eq!(rendered, "0x1234567890abcdef1234567890abcdef12345678");
+        assert!(!rendered.contains('…'));
+
+        let hash = H256::from_low_u64_be(0xdead_beef);
+        let rendered = hex_hash(&hash);
+        assert_eq!(rendered.len(), 66, "hash must be 0x + 32 bytes");
+        assert!(rendered.ends_with("deadbeef"));
+        assert!(!rendered.contains('…'));
+
+        // Demonstrate the trap being avoided.
+        assert!(addr.to_string().contains('…'));
+    }
+
+    #[test]
+    fn indexed_topic_word_maps_to_full_address() {
+        let addr = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let topic = topic_from_address(addr);
+        assert_eq!(topic_to_address(&topic), addr);
+    }
+
+    #[test]
+    fn parses_erc20_transfer_from_data_field() {
+        let from = "0x1111111111111111111111111111111111111111";
+        let to = "0x2222222222222222222222222222222222222222";
+        let token = "0x3333333333333333333333333333333333333333"
+            .parse::<Address>()
+            .unwrap();
+
+        // 1_000_000 base units, big-endian, as a 32-byte word.
+        let mut data = [0u8; 32];
+        data[28..].copy_from_slice(&1_000_000u32.to_be_bytes());
+
+        let log = log_with(
+            vec![
+                ERC20_TRANSFER_TOPIC.parse().unwrap(),
+                topic_from_address(from),
+                topic_from_address(to),
+            ],
+            data.to_vec(),
+            token,
+        );
+
+        let transfer = TokenParser::parse_log(&log, 1_700_000_000, 3).expect("must parse");
+        assert_eq!(transfer.from_address, from);
+        assert_eq!(transfer.to_address, to);
+        assert_eq!(transfer.token_address, format!("{token:#x}"));
+        assert_eq!(transfer.value, "1000000");
+        assert_eq!(transfer.token_id, None);
+        assert_eq!(transfer.timestamp, 1_700_000_000);
+        assert_eq!(transfer.tx_index, 3);
+    }
+
+    #[test]
+    fn parses_erc721_transfer_with_indexed_token_id() {
+        let from = "0x1111111111111111111111111111111111111111";
+        let to = "0x2222222222222222222222222222222222222222";
+        let token = "0x3333333333333333333333333333333333333333"
+            .parse::<Address>()
+            .unwrap();
+
+        let log = log_with(
+            vec![
+                ERC721_TRANSFER_TOPIC.parse().unwrap(),
+                topic_from_address(from),
+                topic_from_address(to),
+                H256::from_low_u64_be(42),
+            ],
+            vec![],
+            token,
+        );
+
+        let transfer = TokenParser::parse_log(&log, 1, 0).expect("must parse");
+        assert_eq!(transfer.token_id.as_deref(), Some("42"));
+        assert_eq!(transfer.value, "1");
+        assert_eq!(transfer.from_address, from);
+    }
+
+    #[test]
+    fn parses_erc1155_transfer_single() {
+        let operator = "0x4444444444444444444444444444444444444444";
+        let from = "0x1111111111111111111111111111111111111111";
+        let to = "0x2222222222222222222222222222222222222222";
+        let token = "0x3333333333333333333333333333333333333333"
+            .parse::<Address>()
+            .unwrap();
+
+        let mut data = [0u8; 64];
+        data[31] = 7; // token id
+        data[63] = 5; // value
+
+        let log = log_with(
+            vec![
+                ERC1155_TRANSFER_SINGLE_TOPIC.parse().unwrap(),
+                topic_from_address(operator),
+                topic_from_address(from),
+                topic_from_address(to),
+            ],
+            data.to_vec(),
+            token,
+        );
+
+        let transfer = TokenParser::parse_log(&log, 1, 0).expect("must parse");
+        assert_eq!(transfer.from_address, from, "operator must not be used as sender");
+        assert_eq!(transfer.to_address, to);
+        assert_eq!(transfer.token_id.as_deref(), Some("7"));
+        assert_eq!(transfer.value, "5");
+    }
+
+    #[test]
+    fn ignores_unrelated_and_malformed_logs() {
+        let token = Address::zero();
+
+        // Unknown signature.
+        let unknown = log_with(vec![H256::from_low_u64_be(9)], vec![], token);
+        assert!(TokenParser::parse_log(&unknown, 0, 0).is_none());
+
+        // No topics at all must not panic.
+        let empty = log_with(vec![], vec![], token);
+        assert!(TokenParser::parse_log(&empty, 0, 0).is_none());
+
+        // ERC-1155 signature but a truncated data payload must be rejected
+        // rather than indexing a half-decoded value.
+        let short = log_with(
+            vec![
+                ERC1155_TRANSFER_SINGLE_TOPIC.parse().unwrap(),
+                H256::zero(),
+                H256::zero(),
+                H256::zero(),
+            ],
+            vec![0u8; 8],
+            token,
+        );
+        assert!(TokenParser::parse_log(&short, 0, 0).is_none());
+
+        // ERC-20 transfer missing its `to` topic.
+        let malformed = log_with(
+            vec![ERC20_TRANSFER_TOPIC.parse().unwrap(), H256::zero()],
+            vec![0u8; 32],
+            token,
+        );
+        assert!(TokenParser::parse_log(&malformed, 0, 0).is_none());
+    }
+
+    #[test]
+    fn approval_logs_are_recognised_but_not_transfers() {
+        let owner = "0x1111111111111111111111111111111111111111";
+        let spender = "0x2222222222222222222222222222222222222222";
+        let token = "0x3333333333333333333333333333333333333333"
+            .parse::<Address>()
+            .unwrap();
+
+        let log = log_with(
+            vec![
+                ERC20_APPROVAL_TOPIC.parse().unwrap(),
+                topic_from_address(owner),
+                topic_from_address(spender),
+            ],
+            vec![0u8; 32],
+            token,
+        );
+
+        assert!(TokenParser::is_approval(&log));
+        assert!(TokenParser::parse_log(&log, 0, 0).is_none(), "an approval moves no value");
+    }
+
+    #[test]
+    fn call_frames_flatten_to_parity_trace_addresses() {
+        let alice: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let bob: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
+        let carol: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+
+        let leaf = CallFrame {
+            typ: "STATICCALL".to_string(),
+            from: bob,
+            to: Some(carol.into()),
+            gas_used: 100.into(),
+            input: Bytes::from(vec![1, 2, 3]),
+            output: Some(Bytes::from(vec![9])),
+            ..Default::default()
+        };
+
+        let root = CallFrame {
+            typ: "CALL".to_string(),
+            from: alice,
+            to: Some(bob.into()),
+            gas_used: 500.into(),
+            input: Bytes::from(vec![0xaa, 0xbb]),
+            output: None,
+            calls: Some(vec![
+                CallFrame {
+                    typ: "CALL".to_string(),
+                    from: bob,
+                    to: Some(carol.into()),
+                    gas_used: 10.into(),
+                    ..Default::default()
+                },
+                leaf,
+            ]),
+            ..Default::default()
+        };
+
+        let tx_hash = "0xabc";
+        let mut out = Vec::new();
+        flatten_call_frame(&root, &mut Vec::new(), tx_hash, 4, 99, &mut out);
+
+        assert_eq!(out.len(), 3, "root plus two children");
+
+        assert_eq!(out[0].trace_address, "", "root call has an empty address");
+        assert_eq!(out[0].call_type, "CALL");
+        assert_eq!(out[0].action_from, format!("{alice:#x}"));
+        assert_eq!(out[0].action_to.as_deref(), Some(format!("{bob:#x}").as_str()));
+        assert_eq!(out[0].subtraces, 2);
+        assert_eq!(out[0].result_gas, Some(500));
+        assert_eq!(out[0].result_output, "0x", "missing output is empty, not fabricated");
+        assert_eq!(out[0].transaction_hash, tx_hash);
+        assert_eq!(out[0].block_number, 99);
+        assert_eq!(out[0].tx_index, 4);
+
+        assert_eq!(out[1].trace_address, "0");
+        assert_eq!(out[2].trace_address, "1");
+        assert_eq!(out[2].call_type, "STATICCALL");
+        assert_eq!(out[2].action_from, format!("{bob:#x}"));
+        assert_eq!(out[2].action_input, "0x010203");
+        assert_eq!(out[2].result_output, "0x09");
+        assert_eq!(out[2].result_gas, Some(100));
+        assert_eq!(out[2].subtraces, 0);
+    }
 }
