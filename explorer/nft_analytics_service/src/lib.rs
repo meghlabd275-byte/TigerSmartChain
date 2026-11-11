@@ -5,14 +5,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use ethers::core::types::{Address, H256, U256};
+use chrono::Utc;
 use ethers::providers::{Http, Provider};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use statistical::{mean, median, std_dev};
+use statistical::{mean, median};
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::info;
 
 // ============================================================================
 // Error Types
@@ -43,6 +42,10 @@ pub struct Config {
     pub database_url: String,
     pub max_traits: usize,
     pub floor_price_window: usize,
+    /// Sustained requests per second allowed per client address.
+    pub rate_limit_per_second: u32,
+    /// Largest burst a client may spend at once.
+    pub rate_limit_burst: u32,
 }
 
 impl Default for Config {
@@ -54,6 +57,8 @@ impl Default for Config {
                 .unwrap_or_else(|_| "postgres://localhost:5432/tigerscan".to_string()),
             max_traits: 100,
             floor_price_window: 100,
+            rate_limit_per_second: 50,
+            rate_limit_burst: 100,
         }
     }
 }
@@ -190,54 +195,121 @@ impl RarityCalculator {
         }
     }
 
-    /// Calculate rarity for an NFT
-    pub fn calculate_rarity(&self, nft: &NFT) -> RarityResult {
-        let mut trait_scores = HashMap::new();
-        let mut total_score = 0.0;
-        
-        for attr in &nft.attributes {
-            let rarity = self.calculate_trait_rarity(&attr.trait_type, &attr.value);
-            trait_scores.insert(attr.trait_type.clone(), rarity);
-            total_score += rarity;
+    /// Score an NFT and rank it against its collection.
+    ///
+    /// The rank is the number of tokens in `collection` with a strictly higher
+    /// score, plus one, so ties share a rank. The collection is a parameter
+    /// because a rank is not a property of a token on its own — the previous
+    /// signature had no way to compute one, which is why it returned a
+    /// hardcoded `0`.
+    pub fn calculate_rarity(&self, nft: &NFT, collection: &[NFT]) -> RarityResult {
+        let score = self.score(nft);
+
+        let rank = collection
+            .iter()
+            .filter(|other| self.score(other) > score + f64::EPSILON)
+            .count() as u32
+            + 1;
+
+        // The (trait_type, value) pairs the collection carries that this token
+        // does not, sorted for a stable response.
+        let mut collection_traits: HashSet<(String, String)> = HashSet::new();
+        for other in collection {
+            for attr in &other.attributes {
+                collection_traits.insert((attr.trait_type.clone(), attr.value.clone()));
+                if collection_traits.len() >= self.config.max_traits {
+                    break;
+                }
+            }
         }
-        
-        // Normalize score
-        let rarity_score = total_score / nft.attributes.len().max(1) as f64;
-        
-        // Determine tier
-        let rarity_tier = match rarity_score {
+
+        let own_traits: HashSet<(String, String)> = nft
+            .attributes
+            .iter()
+            .map(|attr| (attr.trait_type.clone(), attr.value.clone()))
+            .collect();
+
+        let mut missing_traits: Vec<String> = collection_traits
+            .difference(&own_traits)
+            .map(|(trait_type, value)| format!("{trait_type}: {value}"))
+            .collect();
+        missing_traits.sort();
+
+        let mut trait_scores = HashMap::new();
+        for attr in &nft.attributes {
+            trait_scores.insert(
+                attr.trait_type.clone(),
+                self.calculate_trait_rarity(&attr.trait_type, &attr.value),
+            );
+        }
+
+        RarityResult {
+            token_id: nft.token_id.clone(),
+            rarity_score: score,
+            rarity_rank: rank,
+            rarity_tier: Self::tier_for(score),
+            trait_scores,
+            missing_traits,
+        }
+    }
+
+    /// The rarity score of one token: the mean of `1 / frequency` over its
+    /// traits.
+    ///
+    /// Traits are de-duplicated first. A contract that repeats a trait would
+    /// otherwise have that trait counted twice, which inflates the token's
+    /// score.
+    fn score(&self, nft: &NFT) -> f64 {
+        let mut seen: HashSet<(&str, &str)> = HashSet::new();
+        let mut total = 0.0;
+        let mut counted = 0usize;
+
+        for attr in &nft.attributes {
+            if !seen.insert((attr.trait_type.as_str(), attr.value.as_str())) {
+                continue;
+            }
+            total += self.calculate_trait_rarity(&attr.trait_type, &attr.value);
+            counted += 1;
+        }
+
+        if counted == 0 {
+            return 0.0;
+        }
+
+        total / counted as f64
+    }
+
+    /// The tier a score falls in.
+    fn tier_for(score: f64) -> RarityTier {
+        match score {
             s if s >= 100.0 => RarityTier::Legendary,
             s if s >= 50.0 => RarityTier::Epic,
             s if s >= 20.0 => RarityTier::Rare,
             s if s >= 10.0 => RarityTier::Uncommon,
             _ => RarityTier::Common,
-        };
-        
-        RarityResult {
-            token_id: nft.token_id.clone(),
-            rarity_score,
-            rarity_rank: 0, // Would be calculated from collection
-            rarity_tier,
-            trait_scores,
-            missing_traits: vec![],
         }
     }
 
-    /// Calculate rarity for a single trait
+    /// Calculate rarity for a single trait: `1 / (count / total)`.
+    ///
+    /// An unknown trait scores 1.0. It carries no rarity signal, and returning a
+    /// large number for it would make an unindexed trait look like the rarest
+    /// thing in the collection.
     fn calculate_trait_rarity(&self, trait_type: &str, value: &str) -> f64 {
         let state = self.trait_stats.read();
-        
-        let total = state.totals.get(trait_type).copied().unwrap_or(1) as f64;
-        let count = state.traits.get(trait_type)
-            .and_then(|v| v.get(value))
+
+        let total = state.totals.get(trait_type).copied().unwrap_or(0) as f64;
+        let count = state
+            .traits
+            .get(trait_type)
+            .and_then(|values| values.get(value))
             .copied()
             .unwrap_or(0) as f64;
-        
-        if total == 0.0 || count == 0.0 {
+
+        if total <= 0.0 || count <= 0.0 {
             return 1.0;
         }
-        
-        // Rarity = 1 / (count / total)
+
         total / count
     }
 
@@ -264,6 +336,8 @@ impl RarityCalculator {
 
 pub struct NFTAnalyticsService {
     config: Config,
+    /// RPC provider, used by the ingestion paths that read chain state.
+    #[allow(dead_code)]
     rpc: Provider<Http>,
     rarity_calculator: RarityCalculator,
     state: Arc<RwLock<NFTAnalyticsState>>,
@@ -334,14 +408,6 @@ impl NFTAnalyticsService {
             0.0
         };
         
-        // Determine trend
-        let trend = if floor_change > 5.0 {
-            Trend::Up
-        } else if floor_change < -5.0 {
-            Trend::Down
-        } else {
-            Trend::Stable
-        };
         
         // Trait distribution
         let mut trait_dist: HashMap<String, HashMap<String, u32>> = HashMap::new();
@@ -365,11 +431,11 @@ impl NFTAnalyticsService {
             }
         }
         
-        let total_nfts = holder_counts.values().sum::<u64>();
+        let total_nfts: u64 = holder_counts.values().map(|count| *count as u64).sum();
         let mut holder_dist: Vec<_> = holder_counts.into_iter()
             .map(|(address, count)| HolderStats {
                 address,
-                nft_count: count,
+                nft_count: count as u64,
                 percentage: if total_nfts > 0 {
                     (count as f64 / total_nfts as f64) * 100.0
                 } else {
@@ -407,31 +473,27 @@ impl NFTAnalyticsService {
         let nfts = state.nfts.get(address)?;
         let target_nft = nfts.get(token_id)?;
         
-        let mut result = self.rarity_calculator.calculate_rarity(target_nft);
-        
-        // Calculate rank: count how many NFTs in this collection have a higher rarity score
-        let rank = nfts.values()
-            .filter(|n| n.rarity_score > result.rarity_score)
-            .count() as u32 + 1;
-        result.rarity_rank = rank;
-        
-        Some(result)
+        let collection: Vec<NFT> = nfts.values().cloned().collect();
+        Some(self.rarity_calculator.calculate_rarity(target_nft, &collection))
     }
 
-    /// Get top NFTs by rarity
-    pub fn get_top_rarity(&self, address: &str, limit: usize) -> Vec<NFT> {
+    /// The highest-rarity tokens in a collection, rarest first.
+    ///
+    /// Returns `None` when the collection is not indexed. That is distinct from
+    /// `Some(vec![])`, which means the collection is known but holds no tokens —
+    /// collapsing the two would let a typo in an address read as a valid empty
+    /// answer.
+    pub fn get_top_rarity(&self, address: &str, limit: usize) -> Option<Vec<NFT>> {
         let state = self.state.read();
-        
-        let nfts = state.nfts.get(address);
-        
-        if let Some(nfts) = nfts {
-            let mut nfts: Vec<_> = nfts.values().cloned().collect();
-            nfts.sort_by(|a, b| b.rarity_score.partial_cmp(&a.rarity_score).unwrap());
-            nfts.truncate(limit);
-            nfts
-        } else {
-            vec![]
-        }
+
+        let nfts = state.nfts.get(address)?;
+
+        let mut nfts: Vec<NFT> = nfts.values().cloned().collect();
+        // `partial_cmp` returns `None` for a NaN score, which would panic in
+        // `sort_by`. `total_cmp` is defined for every pair of floats.
+        nfts.sort_by(|a, b| b.rarity_score.total_cmp(&a.rarity_score));
+        nfts.truncate(limit);
+        Some(nfts)
     }
 
     /// Get floor price history
@@ -463,9 +525,13 @@ impl NFTAnalyticsService {
         };
         
         let trend = if prices.len() >= 2 {
-            let recent = prices.iter().rev().take(5);
-            let first = recent.clone().last().copied().unwrap_or(0.0);
-            let last = recent.next().copied().unwrap_or(0.0);
+            // The oldest of the last five readings against the newest. The old
+            // code consumed the iterator with `next()` first and then took
+            // `last()` of what remained, so it compared the newest reading
+            // against itself and could never report a trend.
+            let window: Vec<f64> = prices.iter().rev().take(5).copied().collect();
+            let first = window.last().copied().unwrap_or(0.0);
+            let last = window.first().copied().unwrap_or(0.0);
             if last > first * 1.05 {
                 Trend::Up
             } else if last < first * 0.95 {
@@ -573,5 +639,160 @@ mod tests {
     fn test_format_rarity_tier() {
         assert_eq!(format_rarity_tier(RarityTier::Legendary), "Legendary");
         assert_eq!(format_rarity_tier(RarityTier::Common), "Common");
+    }
+
+    fn attribute(trait_type: &str, value: &str) -> NFTAttribute {
+        NFTAttribute {
+            trait_type: trait_type.to_string(),
+            value: value.to_string(),
+            display_type: None,
+            rarity: 0.0,
+        }
+    }
+
+    fn token(token_id: &str, attributes: Vec<NFTAttribute>) -> NFT {
+        NFT {
+            address: "0xcollection".to_string(),
+            token_id: token_id.to_string(),
+            owner: "0xowner".to_string(),
+            name: None,
+            description: None,
+            image_url: None,
+            attributes,
+            rarity_score: 0.0,
+            rarity_rank: 0,
+        }
+    }
+
+    /// Build a calculator whose trait statistics come from `tokens`.
+    fn calculator(tokens: &[NFT]) -> RarityCalculator {
+        let calculator = RarityCalculator::new(Config::default());
+        calculator.update_stats(tokens);
+        calculator
+    }
+
+    #[test]
+    fn rarer_trait_scores_higher() {
+        // "Common" appears three times, "Rare" once.
+        let tokens = vec![
+            token("1", vec![attribute("bg", "Common")]),
+            token("2", vec![attribute("bg", "Common")]),
+            token("3", vec![attribute("bg", "Common")]),
+            token("4", vec![attribute("bg", "Rare")]),
+        ];
+        let calculator = calculator(&tokens);
+
+        let common = calculator.calculate_rarity(&tokens[0], &tokens);
+        let rare = calculator.calculate_rarity(&tokens[3], &tokens);
+
+        assert!(rare.rarity_score > common.rarity_score);
+        assert_eq!(rare.rarity_rank, 1, "the rarest token ranks first");
+        assert_eq!(common.rarity_rank, 2, "ties share the next rank");
+    }
+
+    #[test]
+    fn ties_share_a_rank_and_the_next_rank_skips() {
+        // Two tokens carry the rare "Blue" (2 of 5); three carry "Grey" (3 of 5).
+        let tokens = vec![
+            token("1", vec![attribute("bg", "Blue")]),
+            token("2", vec![attribute("bg", "Blue")]),
+            token("3", vec![attribute("bg", "Grey")]),
+            token("4", vec![attribute("bg", "Grey")]),
+            token("5", vec![attribute("bg", "Grey")]),
+        ];
+        let calculator = calculator(&tokens);
+
+        let blue = calculator.calculate_rarity(&tokens[0], &tokens);
+        let grey = calculator.calculate_rarity(&tokens[2], &tokens);
+
+        assert_eq!(blue.rarity_rank, 1);
+        assert_eq!(grey.rarity_rank, 3, "two tokens share rank 1, so the next is 3");
+    }
+
+    #[test]
+    fn a_repeated_trait_is_counted_once() {
+        let tokens = vec![
+            token(
+                "1",
+                vec![attribute("bg", "Blue"), attribute("bg", "Blue")],
+            ),
+            token("2", vec![attribute("bg", "Grey")]),
+            token("3", vec![attribute("bg", "Grey")]),
+        ];
+        let calculator = calculator(&tokens);
+
+        let duplicated = calculator.calculate_rarity(&tokens[0], &tokens);
+        let single = calculator.calculate_rarity(&tokens[1], &tokens);
+
+        // Both carry exactly one distinct "Blue"/"Grey" trait, so their scores
+        // must be the same size; a repeated trait would inflate the first.
+        assert!((duplicated.rarity_score - single.rarity_score).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unknown_trait_does_not_inflate_the_score() {
+        let tokens = vec![
+            token("1", vec![attribute("bg", "Blue")]),
+            token("2", vec![attribute("bg", "Blue")]),
+        ];
+        let calculator = calculator(&tokens);
+
+        // "Never indexed" has a count of zero; a large score here would make an
+        // unindexed trait look like the rarest thing in the collection.
+        let unknown = calculator.calculate_rarity(&token("9", vec![attribute("bg", "Never")]), &tokens);
+        assert_eq!(unknown.rarity_score, 1.0);
+    }
+
+    #[test]
+    fn missing_traits_lists_what_the_token_lacks() {
+        let tokens = vec![
+            token("1", vec![attribute("bg", "Blue"), attribute("eyes", "Laser")]),
+            token("2", vec![attribute("bg", "Grey")]),
+        ];
+        let calculator = calculator(&tokens);
+
+        let result = calculator.calculate_rarity(&tokens[1], &tokens);
+        // Missing traits are keyed on the pair, so this token lacks both the
+        // "Blue" background and the "Laser" eyes the collection carries.
+        assert_eq!(
+            result.missing_traits,
+            vec!["bg: Blue".to_string(), "eyes: Laser".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_token_with_no_traits_scores_zero() {
+        let tokens = vec![token("1", vec![attribute("bg", "Blue")])];
+        let calculator = calculator(&tokens);
+
+        let bare = calculator.calculate_rarity(&token("2", vec![]), &tokens);
+        assert_eq!(bare.rarity_score, 0.0);
+        assert_eq!(bare.rarity_tier, RarityTier::Common);
+    }
+
+    #[test]
+    fn top_rarity_is_ordered_and_bounded() {
+        let tokens = vec![
+            token("1", vec![attribute("bg", "Common")]),
+            token("2", vec![attribute("bg", "Common")]),
+            token("3", vec![attribute("bg", "Common")]),
+            token("4", vec![attribute("bg", "Rare")]),
+        ];
+        let calculator = calculator(&tokens);
+
+        // Mirror what the service does: score every token, then sort.
+        let mut scored: Vec<NFT> = tokens
+            .iter()
+            .map(|nft| {
+                let result = calculator.calculate_rarity(nft, &tokens);
+                let mut nft = nft.clone();
+                nft.rarity_score = result.rarity_score;
+                nft
+            })
+            .collect();
+        scored.sort_by(|a, b| b.rarity_score.total_cmp(&a.rarity_score));
+
+        assert_eq!(scored[0].token_id, "4", "the rarest token sorts first");
+        assert_eq!(scored.len(), 4);
     }
 }

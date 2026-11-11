@@ -6,13 +6,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use ethers::types::{Address, H256, U256};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
 // ============================================
 // Types
@@ -123,7 +120,7 @@ pub struct NFTIndexer {
     db: Arc<Database>,
     ipfs: IPFSClient,
     metadata_cache: RwLock<HashMap<String, Option<NFTMetadata>>>,
-    rarity_cache: RwLock<HashMap<String, RarityScore>>,
+    rarity_cache: RwLock<HashMap<String, Vec<RarityScore>>>,
 }
 
 pub struct Database {
@@ -251,15 +248,15 @@ impl NFTIndexer {
 
     async fn fetch_from_ipfs(&self, uri: &str) -> Result<Option<NFTMetadata>> {
         let cid = uri.trim_start_matches("ipfs://");
-        let gateway = "https://ipfs.io/ipfs/";
-        
-        let url = if cid.starts_with("ipfs://") {
-            format!("{}{}", gateway, cid.trim_start_matches("ipfs://"))
-        } else {
-            format!("{}{}", gateway, cid)
+
+        // Try every configured gateway in order rather than betting on one.
+        let Some(bytes) = self.ipfs.fetch(cid).await? else {
+            return Ok(None);
         };
-        
-        self.fetch_and_parse(&url).await
+
+        serde_json::from_slice::<NFTMetadata>(&bytes)
+            .map(Some)
+            .map_err(|error| NFTError::Parse(error.to_string()))
     }
 
     async fn fetch_from_arweave(&self, uri: &str) -> Result<Option<NFTMetadata>> {
@@ -314,9 +311,25 @@ impl NFTIndexer {
     }
 
     /// Calculate rarity scores for a collection
+    /// Calculate rarity scores for a collection
+    ///
+    /// Scores are cached per collection: recomputing them walks every token and
+    /// its traits, and rarity only changes when the collection does.
     pub async fn calculate_rarity(&self, contract: &str) -> Result<Vec<RarityScore>> {
+        if let Some(cached) = self.rarity_cache.read().get(contract) {
+            return Ok(cached.clone());
+        }
+
+        let scores = self.compute_rarity(contract).await?;
+        self.rarity_cache
+            .write()
+            .insert(contract.to_string(), scores.clone());
+        Ok(scores)
+    }
+
+    async fn compute_rarity(&self, contract: &str) -> Result<Vec<RarityScore>> {
         // Get all tokens with metadata
-        let tokens = sqlx::query_as::<_, (String, Option<serde_json::Value>)(
+        let tokens = sqlx::query_as::<_, (String, Option<serde_json::Value>)>(
             "SELECT id, metadata FROM nft_tokens WHERE contract_address = $1"
         )
         .bind(contract)
@@ -350,8 +363,8 @@ impl NFTIndexer {
         }
         
         // Calculate rarity scores
-        let mut scores: Vec<RarityScore> = token_traits.iter().enumerate()
-            .map(|(i, (id, traits))| {
+        let mut scores: Vec<RarityScore> = token_traits.iter()
+            .map(|(id, traits)| {
                 let mut score = 0.0;
                 let mut trait_rarities = Vec::new();
                 

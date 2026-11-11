@@ -38,7 +38,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./explorer/databases/postgres/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - ./explorer/databases/postgres_schema/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     environment:
       - POSTGRES_DB=tigerscan
       - POSTGRES_USER=tigerscan

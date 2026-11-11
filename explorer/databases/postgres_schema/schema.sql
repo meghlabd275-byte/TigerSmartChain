@@ -6,10 +6,26 @@
 -- ENUMS
 -- ============================================================================
 
-CREATE TYPE tx_status AS ENUM ('pending', 'success', 'failed');
-CREATE TYPE log_type AS ENUM ('token_transfer', 'token_approval', 'nft_transfer', 'nft_approval', 'swap', 'mint', 'burn', 'stake', 'unstake', 'vote', 'delegate', 'unknown');
-CREATE TYPE contract_type AS ENUM ('contract', 'token', 'nft', 'multisig', 'proxy', 'factory');
-CREATE TYPE verification_status AS ENUM ('unverified', 'pending', 'verified', 'failed', 'queued');
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'tx_status') THEN
+        CREATE TYPE tx_status AS ENUM ('pending', 'success', 'failed');
+    END IF;
+END $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'log_type') THEN
+        CREATE TYPE log_type AS ENUM ('token_transfer', 'token_approval', 'nft_transfer', 'nft_approval', 'swap', 'mint', 'burn', 'stake', 'unstake', 'vote', 'delegate', 'unknown');
+    END IF;
+END $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'contract_type') THEN
+        CREATE TYPE contract_type AS ENUM ('contract', 'token', 'nft', 'multisig', 'proxy', 'factory');
+    END IF;
+END $$;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'verification_status') THEN
+        CREATE TYPE verification_status AS ENUM ('unverified', 'pending', 'verified', 'failed', 'queued');
+    END IF;
+END $$;
 
 -- ============================================================================
 -- BLOCKS
@@ -46,11 +62,11 @@ CREATE TABLE IF NOT EXISTS blocks (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_blocks_number ON blocks(number DESC);
-CREATE INDEX idx_blocks_hash ON blocks(hash);
-CREATE INDEX idx_blocks_timestamp ON blocks(timestamp DESC);
-CREATE INDEX idx_blocks_miner ON blocks(miner);
-CREATE INDEX idx_blocks_timestamp_number ON blocks(timestamp DESC, number DESC);
+CREATE INDEX IF NOT EXISTS idx_blocks_number ON blocks(number DESC);
+CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_blocks_miner ON blocks(miner);
+CREATE INDEX IF NOT EXISTS idx_blocks_timestamp_number ON blocks(timestamp DESC, number DESC);
 
 -- ============================================================================
 -- UNCLES/OMMER BLOCKS
@@ -71,9 +87,9 @@ CREATE TABLE IF NOT EXISTS uncles (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_uncles_hash ON uncles(hash);
-CREATE INDEX idx_uncles_block_number ON uncles(block_number);
-CREATE INDEX idx_uncles_miner ON uncles(miner);
+CREATE INDEX IF NOT EXISTS idx_uncles_hash ON uncles(hash);
+CREATE INDEX IF NOT EXISTS idx_uncles_block_number ON uncles(block_number);
+CREATE INDEX IF NOT EXISTS idx_uncles_miner ON uncles(miner);
 
 -- ============================================================================
 -- TRANSACTIONS
@@ -110,42 +126,15 @@ CREATE TABLE IF NOT EXISTS transactions (
     FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE SET NULL
 );
 
-CREATE INDEX idx_transactions_hash ON transactions(hash);
-CREATE INDEX idx_transactions_block_number ON transactions(block_number DESC);
-CREATE INDEX idx_transactions_from ON transactions(from_address);
-CREATE INDEX idx_transactions_to ON transactions(to_address);
-CREATE INDEX idx_transactions_timestamp ON transactions(block_timestamp DESC);
-CREATE INDEX idx_transactions_status ON transactions(status);
-CREATE INDEX idx_transactions_value ON transactions(value DESC);
-CREATE INDEX idx_transactions_from_to ON transactions(from_address, to_address);
-CREATE INDEX idx_transactions_hash_status ON transactions(hash, status);
-
--- ============================================================================
--- INTERNAL TRANSACTIONS
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS internal_transactions (
-    id BIGSERIAL PRIMARY KEY,
-    transaction_hash VARCHAR(66) NOT NULL,
-    block_number BIGINT NOT NULL,
-    transaction_index INTEGER NOT NULL,
-    depth INTEGER NOT NULL,
-    call_type VARCHAR(32) NOT NULL,
-    from_address VARCHAR(42) NOT NULL,
-    to_address VARCHAR(42) NOT NULL,
-    value NUMERIC(78, 0) NOT NULL DEFAULT 0,
-    gas BIGINT NOT NULL,
-    input TEXT,
-    output TEXT,
-    revert BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_internal_tx_hash ON internal_transactions(transaction_hash);
-CREATE INDEX idx_internal_tx_block ON internal_transactions(block_number);
-CREATE INDEX idx_internal_tx_from ON internal_transactions(from_address);
-CREATE INDEX idx_internal_tx_to ON internal_transactions(to_address);
-CREATE INDEX idx_internal_tx_depth ON internal_transactions(depth);
+CREATE INDEX IF NOT EXISTS idx_transactions_hash ON transactions(hash);
+CREATE INDEX IF NOT EXISTS idx_transactions_block_number ON transactions(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_from ON transactions(from_address);
+CREATE INDEX IF NOT EXISTS idx_transactions_to ON transactions(to_address);
+CREATE INDEX IF NOT EXISTS idx_transactions_timestamp ON transactions(block_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
+CREATE INDEX IF NOT EXISTS idx_transactions_value ON transactions(value DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_from_to ON transactions(from_address, to_address);
+CREATE INDEX IF NOT EXISTS idx_transactions_hash_status ON transactions(hash, status);
 
 -- ============================================================================
 -- TOKEN TRANSFERS
@@ -163,12 +152,12 @@ CREATE TABLE IF NOT EXISTS token_transfers (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_token_transfers_token ON token_transfers(token_address);
-CREATE INDEX idx_token_transfers_from ON token_transfers(from_address);
-CREATE INDEX idx_token_transfers_to ON token_transfers(to_address);
-CREATE INDEX idx_token_transfers_tx ON token_transfers(transaction_hash);
-CREATE INDEX idx_token_transfers_block ON token_transfers(block_number DESC);
-CREATE INDEX idx_token_transfers_composite ON token_transfers(token_address, from_address, to_address);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_token ON token_transfers(token_address);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_from ON token_transfers(from_address);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_to ON token_transfers(to_address);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_tx ON token_transfers(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_block ON token_transfers(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_token_transfers_composite ON token_transfers(token_address, from_address, to_address);
 
 -- ============================================================================
 -- TOKEN APPROVALS
@@ -186,9 +175,9 @@ CREATE TABLE IF NOT EXISTS token_approvals (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_token_approvals_token ON token_approvals(token_address);
-CREATE INDEX idx_token_approvals_owner ON token_approvals(owner);
-CREATE INDEX idx_token_approvals_spender ON token_approvals(spender);
+CREATE INDEX IF NOT EXISTS idx_token_approvals_token ON token_approvals(token_address);
+CREATE INDEX IF NOT EXISTS idx_token_approvals_owner ON token_approvals(owner);
+CREATE INDEX IF NOT EXISTS idx_token_approvals_spender ON token_approvals(spender);
 
 -- ============================================================================
 -- NFT TRANSFERS
@@ -207,12 +196,12 @@ CREATE TABLE IF NOT EXISTS nft_transfers (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_nft_transfers_token ON nft_transfers(token_address);
-CREATE INDEX idx_nft_transfers_token_id ON nft_transfers(token_address, token_id);
-CREATE INDEX idx_nft_transfers_from ON nft_transfers(from_address);
-CREATE INDEX idx_nft_transfers_to ON nft_transfers(to_address);
-CREATE INDEX idx_nft_transfers_tx ON nft_transfers(transaction_hash);
-CREATE INDEX idx_nft_transfers_block ON nft_transfers(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_nft_transfers_token ON nft_transfers(token_address);
+CREATE INDEX IF NOT EXISTS idx_nft_transfers_token_id ON nft_transfers(token_address, token_id);
+CREATE INDEX IF NOT EXISTS idx_nft_transfers_from ON nft_transfers(from_address);
+CREATE INDEX IF NOT EXISTS idx_nft_transfers_to ON nft_transfers(to_address);
+CREATE INDEX IF NOT EXISTS idx_nft_transfers_tx ON nft_transfers(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_nft_transfers_block ON nft_transfers(block_number DESC);
 
 -- ============================================================================
 -- NFT APPROVALS
@@ -230,8 +219,8 @@ CREATE TABLE IF NOT EXISTS nft_approvals (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_nft_approvals_token ON nft_approvals(token_address);
-CREATE INDEX idx_nft_approvals_owner ON nft_approvals(owner);
+CREATE INDEX IF NOT EXISTS idx_nft_approvals_token ON nft_approvals(token_address);
+CREATE INDEX IF NOT EXISTS idx_nft_approvals_owner ON nft_approvals(owner);
 
 -- ============================================================================
 -- CONTRACTS
@@ -260,11 +249,11 @@ CREATE TABLE IF NOT EXISTS contracts (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_contracts_address ON contracts(address);
-CREATE INDEX idx_contracts_name ON contracts(contract_name);
-CREATE INDEX idx_contracts_verified ON contracts(is_verified);
-CREATE INDEX idx_contracts_type ON contracts(contract_type);
-CREATE INDEX idx_contracts_compiler ON contracts(compiler);
+CREATE INDEX IF NOT EXISTS idx_contracts_address ON contracts(address);
+CREATE INDEX IF NOT EXISTS idx_contracts_name ON contracts(contract_name);
+CREATE INDEX IF NOT EXISTS idx_contracts_verified ON contracts(is_verified);
+CREATE INDEX IF NOT EXISTS idx_contracts_type ON contracts(contract_type);
+CREATE INDEX IF NOT EXISTS idx_contracts_compiler ON contracts(compiler);
 
 -- ============================================================================
 -- CONTRACT METADATA
@@ -284,11 +273,11 @@ CREATE TABLE IF NOT EXISTS contract_metadata (
     FOREIGN KEY (contract_address) REFERENCES contracts(address) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_contract_metadata_address ON contract_metadata(contract_address);
+CREATE INDEX IF NOT EXISTS idx_contract_metadata_address ON contract_metadata(contract_address);
 
 -- ============================================================================
 -- VERIFIED SOURCE FILES (Multi-file)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS verified_sources (
     id BIGSERIAL PRIMARY KEY,
@@ -301,12 +290,12 @@ CREATE TABLE IF NOT EXISTS verified_sources (
     FOREIGN KEY (contract_address) REFERENCES contracts(address) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_verified_sources_address ON verified_sources(contract_address);
-CREATE INDEX idx_verified_sources_file ON verified_sources(file_name);
+CREATE INDEX IF NOT EXISTS idx_verified_sources_address ON verified_sources(contract_address);
+CREATE INDEX IF NOT EXISTS idx_verified_sources_file ON verified_sources(file_name);
 
 -- ============================================================================
 -- CONTRACT CREATIONS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS contract_creations (
     id BIGSERIAL PRIMARY KEY,
@@ -320,13 +309,13 @@ CREATE TABLE IF NOT EXISTS contract_creations (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_contract_creations_address ON contract_creations(address);
-CREATE INDEX idx_contract_creations_creator ON contract_creations(creator);
-CREATE INDEX idx_contract_creations_tx ON contract_creations(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_contract_creations_address ON contract_creations(address);
+CREATE INDEX IF NOT EXISTS idx_contract_creations_creator ON contract_creations(creator);
+CREATE INDEX IF NOT EXISTS idx_contract_creations_tx ON contract_creations(transaction_hash);
 
 -- ============================================================================
 -- SOURCIFY METADATA
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS sourcify_metadata (
     id BIGSERIAL PRIMARY KEY,
@@ -339,12 +328,12 @@ CREATE TABLE IF NOT EXISTS sourcify_metadata (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_sourcify_address ON sourcify_metadata(contract_address);
-CREATE INDEX idx_sourcify_chain ON sourcify_metadata(chain_id);
+CREATE INDEX IF NOT EXISTS idx_sourcify_address ON sourcify_metadata(contract_address);
+CREATE INDEX IF NOT EXISTS idx_sourcify_chain ON sourcify_metadata(chain_id);
 
 -- ============================================================================
 -- TOKENS (TEP20)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS tokens (
     id BIGSERIAL PRIMARY KEY,
@@ -372,16 +361,16 @@ CREATE TABLE IF NOT EXISTS tokens (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_tokens_address ON tokens(address);
-CREATE INDEX idx_tokens_symbol ON tokens(symbol);
-CREATE INDEX idx_tokens_name ON tokens(name);
-CREATE INDEX idx_tokens_price ON tokens(price_usd DESC);
-CREATE INDEX idx_tokens_market_cap ON tokens(market_cap DESC);
-CREATE INDEX idx_tokens_verified ON tokens(is_verified);
+CREATE INDEX IF NOT EXISTS idx_tokens_address ON tokens(address);
+CREATE INDEX IF NOT EXISTS idx_tokens_symbol ON tokens(symbol);
+CREATE INDEX IF NOT EXISTS idx_tokens_name ON tokens(name);
+CREATE INDEX IF NOT EXISTS idx_tokens_price ON tokens(price_usd DESC);
+CREATE INDEX IF NOT EXISTS idx_tokens_market_cap ON tokens(market_cap DESC);
+CREATE INDEX IF NOT EXISTS idx_tokens_verified ON tokens(is_verified);
 
 -- ============================================================================
 -- TOKEN HOLDERS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS token_holders (
     id BIGSERIAL PRIMARY KEY,
@@ -397,14 +386,14 @@ CREATE TABLE IF NOT EXISTS token_holders (
     UNIQUE(token_address, address)
 );
 
-CREATE INDEX idx_token_holders_token ON token_holders(token_address);
-CREATE INDEX idx_token_holders_address ON token_holders(address);
-CREATE INDEX idx_token_holders_balance ON token_holders(balance DESC);
-CREATE INDEX idx_token_holders_composite ON token_holders(token_address, balance DESC);
+CREATE INDEX IF NOT EXISTS idx_token_holders_token ON token_holders(token_address);
+CREATE INDEX IF NOT EXISTS idx_token_holders_address ON token_holders(address);
+CREATE INDEX IF NOT EXISTS idx_token_holders_balance ON token_holders(balance DESC);
+CREATE INDEX IF NOT EXISTS idx_token_holders_composite ON token_holders(token_address, balance DESC);
 
 -- ============================================================================
 -- NFT COLLECTIONS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS nft_collections (
     id BIGSERIAL PRIMARY KEY,
@@ -433,14 +422,14 @@ CREATE TABLE IF NOT EXISTS nft_collections (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_nft_collections_address ON nft_collections(address);
-CREATE INDEX idx_nft_collections_name ON nft_collections(name);
-CREATE INDEX idx_nft_collections_floor ON nft_collections(floor_price DESC);
-CREATE INDEX idx_nft_collections_volume ON nft_collections(volume_24h DESC);
+CREATE INDEX IF NOT EXISTS idx_nft_collections_address ON nft_collections(address);
+CREATE INDEX IF NOT EXISTS idx_nft_collections_name ON nft_collections(name);
+CREATE INDEX IF NOT EXISTS idx_nft_collections_floor ON nft_collections(floor_price DESC);
+CREATE INDEX IF NOT EXISTS idx_nft_collections_volume ON nft_collections(volume_24h DESC);
 
 -- ============================================================================
 -- NFTS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS nfts (
     id BIGSERIAL PRIMARY KEY,
@@ -462,15 +451,15 @@ CREATE TABLE IF NOT EXISTS nfts (
     UNIQUE(token_address, token_id)
 );
 
-CREATE INDEX idx_nfts_address ON nfts(token_address);
-CREATE INDEX idx_nfts_token_id ON nfts(token_address, token_id);
-CREATE INDEX idx_nfts_owner ON nfts(owner);
-CREATE INDEX idx_nfts_attributes ON nfts USING GIN(attributes jsonb_path_ops);
-CREATE INDEX idx_nfts_last_transfer ON nfts(last_transfer_block DESC);
+CREATE INDEX IF NOT EXISTS idx_nfts_address ON nfts(token_address);
+CREATE INDEX IF NOT EXISTS idx_nfts_token_id ON nfts(token_address, token_id);
+CREATE INDEX IF NOT EXISTS idx_nfts_owner ON nfts(owner);
+CREATE INDEX IF NOT EXISTS idx_nfts_attributes ON nfts USING GIN(attributes jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS idx_nfts_last_transfer ON nfts(last_transfer_block DESC);
 
 -- ============================================================================
 -- NFT OWNERS (Current)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS nft_owners (
     id BIGSERIAL PRIMARY KEY,
@@ -482,13 +471,13 @@ CREATE TABLE IF NOT EXISTS nft_owners (
     UNIQUE(token_address, token_id)
 );
 
-CREATE INDEX idx_nft_owners_token ON nft_owners(token_address);
-CREATE INDEX idx_nft_owners_token_id ON nft_owners(token_address, token_id);
-CREATE INDEX idx_nft_owners_owner ON nft_owners(owner);
+CREATE INDEX IF NOT EXISTS idx_nft_owners_token ON nft_owners(token_address);
+CREATE INDEX IF NOT EXISTS idx_nft_owners_token_id ON nft_owners(token_address, token_id);
+CREATE INDEX IF NOT EXISTS idx_nft_owners_owner ON nft_owners(owner);
 
 -- ============================================================================
 -- VALIDATORS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS validators (
     id BIGSERIAL PRIMARY KEY,
@@ -517,15 +506,15 @@ CREATE TABLE IF NOT EXISTS validators (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_validators_address ON validators(address);
-CREATE INDEX idx_validators_name ON validators(name);
-CREATE INDEX idx_validators_stake ON validators(total_stake DESC);
-CREATE INDEX idx_validators_uptime ON validators(uptime DESC);
-CREATE INDEX idx_validators_active ON validators(is_active);
+CREATE INDEX IF NOT EXISTS idx_validators_address ON validators(address);
+CREATE INDEX IF NOT EXISTS idx_validators_name ON validators(name);
+CREATE INDEX IF NOT EXISTS idx_validators_stake ON validators(total_stake DESC);
+CREATE INDEX IF NOT EXISTS idx_validators_uptime ON validators(uptime DESC);
+CREATE INDEX IF NOT EXISTS idx_validators_active ON validators(is_active);
 
 -- ============================================================================
 -- BLOCK REWARDS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS block_rewards (
     id BIGSERIAL PRIMARY KEY,
@@ -537,13 +526,13 @@ CREATE TABLE IF NOT EXISTS block_rewards (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_block_rewards_block ON block_rewards(block_number DESC);
-CREATE INDEX idx_block_rewards_validator ON block_rewards(validator);
-CREATE INDEX idx_block_rewards_hash ON block_rewards(block_hash);
+CREATE INDEX IF NOT EXISTS idx_block_rewards_block ON block_rewards(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_block_rewards_validator ON block_rewards(validator);
+CREATE INDEX IF NOT EXISTS idx_block_rewards_hash ON block_rewards(block_hash);
 
 -- ============================================================================
 -- TRACES
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS traces (
     id BIGSERIAL PRIMARY KEY,
@@ -563,16 +552,16 @@ CREATE TABLE IF NOT EXISTS traces (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_traces_tx ON traces(transaction_hash);
-CREATE INDEX idx_traces_block ON traces(block_number);
-CREATE INDEX idx_traces_from ON traces(from_address);
-CREATE INDEX idx_traces_to ON traces(to_address);
-CREATE INDEX idx_traces_depth ON traces(depth);
-CREATE INDEX idx_traces_composite ON traces(transaction_hash, depth);
+CREATE INDEX IF NOT EXISTS idx_traces_tx ON traces(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_traces_block ON traces(block_number);
+CREATE INDEX IF NOT EXISTS idx_traces_from ON traces(from_address);
+CREATE INDEX IF NOT EXISTS idx_traces_to ON traces(to_address);
+CREATE INDEX IF NOT EXISTS idx_traces_depth ON traces(depth);
+CREATE INDEX IF NOT EXISTS idx_traces_composite ON traces(transaction_hash, depth);
 
 -- ============================================================================
 -- STATE ACCOUNTS (Historical)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS state_accounts (
     id BIGSERIAL PRIMARY KEY,
@@ -587,13 +576,13 @@ CREATE TABLE IF NOT EXISTS state_accounts (
     UNIQUE(address, block_number)
 );
 
-CREATE INDEX idx_state_accounts_address ON state_accounts(address);
-CREATE INDEX idx_state_accounts_block ON state_accounts(block_number DESC);
-CREATE INDEX idx_state_accounts_composite ON state_accounts(address, block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_state_accounts_address ON state_accounts(address);
+CREATE INDEX IF NOT EXISTS idx_state_accounts_block ON state_accounts(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_state_accounts_composite ON state_accounts(address, block_number DESC);
 
 -- ============================================================================
 -- ACCOUNTS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS accounts (
     id BIGSERIAL PRIMARY KEY,
@@ -609,13 +598,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_accounts_address ON accounts(address);
-CREATE INDEX idx_accounts_balance ON accounts(balance DESC);
-CREATE INDEX idx_accounts_contract ON accounts(is_contract);
+CREATE INDEX IF NOT EXISTS idx_accounts_address ON accounts(address);
+CREATE INDEX IF NOT EXISTS idx_accounts_balance ON accounts(balance DESC);
+CREATE INDEX IF NOT EXISTS idx_accounts_contract ON accounts(is_contract);
 
 -- ============================================================================
 -- DEX PAIRS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS dex_pairs (
     id BIGSERIAL PRIMARY KEY,
@@ -637,15 +626,15 @@ CREATE TABLE IF NOT EXISTS dex_pairs (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_dex_pairs_address ON dex_pairs(pair_address);
-CREATE INDEX idx_dex_pairs_token0 ON dex_pairs(token0_address);
-CREATE INDEX idx_dex_pairs_token1 ON dex_pairs(token1_address);
-CREATE INDEX idx_dex_pairs_liquidity ON dex_pairs(liquidity_usd DESC);
-CREATE INDEX idx_dex_pairs_volume ON dex_pairs(volume_24h DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_pairs_address ON dex_pairs(pair_address);
+CREATE INDEX IF NOT EXISTS idx_dex_pairs_token0 ON dex_pairs(token0_address);
+CREATE INDEX IF NOT EXISTS idx_dex_pairs_token1 ON dex_pairs(token1_address);
+CREATE INDEX IF NOT EXISTS idx_dex_pairs_liquidity ON dex_pairs(liquidity_usd DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_pairs_volume ON dex_pairs(volume_24h DESC);
 
 -- ============================================================================
 -- TOKEN PRICES (Historical)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS token_prices (
     id BIGSERIAL PRIMARY KEY,
@@ -657,13 +646,13 @@ CREATE TABLE IF NOT EXISTS token_prices (
     UNIQUE(token_address, timestamp)
 );
 
-CREATE INDEX idx_token_prices_address ON token_prices(token_address);
-CREATE INDEX idx_token_prices_time ON token_prices(timestamp DESC);
-CREATE INDEX idx_token_prices_composite ON token_prices(token_address, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_token_prices_address ON token_prices(token_address);
+CREATE INDEX IF NOT EXISTS idx_token_prices_time ON token_prices(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_token_prices_composite ON token_prices(token_address, timestamp DESC);
 
 -- ============================================================================
 -- GAS PRICES
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS gas_prices (
     id BIGSERIAL PRIMARY KEY,
@@ -676,12 +665,12 @@ CREATE TABLE IF NOT EXISTS gas_prices (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_gas_prices_time ON gas_prices(timestamp DESC);
-CREATE INDEX idx_gas_prices_gas_price ON gas_prices(gas_price);
+CREATE INDEX IF NOT EXISTS idx_gas_prices_time ON gas_prices(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_gas_prices_gas_price ON gas_prices(gas_price);
 
 -- ============================================================================
 -- PENDING TRANSACTIONS (MEMPOOL)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS pending_transactions (
     id BIGSERIAL PRIMARY KEY,
@@ -697,14 +686,14 @@ CREATE TABLE IF NOT EXISTS pending_transactions (
     expires_at TIMESTAMP WITH TIME ZONE
 );
 
-CREATE INDEX idx_pending_tx_hash ON pending_transactions(hash);
-CREATE INDEX idx_pending_tx_from ON pending_transactions(from_address);
-CREATE INDEX idx_pending_tx_nonce ON pending_transactions(nonce);
-CREATE INDEX idx_pending_tx_created ON pending_transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pending_tx_hash ON pending_transactions(hash);
+CREATE INDEX IF NOT EXISTS idx_pending_tx_from ON pending_transactions(from_address);
+CREATE INDEX IF NOT EXISTS idx_pending_tx_nonce ON pending_transactions(nonce);
+CREATE INDEX IF NOT EXISTS idx_pending_tx_created ON pending_transactions(created_at DESC);
 
 -- ============================================================================
 -- SEARCH INDEX (Full-text)
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS search_index (
     id BIGSERIAL PRIMARY KEY,
@@ -719,14 +708,14 @@ CREATE TABLE IF NOT EXISTS search_index (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_search_address ON search_index(address);
-CREATE INDEX idx_search_hash ON search_index(hash);
-CREATE INDEX idx_search_number ON search_index(number DESC);
-CREATE INDEX idx_search_tsv ON search_index USING GIN(content_tsv);
+CREATE INDEX IF NOT EXISTS idx_search_address ON search_index(address);
+CREATE INDEX IF NOT EXISTS idx_search_hash ON search_index(hash);
+CREATE INDEX IF NOT EXISTS idx_search_number ON search_index(number DESC);
+CREATE INDEX IF NOT EXISTS idx_search_tsv ON search_index USING GIN(content_tsv);
 
 -- ============================================================================
 -- API KEYS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS api_keys (
     id BIGSERIAL PRIMARY KEY,
@@ -744,13 +733,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_api_keys_hash ON api_keys(key_hash);
-CREATE INDEX idx_api_keys_user ON api_keys(user_id);
-CREATE INDEX idx_api_keys_active ON api_keys(is_active);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(is_active);
 
 -- ============================================================================
 -- WEBHOOKS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS webhooks (
     id BIGSERIAL PRIMARY KEY,
@@ -764,12 +753,12 @@ CREATE TABLE IF NOT EXISTS webhooks (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_webhooks_event ON webhooks(event_type);
-CREATE INDEX idx_webhooks_active ON webhooks(is_active);
+CREATE INDEX IF NOT EXISTS idx_webhooks_event ON webhooks(event_type);
+CREATE INDEX IF NOT EXISTS idx_webhooks_active ON webhooks(is_active);
 
 -- ============================================================================
 -- WEBHOOK EVENTS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS webhook_events (
     id BIGSERIAL PRIMARY KEY,
@@ -786,13 +775,13 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_webhook_events_webhook ON webhook_events(webhook_id);
-CREATE INDEX idx_webhook_events_status ON webhook_events(status);
-CREATE INDEX idx_webhook_events_created ON webhook_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_webhook ON webhook_events(webhook_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_status ON webhook_events(status);
+CREATE INDEX IF NOT EXISTS idx_webhook_events_created ON webhook_events(created_at DESC);
 
 -- ============================================================================
 -- MALICIOUS CONTRACTS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS malicious_contracts (
     id BIGSERIAL PRIMARY KEY,
@@ -807,14 +796,14 @@ CREATE TABLE IF NOT EXISTS malicious_contracts (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_malicious_address ON malicious_contracts(address);
-CREATE INDEX idx_malicious_type ON malicious_contracts(threat_type);
-CREATE INDEX idx_malicious_confidence ON malicious_contracts(confidence DESC);
-CREATE INDEX idx_malicious_active ON malicious_contracts(is_active);
+CREATE INDEX IF NOT EXISTS idx_malicious_address ON malicious_contracts(address);
+CREATE INDEX IF NOT EXISTS idx_malicious_type ON malicious_contracts(threat_type);
+CREATE INDEX IF NOT EXISTS idx_malicious_confidence ON malicious_contracts(confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_malicious_active ON malicious_contracts(is_active);
 
 -- ============================================================================
 -- PHISHING URLs
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS phishing_urls (
     id BIGSERIAL PRIMARY KEY,
@@ -829,13 +818,13 @@ CREATE TABLE IF NOT EXISTS phishing_urls (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_phishing_url ON phishing_urls(url);
-CREATE INDEX idx_phishing_domain ON phishing_urls(domain);
-CREATE INDEX idx_phishing_active ON phishing_urls(is_active);
+CREATE INDEX IF NOT EXISTS idx_phishing_url ON phishing_urls(url);
+CREATE INDEX IF NOT EXISTS idx_phishing_domain ON phishing_urls(domain);
+CREATE INDEX IF NOT EXISTS idx_phishing_active ON phishing_urls(is_active);
 
 -- ============================================================================
 -- SCAM TOKENS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS scam_tokens (
     id BIGSERIAL PRIMARY KEY,
@@ -851,13 +840,13 @@ CREATE TABLE IF NOT EXISTS scam_tokens (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_scam_tokens_address ON scam_tokens(address);
-CREATE INDEX idx_scam_tokens_type ON scam_tokens(threat_type);
-CREATE INDEX idx_scam_tokens_active ON scam_tokens(is_active);
+CREATE INDEX IF NOT EXISTS idx_scam_tokens_address ON scam_tokens(address);
+CREATE INDEX IF NOT EXISTS idx_scam_tokens_type ON scam_tokens(threat_type);
+CREATE INDEX IF NOT EXISTS idx_scam_tokens_active ON scam_tokens(is_active);
 
 -- ============================================================================
 -- WHALE TRANSACTIONS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS whale_transactions (
     id BIGSERIAL PRIMARY KEY,
@@ -872,14 +861,14 @@ CREATE TABLE IF NOT EXISTS whale_transactions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_whale_tx_hash ON whale_transactions(transaction_hash);
-CREATE INDEX idx_whale_from ON whale_transactions(from_address);
-CREATE INDEX idx_whale_value ON whale_transactions(value_usd DESC);
-CREATE INDEX idx_whale_block ON whale_transactions(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_whale_tx_hash ON whale_transactions(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_whale_from ON whale_transactions(from_address);
+CREATE INDEX IF NOT EXISTS idx_whale_value ON whale_transactions(value_usd DESC);
+CREATE INDEX IF NOT EXISTS idx_whale_block ON whale_transactions(block_number DESC);
 
 -- ============================================================================
 -- DEX SWAPS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS dex_swaps (
     id BIGSERIAL PRIMARY KEY,
@@ -897,14 +886,14 @@ CREATE TABLE IF NOT EXISTS dex_swaps (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_dex_swaps_tx ON dex_swaps(transaction_hash);
-CREATE INDEX idx_dex_swaps_pair ON dex_swaps(pair_address);
-CREATE INDEX idx_dex_swaps_from ON dex_swaps(from_address);
-CREATE INDEX idx_dex_swaps_block ON dex_swaps(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_tx ON dex_swaps(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_pair ON dex_swaps(pair_address);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_from ON dex_swaps(from_address);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_block ON dex_swaps(block_number DESC);
 
 -- ============================================================================
 -- CROSS-CHAIN TRANSFERS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS cross_chain_transfers (
     id BIGSERIAL PRIMARY KEY,
@@ -923,14 +912,14 @@ CREATE TABLE IF NOT EXISTS cross_chain_transfers (
     confirmed_at TIMESTAMP WITH TIME ZONE
 );
 
-CREATE INDEX idx_cross_chain_tx ON cross_chain_transfers(transaction_hash);
-CREATE INDEX idx_cross_chain_from ON cross_chain_transfers(from_address);
-CREATE INDEX idx_cross_chain_status ON cross_chain_transfers(status);
-CREATE INDEX idx_cross_chain_block ON cross_chain_transfers(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_cross_chain_tx ON cross_chain_transfers(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_cross_chain_from ON cross_chain_transfers(from_address);
+CREATE INDEX IF NOT EXISTS idx_cross_chain_status ON cross_chain_transfers(status);
+CREATE INDEX IF NOT EXISTS idx_cross_chain_block ON cross_chain_transfers(block_number DESC);
 
 -- ============================================================================
 -- ANALYTICS
-// ============================================================================
+-- ============================================================================
 
 CREATE TABLE IF NOT EXISTS analytics_daily (
     id BIGSERIAL PRIMARY KEY,
@@ -948,11 +937,11 @@ CREATE TABLE IF NOT EXISTS analytics_daily (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_analytics_date ON analytics_daily(date DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_date ON analytics_daily(date DESC);
 
 -- ============================================================================
 -- FUNCTIONS AND PROCEDURES
-// ============================================================================
+-- ============================================================================
 
 -- Function to update token holder counts
 CREATE OR REPLACE FUNCTION update_token_holders_count()
@@ -971,8 +960,8 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Trigger to update token holders count
-CREATE TRIGGER trigger_update_token_holders
-AFTER INSERT ON token_holders
+DROP TRIGGER IF EXISTS trigger_update_token_holders ON token_holders;
+CREATE TRIGGER trigger_update_token_holders AFTER INSERT ON token_holders
 FOR EACH ROW
 EXECUTE FUNCTION update_token_holders_count();
 
@@ -989,8 +978,8 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Trigger to update account nonce
-CREATE TRIGGER trigger_update_nonce
-AFTER INSERT ON transactions
+DROP TRIGGER IF EXISTS trigger_update_nonce ON transactions;
+CREATE TRIGGER trigger_update_nonce AFTER INSERT ON transactions
 FOR EACH ROW
 WHEN (NEW.status = 'success')
 EXECUTE FUNCTION update_account_nonce();
@@ -1028,7 +1017,7 @@ RETURNS TABLE(
     to_address VARCHAR,
     value NUMERIC,
     block_number BIGINT,
-    timestamp BIGINT
+    block_timestamp BIGINT
 ) AS $$
 BEGIN
     RETURN QUERY
@@ -1189,7 +1178,7 @@ GROUP BY no.token_address, no.owner, nc.name, nc.symbol;
 
 -- ============================================================================
 -- PARTITIONS (Optional for large datasets)
-// ============================================================================
+-- ============================================================================
 
 -- Partition transactions by month (example)
 -- CREATE TABLE transactions_y2024 PARTITION OF transactions
@@ -1201,7 +1190,7 @@ GROUP BY no.token_address, no.owner, nc.name, nc.symbol;
 
 -- ============================================================================
 -- COMMENTS
-// ============================================================================
+-- ============================================================================
 
 COMMENT ON TABLE blocks IS 'All blocks on the blockchain';
 COMMENT ON TABLE transactions IS 'All transactions on the blockchain';
@@ -1308,27 +1297,12 @@ CREATE TABLE IF NOT EXISTS internal_transactions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_internal_tx_hash ON internal_transactions(transaction_hash);
-CREATE INDEX idx_internal_tx_block ON internal_transactions(block_number);
-CREATE INDEX idx_internal_tx_from ON internal_transactions(from_address);
-CREATE INDEX idx_internal_tx_to ON internal_transactions(to_address);
+CREATE INDEX IF NOT EXISTS idx_internal_tx_hash ON internal_transactions(transaction_hash);
+CREATE INDEX IF NOT EXISTS idx_internal_tx_block ON internal_transactions(block_number);
+CREATE INDEX IF NOT EXISTS idx_internal_tx_from ON internal_transactions(from_address);
+CREATE INDEX IF NOT EXISTS idx_internal_tx_to ON internal_transactions(to_address);
 
 -- Token Holders
-CREATE TABLE IF NOT EXISTS token_holders (
-    id BIGSERIAL PRIMARY KEY,
-    token_address VARCHAR(42) NOT NULL,
-    holder_address VARCHAR(42) NOT NULL,
-    balance NUMERIC(78, 0) NOT NULL DEFAULT 0,
-    percent NUMERIC(10, 6) DEFAULT 0,
-    rank INTEGER DEFAULT 0,
-    first_block BIGINT NOT NULL,
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(token_address, holder_address)
-);
-
-CREATE INDEX idx_token_holders_token ON token_holders(token_address);
-CREATE INDEX idx_token_holders_holder ON token_holders(holder_address);
-
 -- Token Holder History
 CREATE TABLE IF NOT EXISTS token_holder_history (
     id BIGSERIAL PRIMARY KEY,
@@ -1341,29 +1315,6 @@ CREATE TABLE IF NOT EXISTS token_holder_history (
 );
 
 -- Traces (raw trace data)
-CREATE TABLE IF NOT EXISTS traces (
-    id BIGSERIAL PRIMARY KEY,
-    transaction_hash VARCHAR(66) NOT NULL,
-    block_number BIGINT NOT NULL,
-    trace_address TEXT NOT NULL,
-    trace_type VARCHAR(32) NOT NULL,
-    call_type VARCHAR(32),
-    from_address VARCHAR(42) NOT NULL,
-    to_address VARCHAR(42),
-    value NUMERIC(78, 0) DEFAULT 0,
-    gas VARCHAR(32),
-    gas_used VARCHAR(32),
-    input TEXT,
-    output TEXT,
-    error TEXT,
-    subtraces INTEGER DEFAULT 0,
-    trace_id TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE INDEX idx_traces_hash ON traces(transaction_hash);
-CREATE INDEX idx_traces_block ON traces(block_number);
-
 -- State Diffs (balance/storage changes)
 CREATE TABLE IF NOT EXISTS state_diffs (
     id BIGSERIAL PRIMARY KEY,
@@ -1378,8 +1329,8 @@ CREATE TABLE IF NOT EXISTS state_diffs (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX idx_state_diffs_block ON state_diffs(block_number);
-CREATE INDEX idx_state_diffs_address ON state_diffs(address);
+CREATE INDEX IF NOT EXISTS idx_state_diffs_block ON state_diffs(block_number);
+CREATE INDEX IF NOT EXISTS idx_state_diffs_address ON state_diffs(address);
 
 -- Governance Proposals
 CREATE TABLE IF NOT EXISTS governance_proposals (
@@ -1450,4 +1401,182 @@ CREATE TABLE IF NOT EXISTS nft_rarity (
     traits JSONB,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(collection_address, token_id)
+);
+
+
+-- ============================================================================
+-- TABLES PREVIOUSLY DEFINED ONLY IN databases/postgres/schema.sql
+-- ============================================================================
+-- These were split across two schema files; one of the two was mounted by the
+-- Postgres container and the other by the migrator, so whichever ran second
+-- either created nothing or failed. They live here now, after every table they
+-- reference, and the mount points at this file.
+
+CREATE TABLE IF NOT EXISTS bridge_transfers (
+    id BIGSERIAL PRIMARY KEY,
+    transfer_id VARCHAR(100) NOT NULL UNIQUE,
+    source_chain_id BIGINT NOT NULL,
+    dest_chain_id BIGINT NOT NULL,
+    sender VARCHAR(42) NOT NULL,
+    recipient VARCHAR(42) NOT NULL,
+    token_address VARCHAR(42),
+    amount VARCHAR(66),
+    amount_usd VARCHAR(66),
+    status VARCHAR(50) DEFAULT 'pending',
+    direction VARCHAR(10) NOT NULL,
+    fee VARCHAR(66),
+    nonce BIGINT,
+    message_hash VARCHAR(66),
+    confirmation_time BIGINT,
+    completion_time BIGINT,
+    block_number BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS collections (
+    id BIGSERIAL PRIMARY KEY,
+    address VARCHAR(42) NOT NULL UNIQUE,
+    name VARCHAR(255) NOT NULL,
+    symbol VARCHAR(50),
+    description TEXT,
+    image_url TEXT,
+    external_url TEXT,
+    contract_type VARCHAR(20) DEFAULT 'BEP721',
+    total_supply BIGINT DEFAULT 0,
+    owners_count BIGINT DEFAULT 0,
+    nfts_count BIGINT DEFAULT 0,
+    floor_price VARCHAR(66),
+    volume_24h VARCHAR(66),
+    volume_total VARCHAR(66),
+    creator VARCHAR(42),
+    is_verified BOOLEAN DEFAULT FALSE,
+    is_active BOOLEAN DEFAULT TRUE,
+    tx_hash VARCHAR(66),
+    block_number BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS contract_events (
+    id BIGSERIAL PRIMARY KEY,
+    contract_address VARCHAR(42) NOT NULL,
+    event_name VARCHAR(255) NOT NULL,
+    event_signature VARCHAR(255) NOT NULL,
+    topic0 VARCHAR(66),
+    first_block BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (contract_address) REFERENCES contracts(address) ON DELETE CASCADE,
+    UNIQUE(contract_address, event_signature)
+);
+
+CREATE TABLE IF NOT EXISTS daily_stats (
+    id BIGSERIAL PRIMARY KEY,
+    date DATE NOT NULL UNIQUE,
+    blocks_count INTEGER DEFAULT 0,
+    transactions_count INTEGER DEFAULT 0,
+    new_addresses_count INTEGER DEFAULT 0,
+    gas_used BIGINT DEFAULT 0,
+    avg_gas_price BIGINT DEFAULT 0,
+    total_value_locked VARCHAR(66),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS internal_transfers (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    from_address VARCHAR(42),
+    to_address VARCHAR(42),
+    value VARCHAR(66),
+    call_type VARCHAR(20),
+    depth INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS logs (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    address VARCHAR(42) NOT NULL,
+    topics JSONB NOT NULL,
+    data TEXT NOT NULL,
+    log_index INTEGER NOT NULL,
+    timestamp BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE,
+    UNIQUE(transaction_hash, log_index)
+);
+
+CREATE TABLE IF NOT EXISTS nft_holders (
+    id BIGSERIAL PRIMARY KEY,
+    collection_address VARCHAR(42) NOT NULL,
+    address VARCHAR(42) NOT NULL,
+    balance BIGINT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(collection_address, address)
+);
+
+CREATE TABLE IF NOT EXISTS proposals (
+    id BIGSERIAL PRIMARY KEY,
+    proposal_id BIGINT NOT NULL UNIQUE,
+    proposer VARCHAR(42) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    target_contract VARCHAR(42),
+    call_data TEXT,
+    value VARCHAR(66),
+    status VARCHAR(20) DEFAULT 'pending',
+    for_votes VARCHAR(66) DEFAULT '0',
+    against_votes VARCHAR(66) DEFAULT '0',
+    abstain_votes VARCHAR(66) DEFAULT '0',
+    start_block BIGINT,
+    end_block BIGINT,
+    eta BIGINT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stakings (
+    id BIGSERIAL PRIMARY KEY,
+    delegator VARCHAR(42) NOT NULL,
+    validator VARCHAR(42) NOT NULL,
+    amount VARCHAR(66) NOT NULL,
+    rewards VARCHAR(66) DEFAULT '0',
+    lock_start_time BIGINT,
+    lock_end_time BIGINT,
+    is_compound BOOLEAN DEFAULT FALSE,
+    is_withdrawn BOOLEAN DEFAULT FALSE,
+    block_number BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (validator) REFERENCES validators(address) ON DELETE CASCADE,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS txn_fees (
+    id BIGSERIAL PRIMARY KEY,
+    block_number BIGINT NOT NULL,
+    miner VARCHAR(42) NOT NULL,
+    gas_used BIGINT NOT NULL,
+    gas_price BIGINT NOT NULL,
+    fees VARCHAR(66) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (block_number) REFERENCES blocks(number) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS votes (
+    id BIGSERIAL PRIMARY KEY,
+    proposal_id BIGINT NOT NULL,
+    voter VARCHAR(42) NOT NULL,
+    support BOOLEAN NOT NULL,
+    votes VARCHAR(66) NOT NULL,
+    reason TEXT,
+    timestamp BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(proposal_id, voter)
 );

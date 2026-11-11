@@ -12,7 +12,7 @@ services:
       POSTGRES_DB: tigerscan
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./explorer/databases/postgres/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+      - ./explorer/databases/postgres_schema/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     ports:
       - "5432:5432"
     healthcheck:

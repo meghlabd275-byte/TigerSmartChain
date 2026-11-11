@@ -10,7 +10,7 @@ description = "High-performance NFT metadata and rarity analysis service"
 tokio = { version = "1.35", features = ["full"] }
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate", "chrono", "json"] }
 
 # HTTP client
 reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -30,13 +30,10 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# IPFS support
-ipfs-api = "0.6"
-
 # HTTP server
 axum = "0.6"
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.4", features = ["cors", "trace"] }
+tower-http = { version = "0.4", features = ["cors", "trace", "set-header"] }
 
 # Metrics
 prometheus = "0.13"
