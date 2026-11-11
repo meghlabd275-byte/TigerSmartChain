@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/subtle"
+	"encoding/base32"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,88 +25,99 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/argon2"
+)
+
+// Argon2id parameters for password hashing, following the OWASP recommendation
+// of 19 MiB of memory, two iterations and one lane.
+const (
+	argon2Time    = 2
+	argon2Memory  = 19 * 1024
+	argon2Threads = 1
+	argon2KeyLen  = 32
 )
 
 // Security constants
 const (
-	MinPasswordLength    = 12
+	MinPasswordLength  = 12
 	MaxPasswordLength  = 128
 	MinUsernameLength  = 3
 	MaxUsernameLength  = 50
 	MaxLoginAttempts   = 5
-	LockoutDuration   = 15 * time.Minute
-	SessionDuration   = 24 * time.Hour
+	LockoutDuration    = 15 * time.Minute
+	SessionDuration    = 24 * time.Hour
 	MaxSessionsPerUser = 5
 	APIKeyLength       = 64
-	MaxFailedAttempts = 10
-	RateLimitWindow   = time.Minute
-	MaxRequestsPerMin = 60
-	MaxAuditLogs      = 10000
-	BcryptCost        = 14
+	MaxFailedAttempts  = 10
+	RateLimitWindow    = time.Minute
+	MaxRequestsPerMin  = 60
+	MaxAuditLogs       = 10000
+	BcryptCost         = 14
 )
 
 // UserRole represents user role.
 type UserRole int
 
 const (
-	RoleSuperAdmin UserRole = iota // Super admin (white label owner)
-	RoleAdmin                 // Admin
-	RoleUser                 // Regular user
-	RoleWhitelabelClient     // White level client (needs admin approval)
+	RoleSuperAdmin       UserRole = iota // Super admin (white label owner)
+	RoleAdmin                            // Admin
+	RoleUser                             // Regular user
+	RoleWhitelabelClient                 // White level client (needs admin approval)
 )
 
 // AuditAction represents audit action types.
 type AuditAction string
 
 const (
-	AuditUserLogin       AuditAction = "user.login"
-	AuditUserLogout     AuditAction = "user.logout"
-	AuditUserRegister   AuditAction = "user.register"
-	AuditUserApprove   AuditAction = "user.approve"
-	AuditUserSuspend  AuditAction = "user.suspend"
-	AuditUserBan      AuditAction = "user.ban"
-	AuditUserDelete   AuditAction = "user.delete"
-	AuditProductCreate AuditAction = "product.create"
-	AuditProductPause  AuditAction = "product.pause"
-	AuditProductHalt  AuditAction = "product.halt"
-	AuditProductDestroy AuditAction = "product.destroy"
-	AuditAPIKeyCreate AuditAction = "apikey.create"
-	AuditAPIKeyRevoke AuditAction = "apikey.revoke"
+	AuditUserLogin        AuditAction = "user.login"
+	AuditUserLogout       AuditAction = "user.logout"
+	AuditUserRegister     AuditAction = "user.register"
+	AuditUserApprove      AuditAction = "user.approve"
+	AuditUserSuspend      AuditAction = "user.suspend"
+	AuditUserBan          AuditAction = "user.ban"
+	AuditUserDelete       AuditAction = "user.delete"
+	AuditProductCreate    AuditAction = "product.create"
+	AuditProductPause     AuditAction = "product.pause"
+	AuditProductHalt      AuditAction = "product.halt"
+	AuditProductDestroy   AuditAction = "product.destroy"
+	AuditAPIKeyCreate     AuditAction = "apikey.create"
+	AuditAPIKeyRevoke     AuditAction = "apikey.revoke"
 	AuditPermissionGrant  AuditAction = "permission.grant"
 	AuditPermissionRevoke AuditAction = "permission.revoke"
 	AuditAdminCreate      AuditAction = "admin.create"
-	AuditAdminRemove     AuditAction = "admin.remove"
+	AuditAdminRemove      AuditAction = "admin.remove"
 )
 
 // UserStatus represents user status.
 type UserStatus int
 
 const (
-	StatusPending   UserStatus = iota // Pending admin approval
-	StatusActive                     // Active and approved
-	StatusSuspended                  // Temporarily suspended
-	StatusBanned                    // Permanently banned
-	StatusPending2FA                // Pending 2FA verification
-	StatusLocked                   // Account locked due to failed attempts
-	StatusPendingDeletion         // Pending deletion
+	StatusPending         UserStatus = iota // Pending admin approval
+	StatusActive                            // Active and approved
+	StatusSuspended                         // Temporarily suspended
+	StatusBanned                            // Permanently banned
+	StatusPending2FA                        // Pending 2FA verification
+	StatusLocked                            // Account locked due to failed attempts
+	StatusPendingDeletion                   // Pending deletion
 )
 
 // VerificationCode represents verification code for 2FA/email.
 type VerificationCode struct {
-	Code       string
-	Type       string // "email", "2fa", "password_reset"
-	ExpiresAt  uint64
+	Code      string
+	Type      string // "email", "2fa", "password_reset"
+	ExpiresAt uint64
 	Used      bool
 	Attempts  int
 }
 
 // AuditLog represents audit log entry.
 type AuditLog struct {
-	ID         string
-	UserID     string
-	Action     AuditAction
-	IP         string
-	UserAgent  string
+	ID        string
+	UserID    string
+	Action    AuditAction
+	IP        string
+	UserAgent string
 	Details   string
 	Timestamp uint64
 	Success   bool
@@ -111,28 +125,28 @@ type AuditLog struct {
 
 // AttackPrevention provides protection against various attacks.
 type AttackPrevention struct {
-	mu                     sync.RWMutex
-	failedLogins           map[string]*FailedLoginAttempt
-	failedAttempts        map[string]int
-	suspectedIPs          map[string]bool
-	knownBadIPs           map[string]bool
-	xssPatterns           []*regexp.Regexp
-	sqlInjectionPatterns  []*regexp.Regexp
+	mu                   sync.RWMutex
+	failedLogins         map[string]*FailedLoginAttempt
+	failedAttempts       map[string]int
+	suspectedIPs         map[string]bool
+	knownBadIPs          map[string]bool
+	xssPatterns          []*regexp.Regexp
+	sqlInjectionPatterns []*regexp.Regexp
 	csrfTokens           map[string]*CSRFToken
 	loginAttempts        map[string]*LoginAttemptTracker
 }
 
 // FailedLoginAttempt tracks failed login attempts.
 type FailedLoginAttempt struct {
-	Count     int
+	Count        int
 	FirstAttempt uint64
-	LastAttempt uint64
-	IP        string
+	LastAttempt  uint64
+	IP           string
 }
 
 // LoginAttemptTracker tracks login attempts.
 type LoginAttemptTracker struct {
-	Attempts int
+	Attempts    int
 	LastAttempt uint64
 	LockedUntil uint64
 }
@@ -140,7 +154,7 @@ type LoginAttemptTracker struct {
 // CSRFToken represents CSRF token.
 type CSRFToken struct {
 	Token     string
-	UserID   string
+	UserID    string
 	CreatedAt uint64
 	ExpiresAt uint64
 }
@@ -158,38 +172,38 @@ const (
 
 // User represents a white-label client.
 type User struct {
-	ID             string
-	Username       string
-	Email          string
-	PasswordHash   string
-	Salt           string
-	Role           UserRole
-	Status         UserStatus
-	CreatedAt      uint64
-	UpdatedAt      uint64
-	LastLogin      uint64
-	LastActivity   uint64
-	IPAddress      string
-	TwoFactorSecret string // Encrypted 2FA secret
+	ID               string
+	Username         string
+	Email            string
+	PasswordHash     string
+	Salt             string
+	Role             UserRole
+	Status           UserStatus
+	CreatedAt        uint64
+	UpdatedAt        uint64
+	LastLogin        uint64
+	LastActivity     uint64
+	IPAddress        string
+	TwoFactorSecret  string // Encrypted 2FA secret
 	TwoFactorEnabled bool
-	EmailVerified  bool
-	APIKey         string
-	APIKeyHash     string
-	Features       []string
-	Permissions    map[string]bool
-	ProductID      string
-	AdminID        string // Who approved this user
-	FailedAttempts int
-	LockedUntil    uint64
-	VerifyCode     *VerificationCode
-	AuditLogs      []*AuditLog
+	EmailVerified    bool
+	APIKey           string
+	APIKeyHash       string
+	Features         []string
+	Permissions      map[string]bool
+	ProductID        string
+	AdminID          string // Who approved this user
+	FailedAttempts   int
+	LockedUntil      uint64
+	VerifyCode       *VerificationCode
+	AuditLogs        []*AuditLog
 }
 
 // Product represents a white-label product.
 type Product struct {
-	ID            string
-	Name          string
-	BrandName     string
+	ID           string
+	Name         string
+	BrandName    string
 	Domain       string
 	Cloud        string
 	Storage      string
@@ -197,39 +211,39 @@ type Product struct {
 	OwnerID      string
 	AdminID      string // Who authorized this product
 	CreatedAt    uint64
-	UpdatedAt   uint64
-	APIKeys     map[string]*ProductAPIKey
-	Features    []string
-	Config      map[string]interface{}
+	UpdatedAt    uint64
+	APIKeys      map[string]*ProductAPIKey
+	Features     []string
+	Config       map[string]interface{}
 	AuthRequired bool
-	IsPaused    bool
-	IsHalted    bool
-	PausedBy    string
-	HaltedBy    string
-	PausedAt    uint64
-	HaltedAt    uint64
+	IsPaused     bool
+	IsHalted     bool
+	PausedBy     string
+	HaltedBy     string
+	PausedAt     uint64
+	HaltedAt     uint64
 }
 
 // ProductAPIKey represents API key for product.
 type ProductAPIKey struct {
-	Key        string
-	Name       string
-	CreatedAt  uint64
+	Key       string
+	Name      string
+	CreatedAt uint64
 	ExpiresAt uint64
 	Active    bool
 }
 
 // WhiteLabelConfig represents white-label configuration.
 type WhiteLabelConfig struct {
-	CompanyName      string
-	SupportEmail    string
-	LogoURL         string
-	FaviconURL      string
-	PrimaryColor    string
-	SecondaryColor  string
-	AccentColor     string
-	TermsURL        string
-	PrivacyURL      string
+	CompanyName    string
+	SupportEmail   string
+	LogoURL        string
+	FaviconURL     string
+	PrimaryColor   string
+	SecondaryColor string
+	AccentColor    string
+	TermsURL       string
+	PrivacyURL     string
 }
 
 // WhiteLabelAdmin manages white-label clients with industrial-grade security.
@@ -292,20 +306,20 @@ func NewWhiteLabelAdmin() (*WhiteLabelAdmin, error) {
 
 	return &WhiteLabelAdmin{
 		users:            make(map[string]*User),
-		usersByEmail:    make(map[string]*User),
-		usersByUsername: make(map[string]*User),
-		usersByAPIKey:   make(map[string]*User),
-		products:        make(map[string]*Product),
+		usersByEmail:     make(map[string]*User),
+		usersByUsername:  make(map[string]*User),
+		usersByAPIKey:    make(map[string]*User),
+		products:         make(map[string]*Product),
 		productsByOwner:  make(map[string][]*Product),
-		config:         &WhiteLabelConfig{},
-		sessions:       NewSessionManager(),
-		rateLimiter:    NewRateLimiter(MaxRequestsPerMin, RateLimitWindow),
+		config:           &WhiteLabelConfig{},
+		sessions:         NewSessionManager(),
+		rateLimiter:      NewRateLimiter(MaxRequestsPerMin, RateLimitWindow),
 		attackPrevention: NewAttackPrevention(),
-		encKey:         encKey,
-		twoFactorKey:   twoFactorKey,
-		masterKey:     masterKey,
-		dbKey:         dbKey,
-		auditLogs:     make([]*AuditLog, 0, MaxAuditLogs),
+		encKey:           encKey,
+		twoFactorKey:     twoFactorKey,
+		masterKey:        masterKey,
+		dbKey:            dbKey,
+		auditLogs:        make([]*AuditLog, 0, MaxAuditLogs),
 	}, nil
 }
 
@@ -315,82 +329,91 @@ func (wla *WhiteLabelAdmin) Register(username, email, password, ip string) (stri
 	// Input validation and sanitization
 	username = SanitizeInput(username)
 	email = strings.ToLower(strings.TrimSpace(email))
-	
+
 	if len(username) < MinUsernameLength || len(username) > MaxUsernameLength {
 		return "", fmt.Errorf("username must be between %d and %d characters", MinUsernameLength, MaxUsernameLength)
 	}
-	
+
 	if _, err := mail.ParseAddress(email); err != nil {
 		return "", fmt.Errorf("invalid email address")
 	}
-	
+
 	if err := validatePassword(password); err != nil {
 		return "", err
 	}
-	
+
 	// Rate limiting check
 	if !wla.rateLimiter.Allow(ip + ":register") {
 		return "", fmt.Errorf("too many registration attempts. Please try again later")
 	}
-	
+
 	// Attack prevention check
 	if wla.attackPrevention.IsIPBlocked(ip) {
 		return "", fmt.Errorf("your IP has been blocked due to suspicious activity")
 	}
-	
+
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	// Check if email already registered
 	if _, exists := wla.usersByEmail[email]; exists {
 		wla.attackPrevention.RecordFailedAttempt(ip + ":" + email)
 		return "", fmt.Errorf("email already registered")
 	}
-	
+
 	// Check if username already taken
 	if _, exists := wla.usersByUsername[username]; exists {
 		return "", fmt.Errorf("username already taken")
 	}
-	
+
 	// Generate secure salt and password hash
-	salt := generateSalt()
-	passHash := hashPasswordWithSalt(password, salt)
-	
+	salt, err := generateSalt()
+	if err != nil {
+		return "", err
+	}
+	passHash, err := hashPasswordWithSalt(password, salt)
+	if err != nil {
+		return "", err
+	}
+
 	userID := generateSecureID()
-	verificationCode := generateVerificationCode()
-	
+	verificationCode, err := generateVerificationCode()
+	if err != nil {
+		return "", err
+	}
+
 	user := &User{
 		ID:             userID,
 		Username:       username,
 		Email:          email,
-		PasswordHash:  passHash,
+		PasswordHash:   passHash,
 		Salt:           salt,
 		Role:           RoleWhitelabelClient, // Start as white level client
-		Status:         StatusPending,         // Must be approved by admin
+		Status:         StatusPending,        // Must be approved by admin
 		CreatedAt:      uint64(time.Now().Unix()),
 		UpdatedAt:      uint64(time.Now().Unix()),
 		IPAddress:      ip,
-		EmailVerified: false,
-		Permissions:   make(map[string]bool),
+		EmailVerified:  false,
+		Permissions:    make(map[string]bool),
 		FailedAttempts: 0,
-		LockedUntil:   0,
+		LockedUntil:    0,
 		VerifyCode: &VerificationCode{
 			Code:      verificationCode,
-			Type:     "email",
+			Type:      "email",
 			ExpiresAt: uint64(time.Now().Unix()) + 3600, // 1 hour
-			Used:     false,
-			Attempts: 0,
+			Used:      false,
+			Attempts:  0,
 		},
 		AuditLogs: make([]*AuditLog, 0),
 	}
-	
+
 	wla.users[userID] = user
 	wla.usersByEmail[email] = user
 	wla.usersByUsername[username] = user
-	
+
 	// Create audit log
 	wla.createAuditLog(userID, AuditUserRegister, ip, "", fmt.Sprintf("User registered: %s", email), true)
-	
+
 	return userID, nil
 }
 
@@ -399,19 +422,19 @@ func (wla *WhiteLabelAdmin) RegisterAdmin(username, email, password, ip string) 
 	// Input validation and sanitization
 	username = SanitizeInput(username)
 	email = strings.ToLower(strings.TrimSpace(email))
-	
+
 	if len(username) < MinUsernameLength || len(username) > MaxUsernameLength {
 		return "", fmt.Errorf("username must be between %d and %d characters", MinUsernameLength, MaxUsernameLength)
 	}
-	
+
 	if _, err := mail.ParseAddress(email); err != nil {
 		return "", fmt.Errorf("invalid email address")
 	}
-	
+
 	if err := validatePassword(password); err != nil {
 		return "", err
 	}
-	
+
 	// Check if super admin already exists
 	wla.mu.Lock()
 	if len(wla.users) > 0 {
@@ -423,48 +446,57 @@ func (wla *WhiteLabelAdmin) RegisterAdmin(username, email, password, ip string) 
 		}
 	}
 	wla.mu.Unlock()
-	
+
 	// Generate secure salt and password hash
-	salt := generateSalt()
-	passHash := hashPasswordWithSalt(password, salt)
-	
+	salt, err := generateSalt()
+	if err != nil {
+		return "", err
+	}
+	passHash, err := hashPasswordWithSalt(password, salt)
+	if err != nil {
+		return "", err
+	}
+
 	userID := generateSecureID()
-	verificationCode := generateVerificationCode()
-	
+	verificationCode, err := generateVerificationCode()
+	if err != nil {
+		return "", err
+	}
+
 	user := &User{
-		ID:              userID,
-		Username:        username,
-		Email:           email,
+		ID:             userID,
+		Username:       username,
+		Email:          email,
 		PasswordHash:   passHash,
-		Salt:            salt,
-		Role:            RoleSuperAdmin,
-		Status:          StatusActive, // Super admin is active by default
-		CreatedAt:       uint64(time.Now().Unix()),
-		UpdatedAt:       uint64(time.Now().Unix()),
-		IPAddress:       ip,
+		Salt:           salt,
+		Role:           RoleSuperAdmin,
+		Status:         StatusActive, // Super admin is active by default
+		CreatedAt:      uint64(time.Now().Unix()),
+		UpdatedAt:      uint64(time.Now().Unix()),
+		IPAddress:      ip,
 		EmailVerified:  true,
 		Permissions:    getAllPermissions(),
 		FailedAttempts: 0,
 		LockedUntil:    0,
 		VerifyCode: &VerificationCode{
 			Code:      verificationCode,
-			Type:     "email",
+			Type:      "email",
 			ExpiresAt: uint64(time.Now().Unix()) + 86400, // 24 hours
-			Used:     false,
-			Attempts: 0,
+			Used:      false,
+			Attempts:  0,
 		},
 		AuditLogs: make([]*AuditLog, 0),
 	}
-	
+
 	wla.mu.Lock()
 	wla.users[userID] = user
 	wla.usersByEmail[email] = user
 	wla.usersByUsername[username] = user
 	wla.mu.Unlock()
-	
+
 	// Create audit log
 	wla.createAuditLog(userID, AuditAdminCreate, ip, "", fmt.Sprintf("Super admin registered: %s", email), true)
-	
+
 	return userID, nil
 }
 
@@ -474,14 +506,14 @@ func (wla *WhiteLabelAdmin) Login(email, password, ip, userAgent string) (string
 	if !wla.rateLimiter.Allow(ip + ":login") {
 		return "", fmt.Errorf("too many login attempts. Please try again later")
 	}
-	
+
 	// Attack prevention check
 	if wla.attackPrevention.IsIPBlocked(ip) {
 		return "", fmt.Errorf("your IP has been blocked due to suspicious activity")
 	}
-	
+
 	email = strings.ToLower(strings.TrimSpace(email))
-	
+
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
 
@@ -490,7 +522,7 @@ func (wla *WhiteLabelAdmin) Login(email, password, ip, userAgent string) (string
 		wla.attackPrevention.RecordFailedAttempt(ip + ":" + email)
 		return "", fmt.Errorf("invalid credentials")
 	}
-	
+
 	// Check if account is locked
 	if user.Status == StatusLocked {
 		if uint64(time.Now().Unix()) < user.LockedUntil {
@@ -500,19 +532,19 @@ func (wla *WhiteLabelAdmin) Login(email, password, ip, userAgent string) (string
 		user.Status = StatusPending
 		user.FailedAttempts = 0
 	}
-	
+
 	// Check if account is banned
 	if user.Status == StatusBanned {
 		wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Login attempt while banned", false)
 		return "", fmt.Errorf("account has been permanently banned")
 	}
-	
+
 	// Verify password with constant-time comparison
-	passHash := hashPasswordWithSalt(password, user.Salt)
-	if subtle.ConstantTimeCompare([]byte(user.PasswordHash), []byte(passHash)) != 1 {
+	passHash, err := hashPasswordWithSalt(password, user.Salt)
+	if err != nil || subtle.ConstantTimeCompare([]byte(user.PasswordHash), []byte(passHash)) != 1 {
 		user.FailedAttempts++
 		wla.attackPrevention.RecordFailedAttempt(ip + ":" + email)
-		
+
 		// Lock account after max failed attempts
 		if user.FailedAttempts >= MaxFailedAttempts {
 			user.Status = StatusLocked
@@ -520,38 +552,38 @@ func (wla *WhiteLabelAdmin) Login(email, password, ip, userAgent string) (string
 			wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, fmt.Sprintf("Account locked after %d failed attempts", user.FailedAttempts), false)
 			return "", fmt.Errorf("account has been locked due to too many failed login attempts")
 		}
-		
+
 		wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Invalid password", false)
 		return "", fmt.Errorf("invalid credentials")
 	}
-	
+
 	// Check if 2FA is enabled
 	if user.TwoFactorEnabled {
 		user.Status = StatusPending2FA
 		return "", fmt.Errorf("2fa_required")
 	}
-	
+
 	// Check if user is approved
 	if user.Status == StatusPending {
 		wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Login attempt while pending approval", false)
 		return "", fmt.Errorf("account pending approval. Please contact admin for authorization")
 	}
-	
+
 	// Check if account is suspended
 	if user.Status == StatusSuspended {
 		wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Login attempt while suspended", false)
 		return "", fmt.Errorf("account is suspended. Please contact admin")
 	}
-	
+
 	// Create session
 	session := wla.sessions.CreateWithLimit(user.ID, ip, MaxSessionsPerUser)
 	user.LastLogin = uint64(time.Now().Unix())
 	user.LastActivity = uint64(time.Now().Unix())
 	user.IPAddress = ip
 	user.FailedAttempts = 0
-	
+
 	wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Login successful", true)
-	
+
 	return session, nil
 }
 
@@ -559,41 +591,41 @@ func (wla *WhiteLabelAdmin) Login(email, password, ip, userAgent string) (string
 func (wla *WhiteLabelAdmin) LoginWith2FA(sessionID, code, ip, userAgent string) (string, error) {
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	// Verify session
 	userID, err := wla.sessions.Verify(sessionID)
 	if err != nil {
 		return "", err
 	}
-	
+
 	user, exists := wla.users[userID]
 	if !exists {
 		return "", fmt.Errorf("user not found")
 	}
-	
+
 	// Verify 2FA code
 	if !user.TwoFactorEnabled || user.TwoFactorSecret == "" {
 		return "", fmt.Errorf("2FA not enabled")
 	}
-	
+
 	// Decrypt and verify 2FA code
 	secret, err := decrypt([]byte(user.TwoFactorSecret), wla.twoFactorKey)
 	if err != nil {
 		return "", fmt.Errorf("invalid 2FA secret")
 	}
-	
+
 	if !verifyTOTP(string(secret), code) {
 		user.FailedAttempts++
 		wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Invalid 2FA code", false)
 		return "", fmt.Errorf("invalid 2FA code")
 	}
-	
+
 	// Activate user
 	user.Status = StatusActive
 	user.LastActivity = uint64(time.Now().Unix())
-	
+
 	wla.createAuditLog(user.ID, AuditUserLogin, ip, userAgent, "Login successful with 2FA", true)
-	
+
 	return sessionID, nil
 }
 
@@ -634,19 +666,19 @@ func (wla *WhiteLabelAdmin) ApproveUser(userID, adminID, ip string) error {
 	user.Status = StatusActive
 	user.UpdatedAt = uint64(time.Now().Unix())
 	user.AdminID = adminID
-	
+
 	// Grant default permissions for white level clients
 	if user.Role == RoleWhitelabelClient {
 		user.Permissions = map[string]bool{
-			"product.create": true,
-			"product.manage": true,
-			"product.pause": true,
-			"product.halt": true,
+			"product.create":  true,
+			"product.manage":  true,
+			"product.pause":   true,
+			"product.halt":    true,
 			"product.destroy": false,
-			"admin.create": false,
-			"admin.manage": false,
-			"api_key.create": true,
-			"api_key.manage": true,
+			"admin.create":    false,
+			"admin.manage":    false,
+			"api_key.create":  true,
+			"api_key.manage":  true,
 		}
 	}
 
@@ -764,36 +796,36 @@ func (wla *WhiteLabelAdmin) CreateProduct(ownerID, name, brandName, domain, clou
 	name = SanitizeInput(name)
 	brandName = SanitizeInput(brandName)
 	domain = strings.ToLower(domain)
-	
+
 	if name == "" || brandName == "" || domain == "" {
 		return "", fmt.Errorf("name, brand name, and domain are required")
 	}
-	
+
 	if err := ValidateDomain(domain); err != nil {
 		return "", fmt.Errorf("invalid domain: %v", err)
 	}
-	
+
 	if cloud == "" {
 		cloud = "default"
 	}
-	
+
 	if storage == "" {
 		storage = "default"
 	}
-	
+
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	// Verify owner exists and is active
 	owner, exists := wla.users[ownerID]
 	if !exists {
 		return "", fmt.Errorf("user not found")
 	}
-	
+
 	if owner.Status != StatusActive {
 		return "", fmt.Errorf("user not active. Please contact admin for approval")
 	}
-	
+
 	// Verify admin authorized this product
 	if adminID != "" {
 		admin, exists := wla.users[adminID]
@@ -801,14 +833,14 @@ func (wla *WhiteLabelAdmin) CreateProduct(ownerID, name, brandName, domain, clou
 			return "", fmt.Errorf("unauthorized admin")
 		}
 	}
-	
+
 	// Check permissions
 	if !owner.Permissions["product.create"] {
 		return "", fmt.Errorf("permission denied: product.create")
 	}
-	
+
 	productID := generateSecureID()
-	
+
 	product := &Product{
 		ID:           productID,
 		Name:         name,
@@ -820,24 +852,24 @@ func (wla *WhiteLabelAdmin) CreateProduct(ownerID, name, brandName, domain, clou
 		OwnerID:      ownerID,
 		AdminID:      adminID,
 		CreatedAt:    uint64(time.Now().Unix()),
-		UpdatedAt:   uint64(time.Now().Unix()),
-		APIKeys:     make(map[string]*ProductAPIKey),
-		Features:    getAllFeatures(), // All features included
-		Config:      make(map[string]interface{}),
+		UpdatedAt:    uint64(time.Now().Unix()),
+		APIKeys:      make(map[string]*ProductAPIKey),
+		Features:     getAllFeatures(), // All features included
+		Config:       make(map[string]interface{}),
 		AuthRequired: true, // API keys require authorization
 		IsPaused:     false,
-		IsHalted:    false,
+		IsHalted:     false,
 	}
-	
+
 	wla.products[productID] = product
 	wla.productsByOwner[ownerID] = append(wla.productsByOwner[ownerID], product)
-	
+
 	// Update owner with product ID
 	owner.ProductID = productID
-	
+
 	// Create audit log
 	wla.createAuditLog(ownerID, AuditProductCreate, owner.IPAddress, "", fmt.Sprintf("Product created: %s (%s)", name, productID), true)
-	
+
 	return productID, nil
 }
 
@@ -1139,7 +1171,7 @@ func (wla *WhiteLabelAdmin) GenerateProductAPIKey(productID, adminID, name strin
 		Name:      name,
 		CreatedAt: uint64(time.Now().Unix()),
 		ExpiresAt: expiresAt,
-		Active:   true,
+		Active:    true,
 	}
 
 	wla.createAuditLog(product.OwnerID, AuditAPIKeyCreate, admin.IPAddress, "", fmt.Sprintf("API key created: %s for product: %s", name, productID), true)
@@ -1175,7 +1207,7 @@ func (wla *WhiteLabelAdmin) RevokeProductAPIKey(productID, adminID, keyHash stri
 
 // SessionManager manages user sessions.
 type SessionManager struct {
-	mu sync.RWMutex
+	mu       sync.RWMutex
 	sessions map[string]*Session
 }
 
@@ -1349,23 +1381,45 @@ func generateSecureAPIKey() string {
 	return hex.EncodeToString(b)
 }
 
-func generateSalt() string {
+func generateSalt() (string, error) {
 	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func generateVerificationCode() string {
-	b := make([]byte, 6)
-	for i := range b {
-		b[i] = byte('0' + rand.Intn(10))
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate salt: %w", err)
 	}
-	return string(b)
+	return hex.EncodeToString(b), nil
 }
 
-func hashPasswordWithSalt(password, salt string) string {
-	hash := sha512.Sum512([]byte(password + salt))
-	return hex.EncodeToString(hash[:])
+// generateVerificationCode returns a six-digit code drawn from a uniform
+// distribution over the digits.
+func generateVerificationCode() (string, error) {
+	const digits = 6
+	limit := big.NewInt(10)
+
+	b := make([]byte, digits)
+	for i := range b {
+		n, err := rand.Int(rand.Reader, limit)
+		if err != nil {
+			return "", fmt.Errorf("generate verification code: %w", err)
+		}
+		b[i] = byte('0' + n.Int64())
+	}
+	return string(b), nil
+}
+
+// hashPasswordWithSalt derives a password hash with Argon2id, which is memory
+// hard and therefore resistant to GPU cracking. The salt is decoded from its
+// hex representation and the digest is hex encoded for storage.
+func hashPasswordWithSalt(password, salt string) (string, error) {
+	saltBytes, err := hex.DecodeString(salt)
+	if err != nil {
+		return "", fmt.Errorf("decode salt: %w", err)
+	}
+	if len(saltBytes) < 16 {
+		return "", fmt.Errorf("salt must be at least 16 bytes, got %d", len(saltBytes))
+	}
+
+	digest := argon2.IDKey([]byte(password), saltBytes, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+	return hex.EncodeToString(digest), nil
 }
 
 func hashAPIKey(apiKey string) string {
@@ -1394,7 +1448,7 @@ func encrypt(data []byte, key []byte) ([]byte, error) {
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand, nonce); err != nil {
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, err
 	}
 
@@ -1428,12 +1482,12 @@ func validatePassword(password string) error {
 	if len(password) > MaxPasswordLength {
 		return fmt.Errorf("password must not exceed %d characters", MaxPasswordLength)
 	}
-	
+
 	hasUpper := false
 	hasLower := false
 	hasDigit := false
 	hasSpecial := false
-	
+
 	for _, c := range password {
 		switch {
 		case c >= 'A' && c <= 'Z':
@@ -1446,11 +1500,11 @@ func validatePassword(password string) error {
 			hasSpecial = true
 		}
 	}
-	
+
 	if !hasUpper || !hasLower || !hasDigit || !hasSpecial {
 		return fmt.Errorf("password must contain uppercase, lowercase, digit, and special character")
 	}
-	
+
 	return nil
 }
 
@@ -1482,40 +1536,40 @@ func getAllFeatures() []string {
 
 func getAllPermissions() map[string]bool {
 	return map[string]bool{
-		"product.create":      true,
-		"product.manage":      true,
-		"product.pause":      true,
-		"product.halt":       true,
-		"product.destroy":    true,
+		"product.create":    true,
+		"product.manage":    true,
+		"product.pause":     true,
+		"product.halt":      true,
+		"product.destroy":   true,
 		"product.config":    true,
 		"admin.create":      true,
 		"admin.manage":      true,
-		"admin.suspend":    true,
-		"admin.ban":        true,
+		"admin.suspend":     true,
+		"admin.ban":         true,
 		"api_key.create":    true,
 		"api_key.manage":    true,
 		"api_key.revoke":    true,
-		"permission.grant": true,
+		"permission.grant":  true,
 		"permission.revoke": true,
-		"user.approve":     true,
-		"user.suspend":     true,
-		"user.ban":         true,
+		"user.approve":      true,
+		"user.suspend":      true,
+		"user.ban":          true,
 		"audit.view":        true,
-		"stats.view":       true,
+		"stats.view":        true,
 	}
 }
 
 // NewAttackPrevention creates new attack prevention system.
 func NewAttackPrevention() *AttackPrevention {
 	return &AttackPrevention{
-		failedLogins:          make(map[string]*FailedLoginAttempt),
+		failedLogins:         make(map[string]*FailedLoginAttempt),
 		failedAttempts:       make(map[string]int),
-		suspectedIPs:        make(map[string]bool),
-		knownBadIPs:         make(map[string]bool),
-		xssPatterns:         initXSSPatterns(),
+		suspectedIPs:         make(map[string]bool),
+		knownBadIPs:          make(map[string]bool),
+		xssPatterns:          initXSSPatterns(),
 		sqlInjectionPatterns: initSQLPatterns(),
-		csrfTokens:          make(map[string]*CSRFToken),
-		loginAttempts:       make(map[string]*LoginAttemptTracker),
+		csrfTokens:           make(map[string]*CSRFToken),
+		loginAttempts:        make(map[string]*LoginAttemptTracker),
 	}
 }
 
@@ -1530,7 +1584,7 @@ func initXSSPatterns() []*regexp.Regexp {
 		"eval\\(",
 		"expression\\(",
 	}
-	
+
 	var result []*regexp.Regexp
 	for _, p := range patterns {
 		r, _ := regexp.Compile("(?i)" + p)
@@ -1549,7 +1603,7 @@ func initSQLPatterns() []*regexp.Regexp {
 		"EXEC\\s+@",
 		"EXEC\\s+xp_",
 	}
-	
+
 	var result []*regexp.Regexp
 	for _, p := range patterns {
 		r, _ := regexp.Compile("(?i)" + p)
@@ -1562,18 +1616,18 @@ func initSQLPatterns() []*regexp.Regexp {
 func (ap *AttackPrevention) IsIPBlocked(ip string) bool {
 	ap.mu.RLock()
 	defer ap.mu.RUnlock()
-	
+
 	if ap.knownBadIPs[ip] {
 		return true
 	}
-	
+
 	// Check if IP has too many failed attempts
 	if attempt, ok := ap.failedLogins[ip]; ok {
 		if attempt.Count >= MaxFailedAttempts {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -1581,13 +1635,13 @@ func (ap *AttackPrevention) IsIPBlocked(ip string) bool {
 func (ap *AttackPrevention) RecordFailedAttempt(key string) {
 	ap.mu.Lock()
 	defer ap.mu.Unlock()
-	
+
 	attempt, ok := ap.failedLogins[key]
 	if !ok {
 		ap.failedLogins[key] = &FailedLoginAttempt{
-			Count:         1,
+			Count:        1,
 			FirstAttempt: uint64(time.Now().Unix()),
-			LastAttempt: uint64(time.Now().Unix()),
+			LastAttempt:  uint64(time.Now().Unix()),
 		}
 	} else {
 		attempt.Count++
@@ -1599,7 +1653,7 @@ func (ap *AttackPrevention) RecordFailedAttempt(key string) {
 func (ap *AttackPrevention) CheckXSS(input string) bool {
 	ap.mu.RLock()
 	defer ap.mu.RUnlock()
-	
+
 	for _, pattern := range ap.xssPatterns {
 		if pattern.MatchString(input) {
 			return true
@@ -1612,7 +1666,7 @@ func (ap *AttackPrevention) CheckXSS(input string) bool {
 func (ap *AttackPrevention) CheckSQLInjection(input string) bool {
 	ap.mu.RLock()
 	defer ap.mu.RUnlock()
-	
+
 	for _, pattern := range ap.sqlInjectionPatterns {
 		if pattern.MatchString(input) {
 			return true
@@ -1625,11 +1679,11 @@ func (ap *AttackPrevention) CheckSQLInjection(input string) bool {
 func (ap *AttackPrevention) GenerateCSRFToken(userID string) string {
 	ap.mu.Lock()
 	defer ap.mu.Unlock()
-	
+
 	token := generateSecureID()
 	ap.csrfTokens[token] = &CSRFToken{
 		Token:     token,
-		UserID:   userID,
+		UserID:    userID,
 		CreatedAt: uint64(time.Now().Unix()),
 		ExpiresAt: uint64(time.Now().Unix()) + 3600,
 	}
@@ -1640,32 +1694,76 @@ func (ap *AttackPrevention) GenerateCSRFToken(userID string) string {
 func (ap *AttackPrevention) VerifyCSRFToken(token, userID string) bool {
 	ap.mu.RLock()
 	defer ap.mu.RUnlock()
-	
+
 	csrfToken, ok := ap.csrfTokens[token]
 	if !ok {
 		return false
 	}
-	
+
 	if csrfToken.UserID != userID {
 		return false
 	}
-	
+
 	if uint64(time.Now().Unix()) > csrfToken.ExpiresAt {
 		return false
 	}
-	
+
 	return true
 }
 
-// TOTP implementation (simplified)
+// totpPeriod is the time step, in seconds, defined by RFC 6238.
+const totpPeriod = 30
+
+// verifyTOTP checks a time-based one-time password against the shared secret
+// following RFC 6238 with HMAC-SHA1 and six digits. A one-step window is
+// accepted on either side to tolerate clock drift.
 func verifyTOTP(secret, code string) bool {
-	// Simplified TOTP verification - in production use proper TOTP library
 	if len(code) != 6 {
 		return false
 	}
-	
-	expected := generateVerificationCode()
-	return subtle.ConstantTimeCompare([]byte(code), []byte(expected)) == 1
+
+	key, err := decodeBase32Secret(secret)
+	if err != nil || len(key) == 0 {
+		return false
+	}
+
+	counter := time.Now().Unix() / totpPeriod
+	for offset := int64(-1); offset <= 1; offset++ {
+		expected, err := hotp(key, uint64(counter+offset))
+		if err != nil {
+			return false
+		}
+		if subtle.ConstantTimeCompare([]byte(code), []byte(expected)) == 1 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hotp computes the HMAC-based one-time password for a counter value.
+func hotp(key []byte, counter uint64) (string, error) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], counter)
+
+	mac := hmac.New(sha1.New, key)
+	if _, err := mac.Write(buf[:]); err != nil {
+		return "", err
+	}
+	digest := mac.Sum(nil)
+
+	// Dynamic truncation, RFC 4226 section 5.3.
+	offset := digest[len(digest)-1] & 0x0f
+	binaryCode := binary.BigEndian.Uint32(digest[offset:offset+4]) & 0x7fffffff
+
+	return fmt.Sprintf("%06d", binaryCode%1000000), nil
+}
+
+// decodeBase32Secret decodes a base32-encoded TOTP secret, tolerating padding
+// and lowercase input.
+func decodeBase32Secret(secret string) ([]byte, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(strings.TrimSuffix(secret, "=")))
+	return base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(normalized)
 }
 
 // SanitizeInput sanitizes user input.
@@ -1698,11 +1796,11 @@ func (wla *WhiteLabelAdmin) GetStats() (map[string]interface{}, error) {
 	defer wla.mu.RUnlock()
 
 	stats := map[string]interface{}{
-		"totalUsers":      len(wla.users),
+		"totalUsers":     len(wla.users),
 		"activeUsers":    0,
-		"suspended":     0,
-		"banned":        0,
-		"totalProducts": len(wla.products),
+		"suspended":      0,
+		"banned":         0,
+		"totalProducts":  len(wla.products),
 		"activeProducts": 0,
 	}
 
@@ -1785,20 +1883,20 @@ func (wla *WhiteLabelAdmin) GetAdmins() []*User {
 func (wla *WhiteLabelAdmin) createAuditLog(userID string, action AuditAction, ip, userAgent, details string, success bool) {
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	log := &AuditLog{
-		ID:         generateSecureID(),
-		UserID:     userID,
+		ID:        generateSecureID(),
+		UserID:    userID,
 		Action:    action,
 		IP:        ip,
 		UserAgent: userAgent,
-		Details:  details,
+		Details:   details,
 		Timestamp: uint64(time.Now().Unix()),
-		Success: success,
+		Success:   success,
 	}
-	
+
 	wla.auditLogs = append(wla.auditLogs, log)
-	
+
 	// Limit audit logs
 	if len(wla.auditLogs) > MaxAuditLogs {
 		wla.auditLogs = wla.auditLogs[len(wla.auditLogs)-MaxAuditLogs:]
@@ -1809,14 +1907,14 @@ func (wla *WhiteLabelAdmin) createAuditLog(userID string, action AuditAction, ip
 func (wla *WhiteLabelAdmin) GetAuditLogs(limit int) []*AuditLog {
 	wla.mu.RLock()
 	defer wla.mu.RUnlock()
-	
+
 	if limit > len(wla.auditLogs) {
 		limit = len(wla.auditLogs)
 	}
-	
+
 	result := make([]*AuditLog, limit)
 	copy(result, wla.auditLogs[len(wla.auditLogs)-limit:])
-	
+
 	return result
 }
 
@@ -1824,14 +1922,14 @@ func (wla *WhiteLabelAdmin) GetAuditLogs(limit int) []*AuditLog {
 func (wla *WhiteLabelAdmin) GetUserAuditLogs(userID string, limit int) []*AuditLog {
 	wla.mu.RLock()
 	defer wla.mu.RUnlock()
-	
+
 	var logs []*AuditLog
 	for i := len(wla.auditLogs) - 1; i >= 0 && len(logs) < limit; i-- {
 		if wla.auditLogs[i].UserID == userID {
 			logs = append(logs, wla.auditLogs[i])
 		}
 	}
-	
+
 	return logs
 }
 
@@ -1839,54 +1937,60 @@ func (wla *WhiteLabelAdmin) GetUserAuditLogs(userID string, limit int) []*AuditL
 func (wla *WhiteLabelAdmin) CreateAdmin(superAdminID, username, email, password string) (string, error) {
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	admin, exists := wla.users[superAdminID]
 	if !exists || admin.Role != RoleSuperAdmin {
 		return "", fmt.Errorf("unauthorized: super admin role required")
 	}
-	
+
 	// Validate input
 	username = SanitizeInput(username)
 	email = strings.ToLower(strings.TrimSpace(email))
-	
+
 	if _, err := mail.ParseAddress(email); err != nil {
 		return "", fmt.Errorf("invalid email address")
 	}
-	
+
 	if err := validatePassword(password); err != nil {
 		return "", err
 	}
-	
+
 	// Check if email exists
 	if _, exists := wla.usersByEmail[email]; exists {
 		return "", fmt.Errorf("email already registered")
 	}
-	
+
 	// Generate user
-	salt := generateSalt()
-	passHash := hashPasswordWithSalt(password, salt)
-	
+	salt, err := generateSalt()
+	if err != nil {
+		return "", err
+	}
+	passHash, err := hashPasswordWithSalt(password, salt)
+	if err != nil {
+		return "", err
+	}
+
 	userID := generateSecureID()
-	
+
 	user := &User{
-		ID:            userID,
-		Username:      username,
+		ID:           userID,
+		Username:     username,
 		Email:        email,
 		PasswordHash: passHash,
 		Salt:         salt,
 		Role:         RoleAdmin,
 		Status:       StatusActive,
 		CreatedAt:    uint64(time.Now().Unix()),
-		UpdatedAt:   uint64(time.Now().Unix()),
-		Permissions: getAllPermissions(),
+		UpdatedAt:    uint64(time.Now().Unix()),
+		Permissions:  getAllPermissions(),
 	}
-	
+
 	wla.users[userID] = user
 	wla.usersByEmail[email] = user
 	wla.usersByUsername[username] = user
-	
+
 	wla.createAuditLog(superAdminID, AuditAdminCreate, admin.IPAddress, "", fmt.Sprintf("Admin created: %s", email), true)
-	
+
 	return userID, nil
 }
 
@@ -1894,31 +1998,31 @@ func (wla *WhiteLabelAdmin) CreateAdmin(superAdminID, username, email, password 
 func (wla *WhiteLabelAdmin) RemoveAdmin(superAdminID, adminID string) error {
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	admin, exists := wla.users[superAdminID]
 	if !exists || admin.Role != RoleSuperAdmin {
 		return fmt.Errorf("unauthorized: super admin role required")
 	}
-	
+
 	target, exists := wla.users[adminID]
 	if !exists {
 		return fmt.Errorf("user not found")
 	}
-	
+
 	if target.Role != RoleAdmin {
 		return fmt.Errorf("user is not an admin")
 	}
-	
+
 	// Cannot remove super admin
 	if target.Role == RoleSuperAdmin {
 		return fmt.Errorf("cannot remove super admin")
 	}
-	
+
 	target.Status = StatusBanned
 	wla.sessions.RevokeAll(adminID)
-	
+
 	wla.createAuditLog(superAdminID, AuditAdminRemove, admin.IPAddress, "", fmt.Sprintf("Admin removed: %s", target.Email), true)
-	
+
 	return nil
 }
 
@@ -1926,20 +2030,20 @@ func (wla *WhiteLabelAdmin) RemoveAdmin(superAdminID, adminID string) error {
 func (wla *WhiteLabelAdmin) GrantPermissionToAdmin(superAdminID, adminID, permission string) error {
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	admin, exists := wla.users[superAdminID]
 	if !exists || admin.Role != RoleSuperAdmin {
 		return fmt.Errorf("unauthorized: super admin role required")
 	}
-	
+
 	target, exists := wla.users[adminID]
 	if !exists {
 		return fmt.Errorf("user not found")
 	}
-	
+
 	target.Permissions[permission] = true
 	wla.createAuditLog(superAdminID, AuditPermissionGrant, admin.IPAddress, "", fmt.Sprintf("Permission granted: %s to %s", permission, target.Email), true)
-	
+
 	return nil
 }
 
@@ -1947,20 +2051,20 @@ func (wla *WhiteLabelAdmin) GrantPermissionToAdmin(superAdminID, adminID, permis
 func (wla *WhiteLabelAdmin) RevokePermissionFromAdmin(superAdminID, adminID, permission string) error {
 	wla.mu.Lock()
 	defer wla.mu.Unlock()
-	
+
 	admin, exists := wla.users[superAdminID]
 	if !exists || admin.Role != RoleSuperAdmin {
 		return fmt.Errorf("unauthorized: super admin role required")
 	}
-	
+
 	target, exists := wla.users[adminID]
 	if !exists {
 		return fmt.Errorf("user not found")
 	}
-	
+
 	delete(target.Permissions, permission)
 	wla.createAuditLog(superAdminID, AuditPermissionRevoke, admin.IPAddress, "", fmt.Sprintf("Permission revoked: %s from %s", permission, target.Email), true)
-	
+
 	return nil
 }
 
@@ -1975,17 +2079,17 @@ func ValidateURL(rawURL string) error {
 	if err != nil {
 		return fmt.Errorf("invalid URL")
 	}
-	
+
 	// Only allow http and https
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("invalid URL scheme")
 	}
-	
+
 	// Disallow javascript: protocol
 	if u.Scheme == "javascript" {
 		return fmt.Errorf("javascript scheme not allowed")
 	}
-	
+
 	return nil
 }
 
@@ -1995,5 +2099,5 @@ func (wla *WhiteLabelAdmin) CheckRateLimit(key string) bool {
 }
 
 var _ = context.Background() // Use context
-var _ = big.NewInt(0)     // Use big.Int
-var _ = json.Marshal     // Use json
+var _ = big.NewInt(0)        // Use big.Int
+var _ = json.Marshal         // Use json

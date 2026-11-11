@@ -1,584 +1,423 @@
-// Package graphql provides GraphQL API for TigerScan
-// Built with Go for high performance
+// Package graphql serves the TigerScan read API over GraphQL.
 package graphql
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/graphql-go/graphql"
+	"github.com/graphql-go/graphql/language/ast"
+	"github.com/graphql-go/graphql/language/parser"
+	"github.com/graphql-go/graphql/language/source"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
-	"github.com/99designs/gqlgen/graphql"
-	"github.com/99designs/gqlgen/graphql/handler"
-	"github.com/99designs/gqlgen/graphql/handler/extension"
-	"github.com/99designs/gqlgen/graphql/handler/lru"
-	"github.com/99designs/gqlgen/graphql/handler/transport"
 )
 
-// Config holds GraphQL server configuration
+// Config holds GraphQL server configuration.
 type Config struct {
 	Port           string
 	DBURL          string
 	RedisURL       string
-	MaxComplexity int
-	CacheEnabled  bool
+	MaxComplexity  int
+	MaxDepth       int
+	RateLimit      int
+	CacheEnabled   bool
+	CacheTTL       time.Duration
+	AllowedOrigins []string
+	Debug          bool
 }
 
-// Server represents the GraphQL server
+// Server represents the GraphQL server.
 type Server struct {
-	cfg   *Config
-	pool  *pgxpool.Pool
-	redis *redis.Client
+	cfg      *Config
+	pool     *pgxpool.Pool
+	redis    *redis.Client
+	schema   graphql.Schema
+	hub      *subscriptionHub
+	httpSrv  *http.Server
+	stopOnce sync.Once
 }
 
-// NewServer creates a new GraphQL server
+// NewServer connects to the backing stores and builds the executable schema.
 func NewServer(cfg *Config) (*Server, error) {
+	if cfg.MaxComplexity <= 0 {
+		cfg.MaxComplexity = 500
+	}
+	if cfg.MaxDepth <= 0 {
+		cfg.MaxDepth = 12
+	}
+	if cfg.RateLimit <= 0 {
+		cfg.RateLimit = 300
+	}
+	if cfg.CacheTTL <= 0 {
+		cfg.CacheTTL = 5 * time.Second
+	}
+
 	ctx := context.Background()
-	
-	// Database connection
+
 	pool, err := pgxpool.New(ctx, cfg.DBURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
+		return nil, fmt.Errorf("connect to database: %w", err)
 	}
-	
-	// Redis connection
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisURL,
-		Password: "",
-		DB:       1, // Use separate DB for GraphQL cache
-	})
-	
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisURL, DB: 1})
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("failed to connect to redis: %w", err)
+		pool.Close()
+		return nil, fmt.Errorf("connect to redis: %w", err)
 	}
-	
-	return &Server{
+
+	srv := &Server{
 		cfg:   cfg,
 		pool:  pool,
 		redis: rdb,
-	}, nil
+		hub:   newSubscriptionHub(),
+	}
+
+	schema, err := srv.buildSchema()
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	srv.schema = schema
+
+	return srv, nil
 }
 
-// Start starts the GraphQL server
+// Start begins serving GraphQL over HTTP and WebSocket.
 func (s *Server) Start() error {
-	// Create GraphQL executable schema
-	exec := s.createExecutableSchema()
-	
-	// Create GraphQL handler
-	h := handler.New(exec)
-	
-	// Use extensions
-	h.Use(extension.AutomaticPersistedQueryCache{
-		Cache: lru.New(100),
+	mux := http.NewServeMux()
+
+	handler := &wsHandler{srv: s}
+	mux.Handle("/graphql", handler)
+	mux.Handle("/ws", handler)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.pool.Ping(r.Context()); err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	h.Use(extension.Introspection{})
-	h.Use(extension.ComplexityLimit(s.cfg.MaxComplexity))
-	
-	// WebSocket transport
-	h.AddTransport(transport.WebSocket{
-		Upgrader: transport.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // In production, implement proper origin checking
-			},
-		},
+
+	if s.cfg.Debug {
+		mux.HandleFunc("/graphiql", s.serveGraphiQL)
+	}
+
+	s.httpSrv = &http.Server{
+		Addr:              ":" + s.cfg.Port,
+		Handler:           s.securityHeaders(s.cors(mux)),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	go s.hub.run(context.Background(), s.pool)
+
+	return s.httpSrv.ListenAndServe()
+}
+
+// Stop shuts the HTTP server and background workers down.
+func (s *Server) Stop(ctx context.Context) error {
+	s.stopOnce.Do(func() {
+		s.hub.stop()
 	})
-	
-	// HTTP transport
-	h.AddTransport(transport.GET{})
-	h.AddTransport(transport.POST{})
-	h.AddTransport(transport.MultipartForm{})
-	
-	// GraphQL endpoint
-	http.HandleFunc("/graphql", func(w http.ResponseWriter, r *http.Request) {
-		h.ServeHTTP(w, r)
+	s.pool.Close()
+	if err := s.redis.Close(); err != nil {
+		return err
+	}
+	if s.httpSrv == nil {
+		return nil
+	}
+	return s.httpSrv.Shutdown(ctx)
+}
+
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		next.ServeHTTP(w, r)
 	})
-	
-	// GraphiQL endpoint (for development)
-	http.HandleFunc("/graphiql", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`<!DOCTYPE html>
+}
+
+// cors allows only the origins listed in the configuration.
+func (s *Server) cors(next http.Handler) http.Handler {
+	allowed := make(map[string]struct{}, len(s.cfg.AllowedOrigins))
+	for _, origin := range s.cfg.AllowedOrigins {
+		allowed[strings.TrimRight(origin, "/")] = struct{}{}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			if _, ok := allowed[strings.TrimRight(origin, "/")]; !ok {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) serveGraphiQL(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!DOCTYPE html>
 <html>
 <head>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/graphiql/graphiql.min.css"/>
-<script src="https://cdn.jsdelivr.net/npm/graphiql/graphiql.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/graphiql@3/graphiql.min.css"/>
 </head>
-<body style="margin: 0;">
-<div id="graphiql" style="height: 100vh;"></div>
+<body style="margin:0">
+<div id="graphiql" style="height:100vh"></div>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/graphiql@3/graphiql.min.js"></script>
 <script>
-graphiql.configure({
-  endpoint: '/graphql',
-  subscriptionsEndpoint: 'ws://localhost:8080/ws',
-});
+ReactDOM.createRoot(document.getElementById('graphiql')).render(
+  React.createElement(GraphiQL, {fetcher: GraphiQL.createFetcher({url: '/graphql'})})
+);
 </script>
 </body>
-</html>`))
-	})
-	
-	addr := fmt.Sprintf(":%s", s.cfg.Port)
-	return http.ListenAndServe(addr, nil)
+</html>`)
 }
 
-// createExecutableSchema creates the GraphQL executable schema
-func (s *Server) createExecutableSchema() graphql.ExecutableSchema {
-	resolver := &Resolver{
+// -----------------------------------------------------------------------------
+// Request handling
+// -----------------------------------------------------------------------------
+
+type graphQLRequest struct {
+	Query         string                 `json:"query"`
+	OperationName string                 `json:"operationName"`
+	Variables     map[string]interface{} `json:"variables"`
+}
+
+func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	allowed, err := s.allow(r)
+	if err != nil {
+		http.Error(w, "rate limit unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !allowed {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	var req graphQLRequest
+	if r.Method == http.MethodGet {
+		req.Query = r.URL.Query().Get("query")
+		req.OperationName = r.URL.Query().Get("operationName")
+		if raw := r.URL.Query().Get("variables"); raw != "" {
+			if err := json.Unmarshal([]byte(raw), &req.Variables); err != nil {
+				writeGraphQL(w, nil, fmt.Errorf("invalid variables: %w", err))
+				return
+			}
+		}
+	} else {
+		defer r.Body.Close()
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err := dec.Decode(&req); err != nil {
+			writeGraphQL(w, nil, fmt.Errorf("invalid request body: %w", err))
+			return
+		}
+	}
+
+	result, err := s.execute(r.Context(), req)
+	if err != nil {
+		writeGraphQL(w, nil, err)
+		return
+	}
+	writeGraphQL(w, result, nil)
+}
+
+func writeGraphQL(w http.ResponseWriter, result *graphql.Result, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	status := http.StatusOK
+	payload := map[string]interface{}{}
+
+	if err != nil {
+		payload["errors"] = []map[string]interface{}{{"message": err.Error()}}
+		status = http.StatusBadRequest
+	} else {
+		payload["data"] = result.Data
+		if len(result.Errors) > 0 {
+			errs := make([]map[string]interface{}, 0, len(result.Errors))
+			for _, e := range result.Errors {
+				errs = append(errs, map[string]interface{}{"message": e.Message})
+			}
+			payload["errors"] = errs
+		}
+	}
+
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
+}
+
+// execute validates the document against the limits and runs it.
+func (s *Server) execute(ctx context.Context, req graphQLRequest) (*graphql.Result, error) {
+	if strings.TrimSpace(req.Query) == "" {
+		return nil, fmt.Errorf("query must not be empty")
+	}
+
+	if err := s.validateQuery(req.Query); err != nil {
+		return nil, err
+	}
+
+	d := &deps{
 		pool:  s.pool,
 		redis: s.redis,
+		cache: newResultCache(s.redis, s.cfg.CacheEnabled, s.cfg.CacheTTL),
 	}
-	
-	// Simple schema for now - in production use gqlgen generated code
-	return &SimpleSchema{resolver: resolver}
+
+	return graphql.Do(graphql.Params{
+		Schema:         s.schema,
+		RequestString:  req.Query,
+		VariableValues: req.Variables,
+		OperationName:  req.OperationName,
+		Context:        withDeps(ctx, d),
+	}), nil
 }
 
-// Resolver handles GraphQL resolver functions
-type Resolver struct {
-	pool  *pgxpool.Pool
-	redis *redis.Client
-}
-
-// Query resolvers
-func (r *Resolver) Blocks(ctx context.Context, args struct {
-	First   int
-	After   *string
-}) ([]*Block, error) {
-	query := `
-		SELECT number, hash, parent_hash, timestamp, tx_count, gas_used, miner, size, gas_limit
-		FROM blocks
-		ORDER BY number DESC
-		LIMIT $1
-	`
-	
-	rows, err := r.pool.Query(ctx, query, args.First)
+// validateQuery enforces depth and complexity limits and, in production mode,
+// rejects introspection so the schema is not enumerable.
+func (s *Server) validateQuery(query string) error {
+	doc, err := parser.Parse(parser.ParseParams{
+		Source: source.NewSource(&source.Source{Body: []byte(query)}),
+	})
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("parse query: %w", err)
 	}
-	defer rows.Close()
-	
-	var blocks []*Block
-	for rows.Next() {
-		var b Block
-		if err := rows.Scan(&b.Number, &b.Hash, &b.ParentHash, &b.Timestamp, 
-			&b.TxCount, &b.GasUsed, &b.Miner, &b.Size, &b.GasLimit); err != nil {
-			return nil, err
+
+	for _, def := range doc.Definitions {
+		op, ok := def.(*ast.OperationDefinition)
+		if !ok {
+			continue
 		}
-		blocks = append(blocks, &b)
-	}
-	
-	return blocks, nil
-}
-
-func (r *Resolver) Block(ctx context.Context, args struct {
-	Number *int
-	Hash   *string
-}) (*Block, error) {
-	var query string
-	var arg interface{}
-	
-	if args.Number != nil {
-		query = `SELECT number, hash, parent_hash, timestamp, tx_count, gas_used, miner, size, gas_limit 
-			FROM blocks WHERE number = $1`
-		arg = *args.Number
-	} else {
-		query = `SELECT number, hash, parent_hash, timestamp, tx_count, gas_used, miner, size, gas_limit 
-			FROM blocks WHERE hash = $1`
-		arg = *args.Hash
-	}
-	
-	var b Block
-	err := r.pool.QueryRow(ctx, query, arg).Scan(
-		&b.Number, &b.Hash, &b.ParentHash, &b.Timestamp,
-		&b.TxCount, &b.GasUsed, &b.Miner, &b.Size, &b.GasLimit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	
-	return &b, nil
-}
-
-func (r *Resolver) Transactions(ctx context.Context, args struct {
-	First int
-	From  *string
-	To    *string
-}) ([]*Transaction, error) {
-	query := `
-		SELECT hash, block_number, from_address, to_address, value, gas_price, gas_used, status, timestamp
-		FROM transactions
-		WHERE 1=1
-	`
-	
-	if args.From != nil {
-		query += fmt.Sprintf(" AND from_address = '%s'", *args.From)
-	}
-	if args.To != nil {
-		query += fmt.Sprintf(" AND to_address = '%s'", *args.To)
-	}
-	
-	query += fmt.Sprintf(" ORDER BY timestamp DESC LIMIT %d", args.First)
-	
-	rows, err := r.pool.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	
-	var txs []*Transaction
-	for rows.Next() {
-		var tx Transaction
-		if err := rows.Scan(&tx.Hash, &tx.BlockNumber, &tx.From, &tx.To, 
-			&tx.Value, &tx.GasPrice, &tx.GasUsed, &tx.Status, &tx.Timestamp); err != nil {
-			return nil, err
+		if !s.cfg.Debug && op.Operation == "query" && usesIntrospection(op.SelectionSet) {
+			return fmt.Errorf("introspection is disabled")
 		}
-		txs = append(txs, &tx)
-	}
-	
-	return txs, nil
-}
-
-func (r *Resolver) Transaction(ctx context.Context, args struct {
-	Hash string
-}) (*Transaction, error) {
-	var tx Transaction
-	err := r.pool.QueryRow(ctx, `
-		SELECT hash, block_number, from_address, to_address, value, gas_price, gas_used, status, timestamp, input_data
-		FROM transactions WHERE hash = $1`,
-		args.Hash,
-	).Scan(
-		&tx.Hash, &tx.BlockNumber, &tx.From, &tx.To,
-		&tx.Value, &tx.GasPrice, &tx.GasUsed, &tx.Status, &tx.Timestamp, &tx.Input,
-	)
-	if err != nil {
-		return nil, err
-	}
-	
-	return &tx, nil
-}
-
-func (r *Resolver) Tokens(ctx context.Context, args struct {
-	First int
-	Search *string
-}) ([]*Token, error) {
-	query := `
-		SELECT address, name, symbol, decimals, total_supply, holders_count, transfers_count, price
-		FROM tokens
-		WHERE is_active = true
-	`
-	
-	if args.Search != nil {
-		query += fmt.Sprintf(" AND (name ILIKE '%%%s%%' OR symbol ILIKE '%%%s%%')", *args.Search, *args.Search)
-	}
-	
-	query += fmt.Sprintf(" ORDER BY transfers_count DESC LIMIT %d", args.First)
-	
-	rows, err := r.pool.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	
-	var tokens []*Token
-	for rows.Next() {
-		var t Token
-		if err := rows.Scan(&t.Address, &t.Name, &t.Symbol, &t.Decimals, 
-			&t.TotalSupply, &t.HoldersCount, &t.TransfersCount, &t.Price); err != nil {
-			return nil, err
+		if depth := selectionDepth(op.SelectionSet, 0); depth > s.cfg.MaxDepth {
+			return fmt.Errorf("query depth %d exceeds limit %d", depth, s.cfg.MaxDepth)
 		}
-		tokens = append(tokens, &t)
-	}
-	
-	return tokens, nil
-}
-
-func (r *Resolver) Token(ctx context.Context, args struct {
-	Address string
-}) (*Token, error) {
-	var t Token
-	err := r.pool.QueryRow(ctx, `
-		SELECT address, name, symbol, decimals, total_supply, holders_count, transfers_count, price, market_cap, volume_24h
-		FROM tokens WHERE address = $1`,
-		args.Address,
-	).Scan(
-		&t.Address, &t.Name, &t.Symbol, &t.Decimals,
-		&t.TotalSupply, &t.HoldersCount, &t.TransfersCount, &t.Price,
-		&t.MarketCap, &t.Volume24h,
-	)
-	if err != nil {
-		return nil, err
-	}
-	
-	return &t, nil
-}
-
-func (r *Resolver) NFTs(ctx context.Context, args struct {
-	First      int
-	Collection *string
-}) ([]*NFT, error) {
-	query := `
-		SELECT address, token_id, name, owner, collection_address, image_url, attributes
-		FROM nfts
-		WHERE is_active = true
-	`
-	
-	if args.Collection != nil {
-		query += fmt.Sprintf(" AND collection_address = '%s'", *args.Collection)
-	}
-	
-	query += fmt.Sprintf(" ORDER BY token_id DESC LIMIT %d", args.First)
-	
-	rows, err := r.pool.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	
-	var nfts []*NFT
-	for rows.Next() {
-		var n NFT
-		var attrs json.RawMessage
-		if err := rows.Scan(&n.Address, &n.TokenID, &n.Name, &n.Owner, 
-			&n.CollectionAddress, &n.ImageURL, &attrs); err != nil {
-			return nil, err
-		}
-		json.Unmarshal(attrs, &n.Attributes)
-		nfts = append(nfts, &n)
-	}
-	
-	return nfts, nil
-}
-
-func (r *Resolver) Accounts(ctx context.Context, args struct {
-	Address string
-}) (*Account, error) {
-	var acc Account
-	err := r.pool.QueryRow(ctx, `
-		SELECT address, balance, nonce, code_hash, is_contract, is_verified
-		FROM accounts WHERE address = $1`,
-		args.Address,
-	).Scan(
-		&acc.Address, &acc.Balance, &acc.Nonce, &acc.CodeHash, 
-		&acc.IsContract, &acc.IsVerified,
-	)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Get token holdings
-	tokenRows, err := r.pool.Query(ctx, `
-		SELECT th.token_address, t.name, t.symbol, th.balance
-		FROM token_holders th
-		JOIN tokens t ON t.address = th.token_address
-		WHERE th.address = $1
-		ORDER BY th.balance DESC
-		LIMIT 50`,
-		args.Address,
-	)
-	if err == nil {
-		defer tokenRows.Close()
-		for tokenRows.Next() {
-			var h TokenHolder
-			tokenRows.Scan(&h.TokenAddress, &h.TokenName, &h.TokenSymbol, &h.Balance)
-			acc.TokenHoldings = append(acc.TokenHoldings, h)
+		if cost := selectionCost(op.SelectionSet, 1); cost > s.cfg.MaxComplexity {
+			return fmt.Errorf("query cost %d exceeds limit %d", cost, s.cfg.MaxComplexity)
 		}
 	}
-	
-	return &acc, nil
+
+	return nil
 }
 
-func (r *Resolver) Validators(ctx context.Context, args struct {
-	First int
-	Active  *bool
-}) ([]*Validator, error) {
-	query := `SELECT address, name, commission_rate, total_stake, blocks_proposed, uptime, is_active
-		FROM validators WHERE 1=1`
-	
-	if args.Active != nil {
-		query += fmt.Sprintf(" AND is_active = %v", *args.Active)
+func usesIntrospection(sel *ast.SelectionSet) bool {
+	if sel == nil {
+		return false
 	}
-	
-	query += fmt.Sprintf(" ORDER BY total_stake DESC LIMIT %d", args.First)
-	
-	rows, err := r.pool.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	
-	var validators []*Validator
-	for rows.Next() {
-		var v Validator
-		if err := rows.Scan(&v.Address, &v.Name, &v.CommissionRate, 
-			&v.TotalStake, &v.BlocksProposed, &v.Uptime, &v.IsActive); err != nil {
-			return nil, err
+	for _, item := range sel.Selections {
+		field, ok := item.(*ast.Field)
+		if !ok {
+			continue
 		}
-		validators = append(validators, &v)
+		if name := field.Name.Value; name == "__schema" || name == "__type" {
+			return true
+		}
+		if usesIntrospection(field.SelectionSet) {
+			return true
+		}
 	}
-	
-	return validators, nil
+	return false
 }
 
-func (r *Resolver) Search(ctx context.Context, args struct {
-	Query string
-}) (*SearchResult, error) {
-	result := &SearchResult{}
-	
-	// Search blocks
-	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM blocks WHERE hash = $1`, args.Query).Scan(&result.BlocksCount)
-	if err == nil && result.BlocksCount > 0 {
-		result.Blocks = append(result.Blocks, args.Query)
+func selectionDepth(sel *ast.SelectionSet, current int) int {
+	if sel == nil {
+		return current
 	}
-	
-	// Search transactions
-	err = r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE hash = $1`, args.Query).Scan(&result.TransactionsCount)
-	if err == nil && result.TransactionsCount > 0 {
-		result.Transactions = append(result.Transactions, args.Query)
+	max := current
+	for _, item := range sel.Selections {
+		switch node := item.(type) {
+		case *ast.Field:
+			if d := selectionDepth(node.SelectionSet, current+1); d > max {
+				max = d
+			}
+		case *ast.InlineFragment:
+			if d := selectionDepth(node.SelectionSet, current); d > max {
+				max = d
+			}
+		}
 	}
-	
-	// Search tokens
-	err = r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM tokens WHERE address = $1`, args.Query).Scan(&result.TokensCount)
-	if err == nil && result.TokensCount > 0 {
-		result.Tokens = append(result.Tokens, args.Query)
-	}
-	
-	// Search accounts
-	err = r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts WHERE address = $1`, args.Query).Scan(&result.AccountsCount)
-	if err == nil && result.AccountsCount > 0 {
-		result.Accounts = append(result.Accounts, args.Query)
-	}
-	
-	return result, nil
+	return max
 }
 
-func (r *Resolver) ChainStats(ctx context.Context) (*ChainStats, error) {
-	var stats ChainStats
-	err := r.pool.QueryRow(ctx, `
-		SELECT 
-			(SELECT COUNT(*) FROM blocks) as total_blocks,
-			(SELECT COUNT(*) FROM transactions) as total_transactions,
-			(SELECT COUNT(*) FROM accounts) as total_addresses,
-			(SELECT MAX(number) FROM blocks) as latest_block,
-			(SELECT AVG(gas_price) FROM transactions WHERE timestamp > $1) as avg_gas_price
-		FROM blocks LIMIT 1`,
-		time.Now().Unix()-86400,
-	).Scan(
-		&stats.TotalBlocks, &stats.TotalTransactions, &stats.TotalAddresses,
-		&stats.LatestBlock, &stats.AvgGasPrice,
-	)
+// selectionCost weights list fields more heavily than scalar fields, which
+// approximates the work the resolvers perform.
+func selectionCost(sel *ast.SelectionSet, weight int) int {
+	if sel == nil {
+		return 0
+	}
+	cost := 0
+	for _, item := range sel.Selections {
+		field, ok := item.(*ast.Field)
+		if !ok {
+			continue
+		}
+		fieldCost := weight
+		for _, arg := range field.Arguments {
+			if arg.Name.Value == "first" || arg.Name.Value == "skip" {
+				fieldCost *= 5
+			}
+		}
+		cost += fieldCost + selectionCost(field.SelectionSet, weight)
+	}
+	return cost
+}
+
+// allow applies a fixed-window rate limit keyed on the client address.
+func (s *Server) allow(r *http.Request) (bool, error) {
+	ip := clientIP(r)
+	key := fmt.Sprintf("graphql:rl:%s:%d", ip, time.Now().Unix()/60)
+
+	count, err := s.redis.Incr(r.Context(), key).Result()
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	
-	// Get TPS (last hour)
-	var txsLastHour int
-	r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE timestamp > $1`, time.Now().Unix()-3600).Scan(&txsLastHour)
-	stats.TPS = float64(txsLastHour) / 3600.0
-	
-	return &stats, nil
+	if count == 1 {
+		s.redis.Expire(r.Context(), key, 2*time.Minute)
+	}
+	return count <= int64(s.cfg.RateLimit), nil
 }
 
-// SimpleSchema is a simple GraphQL schema implementation
-type SimpleSchema struct {
-	resolver *Resolver
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		parts := strings.Split(fwd, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	host := r.RemoteAddr
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	return host
 }
 
-func (s *SimpleSchema) Query(ctx context.Context, op *graphql.Operation) (graphql.ResponsePath, error) {
-	// Simplified - in production use gqlgen generated code
-	return nil, nil
-}
-
-// GraphQL Types
-type Block struct {
-	Number      int     `json:"number"`
-	Hash        string  `json:"hash"`
-	ParentHash  string  `json:"parentHash"`
-	Timestamp   int     `json:"timestamp"`
-	TxCount     int     `json:"txCount"`
-	GasUsed     uint64  `json:"gasUsed"`
-	Miner       string  `json:"miner"`
-	Size       int     `json:"size"`
-	GasLimit    uint64  `json:"gasLimit"`
-}
-
-type Transaction struct {
-	Hash         string  `json:"hash"`
-	BlockNumber *int    `json:"blockNumber"`
-	From        string  `json:"from"`
-	To          string  `json:"to"`
-	Value       string  `json:"value"`
-	GasPrice    uint64  `json:"gasPrice"`
-	GasUsed     uint64  `json:"gasUsed"`
-	Status      string  `json:"status"`
-	Timestamp   int     `json:"timestamp"`
-	Input       string  `json:"input"`
-}
-
-type Token struct {
-	Address         string  `json:"address"`
-	Name            string  `json:"name"`
-	Symbol          string  `json:"symbol"`
-	Decimals        int     `json:"decimals"`
-	TotalSupply     string  `json:"totalSupply"`
-	HoldersCount    int     `json:"holdersCount"`
-	TransfersCount  int     `json:"transfersCount"`
-	Price           string  `json:"price"`
-	MarketCap      string  `json:"marketCap"`
-	Volume24h      string  `json:"volume24h"`
-}
-
-type NFT struct {
-	Address            string          `json:"address"`
-	TokenID            string          `json:"tokenId"`
-	Name              string          `json:"name"`
-	Owner             string          `json:"owner"`
-	CollectionAddress string          `json:"collectionAddress"`
-	ImageURL          string          `json:"imageUrl"`
-	Attributes        json.RawMessage `json:"attributes"`
-}
-
-type Account struct {
-	Address         string        `json:"address"`
-	Balance        string        `json:"balance"`
-	Nonce          int           `json:"nonce"`
-	CodeHash       string        `json:"codeHash"`
-	IsContract     bool          `json:"isContract"`
-	IsVerified    bool          `json:"isVerified"`
-	TokenHoldings  []TokenHolder `json:"tokenHoldings"`
-}
-
-type TokenHolder struct {
-	TokenAddress string `json:"tokenAddress"`
-	TokenName   string `json:"tokenName"`
-	TokenSymbol string `json:"tokenSymbol"`
-	Balance    string `json:"balance"`
-}
-
-type Validator struct {
-	Address         string  `json:"address"`
-	Name           string  `json:"name"`
-	CommissionRate float64 `json:"commissionRate"`
-	TotalStake     string  `json:"totalStake"`
-	BlocksProposed int    `json:"blocksProposed"`
-	Uptime         float64 `json:"uptime"`
-	IsActive       bool    `json:"isActive"`
-}
-
-type SearchResult struct {
-	Blocks        []string `json:"blocks"`
-	Transactions []string `json:"transactions"`
-	Tokens       []string `json:"tokens"`
-	Accounts     []string `json:"accounts"`
-	BlocksCount       int `json:"blocksCount"`
-	TransactionsCount int `json:"transactionsCount"`
-	TokensCount       int `json:"tokensCount"`
-	AccountsCount    int `json:"accountsCount"`
-}
-
-type ChainStats struct {
-	TotalBlocks     int     `json:"totalBlocks"`
-	TotalTransactions int   `json:"totalTransactions"`
-	TotalAddresses int     `json:"totalAddresses"`
-	LatestBlock    int     `json:"latestBlock"`
-	AvgGasPrice    uint64  `json:"avgGasPrice"`
-	TPS            float64 `json:"tps"`
-}
+var _ = log.Printf

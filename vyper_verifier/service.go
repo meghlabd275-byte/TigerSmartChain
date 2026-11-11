@@ -1,9 +1,9 @@
 /**
  * TigerScan Vyper Contract Verification Service
- * 
+ *
  * High-performance Go service for verifying Vyper smart contracts
  * with full compilation pipeline and optimization support.
- * 
+ *
  * Features:
  * - Vyper compilation (0.3.x, 0.2.x, 0.1.x)
  * - Multi-file contract verification
@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,42 +44,42 @@ type VyperConfig struct {
 
 // Verification request
 type VerificationRequest struct {
-	Address           string            `json:"address"`
-	SourceCode        string            `json:"source_code"`
-	ContractName      string            `json:"contract_name"`
-	CompilerVersion   string            `json:"compiler_version"`
-	Optimization      bool              `json:"optimization"`
-	OptimizationRuns  int               `json:"optimization_runs"`
-	ABI               string            `json:"abi,omitempty"`
-	Bytecode          string            `json:"bytecode,omitempty"`
-	ConstructorArgs   string            `json:"constructor_args,omitempty"`
-	SourceFiles       map[string]string `json:"source_files,omitempty"`
-	EVMVersion        string            `json:"evm_version,omitempty"`
+	Address          string            `json:"address"`
+	SourceCode       string            `json:"source_code"`
+	ContractName     string            `json:"contract_name"`
+	CompilerVersion  string            `json:"compiler_version"`
+	Optimization     bool              `json:"optimization"`
+	OptimizationRuns int               `json:"optimization_runs"`
+	ABI              string            `json:"abi,omitempty"`
+	Bytecode         string            `json:"bytecode,omitempty"`
+	ConstructorArgs  string            `json:"constructor_args,omitempty"`
+	SourceFiles      map[string]string `json:"source_files,omitempty"`
+	EVMVersion       string            `json:"evm_version,omitempty"`
 }
 
 // Verification result
 type VerificationResult struct {
-	Success         bool                `json:"success"`
-	Address        string              `json:"address"`
-	ContractName   string              `json:"contract_name"`
-	CompilerVersion string             `json:"compiler_version"`
-	ABI            string              `json:"abi"`
-	Bytecode       string              `json:"bytecode"`
-	DeployedBytecode string            `json:"deployed_bytecode"`
-	Match          bool                `json:"match"`
-	Message        string              `json:"message"`
-	Warnings       []string           `json:"warnings,omitempty"`
-	Errors         []string           `json:"errors,omitempty"`
-	CompilationTime int64             `json:"compilation_time_ms"`
+	Success          bool     `json:"success"`
+	Address          string   `json:"address"`
+	ContractName     string   `json:"contract_name"`
+	CompilerVersion  string   `json:"compiler_version"`
+	ABI              string   `json:"abi"`
+	Bytecode         string   `json:"bytecode"`
+	DeployedBytecode string   `json:"deployed_bytecode"`
+	Match            bool     `json:"match"`
+	Message          string   `json:"message"`
+	Warnings         []string `json:"warnings,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
+	CompilationTime  int64    `json:"compilation_time_ms"`
 }
 
 // Compilation output
 type CompilationOutput struct {
-	Bytecode       string            `json:"bytecode"`
-	BytecodeRuntime string           `json:"bytecode_runtime"`
-	ABI            []interface{}     `json:"abi"`
+	Bytecode          string            `json:"bytecode"`
+	BytecodeRuntime   string            `json:"bytecode_runtime"`
+	ABI               []interface{}     `json:"abi"`
 	MethodIdentifiers map[string]string `json:"method_identifiers"`
-	GasEstimate    map[string]uint64 `json:"gas_estimates"`
+	GasEstimate       map[string]uint64 `json:"gas_estimates"`
 }
 
 // Vyper compiler wrapper
@@ -98,13 +99,13 @@ type CompilationJob struct {
 
 // Verification service
 type VyperVerificationService struct {
-	config     VyperConfig
-	compiler   *VyperCompiler
-	redis      *redis.Client
-	jobs       map[string]*VerificationJob
-	jobsMu     sync.RWMutex
-	ctx        context.Context
-	cancel     context.CancelFunc
+	config   VyperConfig
+	compiler *VyperCompiler
+	redis    *redis.Client
+	jobs     map[string]*VerificationJob
+	jobsMu   sync.RWMutex
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 type VerificationJob struct {
@@ -117,7 +118,7 @@ type VerificationJob struct {
 
 func NewVyperCompiler(path string, cacheDir string, maxJobs int) *VyperCompiler {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	compiler := &VyperCompiler{
 		vyperPath:       path,
 		cacheDir:        cacheDir,
@@ -152,9 +153,9 @@ func (c *VyperCompiler) worker(id int) {
 func (c *VyperCompiler) compile(req *VerificationRequest) *VerificationResult {
 	startTime := time.Now()
 	result := &VerificationResult{
-		Success:        false,
-		Address:        req.Address,
-		ContractName:   req.ContractName,
+		Success:         false,
+		Address:         req.Address,
+		ContractName:    req.ContractName,
 		CompilerVersion: req.CompilerVersion,
 	}
 
@@ -167,7 +168,7 @@ func (c *VyperCompiler) compile(req *VerificationRequest) *VerificationResult {
 	defer os.RemoveAll(tmpDir)
 
 	// Write source code
-	sourceFile := filepath.Join(tmpDir, req.ContractName + ".vy")
+	sourceFile := filepath.Join(tmpDir, req.ContractName+".vy")
 	if err := os.WriteFile(sourceFile, []byte(req.SourceCode), 0644); err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("failed to write source: %v", err))
 		return result
@@ -216,7 +217,12 @@ func (c *VyperCompiler) compile(req *VerificationRequest) *VerificationResult {
 
 	// Set result
 	result.Bytecode = output.Bytecode
-	result.ABI, _ = json.Marshal(output.ABI)
+	abiJSON, err := json.Marshal(output.ABI)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("failed to encode ABI: %v", err))
+		return result
+	}
+	result.ABI = string(abiJSON)
 	result.CompilerVersion = req.CompilerVersion
 	result.CompilationTime = time.Since(startTime).Milliseconds()
 
@@ -257,7 +263,7 @@ func (c *VyperCompiler) parseOutput(data []byte, contractName string) (*Compilat
 
 	result := &CompilationOutput{
 		MethodIdentifiers: make(map[string]string),
-		GasEstimate: make(map[string]uint64),
+		GasEstimate:       make(map[string]uint64),
 	}
 
 	// Parse bytecode
@@ -290,13 +296,10 @@ func (c *VyperCompiler) parseOutput(data []byte, contractName string) (*Compilat
 	return result, nil
 }
 
+// normalizeBytecode strips the 0x prefix and lowercases the hex digits so that
+// two encodings of the same bytecode compare equal.
 func normalizeBytecode(bytecode string) string {
-	// Remove 0x prefix
-	if len(bytecode) >= 2 && bytecode[:2] == "0x" {
-		bytecode = bytecode[2:]
-	}
-	// Convert to lowercase for comparison
-	return bytes.ToLower([]byte(bytecode)).(string)
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(bytecode), "0x"))
 }
 
 // Verification service methods
@@ -316,12 +319,12 @@ func NewVyperVerificationService(config VyperConfig) (*VyperVerificationService,
 	})
 
 	service := &VyperVerificationService{
-		config:    config,
-		compiler:  compiler,
-		redis:     redisClient,
-		jobs:      make(map[string]*VerificationJob),
-		ctx:       ctx,
-		cancel:    cancel,
+		config:   config,
+		compiler: compiler,
+		redis:    redisClient,
+		jobs:     make(map[string]*VerificationJob),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
 	return service, nil
@@ -416,7 +419,7 @@ func (s *VyperVerificationService) handleGetStatus(w http.ResponseWriter, r *htt
 
 func (s *VyperVerificationService) startHTTPServer() {
 	router := mux.NewRouter()
-	
+
 	router.HandleFunc("/api/v1/verify", s.handleVerify)
 	router.HandleFunc("/api/v1/versions", s.handleGetCompilerVersions)
 	router.HandleFunc("/api/v1/status/{address}", s.handleGetStatus)
@@ -452,8 +455,8 @@ func main() {
 		CompilerCacheDir:   "/tmp/vyper-cache",
 		RedisURL:           "localhost:6379",
 		Port:               8084,
-		CompilationTimeout:  2 * time.Minute,
-		MaxConcurrentJobs:   10,
+		CompilationTimeout: 2 * time.Minute,
+		MaxConcurrentJobs:  10,
 	}
 
 	// Create cache directory

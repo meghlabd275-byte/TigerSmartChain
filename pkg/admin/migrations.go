@@ -9,10 +9,10 @@ import (
 
 // Migration represents a database migration.
 type Migration struct {
-	Version    string
-	Name      string
-	Migrate   func(*sql.DB) error
-	Rollback  func(*sql.DB) error
+	Version  string
+	Name     string
+	Migrate  func(*sql.DB) error
+	Rollback func(*sql.DB) error
 }
 
 // RunMigrations runs all pending migrations.
@@ -29,7 +29,7 @@ func RunMigrations(db *sql.DB) error {
 	}
 
 	migrations := getMigrations()
-	
+
 	for _, m := range migrations {
 		// Check if already applied
 		var exists bool
@@ -37,18 +37,18 @@ func RunMigrations(db *sql.DB) error {
 		if err != nil {
 			return fmt.Errorf("failed to check migration: %w", err)
 		}
-		
+
 		if exists {
 			fmt.Printf("Migration %s already applied\n", m.Version)
 			continue
 		}
-		
+
 		// Apply migration
 		fmt.Printf("Applying migration %s: %s\n", m.Version, m.Name)
 		if err := m.Migrate(db); err != nil {
 			return fmt.Errorf("failed to apply migration %s: %w", m.Version, err)
 		}
-		
+
 		// Record migration
 		if _, err := db.Exec(
 			"INSERT INTO migrations (version, name, applied_at) VALUES ($1, $2, $3)",
@@ -56,17 +56,17 @@ func RunMigrations(db *sql.DB) error {
 		); err != nil {
 			return fmt.Errorf("failed to record migration: %w", err)
 		}
-		
+
 		fmt.Printf("Migration %s applied successfully\n", m.Version)
 	}
-	
+
 	return nil
 }
 
 // RollbackMigrations rolls back migrations to a specific version.
 func RollbackMigrations(db *sql.DB, toVersion string) error {
 	migrations := getMigrations()
-	
+
 	// Find target version
 	targetIndex := -1
 	for i, m := range migrations {
@@ -75,26 +75,26 @@ func RollbackMigrations(db *sql.DB, toVersion string) error {
 			break
 		}
 	}
-	
+
 	if targetIndex < 0 {
 		return fmt.Errorf("version %s not found", toVersion)
 	}
-	
+
 	// Rollback migrations after target
 	for i := len(migrations) - 1; i > targetIndex; i-- {
 		m := migrations[i]
-		
+
 		// Check if applied
 		var exists bool
 		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM migrations WHERE version = $1)", m.Version).Scan(&exists)
 		if err != nil {
 			return fmt.Errorf("failed to check migration: %w", err)
 		}
-		
+
 		if !exists {
 			continue
 		}
-		
+
 		// Rollback migration
 		fmt.Printf("Rolling back migration %s: %s\n", m.Version, m.Name)
 		if m.Rollback != nil {
@@ -102,15 +102,15 @@ func RollbackMigrations(db *sql.DB, toVersion string) error {
 				return fmt.Errorf("failed to rollback migration %s: %w", m.Version, err)
 			}
 		}
-		
+
 		// Remove migration record
 		if _, err := db.Exec("DELETE FROM migrations WHERE version = $1", m.Version); err != nil {
 			return fmt.Errorf("failed to remove migration record: %w", err)
 		}
-		
+
 		fmt.Printf("Migration %s rolled back successfully\n", m.Version)
 	}
-	
+
 	return nil
 }
 
@@ -118,7 +118,7 @@ func getMigrations() []Migration {
 	return []Migration{
 		{
 			Version: "2024060901",
-			Name: "create_initial_tables",
+			Name:    "create_initial_tables",
 			Migrate: func(db *sql.DB) error {
 				_, err := db.Exec(`
 					CREATE TABLE IF NOT EXISTS users (
@@ -250,7 +250,7 @@ func getMigrations() []Migration {
 		},
 		{
 			Version: "2024060902",
-			Name: "add_indexes",
+			Name:    "add_indexes",
 			Migrate: func(db *sql.DB) error {
 				_, err := db.Exec(`
 					CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
