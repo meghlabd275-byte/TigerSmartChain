@@ -68,6 +68,11 @@ pub struct TigerNode {
 
     /// Background tasks
     tasks: RwLock<JoinSet<()>>,
+
+    /// Durable storage for the chain and the world state. `None` only when
+    /// the directory could not be opened, in which case the node runs
+    /// in memory and says so.
+    storage: Option<crate::storage::Storage>,
 }
 
 impl TigerNode {
@@ -138,6 +143,17 @@ impl TigerNode {
         // Initialize background tasks
         let tasks = RwLock::new(JoinSet::new());
 
+        // Open durable storage and restore whatever was persisted. A failure
+        // to open the directory is reported and the node runs in memory, so a
+        // read-only filesystem does not stop a follower from serving.
+        let storage = match crate::storage::Storage::open(&config.data_dir) {
+            Ok(storage) => Some(storage),
+            Err(e) => {
+                warn!("cannot open data directory {}: {e}; running without persistence", config.data_dir);
+                None
+            }
+        };
+
         Ok(Self {
             config,
             genesis,
@@ -148,7 +164,125 @@ impl TigerNode {
             consensus: tokio::sync::Mutex::new(consensus),
             sync_status,
             tasks,
+            storage,
         })
+    }
+
+    /// Restore the chain and world state from disk, if a snapshot exists.
+    ///
+    /// Returns the number of blocks restored. A snapshot that cannot be read
+    /// or that fails its integrity check is a fatal error: continuing with a
+    /// fresh chain would silently discard the ledger and, worse, restart from
+    /// genesis while other nodes are at a later height.
+    async fn restore_from_disk(&self) -> Result<u64> {
+        let Some(storage) = &self.storage else {
+            return Ok(0);
+        };
+
+        let restored_state = match storage.load_state() {
+            Ok(state) => state,
+            Err(e) => anyhow::bail!("cannot restore world state: {e}"),
+        };
+
+        let chain = match storage.load_chain() {
+            Ok(chain) => chain,
+            Err(e) => anyhow::bail!("cannot restore chain: {e}"),
+        };
+
+        let Some(snapshot) = chain else {
+            if restored_state.is_some() {
+                info!("Found a stored world state but no chain; ignoring the state");
+            }
+            return Ok(0);
+        };
+        debug_assert!(storage.chain_exists());
+
+        // The stored chain must belong to the chain this node was configured
+        // for. Loading a snapshot from a different chain would attach
+        // unrelated blocks to this genesis.
+        let expected_chain_id = self.genesis.config.chain_id;
+        if snapshot.config.chain_id != expected_chain_id {
+            anyhow::bail!(
+                "stored chain is for chain id {}, but this node is configured for {expected_chain_id}",
+                snapshot.config.chain_id
+            );
+        }
+        if let Some(ref stored_genesis) = snapshot.genesis {
+            if stored_genesis.config.chain_id != expected_chain_id {
+                anyhow::bail!(
+                    "stored genesis is for chain id {}, but this node is configured for {expected_chain_id}",
+                    stored_genesis.config.chain_id
+                );
+            }
+        }
+
+        let block_count = snapshot.blocks.len() as u64;
+
+        {
+            let mut cm = self.chain_manager.lock().await;
+            let chain = cm.chain_mut();
+            if let Some(genesis) = snapshot.genesis.clone() {
+                chain.set_genesis(genesis);
+            }
+            // Blocks are inserted in order so each one's parent is already
+            // present; the header maps are rebuilt from the blocks.
+            let mut blocks = snapshot.blocks;
+            blocks.sort_by_key(|b| b.header.number);
+            for block in blocks {
+                chain.insert_block(block);
+            }
+            for (number, receipts) in snapshot.receipts {
+                chain.set_receipts(number, receipts);
+            }
+        }
+
+        if let Some(state) = restored_state {
+            *self.world_state.lock().await = state;
+        }
+
+        let height = {
+            let cm = self.chain_manager.lock().await;
+            cm.chain().height()
+        };
+        info!("Restored {block_count} block(s) from disk; chain height is {height}");
+        Ok(block_count)
+    }
+
+    /// Persist the current chain and world state.
+    async fn persist(&self) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+
+        // Snapshot under the locks, then write without holding them, so block
+        // production is not blocked on disk I/O.
+        let (config, genesis, blocks, receipts) = {
+            let cm = self.chain_manager.lock().await;
+            let chain = cm.chain();
+            let blocks: Vec<_> = (0..=chain.height())
+                .filter_map(|n| chain.get_block(n).cloned())
+                .collect();
+            let receipts: Vec<_> = blocks
+                .iter()
+                .filter_map(|b| chain.receipts(b.header.number).map(|r| (b.header.number, r.to_vec())))
+                .collect();
+            (
+                chain.config().clone(),
+                chain.genesis().cloned(),
+                blocks,
+                receipts,
+            )
+        };
+        let state = self.world_state.lock().await.clone();
+
+        let chain_snapshot =
+            crate::storage::Storage::snapshot_chain(config, genesis, blocks, receipts);
+        if let Err(e) = storage.save_chain(&chain_snapshot) {
+            error!("cannot persist chain: {e}");
+        }
+        if let Err(e) = storage.save_state(&state) {
+            error!("cannot persist world state: {e}");
+        }
     }
 
     /// Validate node configuration.
@@ -180,6 +314,15 @@ impl TigerNode {
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         info!("Starting node components...");
 
+        // Restore any persisted chain before installing genesis. Without
+        // this the node would restart from block 0 and lose every block it
+        // had produced, and would re-apply the genesis allocation on top of a
+        // state that already reflects it.
+        let restored = self.restore_from_disk().await?;
+        if restored > 0 {
+            info!("Resuming from the persisted chain ({restored} block(s))");
+        }
+
         // Install the genesis block if the chain is empty.
         //
         // `height()` returns 0 both for an empty chain and for a chain whose
@@ -199,6 +342,8 @@ impl TigerNode {
                 cm.process_block(genesis_block)
                     .map_err(|e| anyhow::anyhow!("failed to insert genesis block: {e}"))?;
                 info!("Genesis block installed at height 0 (hash: {})", hash);
+                drop(cm);
+                self.persist().await;
             }
         }
 
@@ -312,6 +457,11 @@ impl TigerNode {
                             match result {
                                 Ok(block_hash) => {
                                     info!("Successfully produced block #{} (hash: {})", next_block, block_hash);
+                                    // Persist the new block and the state it
+                                    // produced before reporting success, so a
+                                    // crash cannot lose a block the node has
+                                    // already announced.
+                                    node.persist().await;
                                     // Credit the proposer's pending reward.
                                     {
                                         let mut consensus = node.consensus.lock().await;
@@ -694,33 +844,49 @@ pub fn produce_block(
     // logs are collected into a receipt, because the block header commits to
     // the receipts root and the logs bloom and the node must be able to answer
     // `eth_getTransactionReceipt` from the block it produced.
+    //
+    // Every included transaction gets exactly one receipt, including one that
+    // is rejected before execution. A block whose receipts are shorter than
+    // its transaction list cannot answer for its later transactions and is
+    // rejected by other clients, so a rejection must not silently drop the
+    // receipt.
     let mut gas_used: u64 = 0;
     let mut receipts: Vec<tiger_blockchain::BlockReceipt> = Vec::with_capacity(included.len());
     for (tx, request) in included.iter().zip(requests.iter()) {
-        match apply_transaction(world_state, request, &block_ctx) {
-            Ok(outcome) => {
-                gas_used = gas_used.saturating_add(outcome.gas_used);
-                receipts.push(tiger_blockchain::BlockReceipt {
-                    status: outcome.success,
-                    cumulative_gas_used: gas_used,
-                    gas_used: outcome.gas_used,
-                    logs: outcome
-                        .logs
-                        .iter()
-                        .map(|log| tiger_blockchain::ReceiptLog {
-                            address: log.address.0,
-                            topics: log.topics.iter().map(|t| t.0).collect(),
-                            data: log.data.clone(),
-                        })
-                        .collect(),
-                });
-                if !outcome.success {
-                    info!("transaction {} reverted, gas used {}", tx.hash, outcome.gas_used);
-                }
-            }
+        let outcome = match apply_transaction(world_state, request, &block_ctx) {
+            Ok(outcome) => outcome,
             Err(e) => {
                 warn!("transaction {} rejected: {}", tx.hash, e);
+                // A rejected transaction still consumed the intrinsic gas the
+                // sender committed to. It is charged, and the receipt records
+                // the failure rather than being omitted.
+                tiger_evm::transition::TransitionOutcome {
+                    success: false,
+                    gas_used: tiger_evm::transition::intrinsic_gas(&request.data, request.to.is_none()),
+                    output: Vec::new(),
+                    logs: Vec::new(),
+                    contract_address: None,
+                }
             }
+        };
+
+        gas_used = gas_used.saturating_add(outcome.gas_used);
+        receipts.push(tiger_blockchain::BlockReceipt {
+            status: outcome.success,
+            cumulative_gas_used: gas_used,
+            gas_used: outcome.gas_used,
+            logs: outcome
+                .logs
+                .iter()
+                .map(|log| tiger_blockchain::ReceiptLog {
+                    address: log.address.0,
+                    topics: log.topics.iter().map(|t| t.0).collect(),
+                    data: log.data.clone(),
+                })
+                .collect(),
+        });
+        if !outcome.success {
+            info!("transaction {} did not succeed, gas used {}", tx.hash, outcome.gas_used);
         }
     }
 

@@ -8,7 +8,7 @@
 //! 32-byte big-endian field elements. The point at infinity is (0,0).
 
 use ark_bn254::{Bn254, Fq, Fq12, Fq2, Fr, G1Affine, G2Affine, G1Projective};
-use ark_ec::{AffineRepr, CurveGroup, pairing::Pairing};
+use ark_ec::{AffineRepr, pairing::Pairing};
 use ark_ff::{BigInteger, One, PrimeField};
 
 /// Parse a 32-byte big-endian scalar into the base field Fq.

@@ -109,7 +109,7 @@ async fn handle_connection(
     const MAX_BODY: usize = 4 * 1024 * 1024;
 
     let mut buf = Vec::with_capacity(1024);
-    let mut header_end = None;
+    let header_end;
     loop {
         if buf.len() > MAX_HEADER {
             let response = RpcResponse::error(INVALID_REQUEST, "headers too large", Value::Null);
@@ -122,12 +122,11 @@ async fn handle_connection(
         }
         buf.extend_from_slice(&chunk[..read]);
         if let Some(pos) = find_header_end(&buf) {
-            header_end = Some(pos);
+            header_end = pos;
             break;
         }
     }
 
-    let header_end = header_end.unwrap_or(0);
     let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let content_length = parse_content_length(&headers).unwrap_or(0);
     if content_length > MAX_BODY {
@@ -473,7 +472,8 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
         "eth_sendRawTransaction" => match string_param(params, 0) {
             Some(raw) => match submit_raw_transaction(node, &raw).await {
                 Ok(hash) => RpcResponse::success(json!(hash), id),
-                Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+                Err(SubmitError::BadRequest(e)) => RpcResponse::error(INVALID_PARAMS, e, id),
+                Err(SubmitError::Internal(e)) => RpcResponse::error(INTERNAL_ERROR, e, id),
             },
             None => RpcResponse::error(INVALID_PARAMS, "missing raw transaction", id),
         },
@@ -620,29 +620,47 @@ async fn call_contract(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<u8>,
 /// the transaction hash is recomputed, and only then is it added to the
 /// mempool. A transaction whose signature cannot be recovered is rejected
 /// here, so nothing unauthenticated ever reaches block production.
-async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<String, String> {
+/// Why a submitted transaction was rejected.
+///
+/// The distinction matters to a client: a malformed or unsigned transaction is
+/// the caller's mistake and gets an invalid-params code, while a node that is
+/// out of capacity is the node's condition and gets an internal-error code.
+enum SubmitError {
+    BadRequest(String),
+    Internal(String),
+}
+
+async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<String, SubmitError> {
+    use SubmitError::{BadRequest, Internal};
+
     use tiger_blockchain::{recover_transaction_sender, transaction_hash};
 
-    let bytes = decode_hex(raw)?;
-    let tx = decode_legacy_transaction(&bytes)?;
+    let bytes = decode_hex(raw).map_err(BadRequest)?;
+    let tx = decode_legacy_transaction(&bytes).map_err(BadRequest)?;
 
     // Recovering the sender proves the signature is valid for this chain, and
     // the recovered address is authoritative: the `from` field on the wire is
     // not signed, so it is discarded and replaced rather than trusted.
     let chain_id = node.config().chain_id;
     let sender = recover_transaction_sender(&tx, chain_id)
-        .map_err(|e| format!("invalid transaction signature: {e}"))?;
+        .map_err(|e| BadRequest(format!("invalid transaction signature: {e}")))?;
 
-    let hash = transaction_hash(&tx).map_err(|e| format!("cannot hash transaction: {e}"))?;
+    let hash = transaction_hash(&tx)
+        .map_err(|e| Internal(format!("cannot hash transaction: {e}")))?;
     let mut tx = tx;
     tx.hash = hash.clone();
     tx.from = format!("0x{}", tiger_blockchain::hex_encode(&sender));
 
     {
         let mut mempool = node.get_mempool().await;
-        mempool
-            .add(tx)
-            .map_err(|e| format!("mempool rejected transaction: {e}"))?;
+        if let Err(e) = mempool.add(tx) {
+            // A full pool is a capacity condition, not a bad request.
+            return Err(if e.contains("full") {
+                Internal(e)
+            } else {
+                BadRequest(e)
+            });
+        }
     }
     log::info!("accepted transaction {hash}");
     Ok(hash)

@@ -399,8 +399,12 @@ pub fn apply_transaction_traced(
                 &crate::Address(exec_address),
                 EvmWord(tx.value),
             ) {
-                // Cannot happen after the balance check above, but a failure
-                // here must not leave the sender charged.
+                // The sender was charged the maximum cost before execution, so
+                // the snapshot taken at entry has to be restored before
+                // returning. Leaving the debit in place would burn the
+                // sender's gas for a transaction that never made it into a
+                // block.
+                state.restore(pre_state);
                 return Err(TransitionError::InsufficientFundsForGas);
             }
         }

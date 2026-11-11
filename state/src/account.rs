@@ -31,20 +31,136 @@ pub const EMPTY_STATE_ROOT: [u8; 32] = [
 /// A 20-byte account address.
 pub type Address = [u8; 20];
 
+
+/// Serde support for byte-keyed maps and byte vectors, which JSON cannot
+/// represent directly: a JSON object key must be a string, and an array of
+/// numbers is a wasteful encoding for a byte string. Both are stored as hex.
+mod bytes_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    fn to_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn from_hex(text: &str) -> Result<Vec<u8>, String> {
+        let trimmed = text.strip_prefix("0x").unwrap_or(text);
+        if trimmed.len() % 2 != 0 {
+            return Err("odd number of hex digits".to_string());
+        }
+        let mut out = Vec::with_capacity(trimmed.len() / 2);
+        let bytes = trimmed.as_bytes();
+        for pair in bytes.chunks(2) {
+            let hi = (pair[0] as char).to_digit(16).ok_or("invalid hex digit")?;
+            let lo = (pair[1] as char).to_digit(16).ok_or("invalid hex digit")?;
+            out.push(((hi << 4) | lo) as u8);
+        }
+        Ok(out)
+    }
+
+    fn fixed<const N: usize>(text: &str) -> Result<[u8; N], String> {
+        let bytes = from_hex(text)?;
+        if bytes.len() != N {
+            return Err(format!("expected {N} bytes, got {}", bytes.len()));
+        }
+        let mut out = [0u8; N];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// A `HashMap<[u8; 32], [u8; 32]>` as a sorted list of hex pairs, so the
+    /// encoding is deterministic.
+    pub mod storage_map {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            map: &HashMap<[u8; 32], [u8; 32]>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let mut entries: Vec<(String, String)> =
+                map.iter().map(|(k, v)| (to_hex(k), to_hex(v))).collect();
+            entries.sort();
+            entries.serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<HashMap<[u8; 32], [u8; 32]>, D::Error> {
+            let entries: Vec<(String, String)> = Vec::deserialize(deserializer)?;
+            let mut map = HashMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                let key = fixed::<32>(&k).map_err(serde::de::Error::custom)?;
+                let value = fixed::<32>(&v).map_err(serde::de::Error::custom)?;
+                map.insert(key, value);
+            }
+            Ok(map)
+        }
+    }
+
+    /// A `Vec<u8>` as a hex string.
+    pub mod bytes {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            bytes: &Vec<u8>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&to_hex(bytes))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Vec<u8>, D::Error> {
+            let text = String::deserialize(deserializer)?;
+            from_hex(&text).map_err(serde::de::Error::custom)
+        }
+    }
+
+    /// A fixed-width byte array as a hex string.
+    pub mod fixed32 {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &[u8; 32],
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&to_hex(value))
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<[u8; 32], D::Error> {
+            let text = String::deserialize(deserializer)?;
+            fixed::<32>(&text).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 /// An account, exactly as the Yellow Paper defines it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Account {
     /// Number of transactions sent from this account.
     pub nonce: u64,
     /// Balance in wei.
+    #[serde(with = "bytes_serde::fixed32")]
     pub balance: [u8; 32],
     /// Root of the account's storage trie.
+    #[serde(with = "bytes_serde::fixed32")]
     pub storage_root: [u8; 32],
     /// keccak256 of the account's code.
+    #[serde(with = "bytes_serde::fixed32")]
     pub code_hash: [u8; 32],
     /// Contract code, held out of the trie (it is hashed, not inlined).
+    #[serde(with = "bytes_serde::bytes")]
     pub code: Vec<u8>,
     /// Storage slots, held as a trie internally.
+    #[serde(with = "bytes_serde::storage_map")]
     pub storage: HashMap<[u8; 32], [u8; 32]>,
 }
 

@@ -86,6 +86,14 @@ impl Blockchain {
         self.receipts.get(&number).map(|r| r.as_slice())
     }
 
+    /// Replace the receipts stored for a block.
+    ///
+    /// Used when restoring a persisted chain, where the receipts are loaded
+    /// alongside the blocks rather than recomputed by executing them.
+    pub fn set_receipts(&mut self, number: u64, receipts: Vec<crate::receipt::Receipt>) {
+        self.receipts.insert(number, receipts);
+    }
+
     /// Locate a transaction by hash: its block, its index in that block, and
     /// the block hash. Used to serve `eth_getTransactionByHash`.
     pub fn find_transaction(&self, hash: &str) -> Option<(&Block, usize, String)> {

@@ -13,6 +13,7 @@ mod config;
 mod debug_rpc;
 mod node;
 mod rpc_server;
+mod storage;
 
 pub use config::Config;
 pub use node::TigerNode;

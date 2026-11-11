@@ -18,7 +18,7 @@ use tiger_state::trie::Trie;
 
 /// A log as it appears in a receipt: no transaction or block context, because
 /// that is supplied by the surrounding receipt and block.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReceiptLog {
     /// Contract that emitted the log.
     pub address: [u8; 20],
@@ -29,7 +29,7 @@ pub struct ReceiptLog {
 }
 
 /// A transaction receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Receipt {
     /// Whether the transaction succeeded.
     pub status: bool,
