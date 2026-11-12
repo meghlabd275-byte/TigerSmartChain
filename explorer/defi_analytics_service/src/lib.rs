@@ -95,7 +95,7 @@ pub struct PoolData {
     pub apy: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct LendingRate {
     pub protocol: String,
     pub token: String,
@@ -106,7 +106,7 @@ pub struct LendingRate {
     pub total_borrow: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct YieldOpportunity {
     pub protocol: String,
     pub pool: String,
@@ -316,8 +316,10 @@ impl DeFiAnalyticsService {
     pub async fn get_top_yields(&self, limit: usize) -> Result<Vec<YieldOpportunity>> {
         let yields: Vec<YieldOpportunity> = sqlx::query_as(
             r#"
-            SELECT dp.protocol_name, dp.pair_address, dp.token0_symbol, dp.token1_symbol, 
-                   dp.apy, 0.0 as apy_7d, dp.liquidity_usd, 'medium' as risk_level
+            SELECT dp.protocol_name AS protocol, dp.pair_address AS pool,
+                   dp.token0_symbol AS token0, dp.token1_symbol AS token1, 
+                   dp.apy::float8 AS apy, 0.0::float8 AS apy_7d,
+                   dp.liquidity_usd::float8 AS tvl, 'medium'::text AS risk_level
             FROM dex_pairs dp
             WHERE dp.apy > 0 AND dp.liquidity_usd > 10000
             ORDER BY dp.apy DESC
@@ -334,7 +336,9 @@ impl DeFiAnalyticsService {
     pub async fn get_lending_rates(&self) -> Result<Vec<LendingRate>> {
         // Get lending rates from database (populated by lending protocol indexer)
         let rates: Vec<LendingRate> = sqlx::query_as(
-            "SELECT protocol, token, supply_rate, borrow_rate, utilization, total_supply, total_borrow FROM lending_rates"
+            "SELECT protocol, token, supply_rate::float8, borrow_rate::float8, \
+             utilization::float8, total_supply::float8, total_borrow::float8 \
+             FROM lending_rates"
         )
         .fetch_all(&self.db)
         .await?;
@@ -344,7 +348,9 @@ impl DeFiAnalyticsService {
 
     pub async fn get_tvl_history(&self, protocol: &str, days: i32) -> Result<Vec<TVLHistory>> {
         let history: Vec<TVLHistory> = sqlx::query_as(
-            "SELECT protocol, tvl, date FROM defi_tvl WHERE protocol = $1 AND date >= CURRENT_DATE - ($2 || ' days')::interval ORDER BY date"
+            "SELECT protocol, tvl::float8, date::text FROM defi_tvl \
+             WHERE protocol = $1 AND date >= CURRENT_DATE - ($2 || ' days')::interval \
+             ORDER BY date"
         )
         .bind(protocol)
         .bind(days.to_string())
@@ -359,7 +365,7 @@ impl DeFiAnalyticsService {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TVLHistory {
     pub protocol: String,
     pub tvl: f64,

@@ -438,12 +438,61 @@ impl NFTMetadataService {
     }
 
     pub async fn calculate_rarity(&self, collection: &str) -> Result<Vec<RarityResult>> {
-        let nfts: Vec<NFTMetadata> = sqlx::query_as(
-            "SELECT token_address, token_id, name, description, image_url, external_url, attributes, background_color, animation_url, youtube_url, updated_at FROM nfts WHERE token_address = $1"
+        // `attributes` is a JSONB array and `updated_at` is a timestamp; neither
+        // is decoded by the derive, so both are read as JSON and converted.
+        let rows: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            "SELECT token_address, token_id, name, description, image_url, external_url, \
+             attributes, background_color, animation_url, youtube_url, updated_at \
+             FROM nfts WHERE token_address = $1",
         )
         .bind(collection)
         .fetch_all(&self.db)
         .await?;
+
+        let nfts: Vec<NFTMetadata> = rows
+            .into_iter()
+            .map(
+                |(
+                    token_address,
+                    token_id,
+                    name,
+                    description,
+                    image_url,
+                    external_url,
+                    attributes,
+                    background_color,
+                    animation_url,
+                    youtube_url,
+                    updated_at,
+                )| NFTMetadata {
+                    token_address,
+                    token_id,
+                    name,
+                    description,
+                    image_url,
+                    external_url,
+                    attributes: attributes
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default(),
+                    background_color,
+                    animation_url,
+                    youtube_url,
+                    updated_at: updated_at.unwrap_or_else(Utc::now),
+                },
+            )
+            .collect();
 
         Ok(self.analyzer.analyze(&nfts))
     }
