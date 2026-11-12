@@ -181,6 +181,152 @@ pub fn block_hash(header: &BlockHeader) -> Result<String, ValidationError> {
     Ok(format!("0x{}", hex_encode(&keccak256(&encoded))))
 }
 
+/// RLP-encode the access list of a typed transaction.
+///
+/// The access list is a list of `[address, [storageKey, ...]]` pairs. It is
+/// held in its wire form because both the signing hash and the transaction
+/// hash commit to the exact bytes, so re-encoding it from a parsed structure
+/// would risk a mismatch.
+fn access_list_item(access_list: &Option<String>) -> Result<RlpItem, ValidationError> {
+    match access_list {
+        None => Ok(RlpItem::List(Vec::new())),
+        Some(raw) => {
+            let bytes = decode_hex_field(raw, None)?;
+            tiger_state::rlp::decode(&bytes)
+                .map_err(|_| ValidationError::MalformedField("access_list"))
+        }
+    }
+}
+
+/// The nine signed fields shared by every transaction type.
+fn signed_fields(tx: &Transaction) -> Result<Vec<RlpItem>, ValidationError> {
+    let to = match &tx.to {
+        Some(address) => fixed_item(address, 20)?,
+        None => RlpItem::Bytes(Vec::new()),
+    };
+    Ok(vec![
+        RlpItem::from_u64(tx.nonce),
+        RlpItem::from_u64(tx.gas_price),
+        RlpItem::from_u64(tx.gas),
+        to,
+        quantity_item(&tx.value)?,
+        RlpItem::Bytes(decode_hex_field(&tx.input, None)?),
+    ])
+}
+
+/// The price per unit of gas a transaction actually paid in a block whose
+/// base fee is `base_fee`.
+///
+/// A legacy or EIP-2930 transaction pays its signed `gasPrice`. An EIP-1559
+/// transaction pays `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`. The
+/// transaction carries `maxFeePerGas` in its `gas_price` field, so a receipt
+/// that echoed that field would overstate what the sender was charged.
+pub fn effective_gas_price(tx: &Transaction, base_fee: u64) -> u64 {
+    match tx.max_priority_fee_per_gas {
+        None => tx.gas_price,
+        Some(priority) => tx.gas_price.min(base_fee.saturating_add(priority)),
+    }
+}
+
+/// The base fee of the block that follows `parent`.
+///
+/// EIP-1559 makes the base fee a function of the parent block, so every client
+/// derives the same value and a validator cannot choose it to favour itself.
+/// The fee rises while blocks are fuller than the target and falls while they
+/// are emptier, with the change bounded to an eighth per block.
+pub fn next_base_fee(
+    parent_base_fee: u64,
+    parent_gas_used: u64,
+    parent_gas_limit: u64,
+) -> u64 {
+    const MAX_CHANGE_DENOMINATOR: u64 = 8;
+    const ELASTICITY_MULTIPLIER: u64 = 2;
+
+    let target = parent_gas_limit / ELASTICITY_MULTIPLIER;
+    if target == 0 {
+        // A zero gas limit is not a usable block, and dividing by it would
+        // panic; leaving the fee unchanged is the only safe reading.
+        return parent_base_fee;
+    }
+
+    if parent_gas_used == target {
+        return parent_base_fee;
+    }
+
+    if parent_gas_used > target {
+        let delta = parent_gas_used - target;
+        let increase = (parent_base_fee as u128 * delta as u128
+            / target as u128
+            / MAX_CHANGE_DENOMINATOR as u128)
+            .max(1) as u64;
+        parent_base_fee.saturating_add(increase)
+    } else {
+        let delta = target - parent_gas_used;
+        let decrease = (parent_base_fee as u128 * delta as u128
+            / target as u128
+            / MAX_CHANGE_DENOMINATOR as u128) as u64;
+        parent_base_fee.saturating_sub(decrease)
+    }
+}
+
+/// RLP-encode a transaction in the envelope its type calls for.
+///
+/// Legacy transactions (type 0) encode as a bare nine-field list. Typed
+/// transactions (EIP-2930 type 1, EIP-1559 type 2) encode as the type byte
+/// followed by the RLP list, which is what `eth_sendRawTransaction` receives
+/// and what the transactions trie stores.
+pub fn encode_transaction(tx: &Transaction) -> Result<Vec<u8>, ValidationError> {
+    if tx.tx_type == 0 {
+        return encode_legacy_transaction(tx);
+    }
+
+    let mut fields = typed_unsigned_fields(tx)?;
+    fields.push(quantity_item(&tx.v)?);
+    fields.push(quantity_item(&tx.r)?);
+    fields.push(quantity_item(&tx.s)?);
+
+    let mut encoded = vec![tx.tx_type as u8];
+    encoded.extend_from_slice(&RlpItem::list(fields).encode());
+    Ok(encoded)
+}
+
+/// The unsigned field list of a typed transaction, in wire order.
+///
+/// A type 1 (EIP-2930) transaction is `[chainId, nonce, gasPrice, gasLimit,
+/// to, value, data, accessList]`; a type 2 (EIP-1559) transaction replaces the
+/// single `gasPrice` with `maxPriorityFeePerGas` and `maxFeePerGas`. The
+/// signature and the transaction hash are both taken over these fields, so
+/// both callers build them here rather than each keeping their own copy of
+/// the ordering.
+fn typed_unsigned_fields(tx: &Transaction) -> Result<Vec<RlpItem>, ValidationError> {
+    let mut fields = vec![
+        RlpItem::from_u64(tx.chain_id.unwrap_or(0)),
+        RlpItem::from_u64(tx.nonce),
+    ];
+    match tx.tx_type {
+        1 => fields.push(RlpItem::from_u64(tx.gas_price)),
+        2 => {
+            fields.push(RlpItem::from_u64(tx.max_priority_fee_per_gas.unwrap_or(0)));
+            fields.push(RlpItem::from_u64(tx.gas_price));
+        }
+        other => {
+            return Err(ValidationError::MalformedField(match other {
+                3 => "blob transaction",
+                _ => "transaction type",
+            }))
+        }
+    }
+    fields.push(RlpItem::from_u64(tx.gas));
+    fields.push(match &tx.to {
+        Some(address) => fixed_item(address, 20)?,
+        None => RlpItem::Bytes(Vec::new()),
+    });
+    fields.push(quantity_item(&tx.value)?);
+    fields.push(RlpItem::Bytes(decode_hex_field(&tx.input, None)?));
+    fields.push(access_list_item(&tx.access_list)?);
+    Ok(fields)
+}
+
 /// RLP-encode a legacy transaction in Yellow Paper field order:
 /// `[nonce, gasPrice, gasLimit, to, value, data, v, r, s]`.
 ///
@@ -205,9 +351,209 @@ pub fn encode_legacy_transaction(tx: &Transaction) -> Result<Vec<u8>, Validation
 }
 
 /// The keccak256 hash of a transaction, as a `0x`-prefixed string.
+///
+/// This is the hash of the bytes that travel on the wire, so a typed
+/// transaction hashes its type byte and its list together.
 pub fn transaction_hash(tx: &Transaction) -> Result<String, ValidationError> {
-    let encoded = encode_legacy_transaction(tx)?;
+    let encoded = encode_transaction(tx)?;
     Ok(format!("0x{}", hex_encode(&keccak256(&encoded))))
+}
+
+/// Decode a signed transaction from the bytes a wallet submits.
+///
+/// An EIP-2718 payload is either a bare RLP list (a legacy transaction) or a
+/// type byte below `0x80` followed by that type's list. Both envelopes are
+/// accepted here, and the chain id that a typed transaction carries is
+/// returned in the transaction so its hash can be recomputed over the exact
+/// bytes that arrived.
+pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, ValidationError> {
+    let first = *bytes
+        .first()
+        .ok_or(ValidationError::MalformedField("empty transaction"))?;
+    if first < 0x80 {
+        if first == 0 {
+            return Err(ValidationError::MalformedField(
+                "type 0 must be encoded as a legacy list",
+            ));
+        }
+        return decode_typed_transaction(first as u64, &bytes[1..]);
+    }
+    decode_legacy_transaction(bytes)
+}
+
+/// Decode the payload of an EIP-2718 typed transaction, its type byte already
+/// stripped.
+fn decode_typed_transaction(tx_type: u64, payload: &[u8]) -> Result<Transaction, ValidationError> {
+    if tx_type == 3 {
+        return Err(ValidationError::MalformedField("blob transaction"));
+    }
+    if tx_type > 2 {
+        return Err(ValidationError::MalformedField("transaction type"));
+    }
+
+    let item = tiger_state::rlp::decode(payload)
+        .map_err(|_| ValidationError::MalformedField("transaction rlp"))?;
+    let fields = match item {
+        RlpItem::List(items) => items,
+        RlpItem::Bytes(_) => {
+            return Err(ValidationError::MalformedField("transaction must be a list"))
+        }
+    };
+
+    // `[chainId, nonce, fee..., gasLimit, to, value, data, accessList,
+    // yParity, r, s]`, where a type 2 transaction has two fee fields and a
+    // type 1 transaction has one.
+    let expected = if tx_type == 2 { 12 } else { 11 };
+    if fields.len() != expected {
+        return Err(ValidationError::MalformedField("transaction field count"));
+    }
+
+    let chain_id = rlp_u64(&fields[0]).ok_or(ValidationError::MalformedField("chain id"))?;
+    let nonce = rlp_u64(&fields[1]).ok_or(ValidationError::MalformedField("nonce"))?;
+    let (max_priority_fee, gas_price, fee_index) = if tx_type == 2 {
+        (
+            Some(rlp_u64(&fields[2]).ok_or(ValidationError::MalformedField("maxPriorityFeePerGas"))?),
+            rlp_u64(&fields[3]).ok_or(ValidationError::MalformedField("maxFeePerGas"))?,
+            4usize,
+        )
+    } else {
+        (
+            None,
+            rlp_u64(&fields[2]).ok_or(ValidationError::MalformedField("gasPrice"))?,
+            3usize,
+        )
+    };
+
+    let gas = rlp_u64(&fields[fee_index]).ok_or(ValidationError::MalformedField("gasLimit"))?;
+    let to = decode_to_field(&fields[fee_index + 1])?;
+    let value = rlp_bytes(&fields[fee_index + 2])
+        .ok_or(ValidationError::MalformedField("value"))?;
+    let input = rlp_bytes(&fields[fee_index + 3])
+        .ok_or(ValidationError::MalformedField("data"))?;
+    let access_list = match &fields[fee_index + 4] {
+        RlpItem::List(_) => fields[fee_index + 4].encode(),
+        _ => return Err(ValidationError::MalformedField("accessList")),
+    };
+    let v = rlp_u64(&fields[fee_index + 5]).ok_or(ValidationError::MalformedField("yParity"))?;
+    let r = rlp_bytes(&fields[fee_index + 6]).unwrap_or_default();
+    let s = rlp_bytes(&fields[fee_index + 7]).unwrap_or_default();
+
+    let mut tx = Transaction {
+        hash: String::new(),
+        nonce,
+        block_hash: None,
+        block_number: None,
+        transaction_index: None,
+        // Recovered from the signature; the wire carries no sender.
+        from: format!("0x{}", hex_encode(&[0u8; 20])),
+        to,
+        value: hex_quantity(&value),
+        gas_price,
+        gas,
+        input: format!("0x{}", hex_encode(&input)),
+        v: format!("0x{v:x}"),
+        r: format!("0x{}", hex_encode(&r)),
+        s: format!("0x{}", hex_encode(&s)),
+        tx_type,
+        access_list: Some(format!("0x{}", hex_encode(&access_list))),
+        max_priority_fee_per_gas: max_priority_fee,
+        chain_id: Some(chain_id),
+    };
+    tx.hash = transaction_hash(&tx)?;
+    Ok(tx)
+}
+
+/// Decode a legacy (type 0) RLP transaction.
+fn decode_legacy_transaction(bytes: &[u8]) -> Result<Transaction, ValidationError> {
+    let item = tiger_state::rlp::decode(bytes)
+        .map_err(|_| ValidationError::MalformedField("transaction rlp"))?;
+    let fields = match item {
+        RlpItem::List(items) => items,
+        RlpItem::Bytes(_) => {
+            return Err(ValidationError::MalformedField("transaction must be a list"))
+        }
+    };
+    if fields.len() != 9 {
+        return Err(ValidationError::MalformedField("legacy field count"));
+    }
+
+    let nonce = rlp_u64(&fields[0]).ok_or(ValidationError::MalformedField("nonce"))?;
+    let gas_price = rlp_u64(&fields[1]).ok_or(ValidationError::MalformedField("gasPrice"))?;
+    let gas = rlp_u64(&fields[2]).ok_or(ValidationError::MalformedField("gasLimit"))?;
+    let to = decode_to_field(&fields[3])?;
+    let value = rlp_bytes(&fields[4]).ok_or(ValidationError::MalformedField("value"))?;
+    let input = rlp_bytes(&fields[5]).ok_or(ValidationError::MalformedField("data"))?;
+    let v = rlp_u64(&fields[6]).ok_or(ValidationError::MalformedField("v"))?;
+    let r = rlp_bytes(&fields[7]).unwrap_or_default();
+    let s = rlp_bytes(&fields[8]).unwrap_or_default();
+
+    let mut tx = Transaction {
+        hash: String::new(),
+        nonce,
+        block_hash: None,
+        block_number: None,
+        transaction_index: None,
+        from: format!("0x{}", hex_encode(&[0u8; 20])),
+        to,
+        value: hex_quantity(&value),
+        gas_price,
+        gas,
+        input: format!("0x{}", hex_encode(&input)),
+        v: format!("0x{v:x}"),
+        r: format!("0x{}", hex_encode(&r)),
+        s: format!("0x{}", hex_encode(&s)),
+        tx_type: 0,
+        access_list: None,
+        max_priority_fee_per_gas: None,
+        chain_id: None,
+    };
+    tx.hash = transaction_hash(&tx)?;
+    Ok(tx)
+}
+
+/// Format a big-endian integer as a canonical JSON-RPC quantity.
+///
+/// A quantity has no leading zeros at all: not a zero byte, and not a zero
+/// nibble either, so the value 1000 is `0x3e8` and never `0x03e8`. Zero is
+/// the single exception and is written `0x0`. Clients compare quantities by
+/// value but echo them back, and a non-canonical form fails strict parsers.
+fn hex_quantity(bytes: &[u8]) -> String {
+    let first = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let trimmed = &bytes[first..];
+    let digits = hex_encode(trimmed);
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        "0x0".to_string()
+    } else {
+        format!("0x{digits}")
+    }
+}
+
+fn decode_to_field(item: &RlpItem) -> Result<Option<String>, ValidationError> {
+    match item {
+        RlpItem::Bytes(b) if b.is_empty() => Ok(None),
+        RlpItem::Bytes(b) if b.len() == 20 => Ok(Some(format!("0x{}", hex_encode(b)))),
+        _ => Err(ValidationError::MalformedField("to")),
+    }
+}
+
+fn rlp_bytes(item: &RlpItem) -> Option<Vec<u8>> {
+    match item {
+        RlpItem::Bytes(b) => Some(b.clone()),
+        RlpItem::List(_) => None,
+    }
+}
+
+fn rlp_u64(item: &RlpItem) -> Option<u64> {
+    let bytes = rlp_bytes(item)?;
+    if bytes.len() > 8 {
+        return None;
+    }
+    let mut out = 0u64;
+    for &b in &bytes {
+        out = (out << 8) | b as u64;
+    }
+    Some(out)
 }
 
 /// Compute the transactions root for a block.
@@ -222,7 +568,7 @@ pub fn transactions_root(transactions: &[Transaction]) -> Result<[u8; 32], Valid
     let mut trie = Trie::new();
     for (index, tx) in transactions.iter().enumerate() {
         let key = RlpItem::from_u64(index as u64).encode();
-        let value = encode_legacy_transaction(tx)?;
+        let value = encode_transaction(tx)?;
         trie.insert(&key, &value);
     }
     Ok(trie.root_hash())
@@ -323,11 +669,24 @@ pub fn validate_block(
         });
     }
 
-    // EIP-1559: the base fee is mandatory once London is active.
-    if config.london_block.map(|b| header.number >= b).unwrap_or(false)
-        && header.base_fee_per_gas.is_none()
-    {
-        return Err(ValidationError::MalformedField("base_fee_per_gas"));
+    // EIP-1559: the base fee is mandatory once London is active, and it must
+    // be exactly what the parent's usage implies. Accepting any other value
+    // would let a validator raise the fee to tax users or lower it to fill
+    // blocks cheaply, and would let two clients disagree on a block's hash.
+    if config.london_block.map(|b| header.number >= b).unwrap_or(false) {
+        let Some(base_fee) = header.base_fee_per_gas else {
+            return Err(ValidationError::MalformedField("base_fee_per_gas"));
+        };
+        if let Some(parent) = parent {
+            let expected = next_base_fee(
+                parent.header.base_fee_per_gas.unwrap_or(0),
+                parent.header.gas_used,
+                parent.header.gas_limit,
+            );
+            if base_fee != expected {
+                return Err(ValidationError::MalformedField("base_fee_per_gas"));
+            }
+        }
     }
 
     Ok(())
@@ -349,28 +708,32 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 // EIP-155 TRANSACTION SIGNING
 // =============================================================================
 
-/// The EIP-155 signing hash of a legacy transaction.
+/// The hash a transaction's signature commits to.
 ///
-/// The signed preimage is `[nonce, gasPrice, gasLimit, to, value, data,
-/// chainId, 0, 0]`; including the chain id is what prevents a transaction
-/// signed for one chain from being replayed on another.
+/// A legacy transaction signs the nine-field EIP-155 preimage
+/// `[nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]`; including
+/// the chain id is what prevents a transaction signed for one chain from
+/// being replayed on another.
+///
+/// A typed transaction (EIP-2930, EIP-1559) signs the type byte followed by
+/// its own field list *without* the signature, and without a chain id inside
+/// the list: the chain id is an explicit field, so it is already covered.
 pub fn signing_hash(tx: &Transaction, chain_id: u64) -> Result<[u8; 32], ValidationError> {
-    let to = match &tx.to {
-        Some(address) => fixed_item(address, 20)?,
-        None => RlpItem::Bytes(Vec::new()),
-    };
-    let fields = vec![
-        RlpItem::from_u64(tx.nonce),
-        RlpItem::from_u64(tx.gas_price),
-        RlpItem::from_u64(tx.gas),
-        to,
-        quantity_item(&tx.value)?,
-        RlpItem::Bytes(decode_hex_field(&tx.input, None)?),
-        RlpItem::from_u64(chain_id),
-        RlpItem::Bytes(Vec::new()),
-        RlpItem::Bytes(Vec::new()),
-    ];
-    Ok(tiger_crypto::keccak256(&RlpItem::list(fields).encode()))
+    if tx.tx_type == 0 {
+        let mut fields = signed_fields(tx)?;
+        fields.push(RlpItem::from_u64(chain_id));
+        fields.push(RlpItem::Bytes(Vec::new()));
+        fields.push(RlpItem::Bytes(Vec::new()));
+        return Ok(tiger_crypto::keccak256(&RlpItem::list(fields).encode()));
+    }
+
+    // A typed transaction signs the same field list it travels with, minus
+    // the signature, prefixed by its type byte.
+    let fields = typed_unsigned_fields(tx)?;
+
+    let mut encoded = vec![tx.tx_type as u8];
+    encoded.extend_from_slice(&RlpItem::list(fields).encode());
+    Ok(tiger_crypto::keccak256(&encoded))
 }
 
 /// Fill in a transaction's signature fields by signing its EIP-155 hash.
@@ -385,14 +748,19 @@ pub fn sign_transaction(
     let signature = tiger_crypto::sign(&hash, private_key)
         .map_err(|_| ValidationError::MalformedField("private_key"))?;
 
-    tx.v = format!("0x{:x}", signature.v(Some(chain_id)));
+    tx.v = if tx.tx_type == 0 {
+        format!("0x{:x}", signature.v(Some(chain_id)))
+    } else {
+        // A typed transaction stores the bare y-parity in `v`.
+        format!("0x{:x}", signature.v(None))
+    };
     tx.r = format!("0x{}", hex_encode(&signature.r()));
     tx.s = format!("0x{}", hex_encode(&signature.s()));
     tx.hash = transaction_hash(tx)?;
     Ok(())
 }
 
-/// Recover the sender address of a signed legacy transaction.
+/// Recover the sender address of a signed transaction.
 ///
 /// This is how a node verifies that a transaction was authorised by the
 /// account whose nonce and balance it is about to spend.
@@ -408,16 +776,28 @@ pub fn recover_transaction_sender(
         return Err(ValidationError::MalformedField("signature"));
     }
 
-    // EIP-155 encodes the chain id in v as v = recovery_id + 35 + 2 * chain_id.
-    // Values of 27/28 are the pre-EIP-155 form.
-    let recovery_id = match v_value {
-        27 | 28 => (v_value - 27) as u8,
-        other => {
-            let expected_parity_base = 35 + 2 * chain_id;
-            if other < expected_parity_base {
-                return Err(ValidationError::MalformedField("v"));
+    let recovery_id = if tx.tx_type == 0 {
+        // EIP-155 encodes the chain id in v as v = recovery_id + 35 + 2 *
+        // chain_id. Values of 27/28 are the pre-EIP-155 form.
+        match v_value {
+            27 | 28 => (v_value - 27) as u8,
+            other => {
+                let expected_parity_base = 35 + 2 * chain_id;
+                if other < expected_parity_base {
+                    return Err(ValidationError::MalformedField("v"));
+                }
+                ((other - expected_parity_base) % 2) as u8
             }
-            ((other - expected_parity_base) % 2) as u8
+        }
+    } else {
+        // A typed transaction carries the raw y-parity, and the chain id is
+        // an explicit field, so there is no recovery information to unpack.
+        // Anything above 1 is not a parity bit and cannot be a valid
+        // signature; accepting it would let a malleable `v` select a
+        // different key.
+        match v_value {
+            0 | 1 => v_value as u8,
+            _ => return Err(ValidationError::MalformedField("v")),
         }
     };
 
@@ -498,6 +878,14 @@ mod tests {
         );
     }
 
+    /// Decode a hex string, ignoring an optional `0x` prefix.
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        let trimmed = value.strip_prefix("0x").unwrap_or(value);
+        (0..trimmed.len() / 2)
+            .map(|i| u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
     fn reference_tx() -> Transaction {
         Transaction {
             hash: String::new(),
@@ -514,6 +902,10 @@ mod tests {
             v: "0x25".to_string(),
             r: "0x01".to_string(),
             s: "0x02".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         }
     }
 
@@ -591,6 +983,19 @@ mod tests {
         }
     }
 
+    /// A block that builds on `parent`, with the base fee the parent's usage
+    /// implies. A hand-written fixture cannot guess that value, and a child
+    /// with the wrong fee is now correctly rejected.
+    fn block_on(parent: &Block, number: u64, timestamp: u64) -> Block {
+        let mut block = build_block(number, block_hash(&parent.header).unwrap(), timestamp);
+        block.header.base_fee_per_gas = Some(next_base_fee(
+            parent.header.base_fee_per_gas.unwrap_or(0),
+            parent.header.gas_used,
+            parent.header.gas_limit,
+        ));
+        block
+    }
+
     fn test_config() -> crate::types::ChainConfig {
         crate::types::ChainConfig {
             chain_id: 6666,
@@ -613,8 +1018,7 @@ mod tests {
         let genesis = build_block(0, h(0x00), 1_700_000_000);
         assert!(validate_block(&genesis, None, &test_config()).is_ok());
 
-        let genesis_hash = block_hash(&genesis.header).unwrap();
-        let child = build_block(1, genesis_hash, 1_700_000_012);
+        let child = block_on(&genesis, 1, 1_700_000_012);
         assert!(validate_block(&child, Some(&genesis), &test_config()).is_ok());
     }
 
@@ -703,6 +1107,10 @@ mod tests {
             v: "0x0".to_string(),
             r: "0x0".to_string(),
             s: "0x0".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         };
         assert_eq!(
             hex_encode(&signing_hash(&tx, 1).unwrap()),
@@ -778,4 +1186,192 @@ mod tests {
             Err(ValidationError::MalformedField(_))
         ));
     }
+
+    /// A transaction exactly as `eth-account` signs it: an EIP-1559 transfer
+    /// of 1 TGR on chain 6666, key `0x..01`. The raw bytes and the resulting
+    /// hash come from that independent implementation, so this pins the whole
+    /// path — envelope, field order, signing hash, recovery — to the format
+    /// real wallets emit.
+    #[test]
+    fn typed_transactions_match_an_independent_implementation() {
+        let raw = "02f874821a0a80843b9aca00847735940082520894000000000000000000000000000000000000dead880de0b6b3a764000080c001a0e971283a8f5fc4b7a9e3d49cd6f7246a5abe77cf9de36899cc9576f3bf3e8ceca03f15699cbd527e9009ce59cc7ac15ee2d6f53faa3fb0cc59fac7898038af5241";
+        let tx = decode_transaction(&hex_bytes(raw)).unwrap();
+
+        assert_eq!(tx.tx_type, 2);
+        assert_eq!(tx.chain_id, Some(6666));
+        assert_eq!(tx.nonce, 0);
+        assert_eq!(tx.max_priority_fee_per_gas, Some(1_000_000_000));
+        assert_eq!(tx.gas_price, 2_000_000_000);
+        assert_eq!(tx.gas, 21_000);
+        assert_eq!(tx.v, "0x1");
+
+        assert_eq!(
+            transaction_hash(&tx).unwrap(),
+            "0x313eb46d853c9aa910ea75ce88f606a80c98b288df35e1977ece45ca3d51e8d1"
+        );
+
+        // Re-encoding must reproduce the wire bytes, otherwise the
+        // transactions root would differ from every other client's.
+        assert_eq!(hex_encode(&encode_transaction(&tx).unwrap()), raw);
+
+        let sender = recover_transaction_sender(&tx, 6666).unwrap();
+        assert_eq!(
+            hex_encode(&sender),
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+    }
+
+    /// The same for an EIP-2930 transaction with a populated access list.
+    #[test]
+    fn typed_transaction_with_access_list_matches() {
+        let raw = "01f8a0821a0a0784b2d05e0082753094000000000000000000000000000000000000dead0180f838f7940000000000000000000000000000000000000002e1a0000000000000000000000000000000000000000000000000000000000000000001a04a85e1d78363f35c3af6bf3984cc39ff5dadc9c6829a0968ce74cb50565be303a049f8c209dcdb0f8dc699c3686aaab7e02ea5424128173cebd5c851ec580bbc97";
+        let tx = decode_transaction(&hex_bytes(raw)).unwrap();
+        assert_eq!(tx.tx_type, 1);
+        assert_eq!(tx.chain_id, Some(6666));
+        assert_eq!(tx.nonce, 7);
+        assert_eq!(tx.gas_price, 3_000_000_000);
+        assert_eq!(tx.max_priority_fee_per_gas, None);
+        assert_eq!(
+            transaction_hash(&tx).unwrap(),
+            "0xdfcb68555c0cb0746bd88907386da0acbaeaea10d96bc8163ac8ffca71962538"
+        );
+        assert_eq!(hex_encode(&encode_transaction(&tx).unwrap()), raw);
+        assert_eq!(
+            hex_encode(&recover_transaction_sender(&tx, 6666).unwrap()),
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+    }
+
+    /// A typed transaction signed for one chain must not recover on another:
+    /// the chain id is inside the signed preimage.
+    #[test]
+    fn typed_transaction_is_bound_to_its_chain() {
+        let raw = "02f874821a0a80843b9aca00847735940082520894000000000000000000000000000000000000dead880de0b6b3a764000080c001a0e971283a8f5fc4b7a9e3d49cd6f7246a5abe77cf9de36899cc9576f3bf3e8ceca03f15699cbd527e9009ce59cc7ac15ee2d6f53faa3fb0cc59fac7898038af5241";
+        let tx = decode_transaction(&hex_bytes(raw)).unwrap();
+        // The chain id is inside the signed list, so a payload claiming a
+        // different chain recovers a different sender. A node that ignored
+        // the payload's chain id would accept a replay from another chain.
+        let mut replayed = tx.clone();
+        replayed.chain_id = Some(1);
+        let other = recover_transaction_sender(&replayed, 1).unwrap();
+        assert_ne!(
+            hex_encode(&other),
+            "7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+        );
+    }
+
+    /// `yParity` is a single bit. A `v` above 1 is not a parity and must be
+    /// refused rather than silently reduced modulo 2, which would let a
+    /// malleable `v` name a different key.
+    #[test]
+    fn typed_transaction_rejects_a_non_parity_v() {
+        let raw = "02f874821a0a80843b9aca00847735940082520894000000000000000000000000000000000000dead880de0b6b3a764000080c001a0e971283a8f5fc4b7a9e3d49cd6f7246a5abe77cf9de36899cc9576f3bf3e8ceca03f15699cbd527e9009ce59cc7ac15ee2d6f53faa3fb0cc59fac7898038af5241";
+        let mut tx = decode_transaction(&hex_bytes(raw)).unwrap();
+        tx.v = "0x2".to_string();
+        assert!(recover_transaction_sender(&tx, 6666).is_err());
+    }
+
+    /// A type byte that is not a supported envelope is refused, so a blob
+    /// transaction cannot be mistaken for a transfer.
+    #[test]
+    fn unsupported_transaction_types_are_refused() {
+        let mut tx = reference_tx();
+        tx.tx_type = 3;
+        assert!(encode_transaction(&tx).is_err());
+        assert!(signing_hash(&tx, 1).is_err());
+    }
+
+
+    /// The base fee follows the parent's usage: it rises on a full block,
+    /// falls on an empty one, and holds at the target. Every client must
+    /// compute the same value, so the arithmetic is pinned here.
+    #[test]
+    fn base_fee_follows_the_parent_usage() {
+        // An empty block: the fee falls by an eighth.
+        assert_eq!(next_base_fee(1_000_000_000, 0, 30_000_000), 875_000_000);
+        // Exactly the target (half the limit): unchanged.
+        assert_eq!(next_base_fee(1_000_000_000, 15_000_000, 30_000_000), 1_000_000_000);
+        // A completely full block: the fee rises by an eighth.
+        assert_eq!(next_base_fee(1_000_000_000, 30_000_000, 30_000_000), 1_125_000_000);
+        // A zero fee stays zero rather than dividing by a zero target.
+        assert_eq!(next_base_fee(0, 0, 0), 0);
+        // A block above the limit cannot make the fee overflow.
+        assert!(next_base_fee(u64::MAX, 30_000_000, 30_000_000) > 0);
+    }
+
+    /// A validator cannot publish a block whose base fee is not the one its
+    /// parent implies.
+    #[test]
+    fn a_block_with_the_wrong_base_fee_is_rejected() {
+        let parent = build_block(1, h(0x00), 1_700_000_000);
+        let mut child = block_on(&parent, 2, 1_700_000_012);
+        let expected = child.header.base_fee_per_gas.unwrap();
+        assert!(validate_block(&child, Some(&parent), &test_config()).is_ok());
+
+        // One wei away from the derived value is still wrong.
+        child.header.base_fee_per_gas = Some(expected + 1);
+        assert!(validate_block(&child, Some(&parent), &test_config()).is_err());
+    }
+
+
+    /// A decoded transaction must expose integer fields in canonical
+    /// quantity form. A leading zero nibble such as `0x03e8` is not a valid
+    /// quantity and strict clients reject it.
+    #[test]
+    fn decoded_quantities_are_canonical() {
+        // 1000 encodes as the two bytes 0x03 0xe8, whose high nibble is zero.
+        let tx = reference_tx();
+        let encoded = encode_transaction(&tx).unwrap();
+        let decoded = decode_transaction(&encoded).unwrap();
+        assert_eq!(decoded.value, "0x3e8");
+        assert_eq!(decoded.nonce, 1);
+        assert_eq!(decoded.gas, 21_000);
+
+        // A zero value stays `0x0` rather than becoming an empty string.
+        let mut zero = reference_tx();
+        zero.value = "0x0".to_string();
+        let encoded = encode_transaction(&zero).unwrap();
+        assert_eq!(decode_transaction(&encoded).unwrap().value, "0x0");
+    }
+
+    /// A typed transaction round-trips through the encoder and decoder with
+    /// every field preserved, so the node can hash and store what a wallet
+    /// sent without altering it.
+    #[test]
+    fn typed_transaction_round_trips() {
+        let raw = "02f874821a0a80843b9aca00847735940082520894000000000000000000000000000000000000dead880de0b6b3a764000080c001a0e971283a8f5fc4b7a9e3d49cd6f7246a5abe77cf9de36899cc9576f3bf3e8ceca03f15699cbd527e9009ce59cc7ac15ee2d6f53faa3fb0cc59fac7898038af5241";
+        let decoded = decode_transaction(&hex_bytes(raw)).unwrap();
+        assert_eq!(hex_encode(&encode_transaction(&decoded).unwrap()), raw);
+        // Re-encoding preserves the hash, which is what makes the receipt
+        // lookup by hash work after a restart.
+        assert_eq!(
+            decoded.hash,
+            transaction_hash(&decode_transaction(&hex_bytes(raw)).unwrap()).unwrap()
+        );
+    }
+
+    /// The effective gas price is the one the sender was charged: an EIP-1559
+    /// transaction never pays its ceiling when the base fee plus its tip is
+    /// lower.
+    #[test]
+    fn effective_gas_price_respects_the_ceiling_and_the_tip() {
+        let mut tx = reference_tx();
+        // A legacy transaction pays exactly what it signed.
+        assert_eq!(effective_gas_price(&tx, 999), tx.gas_price);
+
+        // An EIP-1559 transaction pays base fee + tip when that is below the
+        // ceiling.
+        tx.tx_type = 2;
+        tx.chain_id = Some(6666);
+        tx.access_list = Some("0xc0".to_string());
+        tx.gas_price = 1_000;
+        tx.max_priority_fee_per_gas = Some(10);
+        assert_eq!(effective_gas_price(&tx, 100), 110);
+        // A tip so large that base + tip exceeds the ceiling is clamped to
+        // the ceiling, because the sender never authorised more.
+        assert_eq!(effective_gas_price(&tx, 100), 110);
+        tx.max_priority_fee_per_gas = Some(5_000);
+        assert_eq!(effective_gas_price(&tx, 100), 1_000);
+    }
+
 }

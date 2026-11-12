@@ -280,3 +280,84 @@ crypto 22, state 28, evm 72, blockchain 40, consensus 15, precompile 20, node 47
 - There are no open PRs to merge; if one ever exists, merge it into `main`
   directly rather than reviewing it as a separate step.
 - Keep `main` buildable: run the relevant crate's tests before pushing.
+
+## Session 2026-11-11 — EIP-1559 fee semantics (VERIFIED, tests pass)
+
+### Real defects found and fixed
+1. **Base fee was permanently zero.** `node/src/node.rs` hardcoded
+   `base_fee: 0` / `base_fee_per_gas: Some(0)` for both genesis and produced
+   blocks, so the chain had no EIP-1559 fee mechanism at all. Added
+   `next_base_fee()` in `blockchain/src/block.rs` (real EIP-1559 schedule:
+   target = limit/2, +/- 1/8 per block, saturating) and wired it into block
+   production. Genesis now sets 1 gwei; each block derives its fee from the
+   parent. Verified live: 1e9 -> 0x147b0e55 after 8 empty blocks (= 0.875^8).
+
+2. **The whole gas charge was credited to the validator.** `evm/src/transition.rs`
+   credited `actual_cost = gas_price * gas_used` to the coinbase, minting the
+   base-fee portion. Now `effective_gas_price()` = `min(maxFeePerGas,
+   baseFee + maxPriorityFeePerGas)` and `fee_split()` burns the base fee while
+   crediting only the tip. `TransitionOutcome` gained a `burned: [u8; 32]`
+   field. Verified against an independent sender: validator received exactly
+   `used * tip`, sender was debited exactly `used * effective`, and
+   `used * base_fee` was burned.
+
+3. **`effective_gas_price` was computed after the sender was debited.** An
+   unusable fee ceiling returned an error while leaving the account mutated.
+   Moved the computation before any state change, so a rejection is atomic.
+
+4. **Invalid transactions were included in blocks.** `produce_block` pushed
+   any recoverable transaction into the block and, when `apply_transaction`
+   failed (bad nonce, insufficient funds, fee ceiling below base fee),
+   synthesised a receipt with intrinsic gas that no state transition backed.
+   The header's `gas_used` then disagreed with the receipts. Now a
+   transaction that fails validation is excluded entirely (`continue`), while
+   an execution *revert* is still included with a failed receipt, as before.
+   Verified: an under-priced EIP-1559 tx is left out, nonce and balance
+   untouched, so it remains valid for a later block.
+
+5. **Gas-limit overflow was checked after execution.** Applying a transaction
+   and then deciding it does not fit would leave its state changes in a block
+   that does not list it. The limit is now checked against `request.gas_limit`
+   before the transaction runs.
+
+6. **The mempool evicted transactions that were never mined.** It removed
+   every pending hash after a block was produced. Now only hashes present in
+   the produced block are removed, so a transaction left out for space or
+   price is not silently lost.
+
+7. **Decoded quantities were not canonical.** `trim_leading_zeros` stripped
+   zero *bytes* but not zero *nibbles*, so the value 1000 decoded as `0x03e8`
+   instead of `0x3e8` — invalid per the JSON-RPC spec. Replaced with
+   `hex_quantity()`. This was caught by an existing node test.
+
+8. **Receipt/transaction JSON reported the wrong price and type.**
+   `effectiveGasPrice` echoed `tx.gas_price` (the *ceiling* for a type-2 tx),
+   and `type` was hardcoded `"0x0"`. Both fixed via the shared
+   `blockchain::effective_gas_price()` helper; mined transactions now report
+   the price actually paid while `maxFeePerGas` carries the ceiling.
+
+9. **`eth_gasPrice`/`eth_maxPriorityFeePerGas`/`eth_feeHistory` were stale.**
+   `eth_gasPrice` reported the last transaction's `gas_price` (a ceiling);
+   it now returns next-block base fee + a suggested tip. `eth_maxPriorityFeePerGas`
+   is the median tip of recent blocks, floored at `min_gas_price`.
+   `eth_feeHistory` rewards now report the *tip* (not the whole price) and the
+   `baseFeePerGas` array ends with the next block's fee, as clients expect.
+
+10. **Consensus now enforces the base fee.** `validate_block` previously only
+    checked that `base_fee_per_gas` was present once London was active.
+    Without an equality check a validator could set any fee. It now requires
+    exactly `next_base_fee(parent...)`.
+
+### Test counts (all passing)
+- state 32, evm 77, blockchain 50, node 58, debug_trace 9, network 22
+
+### Live verification (chain id 6666, genesis 1e21 wei, key 0x..01)
+- Node on 127.0.0.1:8554, base fee falls 1e9 -> 0x147b0e55 over 8 empty blocks.
+- Real type-2 tx from an independent key: receipt `status 0x1`, `type 0x2`,
+  `effectiveGasPrice == block baseFee + tip`, sender debit == `gasUsed * eff`,
+  validator credit == `gasUsed * tip`, burn == `gasUsed * baseFee`.
+
+### Note for future sessions
+Earlier notes in this file said `blockchain` had 21 tests; it now has 50.
+The `TransactionRequest` (evm) and `Transaction` (blockchain) structs both
+carry `max_priority_fee_per_gas`; any new literal must set it.

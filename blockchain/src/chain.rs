@@ -252,6 +252,10 @@ mod tests {
             v: "0x25".to_string(),
             r: "0x01".to_string(),
             s: "0x02".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         }
     }
 
@@ -286,6 +290,13 @@ mod tests {
         block.header.number = parent.header.number + 1;
         block.header.parent_hash = crate::block::block_hash(&parent.header).unwrap();
         block.header.timestamp = timestamp;
+        // The base fee is a function of the parent, so a child built by hand
+        // still has to derive it to be a valid block.
+        block.header.base_fee_per_gas = Some(crate::block::next_base_fee(
+            parent.header.base_fee_per_gas.unwrap_or(0),
+            parent.header.gas_used,
+            parent.header.gas_limit,
+        ));
         block
     }
 

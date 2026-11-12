@@ -89,7 +89,11 @@ impl std::error::Error for TransitionError {}
 pub struct TransactionRequest {
     /// Sender nonce.
     pub nonce: u64,
-    /// Price per unit of gas in wei.
+    /// The maximum price per unit of gas the sender authorised, in wei.
+    ///
+    /// For a legacy or EIP-2930 transaction this is the signed `gasPrice`. For
+    /// an EIP-1559 transaction it is `maxFeePerGas`, and the price actually
+    /// paid is `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`.
     pub gas_price: [u8; 32],
     /// Maximum gas the transaction may consume.
     pub gas_limit: u64,
@@ -101,6 +105,9 @@ pub struct TransactionRequest {
     pub data: Vec<u8>,
     /// The sender recovered from the signature.
     pub sender: [u8; 20],
+    /// EIP-1559 maximum priority fee per gas. `None` for a legacy or EIP-2930
+    /// transaction, whose `gas_price` is the price paid outright.
+    pub max_priority_fee_per_gas: Option<[u8; 32]>,
 }
 
 /// The outcome of applying a transaction.
@@ -117,6 +124,10 @@ pub struct TransitionOutcome {
     /// Logs the transaction emitted, in the order they were emitted. Empty for
     /// a transaction that reverted, since a revert discards its logs.
     pub logs: Vec<crate::types::Log>,
+    /// Fee burned by this transaction, per EIP-1559. The base-fee portion of
+    /// the charge is removed from circulation rather than paid to anyone, so
+    /// a caller tracking supply needs it.
+    pub burned: [u8; 32],
 }
 
 /// The intrinsic gas cost of a transaction: the base charge plus the per-byte
@@ -337,6 +348,12 @@ pub fn apply_transaction_traced(
         });
     }
 
+    // The price actually paid per unit of gas. An EIP-1559 transaction
+    // derives it from the block's base fee, and a ceiling below that base fee
+    // is unusable, so this is resolved before any state is touched: a
+    // rejection must leave the account exactly as it was.
+    let effective = effective_gas_price(tx, block)?;
+
     // 3. The sender must be able to pay the maximum possible cost:
     //    gas_limit * gas_price + value.
     let max_gas_cost = u256_mul_u64(&tx.gas_price, tx.gas_limit)
@@ -364,7 +381,9 @@ pub fn apply_transaction_traced(
     ctx.caller = crate::Address(sender);
     ctx.origin = crate::Address(sender);
     ctx.gas = tx.gas_limit;
-    ctx.gas_price = u64_from_be(&tx.gas_price);
+    // GASPRICE reports the price actually paid, which for an EIP-1559
+    // transaction is the effective price rather than the authorised ceiling.
+    ctx.gas_price = u64_from_be(&effective);
     ctx.value = u64_from_be(&tx.value);
     ctx.data = tx.data.clone();
     ctx.block_number = block.number;
@@ -453,17 +472,26 @@ pub fn apply_transaction_traced(
     let refund = host.refund().min(gas_used / 2);
     gas_used -= refund;
 
-    let actual_cost = u256_mul_u64(&tx.gas_price, gas_used)
+    let actual_cost = u256_mul_u64(&effective, gas_used)
         .ok_or(TransitionError::MalformedTransaction)?;
     let unused = u256_sub(&max_total, &actual_cost)
         .ok_or(TransitionError::MalformedTransaction)?;
 
-    // Return the unused gas to the sender and pay the beneficiary.
+    // Return the unused gas to the sender, then settle the fee. Under
+    // EIP-1559 the base fee is burned and only the tip reaches the validator,
+    // so crediting the whole cost would mint supply the chain never issued.
     let sender_addr = sender;
     host.state.credit(&sender_addr, &unused);
-    if actual_cost != [0u8; 32] {
-        host.state.credit(&block.coinbase, &actual_cost);
+    let (burned_per_gas, tip_per_gas) = fee_split(&effective, block);
+    let tip = u256_mul_u64(&tip_per_gas, gas_used)
+        .ok_or(TransitionError::MalformedTransaction)?;
+    if tip != [0u8; 32] {
+        host.state.credit(&block.coinbase, &tip);
     }
+    // The burned portion is accounted for so a caller can report the supply
+    // removed by the block.
+    let burned = u256_mul_u64(&burned_per_gas, gas_used)
+        .ok_or(TransitionError::MalformedTransaction)?;
 
     // 9. The nonce advances whether or not execution succeeded, because the
     //    transaction was included and paid for.
@@ -477,6 +505,7 @@ pub fn apply_transaction_traced(
                 output: result.output,
                 contract_address: None,
                 logs,
+                burned,
             },
             diffs,
         ));
@@ -503,6 +532,7 @@ pub fn apply_transaction_traced(
             output: result.output,
             contract_address,
             logs,
+            burned,
         },
         diffs,
     ))
@@ -523,6 +553,55 @@ pub fn create_address(sender: &[u8; 20], nonce: u64) -> [u8; 20] {
 }
 
 /// The low 8 bytes of a 256-bit value, saturating at u64::MAX.
+
+/// The price per unit of gas a transaction actually pays, per EIP-1559.
+///
+/// A legacy or EIP-2930 transaction pays its signed `gasPrice`. An EIP-1559
+/// transaction pays `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`, so
+/// the sender never pays more than they authorised and the validator is never
+/// underpaid relative to the tip the sender offered.
+fn effective_gas_price(
+    tx: &TransactionRequest,
+    block: &BlockContext,
+) -> Result<[u8; 32], TransitionError> {
+    let Some(priority) = tx.max_priority_fee_per_gas else {
+        return Ok(tx.gas_price);
+    };
+
+    // A sender who authorised less than the base fee cannot have their
+    // transaction included; including it would either overcharge them or
+    // underpay the burn.
+    let base_fee = u256_from_u64(block.base_fee);
+    if u256_cmp(&tx.gas_price, &base_fee) == std::cmp::Ordering::Less {
+        return Err(TransitionError::MalformedTransaction);
+    }
+
+    let (base_plus_tip, overflow) = u256_add(&base_fee, &priority);
+    if overflow {
+        // An absurd tip would wrap the sum; refuse rather than charge a
+        // nonsense price.
+        return Err(TransitionError::MalformedTransaction);
+    }
+    Ok(if u256_cmp(&tx.gas_price, &base_plus_tip) == std::cmp::Ordering::Less {
+        tx.gas_price
+    } else {
+        base_plus_tip
+    })
+}
+
+/// Split a fee into the part that is burned and the part paid to the
+/// validator, per EIP-1559. The base fee is burned; only the tip is credited
+/// to the block's beneficiary.
+fn fee_split(effective: &[u8; 32], block: &BlockContext) -> ([u8; 32], [u8; 32]) {
+    let base_fee = u256_from_u64(block.base_fee);
+    if u256_cmp(effective, &base_fee) == std::cmp::Ordering::Less {
+        return ([0u8; 32], *effective);
+    }
+    let burned = base_fee;
+    let tip = u256_sub(effective, &base_fee).unwrap_or([0u8; 32]);
+    (burned, tip)
+}
+
 fn u64_from_be(value: &[u8; 32]) -> u64 {
     if value[..24].iter().any(|&b| b != 0) {
         return u64::MAX;
@@ -587,6 +666,7 @@ mod tests {
             value: wei(1000),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -619,6 +699,7 @@ mod tests {
             value: wei(1000),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(64);
@@ -683,6 +764,7 @@ mod tests {
             value: wei(0),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(128);
@@ -722,6 +804,7 @@ mod tests {
             value: wei(0),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(64);
@@ -766,6 +849,7 @@ mod tests {
             value: wei(0),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(64);
@@ -797,6 +881,7 @@ mod tests {
             value: wei(1),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         assert_eq!(
@@ -825,6 +910,7 @@ mod tests {
             value: wei(1000),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         assert_eq!(
@@ -848,6 +934,7 @@ mod tests {
             value: wei(1),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         assert_eq!(
@@ -877,6 +964,7 @@ mod tests {
             value: wei(0),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -919,6 +1007,7 @@ mod tests {
             value: wei(0),
             data: init_code,
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -947,6 +1036,7 @@ mod tests {
             value: wei(500),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -977,6 +1067,7 @@ mod tests {
             value: [0u8; 32],
             data: vec![0x00],
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &request, &block()).unwrap();
@@ -1013,6 +1104,7 @@ mod tests {
             value: [0u8; 32],
             data: init,
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &request, &block()).unwrap();
@@ -1056,6 +1148,7 @@ mod tests {
             value: wei(0),
             data: Vec::new(),
             sender,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -1065,4 +1158,115 @@ mod tests {
         // The slot is now zero.
         assert_eq!(state.storage(&contract, &slot), [0u8; 32]);
     }
+
+    /// EIP-1559 splits the charge: the base fee is burned and only the tip
+    /// reaches the validator. Crediting the whole charge would mint supply.
+    #[test]
+    fn eip1559_burns_the_base_fee_and_pays_only_the_tip() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        let coinbase = addr(0xcc);
+        state.set_balance(&sender, wei(100_000_000));
+        state.set_nonce(&sender, 0);
+
+        // base fee 100, tip 10, ceiling 1000: the sender pays 110 per unit.
+        let block = BlockContext {
+            base_fee: 100,
+            coinbase,
+            gas_limit: 30_000_000,
+            ..BlockContext::default()
+        };
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(1000),
+            max_priority_fee_per_gas: Some(wei(10)),
+            gas_limit: 21_000,
+            to: Some(addr(0x22)),
+            value: wei(0),
+            data: Vec::new(),
+            sender,
+        };
+
+        let outcome = apply_transaction(&mut state, &tx, &block).unwrap();
+        let gas_used = outcome.gas_used as u64;
+        assert_eq!(gas_used, 21_000);
+
+        // The validator receives only the tip.
+        let expected_tip = u256_mul_u64(&wei(10), gas_used).unwrap();
+        assert_eq!(state.balance(&coinbase), expected_tip);
+
+        // The burned amount is the base-fee portion.
+        assert_eq!(outcome.burned, u256_mul_u64(&wei(100), gas_used).unwrap());
+
+        // The sender paid the effective price, not the ceiling.
+        let effective = u256_mul_u64(&wei(110), gas_used).unwrap();
+        assert_eq!(
+            state.balance(&sender),
+            u256_sub(&wei(100_000_000), &effective).unwrap()
+        );
+    }
+
+    /// A ceiling below the base fee cannot be included: the sender never
+    /// authorised the burn, so the transaction is rejected outright.
+    #[test]
+    fn eip1559_rejects_a_ceiling_below_the_base_fee() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        state.set_balance(&sender, wei(10_000_000));
+        state.set_nonce(&sender, 0);
+
+        let block = BlockContext {
+            base_fee: 500,
+            ..BlockContext::default()
+        };
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(100),
+            max_priority_fee_per_gas: Some(wei(1)),
+            gas_limit: 21_000,
+            to: Some(addr(0x22)),
+            value: wei(0),
+            data: Vec::new(),
+            sender,
+        };
+        assert!(apply_transaction(&mut state, &tx, &block).is_err());
+        // A rejected transaction leaves no trace on the state.
+        assert_eq!(state.balance(&sender), wei(10_000_000));
+        assert_eq!(state.nonce(&sender), 0);
+    }
+
+    /// With a zero base fee every unit of the ceiling is a tip, so a legacy
+    /// transaction and an EIP-1559 transaction paying the same price behave
+    /// identically. This is the case a chain with no base fee must not break.
+    #[test]
+    fn eip1559_with_no_base_fee_pays_the_whole_price_as_tip() {
+        let mut state = WorldState::new();
+        let sender = addr(0x11);
+        let coinbase = addr(0xcc);
+        state.set_balance(&sender, wei(10_000_000));
+        state.set_nonce(&sender, 0);
+
+        let block = BlockContext {
+            base_fee: 0,
+            coinbase,
+            ..BlockContext::default()
+        };
+        let tx = TransactionRequest {
+            nonce: 0,
+            gas_price: wei(7),
+            max_priority_fee_per_gas: Some(wei(7)),
+            gas_limit: 21_000,
+            to: Some(addr(0x22)),
+            value: wei(0),
+            data: Vec::new(),
+            sender,
+        };
+        let outcome = apply_transaction(&mut state, &tx, &block).unwrap();
+        assert_eq!(outcome.burned, [0u8; 32]);
+        assert_eq!(
+            state.balance(&coinbase),
+            u256_mul_u64(&wei(7), outcome.gas_used as u64).unwrap()
+        );
+    }
+
 }

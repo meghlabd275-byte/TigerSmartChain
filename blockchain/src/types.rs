@@ -51,12 +51,36 @@ pub struct Transaction {
     pub from: String,
     pub to: Option<String>,
     pub value: String,
+    /// Effective gas price. For a legacy transaction this is the signed
+    /// `gasPrice`. For an EIP-1559 transaction there is no such field on the
+    /// wire, and this carries the `maxFeePerGas` the sender committed to,
+    /// which is the ceiling the fee is actually charged against.
     pub gas_price: u64,
     pub gas: u64,
     pub input: String,
     pub v: String,
     pub r: String,
     pub s: String,
+    /// Transaction envelope type: 0 for a legacy transaction, 1 for
+    /// EIP-2930 (access list) and 2 for EIP-1559. It is not part of the
+    /// legacy field list, so it defaults to 0 when decoding a legacy
+    /// transaction or a JSON payload that omits it.
+    #[serde(default)]
+    pub tx_type: u64,
+    /// EIP-2930/1559 access list, RLP-encoded as the list of
+    /// `[address, storageKeys]` entries. Held in its wire form because the
+    /// signing hash commits to it byte-for-byte.
+    #[serde(default)]
+    pub access_list: Option<String>,
+    /// EIP-1559 maximum priority fee per gas. `None` for a legacy or
+    /// EIP-2930 transaction.
+    #[serde(default)]
+    pub max_priority_fee_per_gas: Option<u64>,
+    /// Chain id carried in the payload of a typed transaction. It is a field
+    /// of the signed list, so re-encoding the transaction for its hash needs
+    /// it. A legacy transaction leaves this `None`; its chain id lives in `v`.
+    #[serde(default)]
+    pub chain_id: Option<u64>,
 }
 
 /// Transaction Status

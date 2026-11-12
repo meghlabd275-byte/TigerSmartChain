@@ -20,6 +20,8 @@ use tokio::net::TcpListener;
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
+    /// The protocol version. JSON-RPC 2.0 requires "2.0" whenever it is
+    /// present, so it is validated rather than ignored.
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub method: String,
@@ -209,6 +211,20 @@ async fn write_cors_preflight(stream: &mut tokio::net::TcpStream) -> std::io::Re
 /// Route a request to the matching method.
 async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
     let id = request.id.clone().unwrap_or(Value::Null);
+
+    // The specification requires the version to be exactly "2.0" when it is
+    // sent, so a client that declares something else is told rather than
+    // silently served.
+    if let Some(version) = request.jsonrpc.as_deref() {
+        if version != "2.0" {
+            return RpcResponse::error(
+                INVALID_REQUEST,
+                format!("unsupported JSON-RPC version {version:?}, expected \"2.0\""),
+                id,
+            );
+        }
+    }
+
     let method = request.method.as_str();
     let params = &request.params;
 
@@ -439,8 +455,13 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
             }
         }
         "eth_maxPriorityFeePerGas" => {
-            // The minimum tip this node will accept, taken from configuration.
-            RpcResponse::success(hex_u64(node.config().min_gas_price), id)
+            // The tip a wallet should offer: the median tip of the recent
+            // blocks, floored at the minimum this node will relay. A wallet
+            // that offers this is neither overpaying nor likely to be
+            // outbid by the transactions already in flight.
+            let manager = node.get_chain_manager().await;
+            let tip = suggested_tip(manager.chain()).max(node.config().min_gas_price);
+            RpcResponse::success(hex_u64(tip), id)
         }
         "eth_feeHistory" => match fee_history(node, params).await {
             Ok(value) => RpcResponse::success(value, id),
@@ -469,15 +490,20 @@ async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
         }
         "eth_protocolVersion" => RpcResponse::success(json!("0x41"), id),
         "eth_gasPrice" => {
-            // The price of the last block's transactions, or a floor when the
-            // chain is empty. Reported from state rather than a constant.
+            // The price a transaction sent now would pay: the next block's
+            // base fee plus a tip. Reporting only the last transaction's
+            // ceiling would understate the cost of the very next block.
             let manager = node.get_chain_manager().await;
-            let price = manager
-                .chain()
-                .get_block(manager.chain().height())
-                .and_then(|b| b.transactions.last().map(|tx| tx.gas_price))
-                .unwrap_or(node.config().min_gas_price);
-            RpcResponse::success(hex_u64(price), id)
+            let chain = manager.chain();
+            let base_fee = match chain.get_block(chain.height()) {
+                Some(parent) => tiger_blockchain::next_base_fee(
+                    parent.header.base_fee_per_gas.unwrap_or(0),
+                    parent.header.gas_used,
+                    parent.header.gas_limit,
+                ),
+                None => node.config().min_gas_price,
+            };
+            RpcResponse::success(hex_u64(base_fee.saturating_add(suggested_tip(chain))), id)
         }
         "eth_estimateGas" => {
             // A plain transfer costs the intrinsic 21,000. A call is estimated
@@ -836,7 +862,10 @@ async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<Stri
     use SubmitError::{BadRequest, Internal};
 
     let bytes = decode_hex(raw).map_err(BadRequest)?;
-    let tx = decode_legacy_transaction(&bytes).map_err(BadRequest)?;
+    // Decoding lives with the transaction type itself, so the node and any
+    // other consumer agree on the wire format rather than each keeping a copy.
+    let tx = tiger_blockchain::decode_transaction(&bytes)
+        .map_err(|e| BadRequest(format!("invalid transaction: {e}")))?;
 
     // The signature is what authorises the transaction, so the sender is
     // recovered from it and the wire's `from` field is discarded rather than
@@ -864,63 +893,6 @@ async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<Stri
         p2p.announce_transaction(&hash).await;
     }
     Ok(hash)
-}
-
-/// Decode a legacy (type 0) RLP transaction into the node's transaction type.
-fn decode_legacy_transaction(bytes: &[u8]) -> Result<tiger_blockchain::types::Transaction, String> {
-    use tiger_blockchain::types::Transaction;
-    use tiger_state::rlp::RlpItem;
-
-    let item = tiger_state::rlp::decode(bytes).map_err(|e| format!("RLP decode failed: {e}"))?;
-    let fields = match item {
-        RlpItem::List(items) => items,
-        RlpItem::Bytes(_) => return Err("transaction must be an RLP list".to_string()),
-    };
-    if fields.len() != 9 {
-        return Err(format!(
-            "a legacy transaction has 9 fields, got {}",
-            fields.len()
-        ));
-    }
-
-    let nonce = as_u64(&fields[0]).ok_or("invalid nonce")?;
-    let gas_price = as_u64(&fields[1]).ok_or("invalid gas price")?;
-    let gas = as_u64(&fields[2]).ok_or("invalid gas limit")?;
-    let to = match &fields[3] {
-        RlpItem::Bytes(b) if b.is_empty() => None,
-        RlpItem::Bytes(b) if b.len() == 20 => Some(format!("0x{}", tiger_blockchain::hex_encode(b))),
-        _ => return Err("invalid `to` address".to_string()),
-    };
-    let value_bytes = match &fields[4] {
-        RlpItem::Bytes(b) => b.clone(),
-        _ => return Err("invalid value".to_string()),
-    };
-    let input = match &fields[5] {
-        RlpItem::Bytes(b) => b.clone(),
-        _ => return Err("invalid data".to_string()),
-    };
-    let v = as_u64(&fields[6]).ok_or("invalid v")?;
-    let r = as_bytes(&fields[7]);
-    let s = as_bytes(&fields[8]);
-
-    Ok(Transaction {
-        hash: String::new(),
-        nonce,
-        block_hash: None,
-        block_number: None,
-        transaction_index: None,
-        from: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 20])),
-        to,
-        // `value` is an integer, so it is formatted as a canonical quantity
-        // with no leading zeros; RLP already stores it minimally.
-        value: hex_quantity(&value_bytes),
-        gas_price,
-        gas,
-        input: format!("0x{}", tiger_blockchain::hex_encode(&input)),
-        v: format!("0x{v:x}"),
-        r: format!("0x{}", tiger_blockchain::hex_encode(&r)),
-        s: format!("0x{}", tiger_blockchain::hex_encode(&s)),
-    })
 }
 
 /// Serialise an account proof the way `eth_getProof` defines it.
@@ -972,29 +944,6 @@ fn hex_quantity(bytes: &[u8]) -> String {
         "0x0".to_string()
     } else {
         format!("0x{stripped}")
-    }
-}
-
-fn as_u64(item: &tiger_state::rlp::RlpItem) -> Option<u64> {
-    match item {
-        tiger_state::rlp::RlpItem::Bytes(b) => {
-            if b.len() > 8 {
-                return None;
-            }
-            let mut out = 0u64;
-            for &byte in b {
-                out = (out << 8) | byte as u64;
-            }
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
-fn as_bytes(item: &tiger_state::rlp::RlpItem) -> Vec<u8> {
-    match item {
-        tiger_state::rlp::RlpItem::Bytes(b) => b.clone(),
-        _ => Vec::new(),
     }
 }
 
@@ -1106,13 +1055,23 @@ fn transaction_to_json(
         "from": tx.from,
         "to": tx.to,
         "value": tx.value,
-        "gasPrice": hex_u64_str(tx.gas_price),
+        // A mined transaction reports the price it paid, which is what a
+        // caller reconciling a balance needs. The ceiling it authorised is
+        // reported separately as `maxFeePerGas`.
+        "gasPrice": hex_u64_str(tiger_blockchain::effective_gas_price(
+            tx,
+            block.header.base_fee_per_gas.unwrap_or(0),
+        )),
         "gas": hex_u64_str(tx.gas),
         "input": tx.input,
         "v": tx.v,
         "r": tx.r,
         "s": tx.s,
-        "type": "0x0",
+        "type": format!("0x{:x}", tx.tx_type),
+        "chainId": hex_u64_str(tx.chain_id.unwrap_or(0)),
+        "accessList": tx.access_list,
+        "maxPriorityFeePerGas": tx.max_priority_fee_per_gas.map(hex_u64_str),
+        "maxFeePerGas": if tx.tx_type == 2 { Some(hex_u64_str(tx.gas_price)) } else { None },
     })
 }
 
@@ -1202,20 +1161,28 @@ fn receipt_to_json(
         "to": tx.to,
         "cumulativeGasUsed": hex_u64_str(receipt.cumulative_gas_used),
         "gasUsed": hex_u64_str(receipt.gas_used),
-        "effectiveGasPrice": hex_u64_str(tx.gas_price),
+        // The price the sender was actually charged, which for an EIP-1559
+        // transaction is derived from this block's base fee rather than taken
+        // from the ceiling it authorised.
+        "effectiveGasPrice": hex_u64_str(tiger_blockchain::effective_gas_price(
+            tx,
+            block.header.base_fee_per_gas.unwrap_or(0),
+        )),
         "contractAddress": contract_address,
         "logs": logs,
         "logsBloom": tiger_blockchain::bloom_hex(&receipt.bloom()),
         "status": if receipt.status { "0x1" } else { "0x0" },
-        "type": "0x0",
+        "type": format!("0x{:x}", tx.tx_type),
     }))
 }
 
 /// `eth_feeHistory`: a window of base-fee and gas-usage history.
 ///
-/// TigerSmartChain has no EIP-1559 base-fee mechanism (base fee is zero), so
-/// the honest answer reports the real gas usage of each block in the window
-/// with a zero base fee, rather than fabricating fee data.
+/// Each block reports the base fee its header commits to, the share of its
+/// gas limit it used, and the tip its transactions actually paid. The window
+/// ends with one extra base-fee entry — the fee the next block would carry —
+/// because that is the value a wallet needs to price a transaction it is
+/// about to send.
 async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, String> {
     let count = params
         .get(0)
@@ -1252,13 +1219,18 @@ async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, Str
                     block.header.gas_used as f64 / block.header.gas_limit as f64
                 };
                 gas_used_ratios.push(json!(ratio));
-                // One reward entry per transaction, at that transaction's
-                // effective gas price.
+                // One reward entry per transaction, at the tip it paid: the
+                // part of the effective price above the base fee, which is
+                // what the validator received. Reporting the whole price
+                // would overstate the reward by the burned portion.
                 rewards.push(Value::Array(
                     block
                         .transactions
                         .iter()
-                        .map(|tx| Value::String(hex_u64_str(tx.gas_price)))
+                        .map(|tx| {
+                            let tip = tx.gas_price.saturating_sub(base_fee);
+                            Value::String(hex_u64_str(tip))
+                        })
                         .collect(),
                 ));
             }
@@ -1270,12 +1242,18 @@ async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, Str
         }
     }
 
-    // The oldest block's base fee is prepended to the window.
-    let oldest_base_fee = chain
-        .get_block(oldest)
-        .and_then(|b| b.header.base_fee_per_gas)
-        .unwrap_or(0);
-    base_fees.insert(0, Value::String(hex_u64_str(oldest_base_fee)));
+    // The window carries one more base-fee entry than it has blocks: the fee
+    // the block after the newest one would use. That is the value a wallet
+    // prices its next transaction against.
+    let next_fee = match chain.get_block(newest) {
+        Some(parent) => tiger_blockchain::next_base_fee(
+            parent.header.base_fee_per_gas.unwrap_or(0),
+            parent.header.gas_used,
+            parent.header.gas_limit,
+        ),
+        None => 0,
+    };
+    base_fees.push(Value::String(hex_u64_str(next_fee)));
 
     Ok(json!({
         "oldestBlock": hex_u64_str(oldest),
@@ -1283,6 +1261,34 @@ async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, Str
         "gasUsedRatio": gas_used_ratios,
         "reward": rewards,
     }))
+}
+
+/// The tip to suggest for a new transaction.
+///
+/// Taken as the median tip of the transactions in the most recent blocks that
+/// carried any, so the suggestion tracks what the chain is actually paying.
+/// Falls back to zero when no transaction has paid a tip, which lets the
+/// caller apply its own floor rather than inventing one here.
+fn suggested_tip(chain: &tiger_blockchain::Blockchain) -> u64 {
+    let mut tips: Vec<u64> = Vec::new();
+    let height = chain.height();
+    let mut number = height;
+    // A short window: recent enough to reflect current demand, long enough
+    // not to be set by a single block.
+    while tips.len() < 5 && number > 0 {
+        if let Some(block) = chain.get_block(number) {
+            let base_fee = block.header.base_fee_per_gas.unwrap_or(0);
+            for tx in &block.transactions {
+                tips.push(tx.gas_price.saturating_sub(base_fee));
+            }
+        }
+        number -= 1;
+    }
+    if tips.is_empty() {
+        return 0;
+    }
+    tips.sort_unstable();
+    tips[tips.len() / 2]
 }
 
 /// `eth_getLogs`: match logs from a block range against a filter.
@@ -1551,6 +1557,7 @@ fn transaction_to_json_pool(tx: &tiger_blockchain::types::Transaction) -> Value 
         "gas": hex_u64_str(tx.gas),
         "gasPrice": hex_u64_str(tx.gas_price),
         "input": tx.input,
+        "type": format!("0x{:x}", tx.tx_type),
     })
 }
 
@@ -1905,11 +1912,15 @@ mod tests {
             v: "0x0".to_string(),
             r: "0x0".to_string(),
             s: "0x0".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         };
         sign_transaction(&mut tx, 6666, &key).unwrap();
         let encoded = encode_legacy_transaction(&tx).unwrap();
 
-        let decoded = decode_legacy_transaction(&encoded).unwrap();
+        let decoded = tiger_blockchain::decode_transaction(&encoded).unwrap();
         assert_eq!(decoded.nonce, tx.nonce);
         assert_eq!(decoded.gas_price, tx.gas_price);
         assert_eq!(decoded.gas, tx.gas);
@@ -1926,7 +1937,7 @@ mod tests {
         // `from` is not covered by the signature, so a client can put anything
         // there. The decoder leaves it zeroed; admission must overwrite it with
         // the recovered address.
-        let decoded = decode_legacy_transaction(&[0xc0]).err();
+        let decoded = tiger_blockchain::decode_transaction(&[0xc0]).err();
         assert!(decoded.is_some());
 
         // Confirm the recovered address differs from the placeholder the
@@ -1949,10 +1960,14 @@ mod tests {
             v: "0x0".to_string(),
             r: "0x0".to_string(),
             s: "0x0".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         };
         sign_transaction(&mut tx, 6666, &key).unwrap();
         let encoded = encode_legacy_transaction(&tx).unwrap();
-        let decoded = decode_legacy_transaction(&encoded).unwrap();
+        let decoded = tiger_blockchain::decode_transaction(&encoded).unwrap();
         assert_eq!(decoded.from, format!("0x{}", "00".repeat(20)));
 
         let recovered =
@@ -1963,12 +1978,12 @@ mod tests {
     #[test]
     fn a_malformed_transaction_is_rejected() {
         // Not RLP at all.
-        assert!(decode_legacy_transaction(&[0xff, 0xff]).is_err());
+        assert!(tiger_blockchain::decode_transaction(&[0xff, 0xff]).is_err());
         // An RLP list with the wrong arity.
         let short = tiger_state::rlp::RlpItem::list(vec![
             tiger_state::rlp::RlpItem::from_u64(1),
         ])
         .encode();
-        assert!(decode_legacy_transaction(&short).is_err());
+        assert!(tiger_blockchain::decode_transaction(&short).is_err());
     }
 }

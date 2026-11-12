@@ -225,6 +225,10 @@ mod tests {
             v: "0x1".to_string(),
             r: "0x1".to_string(),
             s: "0x1".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         }
     }
 

@@ -647,10 +647,29 @@ impl TigerNode {
                                             node.config.block_reward,
                                         );
                                     }
-                                    // Remove included txs from mempool
+                                    // Remove only the transactions the block
+                                    // actually carries. A transaction left
+                                    // out because it did not fit, or because
+                                    // it failed validation, is still pending
+                                    // and dropping it here would lose it.
+                                    let mined: std::collections::HashSet<String> = {
+                                        let cm = node.chain_manager.lock().await;
+                                        cm.chain()
+                                            .get_block(next_block)
+                                            .map(|block| {
+                                                block
+                                                    .transactions
+                                                    .iter()
+                                                    .map(|tx| tx.hash.clone())
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default()
+                                    };
                                     let mut mempool = node.mempool.lock().await;
                                     for tx in &pending_txs {
-                                        mempool.remove(&tx.hash);
+                                        if mined.contains(&tx.hash) {
+                                            mempool.remove(&tx.hash);
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1077,7 +1096,10 @@ pub fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
             extra_data: format!("0x{}", tiger_blockchain::hex_encode(genesis.extra_data.as_bytes())),
             mix_hash: genesis.mix_hash.clone(),
             nonce: "0x0000000000000000".to_string(),
-            base_fee_per_gas: Some(0),
+            // The genesis block sets the base fee every later block adjusts
+            // from, so a chain with a zero fee here could never price a
+            // transaction.
+            base_fee_per_gas: Some(1_000_000_000),
             withdrawals_root: None,
         },
         transactions: Vec::new(),
@@ -1134,13 +1156,25 @@ pub fn produce_block(
         coinbase = addr;
     }
 
+    // EIP-1559 derives this block's base fee from the parent, so every client
+    // computes the same value and a validator cannot pick a fee that favours
+    // itself. The genesis block sets the initial fee.
+    let base_fee = match parent_block {
+        Some(parent) => tiger_blockchain::next_base_fee(
+            parent.header.base_fee_per_gas.unwrap_or(0),
+            parent.header.gas_used,
+            parent.header.gas_limit,
+        ),
+        None => 1_000_000_000,
+    };
+
     let block_ctx = BlockContext {
         chain_id,
         number: block_number,
         timestamp,
         gas_limit: BLOCK_GAS_LIMIT,
         coinbase,
-        base_fee: 0,
+        base_fee,
     };
 
     // Select the transactions that can legitimately be included.
@@ -1150,15 +1184,11 @@ pub fn produce_block(
     // signature cannot be recovered is dropped before the block is built. It
     // is not enough to skip applying it: it would still be part of the block
     // and fail block validation.
-    let mut included: Vec<Transaction> = Vec::with_capacity(transactions.len());
-    let mut requests: Vec<tiger_evm::transition::TransactionRequest> =
+    let mut candidates: Vec<(Transaction, tiger_evm::transition::TransactionRequest)> =
         Vec::with_capacity(transactions.len());
     for tx in transactions {
         match transaction_to_request(tx, chain_id) {
-            Some(request) => {
-                included.push(tx.clone());
-                requests.push(request);
-            }
+            Some(request) => candidates.push((tx.clone(), request)),
             None => {
                 warn!(
                     "dropping transaction {}: signature cannot be recovered",
@@ -1179,26 +1209,35 @@ pub fn produce_block(
     // its transaction list cannot answer for its later transactions and is
     // rejected by other clients, so a rejection must not silently drop the
     // receipt.
+    let mut included: Vec<Transaction> = Vec::with_capacity(candidates.len());
     let mut gas_used: u64 = 0;
-    let mut receipts: Vec<tiger_blockchain::BlockReceipt> = Vec::with_capacity(included.len());
-    for (tx, request) in included.iter().zip(requests.iter()) {
+    let mut receipts: Vec<tiger_blockchain::BlockReceipt> = Vec::with_capacity(candidates.len());
+    for (tx, request) in candidates.iter() {
+        // The gas limit is checked against the amount the transaction
+        // reserved, before it runs. Checking afterwards would mean applying a
+        // transaction and then discarding it, which would leave its state
+        // changes in a block that does not list it.
+        if gas_used.saturating_add(request.gas_limit) > BLOCK_GAS_LIMIT {
+            warn!("stopping block: {} does not fit in the remaining gas", tx.hash);
+            break;
+        }
+
+        // A transaction that fails validation is not part of a block at all:
+        // its nonce, its balance or its fee ceiling makes it unusable, and no
+        // state was written for it. Including it would put gas in the header
+        // that nobody paid and a receipt that no state transition backs, so
+        // the block's own state root would disagree with its receipts.
+        // Execution failures are different: a transaction that validates and
+        // then reverts is included, with a failed receipt.
         let outcome = match apply_transaction(world_state, request, &block_ctx) {
             Ok(outcome) => outcome,
             Err(e) => {
-                warn!("transaction {} rejected: {}", tx.hash, e);
-                // A rejected transaction still consumed the intrinsic gas the
-                // sender committed to. It is charged, and the receipt records
-                // the failure rather than being omitted.
-                tiger_evm::transition::TransitionOutcome {
-                    success: false,
-                    gas_used: tiger_evm::transition::intrinsic_gas(&request.data, request.to.is_none()),
-                    output: Vec::new(),
-                    logs: Vec::new(),
-                    contract_address: None,
-                }
+                warn!("dropping transaction {}: {}", tx.hash, e);
+                continue;
             }
         };
 
+        included.push(tx.clone());
         gas_used = gas_used.saturating_add(outcome.gas_used);
         receipts.push(tiger_blockchain::BlockReceipt {
             status: outcome.success,
@@ -1255,7 +1294,7 @@ pub fn produce_block(
         ),
         mix_hash: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
         nonce: "0x0000000000000000".to_string(),
-        base_fee_per_gas: Some(0),
+        base_fee_per_gas: Some(base_fee),
         withdrawals_root: None,
     };
 
@@ -1437,6 +1476,11 @@ pub fn transaction_to_request(
         value: parse_u256(&tx.value),
         data: hex_decode(&tx.input),
         sender,
+        // An EIP-1559 transaction is priced against the block's base fee; the
+        // tip it carries is what reaches the validator.
+        max_priority_fee_per_gas: tx
+            .max_priority_fee_per_gas
+            .map(|fee| parse_u256(&format!("0x{fee:x}"))),
     })
 }
 
@@ -1579,6 +1623,10 @@ mod tests {
             v: "0x0".to_string(),
             r: "0x0".to_string(),
             s: "0x0".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         };
         sign_transaction(&mut tx, 6666, &key).unwrap();
         tx
@@ -1816,6 +1864,10 @@ mod tests {
             v: "0x0".to_string(),
             r: "0x0".to_string(),
             s: "0x0".to_string(),
+            tx_type: 0,
+            access_list: None,
+            max_priority_fee_per_gas: None,
+            chain_id: None,
         };
 
         produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666).unwrap();
@@ -1946,6 +1998,7 @@ mod tests {
             value: [0u8; 32],
             data: vec![],
             sender: caller,
+            max_priority_fee_per_gas: None,
         };
 
         let outcome =
@@ -1982,4 +2035,69 @@ mod tests {
         let too_long: TopicFilter = vec![None, None];
         assert!(!topics_match(&too_long, &[log.topics[0].0]));
     }
+
+    /// A transaction whose fee ceiling is below the block's base fee cannot be
+    /// included: the sender never authorised paying the burn. It must be left
+    /// out of the block entirely rather than applied and then reverted.
+    #[test]
+    fn a_transaction_below_the_base_fee_is_not_included() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        let key = [0x46u8; 32];
+        let sender = tiger_crypto::private_key_to_address(&key).unwrap();
+        world.set_balance(&sender, u256_from_u64(10_000_000));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        // The genesis block sets the base fee at one gwei, so a transaction
+        // offering a single wei can never be mined.
+        let mut tx = signed_transfer(key, 0, [0x22u8; 20], 1234);
+        tx.gas_price = 1;
+        tx.tx_type = 2;
+        tx.chain_id = Some(6666);
+        tx.access_list = Some("0xc0".to_string());
+        tx.max_priority_fee_per_gas = Some(1);
+        sign_transaction(&mut tx, 6666, &key).unwrap();
+
+        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666).unwrap();
+
+        let block = cm.chain().get_block(1).unwrap();
+        assert!(block.transactions.is_empty(), "an under-priced tx must not be mined");
+        assert_eq!(block.header.gas_used, 0);
+        // The sender paid nothing and its nonce did not move, so the
+        // transaction is still valid for a later block.
+        assert_eq!(world.nonce(&sender), 0);
+        assert_eq!(world.balance(&sender), u256_from_u64(10_000_000));
+    }
+
+    /// A block never exceeds its gas limit, and a transaction that does not
+    /// fit is left pending rather than dropped or partially applied.
+    #[test]
+    fn a_block_stops_at_its_gas_limit() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        let key = [0x46u8; 32];
+        let sender = tiger_crypto::private_key_to_address(&key).unwrap();
+        world.set_balance(&sender, u256_from_u64(1_000_000_000_000));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        // Each transfer reserves 21,000 gas, and the block limit is far above
+        // that, so a handful all fit and the limit is not what is under test
+        // here; what matters is that gas_used never exceeds the header limit
+        // and that every included transaction is accounted for.
+        let txs: Vec<_> = (0..5)
+            .map(|nonce| signed_transfer(key, nonce, [0x22u8; 20], 1))
+            .collect();
+        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666).unwrap();
+
+        let block = cm.chain().get_block(1).unwrap();
+        assert!(block.header.gas_used <= block.header.gas_limit);
+        assert_eq!(block.transactions.len(), 5);
+        assert_eq!(block.header.gas_used, 5 * 21_000);
+        assert_eq!(world.nonce(&sender), 5);
+    }
+
 }

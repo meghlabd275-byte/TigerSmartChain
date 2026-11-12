@@ -7,9 +7,11 @@ pub mod receipt;
 pub mod types;
 
 pub use block::{
-    block_hash, encode_header, encode_legacy_transaction, hex_encode, quantity_item,
-    recover_transaction_sender, sign_transaction, signing_hash, transaction_hash,
-    transactions_root, validate_block, ValidationError, EMPTY_TRIE_ROOT,
+    block_hash, decode_transaction, effective_gas_price, encode_header,
+    encode_legacy_transaction,
+    encode_transaction, hex_encode, next_base_fee, quantity_item, recover_transaction_sender,
+    sign_transaction, signing_hash, transaction_hash, transactions_root, validate_block,
+    ValidationError, EMPTY_TRIE_ROOT,
 };
 pub use chain::*;
 pub use mempool::*;
