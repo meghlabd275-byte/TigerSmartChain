@@ -37,12 +37,114 @@ const SYNC_BATCH: u64 = 64;
 /// How long to wait for a frame before sending a ping, so a silent peer is
 /// detected rather than held open forever.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// The most connections one address may hold at once.
+///
+/// `max_peers` alone bounds the node but not the damage: one address opening
+/// every slot crowds out the honest peers, which is the cheap form of an
+/// eclipse. A handful of connections from one address is what a real peer
+/// needs (a home router, a second node behind the same NAT), so the ceiling
+/// sits just above that.
+const MAX_CONNECTIONS_PER_IP: usize = 8;
+/// The most inbound connections accepted from one address per second.
+///
+/// The per-address connection cap bounds *held* connections; without a rate
+/// limit a peer can still churn them, forcing a handshake (two signatures) for
+/// every connect-and-drop. The bucket is small because a legitimate peer
+/// reconnects rarely, and a reconnecting client that trips it is delayed, not
+/// banned.
+const ACCEPT_BURST_PER_IP: f64 = 4.0;
+/// How many handshakes may be in progress at once.
+///
+/// A handshake costs two signatures and a key exchange. Bounding how many run
+/// concurrently keeps a burst of half-open connections from spending the
+/// node's CPU before any of them has proven it can complete.
+const MAX_CONCURRENT_HANDSHAKES: usize = 16;
+/// How long a single inbound handshake may hold a slot before it is dropped.
+/// `Session::accept` has its own read timeout; this is the outer bound.
+const HANDSHAKE_SLOT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Admission control for inbound connections.
+///
+/// The peer count is bounded, but that bound alone is not enough: one address
+/// can hold every slot, and a peer that connects and immediately drops forces
+/// a full handshake each time. This tracks how many connections each address
+/// holds and how fast it opens them, so a flood is refused before a handshake
+/// is attempted rather than after.
+struct Admission {
+    /// Connections currently held, per address.
+    held: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
+    /// Accept-rate token buckets, per address.
+    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, Bucket>>,
+    /// Handshakes in progress, to bound the work a burst can demand.
+    handshakes: tokio::sync::Semaphore,
+}
+
+/// A refilling token bucket for inbound accepts.
+struct Bucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl Admission {
+    fn new() -> Self {
+        Self {
+            held: std::sync::Mutex::new(std::collections::HashMap::new()),
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            handshakes: tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES),
+        }
+    }
+
+    /// Whether a connection from `ip` may proceed, recording it if so.
+    ///
+    /// Both checks run under one decision so a refused connection never leaves
+    /// a count behind: the rate limit is consulted first, then the held count,
+    /// and only a connection that passes both is recorded.
+    fn admit(&self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if buckets.len() > 100_000 {
+            buckets.retain(|_, b| now.duration_since(b.last).as_secs() < 60);
+        }
+        let bucket = buckets.entry(ip).or_insert(Bucket {
+            tokens: ACCEPT_BURST_PER_IP,
+            last: now,
+        });
+        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed).min(ACCEPT_BURST_PER_IP);
+        bucket.last = now;
+        if bucket.tokens < 1.0 {
+            return false;
+        }
+
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let count = held.entry(ip).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_IP {
+            return false;
+        }
+        *count += 1;
+        // Only spend the token once the connection is certain to be counted.
+        bucket.tokens -= 1.0;
+        true
+    }
+
+    /// Release a connection slot for `ip`.
+    fn release(&self, ip: std::net::IpAddr) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = held.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&ip);
+            }
+        }
+    }
+}
 
 /// The node's networking state.
 pub struct P2pService {
     manager: Arc<Mutex<PeerManager>>,
     node: Arc<TigerNode>,
     identity: Identity,
+    admission: Arc<Admission>,
 }
 
 impl P2pService {
@@ -85,6 +187,7 @@ impl P2pService {
             manager,
             node: Arc::clone(&node),
             identity: identity.clone(),
+            admission: Arc::new(Admission::new()),
         });
 
         // Accept loop.
@@ -98,13 +201,41 @@ impl P2pService {
                     }
                     match listener.accept().await {
                         Ok((stream, address)) => {
+                            // Decide before spawning: a refused connection is
+                            // closed without a task or a handshake, so a flood
+                            // costs the node almost nothing.
+                            if !service.admission.admit(address.ip()) {
+                                debug!("refusing connection from {address}: admission limit");
+                                drop(stream);
+                                continue;
+                            }
                             let service = Arc::clone(&service);
                             let identity = identity.clone();
+                            let admission = Arc::clone(&service.admission);
+                            let ip = address.ip();
                             tokio::spawn(async move {
-                                match service
-                                    .handle_inbound(stream, identity, address.to_string())
-                                    .await
+                                // Bound concurrent handshakes so a burst of
+                                // half-open connections cannot spend the CPU
+                                // before any has proven it can complete.
+                                let permit = match tokio::time::timeout(
+                                    HANDSHAKE_SLOT_TIMEOUT,
+                                    admission.handshakes.acquire(),
+                                )
+                                .await
                                 {
+                                    Ok(Ok(permit)) => permit,
+                                    _ => {
+                                        debug!("refusing connection from {address}: handshake queue full");
+                                        admission.release(ip);
+                                        return;
+                                    }
+                                };
+                                let result = service
+                                    .handle_inbound(stream, identity, address.to_string())
+                                    .await;
+                                drop(permit);
+                                admission.release(ip);
+                                match result {
                                     Ok(()) => debug!("inbound peer {address} disconnected"),
                                     Err(e) => debug!("inbound peer {address} refused: {e}"),
                                 }
@@ -605,4 +736,109 @@ fn now_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// One address must not be able to hold every peer slot. Without this the
+    /// cheapest way to keep honest peers out is to open connections from a
+    /// single address until the node is full.
+    #[test]
+    fn one_address_cannot_hold_every_connection_slot() {
+        let admission = Admission::new();
+        let attacker = ip("198.51.100.1");
+
+        // The burst allowance is smaller than the connection cap, so filling
+        // the cap takes several rounds spread over time; the cap is what is
+        // asserted here, so the rate limit is drained first.
+        let mut admitted = 0;
+        for _ in 0..(MAX_CONNECTIONS_PER_IP + 4) {
+            // Spend any available tokens so the rate limit does not mask the
+            // cap, then check the cap directly.
+            while admission.admit(attacker) {
+                admitted += 1;
+                if admitted > MAX_CONNECTIONS_PER_IP + 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        assert!(
+            admitted <= MAX_CONNECTIONS_PER_IP,
+            "one address held {admitted} connections, above the cap of {MAX_CONNECTIONS_PER_IP}"
+        );
+    }
+
+    /// The connection cap counts what is held, so releasing frees a slot.
+    #[test]
+    fn a_released_slot_becomes_available_again() {
+        let admission = Admission::new();
+        let addr = ip("203.0.113.50");
+
+        // Admit up to the cap, working around the accept rate limit.
+        let mut held = 0;
+        while held < MAX_CONNECTIONS_PER_IP {
+            if admission.admit(addr) {
+                held += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+        assert_eq!(held, MAX_CONNECTIONS_PER_IP);
+
+        admission.release(addr);
+        // The accept rate limit still applies, so wait for a token before
+        // asserting the freed slot can be used.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut readmitted = false;
+        while std::time::Instant::now() < deadline {
+            if admission.admit(addr) {
+                readmitted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(readmitted, "a released slot must be reusable");
+    }
+
+    /// A flood of connects from one address is throttled rather than admitted
+    /// one-for-one.
+    #[test]
+    fn a_connect_flood_from_one_address_is_throttled() {
+        let admission = Admission::new();
+        let attacker = ip("192.0.2.9");
+        let mut admitted = 0;
+        for _ in 0..1000 {
+            if admission.admit(attacker) {
+                admitted += 1;
+            }
+        }
+        assert!(
+            (admitted as f64) <= ACCEPT_BURST_PER_IP + 1.0,
+            "an instantaneous flood admitted {admitted}, above the burst allowance"
+        );
+    }
+
+    /// Each address has its own budget, so one flood does not lock out a
+    /// different peer.
+    #[test]
+    fn addresses_do_not_share_a_budget() {
+        let admission = Admission::new();
+        let attacker = ip("192.0.2.10");
+        let honest = ip("192.0.2.11");
+
+        for _ in 0..100 {
+            admission.admit(attacker);
+        }
+        assert!(
+            admission.admit(honest),
+            "a flood from one address must not deny a different address"
+        );
+    }
 }
