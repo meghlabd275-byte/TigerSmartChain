@@ -23,25 +23,25 @@ import (
 
 // Config holds indexer configuration
 type Config struct {
-	RPCURL          string
-	WSURL           string
-	DatabaseURL     string
-	RedisURL        string
-	StartBlock      uint64
-	BatchSize       uint64
-	Confirmations   uint64
-	Workers         int
-	RateLimit       int
+	RPCURL        string
+	WSURL         string
+	DatabaseURL   string
+	RedisURL      string
+	StartBlock    uint64
+	BatchSize     uint64
+	Confirmations uint64
+	Workers       int
+	RateLimit     int
 }
 
 // Indexer is the main indexer
 type Indexer struct {
-	config      Config
-	ethClient   *ethclient.Client
-	pool        *pgxpool.Pool
-	redis       *redis.Client
+	config       Config
+	ethClient    *ethclient.Client
+	pool         *pgxpool.Pool
+	redis        *redis.Client
 	currentBlock uint64
-	mu          sync.RWMutex
+	mu           sync.RWMutex
 }
 
 // LoadConfig loads configuration from environment
@@ -50,12 +50,12 @@ func LoadConfig() Config {
 		RPCURL:        getEnv("RPC_URL", "https://bsc-dataseed1.binance.org"),
 		WSURL:         getEnv("WS_URL", "wss://bsc-ws.noderadio.cn"),
 		DatabaseURL:   getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tigerscan"),
-		RedisURL:     getEnv("REDIS_URL", "localhost:6379"),
-		StartBlock:   0,
-		BatchSize:    100,
+		RedisURL:      getEnv("REDIS_URL", "localhost:6379"),
+		StartBlock:    0,
+		BatchSize:     100,
 		Confirmations: 12,
-		Workers:      10,
-		RateLimit:    100,
+		Workers:       10,
+		RateLimit:     100,
 	}
 }
 
@@ -85,10 +85,10 @@ func NewIndexer(config Config) *Indexer {
 	}
 
 	return &Indexer{
-		config:      config,
-		ethClient:   client,
-		pool:        pool,
-		redis:       rdb,
+		config:       config,
+		ethClient:    client,
+		pool:         pool,
+		redis:        rdb,
 		currentBlock: header.Number.Uint64(),
 	}
 }
@@ -143,7 +143,7 @@ func (i *Indexer) indexBlock(blockNum uint64) error {
 
 	// Insert block into database
 	_, err = i.pool.Exec(context.Background(), `
-		INSERT INTO blocks (number, hash, parent_hash, nonce, gas_limit, gas_used, timestamp, miner, size, base_fee_per_gas, transactions_count)
+		INSERT INTO blocks (number, hash, parent_hash, nonce, gas_limit, gas_used, timestamp, miner, size, base_fee_per_gas, tx_count)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (number) DO NOTHING
 	`,
@@ -204,13 +204,13 @@ func (i *Indexer) indexTransaction(tx *types.Transaction, block *types.Block) er
 		if receipt.Status == 1 {
 			status = "success"
 		} else {
-			status = "failure"
+			status = "failed"
 		}
 	}
 
 	// Insert transaction
 	_, err = i.pool.Exec(context.Background(), `
-		INSERT INTO transactions (hash, block_number, block_hash, from_address, to_address, value, gas_price, gas, nonce, input, tx_type, status)
+		INSERT INTO transactions (hash, block_number, block_hash, from_address, to_address, value, gas_price, gas_limit, nonce, input, transaction_type, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (hash) DO NOTHING
 	`,
@@ -310,7 +310,7 @@ func (i *Indexer) processERC721Transfer(lg *types.Log) {
 	tokenId := new(big.Int).SetBytes(lg.Data[:32]).String()
 
 	_, err := i.pool.Exec(context.Background(), `
-		INSERT INTO nft_transfers (collection_address, token_id, from_address, to_address, transaction_hash, block_number, log_index)
+		INSERT INTO nft_transfers (token_address, token_id, from_address, to_address, transaction_hash, block_number, log_index)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT DO NOTHING
 	`,
@@ -337,23 +337,23 @@ func (i *Indexer) StartTransactionIndexer(ctx context.Context) error {
 // StartTokenIndexer indexes tokens
 func (i *Indexer) StartTokenIndexer(ctx context.Context) error {
 	log.Println("Starting token indexer...")
-	
+
 	// Get known token addresses
 	tokenAddresses := i.getKnownTokenAddresses()
-	
+
 	for _, addr := range tokenAddresses {
 		if err := i.indexToken(common.HexToAddress(addr)); err != nil {
 			log.Printf("Error indexing token %s: %v", addr, err)
 		}
 	}
-	
+
 	return nil
 }
 
 func (i *Indexer) indexToken(addr common.Address) error {
 	// Query token contract for metadata
 	// In production, would call token contract methods
-	
+
 	log.Printf("Indexing token: %s", addr.Hex())
 	return nil
 }
@@ -405,28 +405,28 @@ type InternalTxTrace struct {
 
 // traceCallResult represents a single call within a debug_traceTransaction trace
 type traceCallResult struct {
-	Type    string                 `json:"type"`
-	From    string                 `json:"from"`
-	To      string                 `json:"to"`
-	Value   string                 `json:"value"`
-	Gas     string                 `json:"gas"`
-	GasUsed string                 `json:"gasUsed"`
-	Error   string                 `json:"error"`
-	Calls   []traceCallResult      `json:"calls"`
-	Output  string                 `json:"output"`
+	Type    string            `json:"type"`
+	From    string            `json:"from"`
+	To      string            `json:"to"`
+	Value   string            `json:"value"`
+	Gas     string            `json:"gas"`
+	GasUsed string            `json:"gasUsed"`
+	Error   string            `json:"error"`
+	Calls   []traceCallResult `json:"calls"`
+	Output  string            `json:"output"`
 }
 
 // traceResult represents the top-level result of debug_traceTransaction
 type traceResult struct {
-	Type         string            `json:"type"`
-	From         string            `json:"from"`
-	To           string            `json:"to"`
-	Value        string            `json:"value"`
-	Gas          string            `json:"gas"`
-	GasUsed      string            `json:"gasUsed"`
-	Input        string            `json:"input"`
-	Output       string            `json:"output"`
-	Calls        []traceCallResult `json:"calls"`
+	Type    string            `json:"type"`
+	From    string            `json:"from"`
+	To      string            `json:"to"`
+	Value   string            `json:"value"`
+	Gas     string            `json:"gas"`
+	GasUsed string            `json:"gasUsed"`
+	Input   string            `json:"input"`
+	Output  string            `json:"output"`
+	Calls   []traceCallResult `json:"calls"`
 }
 
 // rpcRequest is a JSON-RPC 2.0 request envelope
@@ -561,7 +561,7 @@ func (i *Indexer) setLastIndexedBlock(key string, block uint64) {
 func (i *Indexer) getKnownTokenAddresses() []string {
 	// Common BSC tokens
 	return []string{
-		"0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b095c", // WBNB
+		"0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b095c",  // WBNB
 		"0x55d398326f99059fF775485246999027B3197955", // USDT
 		"0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56", // BUSD
 		"0x8Ba1f109551bD432803012645Ac136ddd64DBA72", // BNB

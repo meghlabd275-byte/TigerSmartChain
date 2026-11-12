@@ -21,9 +21,9 @@ func (h *Handler) GetInternalTransactionList(c *gin.Context) {
 	var rows []map[string]interface{}
 	var err error
 	if address != "" {
-		rows, err = h.queryRows(ctx, `SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas, revert FROM internal_transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number DESC, transaction_index DESC LIMIT $2 OFFSET $3`, address, limit, offset)
+		rows, err = h.queryRows(ctx, `SELECT id, transaction_hash, block_number, trace_index, depth, call_type, from_address, to_address, value, gas, revert_reason FROM internal_transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number DESC, trace_index DESC LIMIT $2 OFFSET $3`, address, limit, offset)
 	} else {
-		rows, err = h.queryRows(ctx, `SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas, revert FROM internal_transactions ORDER BY block_number DESC, transaction_index DESC LIMIT $1 OFFSET $2`, limit, offset)
+		rows, err = h.queryRows(ctx, `SELECT id, transaction_hash, block_number, trace_index, depth, call_type, from_address, to_address, value, gas, revert_reason FROM internal_transactions ORDER BY block_number DESC, trace_index DESC LIMIT $1 OFFSET $2`, limit, offset)
 	}
 	if err != nil {
 		dbError(c, err)

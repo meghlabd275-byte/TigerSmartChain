@@ -309,7 +309,7 @@ func (h *Handler) GetNFTToken(c *gin.Context) {
 	collection := c.Param("address")
 	tokenID := c.Param("token_id")
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT id, collection_address, token_id, owner, uri, metadata FROM nfts WHERE collection_address = $1 AND token_id = $2 LIMIT 1`, collection, tokenID)
+	row, err := h.queryOne(ctx, `SELECT id, token_address, token_id, owner, uri, metadata FROM nfts WHERE token_address = $1 AND token_id = $2 LIMIT 1`, collection, tokenID)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -448,7 +448,7 @@ func (h *Handler) GetTransactionChart(c *gin.Context) {
 func (h *Handler) GetAddressChart(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 30)
-	rows, err := h.queryRows(ctx, `SELECT date, total_blocks, total_transactions, active_addresses FROM analytics_daily ORDER BY date DESC LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT date, total_blocks, total_transactions, total_volume FROM analytics_daily ORDER BY date DESC LIMIT $1`, limit)
 	if err != nil {
 		// active_addresses may not exist; retry without it.
 		rows, err = h.queryRows(ctx, `SELECT date, total_blocks, total_transactions FROM analytics_daily ORDER BY date DESC LIMIT $1`, limit)

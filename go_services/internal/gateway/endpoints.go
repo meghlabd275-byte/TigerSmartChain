@@ -425,7 +425,7 @@ func (h *Handler) GetTransactionStatus(c *gin.Context) {
 func (h *Handler) GetRawTransaction(c *gin.Context) {
 	ctx := c.Request.Context()
 	hash := c.Param("hash")
-	row, err := h.queryOne(ctx, `SELECT hash, nonce, from_address, to_address, value, gas_price, gas, input, block_number FROM transactions WHERE hash = $1`, hash)
+	row, err := h.queryOne(ctx, `SELECT hash, nonce, from_address, to_address, value, gas_price, gas_limit, input, block_number FROM transactions WHERE hash = $1`, hash)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -587,7 +587,7 @@ func (h *Handler) GetNFTOwnerCount(c *gin.Context) {
 	var n int64
 	var err error
 	if collection != "" {
-		n, err = h.countQuery(ctx, `SELECT count(DISTINCT owner) FROM nfts WHERE collection_address = $1`, collection)
+		n, err = h.countQuery(ctx, `SELECT count(DISTINCT owner) FROM nfts WHERE token_address = $1`, collection)
 	} else {
 		n, err = h.countQuery(ctx, `SELECT count(DISTINCT owner) FROM nfts`)
 	}
@@ -601,7 +601,7 @@ func (h *Handler) GetNFTTokenOwner(c *gin.Context) {
 	ctx := c.Request.Context()
 	collection := c.Param("address")
 	tokenID := c.Param("token_id")
-	row, err := h.queryOne(ctx, `SELECT owner FROM nfts WHERE collection_address = $1 AND token_id = $2`, collection, tokenID)
+	row, err := h.queryOne(ctx, `SELECT owner FROM nfts WHERE token_address = $1 AND token_id = $2`, collection, tokenID)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -657,9 +657,9 @@ func (h *Handler) VerifyContractMultiFile(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	_, err := h.pool.Exec(ctx, `
-		INSERT INTO verified_sources (address, source_code, compiler_version, evm_version, optimization, runs, verified_at)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW())
-		ON CONFLICT (address) DO UPDATE SET source_code = EXCLUDED.source_code, compiler_version = EXCLUDED.compiler_version, verified_at = NOW()
+		INSERT INTO contracts (address, source_code, compiler_version, evm_version, optimization_enabled, optimization_runs, contract_type, is_verified, verification_status, verified_at)
+		VALUES ($1, $2, $3, $4, $5, $6, 'contract', TRUE, 'verified', NOW())
+		ON CONFLICT (address) DO UPDATE SET source_code = EXCLUDED.source_code, compiler_version = EXCLUDED.compiler_version, evm_version = EXCLUDED.evm_version, optimization_enabled = EXCLUDED.optimization_enabled, optimization_runs = EXCLUDED.optimization_runs, is_verified = TRUE, verification_status = 'verified', verified_at = NOW(), updated_at = NOW()
 	`, req.Address, req.Sources, req.CompilerVersion, req.EvmVersion, req.Optimization, req.Runs)
 	if err != nil {
 		dbError(c, err)
@@ -745,7 +745,7 @@ func (h *Handler) GetContractType(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT standard FROM contracts WHERE address = $1`, addr)
+	row, err := h.queryOne(ctx, `SELECT contract_name, is_verified FROM contracts WHERE address = $1`, addr)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -810,7 +810,7 @@ func (h *Handler) GetAddressFirstSeen(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT block_number, timestamp FROM transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number ASC LIMIT 1`, addr)
+	row, err := h.queryOne(ctx, `SELECT block_number, block_timestamp FROM transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number ASC LIMIT 1`, addr)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -824,7 +824,7 @@ func (h *Handler) GetAddressLastSeen(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT block_number, timestamp FROM transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number DESC LIMIT 1`, addr)
+	row, err := h.queryOne(ctx, `SELECT block_number, block_timestamp FROM transactions WHERE from_address = $1 OR to_address = $1 ORDER BY block_number DESC LIMIT 1`, addr)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -848,9 +848,9 @@ func (h *Handler) AnnotateAddress(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	_, err := h.pool.Exec(ctx, `
-		INSERT INTO search_index (address, label, category, description, updated_at)
-		VALUES ($1, $2, $3, $4, NOW())
-		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, category = EXCLUDED.category, description = EXCLUDED.description, updated_at = NOW()
+		INSERT INTO address_labels (address, label, label_type, notes)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, label_type = EXCLUDED.label_type, notes = EXCLUDED.notes, updated_at = NOW()
 	`, addr, req.Label, req.Category, req.Description)
 	if err != nil {
 		dbError(c, err)
@@ -906,7 +906,7 @@ func (h *Handler) CalculateGasSavings(c *gin.Context) {
 			COALESCE(AVG(gas_price), 0) AS avg_gas_price,
 			COALESCE(MIN(gas_price), 0) AS min_gas_price,
 			COALESCE((AVG(gas_price) - MIN(gas_price)), 0) AS potential_savings
-		FROM gas_prices ORDER BY block_number DESC LIMIT 100
+		FROM gas_prices ORDER BY timestamp DESC LIMIT 100
 	`)
 	if err != nil {
 		dbError(c, err)
@@ -978,9 +978,9 @@ func (h *Handler) CreateLabel(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	_, err := h.pool.Exec(ctx, `
-		INSERT INTO search_index (address, label, category, description, updated_at)
-		VALUES ($1, $2, $3, $4, NOW())
-		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, category = EXCLUDED.category, description = EXCLUDED.description
+		INSERT INTO address_labels (address, label, label_type, notes)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (address) DO UPDATE SET label = EXCLUDED.label, label_type = EXCLUDED.label_type, notes = EXCLUDED.notes, updated_at = NOW()
 	`, req.Address, req.Label, req.Category, req.Description)
 	if err != nil {
 		dbError(c, err)
@@ -1004,7 +1004,7 @@ func (h *Handler) UpdateLabel(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	ct, err := h.pool.Exec(ctx, `UPDATE search_index SET label = $1, category = $2, description = $3, updated_at = NOW() WHERE id = $4`, req.Label, req.Category, req.Description, id)
+	ct, err := h.pool.Exec(ctx, `UPDATE address_labels SET label = $1, label_type = $2, notes = $3, updated_at = NOW() WHERE id = $4`, req.Label, req.Category, req.Description, id)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -1445,15 +1445,15 @@ func (h *Handler) queryResource(c *gin.Context, resource string, defLimit int) {
 	case "transfers":
 		qq = q{`SELECT id, token_address, from_address, to_address, value, transaction_hash, block_number, log_index FROM token_transfers ORDER BY block_number DESC, log_index DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM token_transfers`}
 	case "internalTxs":
-		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas, revert FROM internal_transactions ORDER BY block_number DESC, transaction_index DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions`}
+		qq = q{`SELECT id, transaction_hash, block_number, trace_index, depth, call_type, from_address, to_address, value, gas, revert_reason FROM internal_transactions ORDER BY block_number DESC, trace_index DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions`}
 	case "callTree":
-		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas, input, output FROM internal_transactions WHERE transaction_hash = $3 ORDER BY transaction_index, depth LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions WHERE transaction_hash = $3`}
+		qq = q{`SELECT id, transaction_hash, block_number, trace_index, depth, call_type, from_address, to_address, value, gas, input, output FROM internal_transactions WHERE transaction_hash = $3 ORDER BY trace_index, depth LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions WHERE transaction_hash = $3`}
 	case "execution":
 		qq = q{`SELECT hash, block_number, from_address, to_address, gas_used, status, effective_gas_price, logs FROM transactions WHERE hash = $3 LIMIT 1`, `SELECT 1`}
 	case "storage":
 		qq = q{`SELECT id, transaction_hash, block_number, address, storage_key, storage_value, old_value, new_value, diff_type FROM state_diffs WHERE address = $3 OR transaction_hash = $3 ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM state_diffs`}
 	case "callList":
-		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, depth, call_type, from_address, to_address, value, gas FROM internal_transactions WHERE transaction_hash = $3 ORDER BY depth, transaction_index LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions WHERE transaction_hash = $3`}
+		qq = q{`SELECT id, transaction_hash, block_number, trace_index, depth, call_type, from_address, to_address, value, gas FROM internal_transactions WHERE transaction_hash = $3 ORDER BY depth, trace_index LIMIT $1 OFFSET $2`, `SELECT count(*) FROM internal_transactions WHERE transaction_hash = $3`}
 	case "vmTrace", "replay", "ops":
 		qq = q{`SELECT id, transaction_hash, block_number, transaction_index, from_address, to_address, call_type, value, gas, input, output, revert, error, depth FROM traces WHERE transaction_hash = $3 ORDER BY id LIMIT $1 OFFSET $2`, `SELECT count(*) FROM traces`}
 	case "traces":
@@ -1475,7 +1475,7 @@ func (h *Handler) queryResource(c *gin.Context, resource string, defLimit int) {
 	case "tokens":
 		qq = q{`SELECT id, address, name, symbol, decimals, total_supply, holders_count, price_usd, is_verified FROM tokens ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM tokens`}
 	case "nfts":
-		qq = q{`SELECT id, collection_address, token_id, owner, uri, metadata FROM nfts ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nfts`}
+		qq = q{`SELECT id, token_address, token_id, owner, uri, metadata FROM nfts ORDER BY id DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nfts`}
 	case "volumeHistory":
 		qq = q{`SELECT collection_address, floor_price, volume_24h, sales_24h, holders FROM nft_floor_prices ORDER BY updated_at DESC LIMIT $1 OFFSET $2`, `SELECT count(*) FROM nft_floor_prices`}
 	case "rankings":

@@ -52,7 +52,7 @@ func (h *Handler) GetBlocksByRange(c *gin.Context) {
 func (h *Handler) GetBlockValidators(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 50)
-	rows, err := h.queryRows(ctx, `SELECT * FROM validators ORDER BY total_staked DESC LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT * FROM validators ORDER BY total_stake DESC LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -89,7 +89,7 @@ func (h *Handler) GetTransactionReceipt(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT hash, block_number, block_hash, transaction_index, from_address, to_address, status, gas_used, cumulative_gas_used, effective_gas_price, contract_address, logs_bloom FROM transactions WHERE hash = $1`, hash)
+	row, err := h.queryOne(ctx, `SELECT hash, block_number, block_hash, transaction_index, from_address, to_address, status, gas_used, cumulative_gas_used, effective_gas_price, contract_address FROM transactions WHERE hash = $1`, hash)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -188,7 +188,7 @@ func (h *Handler) GetInternalTxsByBlock(c *gin.Context) {
 }
 
 func (h *Handler) GetCallTree(c *gin.Context) {
-	h.listByTxHash(c, `SELECT * FROM traces WHERE transaction_hash = $1 ORDER BY depth, trace_index LIMIT $2`)
+	h.listByTxHash(c, `SELECT * FROM traces WHERE transaction_hash = $1 ORDER BY depth, id LIMIT $2`)
 }
 
 // ==================== TRACE ENDPOINTS ====================
@@ -198,7 +198,7 @@ func (h *Handler) GetTraceStateDiff(c *gin.Context) {
 }
 
 func (h *Handler) GetTraceStorage(c *gin.Context) {
-	h.listByTxHash(c, `SELECT address, slot, value FROM traces WHERE transaction_hash = $1 AND call_type = 'STATICCALL' LIMIT $2`)
+	h.listByTxHash(c, `SELECT from_address, to_address, input, output FROM traces WHERE transaction_hash = $1 AND call_type = 'STATICCALL' LIMIT $2`)
 }
 
 func (h *Handler) GetTraceCallList(c *gin.Context) {
@@ -221,7 +221,7 @@ func (h *Handler) GetVMTrace(c *gin.Context) {
 }
 
 func (h *Handler) GetTracesByBlock(c *gin.Context) {
-	h.listByBlockNumber(c, `SELECT * FROM traces WHERE block_number = $1 ORDER BY transaction_index, trace_index LIMIT $2`)
+	h.listByBlockNumber(c, `SELECT * FROM traces WHERE block_number = $1 ORDER BY transaction_index, depth LIMIT $2`)
 }
 
 func (h *Handler) ReplayTransaction(c *gin.Context) {
@@ -252,7 +252,7 @@ func (h *Handler) GetTokenMetadata(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT address, name, symbol, decimals, total_supply, logo_uri, website FROM tokens WHERE address = $1`, token)
+	row, err := h.queryOne(ctx, `SELECT address, name, symbol, decimals, total_supply, logo_url, website FROM tokens WHERE address = $1`, token)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -306,7 +306,7 @@ func (h *Handler) GetTokenAnalytics(c *gin.Context) {
 
 func (h *Handler) GetTokenFlippening(c *gin.Context) {
 	ctx := c.Request.Context()
-	rows, err := h.queryRows(ctx, `SELECT address, name, symbol, market_cap_usd FROM tokens WHERE market_cap_usd IS NOT NULL ORDER BY market_cap_usd DESC LIMIT 10`)
+	rows, err := h.queryRows(ctx, `SELECT address, name, symbol, market_cap FROM tokens WHERE market_cap IS NOT NULL ORDER BY market_cap DESC LIMIT 10`)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -361,7 +361,7 @@ func (h *Handler) GetNFTMetadata(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT address, name, symbol, total_supply, logo_uri, website, discord, twitter FROM nft_collections WHERE address = $1`, collection)
+	row, err := h.queryOne(ctx, `SELECT address, name, symbol, total_supply, image_url, external_url, social FROM nft_collections WHERE address = $1`, collection)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -370,11 +370,11 @@ func (h *Handler) GetNFTMetadata(c *gin.Context) {
 }
 
 func (h *Handler) GetNFTTokens(c *gin.Context) {
-	h.listByAddress(c, "address", `SELECT collection_address, token_id, owner, uri FROM nfts WHERE collection_address = $1 ORDER BY token_id LIMIT $2`)
+	h.listByAddress(c, "address", `SELECT token_address, token_id, owner, uri FROM nfts WHERE token_address = $1 ORDER BY token_id LIMIT $2`)
 }
 
 func (h *Handler) GetNFTTokenTransfers(c *gin.Context) {
-	h.listByAddress(c, "address", `SELECT * FROM nft_transfers WHERE collection_address = $1 ORDER BY block_number DESC LIMIT $2`)
+	h.listByAddress(c, "address", `SELECT * FROM nft_transfers WHERE token_address = $1 ORDER BY block_number DESC LIMIT $2`)
 }
 
 func (h *Handler) GetNFTVolumeHistory(c *gin.Context) {
@@ -384,9 +384,9 @@ func (h *Handler) GetNFTVolumeHistory(c *gin.Context) {
 	var rows []map[string]interface{}
 	var err error
 	if collection != "" {
-		rows, err = h.queryRows(ctx, `SELECT * FROM analytics_daily WHERE entity_type = 'nft' AND entity_address = $1 ORDER BY date DESC LIMIT $2`, collection, limit)
+		rows, err = h.queryRows(ctx, `SELECT to_char(block_timestamp, 'YYYY-MM-DD') AS date, COUNT(*) AS sales, COALESCE(SUM(price), 0) AS volume FROM nft_sales WHERE token_address = $1 GROUP BY 1 ORDER BY 1 DESC LIMIT $2`, collection, limit)
 	} else {
-		rows, err = h.queryRows(ctx, `SELECT * FROM analytics_daily WHERE entity_type = 'nft' ORDER BY date DESC LIMIT $1`, limit)
+		rows, err = h.queryRows(ctx, `SELECT to_char(block_timestamp, 'YYYY-MM-DD') AS date, COUNT(*) AS sales, COALESCE(SUM(price), 0) AS volume FROM nft_sales GROUP BY 1 ORDER BY 1 DESC LIMIT $1`, limit)
 	}
 	if err != nil {
 		dbError(c, err)
@@ -396,7 +396,7 @@ func (h *Handler) GetNFTVolumeHistory(c *gin.Context) {
 }
 
 func (h *Handler) GetNFTHolders(c *gin.Context) {
-	h.listByAddress(c, "address", `SELECT owner, COUNT(*) AS token_count FROM nfts WHERE collection_address = $1 GROUP BY owner ORDER BY token_count DESC LIMIT $2`)
+	h.listByAddress(c, "address", `SELECT owner, COUNT(*) AS token_count FROM nfts WHERE token_address = $1 GROUP BY owner ORDER BY token_count DESC LIMIT $2`)
 }
 
 func (h *Handler) GetNFTRankings(c *gin.Context) {
@@ -486,7 +486,7 @@ func (h *Handler) GetContractSource(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT address, source_code, compiler_version, abi, contract_name FROM verified_sources WHERE address = $1`, addr)
+	row, err := h.queryOne(ctx, `SELECT address, contract_name, compiler_version, source_code, abi, bytecode FROM contracts WHERE address = $1 AND is_verified = true`, addr)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -501,7 +501,7 @@ func (h *Handler) GetVerifiedContract(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT address, contract_name, compiler_version, verified_at, license_type FROM verified_sources WHERE address = $1`, addr)
+	row, err := h.queryOne(ctx, `SELECT address, contract_name, compiler_version, verified_at, license_type FROM contracts WHERE address = $1 AND is_verified = true`, addr)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -524,7 +524,7 @@ func (h *Handler) GetAddressBlocksMined(c *gin.Context) {
 }
 
 func (h *Handler) GetAddressAnnotations(c *gin.Context) {
-	h.listByAddress(c, "address", `SELECT label, category, description FROM search_index WHERE address = $1 LIMIT $2`)
+	h.listByAddress(c, "address", `SELECT label, label_type, label_subtype, label_source, is_scam, is_verified, notes FROM address_labels WHERE address = $1 LIMIT $2`)
 }
 
 func (h *Handler) GetAllTokenBalances(c *gin.Context) {
@@ -532,7 +532,7 @@ func (h *Handler) GetAllTokenBalances(c *gin.Context) {
 }
 
 func (h *Handler) GetAllNFTBalances(c *gin.Context) {
-	h.listByAddress(c, "address", `SELECT collection_address, COUNT(*) AS token_count FROM nfts WHERE owner = $1 GROUP BY collection_address LIMIT $2`)
+	h.listByAddress(c, "address", `SELECT token_address, COUNT(*) AS token_count FROM nfts WHERE owner = $1 GROUP BY token_address LIMIT $2`)
 }
 
 func (h *Handler) GetAddressAnalytics(c *gin.Context) {
@@ -563,7 +563,7 @@ func (h *Handler) GetAddressAnalytics(c *gin.Context) {
 func (h *Handler) GetGasTrends(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 24)
-	rows, err := h.queryRows(ctx, `SELECT block_number, gas_price, base_fee_per_gas, timestamp FROM gas_prices ORDER BY block_number DESC LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT gas_price, base_fee, priority_fee, gas_used, timestamp FROM gas_prices ORDER BY timestamp DESC LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -590,13 +590,41 @@ func (h *Handler) GetGasAggregator(c *gin.Context) {
 
 // ==================== CHART ENDPOINTS ====================
 
+// analyticsMetricColumn maps a chart metric name to the analytics_daily column
+// that stores it. The value returned is interpolated into the query, so the map
+// is also the allow-list that keeps request input out of the SQL text.
+var analyticsMetricColumnMap = map[string]string{
+	"daily_tx":         "total_transactions",
+	"weekly_tx":        "total_transactions",
+	"monthly_tx":       "total_transactions",
+	"new_addresses":    "new_tokens",
+	"active_addresses": "total_transactions",
+	"token_price":      "avg_gas_price",
+	"token_volume":     "total_volume",
+	"nft_floor":        "total_volume",
+	"nft_volume":       "total_volume",
+	"difficulty":       "avg_block_time",
+	"dex_liquidity":    "total_volume",
+	"dex_volume":       "total_volume",
+}
+
+func analyticsMetricColumn(metric string) (string, bool) {
+	column, ok := analyticsMetricColumnMap[metric]
+	return column, ok
+}
+
 func (h *Handler) dailyChart(c *gin.Context, metric string, days int) {
 	ctx := c.Request.Context()
+	column, ok := analyticsMetricColumn(metric)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown metric", "metric": metric})
+		return
+	}
 	rows, err := h.queryRows(ctx, `
-		SELECT date, $1::text AS metric, value FROM analytics_daily
-		WHERE metric = $1 AND date >= NOW() - ($2 || ' days')::INTERVAL
+		SELECT date, `+column+` AS value FROM analytics_daily
+		WHERE date >= NOW() - ($1 || ' days')::INTERVAL
 		ORDER BY date
-	`, metric, strconv.Itoa(days))
+	`, strconv.Itoa(days))
 	if err != nil {
 		dbError(c, err)
 		return
@@ -629,7 +657,12 @@ func (h *Handler) GetCustomChart(c *gin.Context) {
 	}
 	days := paramInt(c, "days", 30)
 	ctx := c.Request.Context()
-	rows, err := h.queryRows(ctx, `SELECT date, value FROM analytics_daily WHERE metric = $1 AND date >= NOW() - ($2 || ' days')::INTERVAL ORDER BY date`, metric, strconv.Itoa(days))
+	column, ok := analyticsMetricColumn(metric)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown metric", "metric": metric})
+		return
+	}
+	rows, err := h.queryRows(ctx, `SELECT date, `+column+` AS value FROM analytics_daily WHERE date >= NOW() - ($1 || ' days')::INTERVAL ORDER BY date`, strconv.Itoa(days))
 	if err != nil {
 		dbError(c, err)
 		return
@@ -646,7 +679,7 @@ func (h *Handler) GetDexPairTokens(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT token0_address, token1_address, token0_symbol, token1_symbol FROM dex_pairs WHERE address = $1`, pair)
+	row, err := h.queryOne(ctx, `SELECT token0_address, token1_address, token0_symbol, token1_symbol FROM dex_pairs WHERE pair_address = $1`, pair)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -695,7 +728,7 @@ func (h *Handler) SearchDexPairs(c *gin.Context) {
 func (h *Handler) GetPopularDexTokens(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 20)
-	rows, err := h.queryRows(ctx, `SELECT token0_address, token0_symbol, COUNT(*) AS swap_count FROM dex_swaps GROUP BY token0_address, token0_symbol ORDER BY swap_count DESC LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT from_token AS token_address, COUNT(*) AS swap_count FROM dex_swaps GROUP BY from_token ORDER BY swap_count DESC LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -717,7 +750,7 @@ func (h *Handler) GetDexExchanges(c *gin.Context) {
 func (h *Handler) GetDexProtocols(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 5)
-	rows, err := h.queryRows(ctx, `SELECT protocol_name, COALESCE(SUM(tvl_usd), 0) AS tvl FROM defi_tvl GROUP BY protocol_name ORDER BY tvl DESC LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT protocol, COALESCE(SUM(tvl), 0) AS tvl FROM defi_tvl GROUP BY protocol ORDER BY tvl DESC LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -772,7 +805,7 @@ func (h *Handler) GetGovernanceVoters(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 50)
-	rows, err := h.queryRows(ctx, `SELECT voter, vote_choice, voting_power FROM governance_votes WHERE proposal_id = $1 ORDER BY voting_power DESC LIMIT $2`, proposalID, limit)
+	rows, err := h.queryRows(ctx, `SELECT voter, vote_choice, votes FROM governance_votes WHERE proposal_id = $1 ORDER BY votes DESC LIMIT $2`, proposalID, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -783,7 +816,7 @@ func (h *Handler) GetGovernanceVoters(c *gin.Context) {
 func (h *Handler) GetDelegations(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 20)
-	rows, err := h.queryRows(ctx, `SELECT delegator, delegatee, voting_power FROM governance_votes WHERE delegator IS NOT NULL ORDER BY voting_power DESC LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT delegator_address, validator_address, amount, reward FROM staking_delegations ORDER BY amount DESC LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -798,7 +831,7 @@ func (h *Handler) GetDelegatorInfo(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT delegator, delegatee, voting_power FROM governance_votes WHERE delegator = $1 ORDER BY voting_power DESC LIMIT 1`, addr)
+	row, err := h.queryOne(ctx, `SELECT delegator_address, validator_address, amount, reward FROM staking_delegations WHERE delegator_address = $1 ORDER BY amount DESC LIMIT 1`, addr)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -837,7 +870,7 @@ func (h *Handler) GetFlashbotsBundles(c *gin.Context) {
 func (h *Handler) GetMEVRelays(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 5)
-	rows, err := h.queryRows(ctx, `SELECT DISTINCT relay_url FROM mev_bundles WHERE relay_url IS NOT NULL LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT DISTINCT sender AS relay FROM mev_bundles WHERE sender IS NOT NULL LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -894,7 +927,7 @@ func (h *Handler) GetMEVJobs(c *gin.Context) {
 func (h *Handler) GetLabelCategories(c *gin.Context) {
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 10)
-	rows, err := h.queryRows(ctx, `SELECT DISTINCT category FROM search_index WHERE category IS NOT NULL LIMIT $1`, limit)
+	rows, err := h.queryRows(ctx, `SELECT DISTINCT label_type AS category FROM address_labels WHERE label_type IS NOT NULL LIMIT $1`, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -913,7 +946,7 @@ func (h *Handler) GetAddressesByLabel(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 50)
-	rows, err := h.queryRows(ctx, `SELECT address, label, description FROM search_index WHERE category = $1 LIMIT $2`, category, limit)
+	rows, err := h.queryRows(ctx, `SELECT address, label, label_type, notes FROM address_labels WHERE label_type = $1 LIMIT $2`, category, limit)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -1013,7 +1046,7 @@ func (h *Handler) GetStatsOverview(c *gin.Context) {
 
 func (h *Handler) GetHistoricalStats(c *gin.Context) {
 	ctx := c.Request.Context()
-	rows, err := h.queryRows(ctx, `SELECT date, metric, value FROM analytics_daily WHERE date >= NOW() - INTERVAL '365 days' ORDER BY date`)
+	rows, err := h.queryRows(ctx, `SELECT date, total_transactions, total_volume, total_gas_used, avg_gas_price FROM analytics_daily WHERE date >= NOW() - INTERVAL '365 days' ORDER BY date`)
 	if err != nil {
 		dbError(c, err)
 		return
@@ -1047,7 +1080,7 @@ func (h *Handler) SearchAddresses(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 	limit := paramInt(c, "limit", 20)
-	rows, err := h.queryRows(ctx, `SELECT address, label, category FROM search_index WHERE address ILIKE '%' || $1 || '%' OR label ILIKE '%' || $1 || '%' LIMIT $2`, q, limit)
+	rows, err := h.queryRows(ctx, `SELECT address, label, label_type FROM address_labels WHERE address ILIKE '%' || $1 || '%' OR label ILIKE '%' || $1 || '%' LIMIT $2`, q, limit)
 	if err != nil {
 		dbError(c, err)
 		return
