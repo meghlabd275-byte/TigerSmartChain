@@ -1206,6 +1206,12 @@ impl TigerNode {
                     (consensus.get_proposer(next_block), settled)
                 };
 
+                if let Some(expected) = &proposer {
+                    log::trace!(
+                        "block {next_block}: in-turn proposer is {expected}"
+                    );
+                }
+
                 if !settled_rewards.is_empty() {
                     let mut world = node.world_state.lock().await;
                     for (validator, reward) in &settled_rewards {
@@ -1222,9 +1228,41 @@ impl TigerNode {
                     );
                 }
 
-                if let Some(proposer) = proposer {
+                // Liveness: the in-turn validator proposes first, but any
+                // active validator may take over once its own slot arrives.
+                // A strict in-turn rule would keep naming an offline validator
+                // and the chain would stall until it came back; here the next
+                // validator in the rotation takes over a slot later.
+                let proposal_slot = match (&proposer, &node.config.validator_addr) {
+                    (Some(_), Some(me)) => {
+                        let consensus = node.consensus.lock().await;
+                        if consensus.is_validator(me) {
+                            let parent_timestamp = {
+                                let cm = node.chain_manager.lock().await;
+                                cm.chain()
+                                    .get_block(next_block.saturating_sub(1))
+                                    .map(|b| b.header.timestamp)
+                                    .unwrap_or(0)
+                            };
+                            consensus.earliest_proposal_time(next_block, me, parent_timestamp)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+                let may_propose = proposal_slot
+                    .map(|earliest| now_secs >= earliest)
+                    .unwrap_or(false);
+
+                if may_propose {
                     if let Some(ref my_addr) = node.config.validator_addr {
-                        if proposer.eq_ignore_ascii_case(my_addr) {
+                        // This node seals with its own key, so it is the
+                        // proposer. `produce_block` derives the address from
+                        // the key and the two cannot disagree.
+                        let proposer = my_addr.clone();
+                        {
                             info!("Proposing block #{}", next_block);
                             // Collect pending transactions from mempool
                             let pending_txs = {
@@ -3569,6 +3607,84 @@ mod tests {
             Some(expected.as_str()),
             "the address must be derived from the key"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Liveness at the node boundary: a node that is not the in-turn proposer
+    /// must still be able to produce. Under a strict in-turn rule the loop
+    /// would keep naming a validator that is not running and the chain would
+    /// never advance.
+    #[tokio::test]
+    async fn a_validator_out_of_turn_can_still_propose() {
+        let dir = unique_data_dir("out-of-turn");
+        // Two validators. Height 1 belongs to the second one in the rotation.
+        let key = [0x44u8; 32];
+        let mine = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&key).unwrap()
+            )
+        );
+        let other = format!("0x{}", tiger_blockchain::hex_encode(&[0x55u8; 20]));
+        // Put `other` first so `mine` is not the in-turn proposer at height 1.
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![other.clone(), mine.clone()],
+            validator_key: Some(format!("0x{}", tiger_blockchain::hex_encode(&key))),
+            validator_addr: None,
+            data_dir: dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
+            ..Config::default_mainnet()
+        };
+        let node = TigerNode::from_genesis(config, create_genesis_block(6666))
+            .await
+            .unwrap();
+
+        let consensus = node.consensus.lock().await;
+        assert!(consensus.is_validator(&mine), "this node is a validator");
+
+        // The election sorts by stake then address, so the rotation order is
+        // not the order the validators were listed in. Find a height at which
+        // this node is genuinely out of turn; with two validators one exists.
+        let height = (1..=4)
+            .find(|h| {
+                consensus
+                    .expected_proposer(*h)
+                    .map(|p| !p.eq_ignore_ascii_case(&mine))
+                    .unwrap_or(false)
+            })
+            .expect("with two validators, some height is not this node's turn");
+
+        let distance = consensus
+            .proposer_turn_distance(height, &mine)
+            .expect("a registered validator has a slot");
+        assert!(
+            distance > 0,
+            "the node must be out of turn at the chosen height, got {distance}"
+        );
+
+        let parent_timestamp = 1_000;
+        let earliest = consensus
+            .earliest_proposal_time(height, &mine, parent_timestamp)
+            .unwrap();
+        assert!(
+            earliest > parent_timestamp,
+            "an out-of-turn proposer must wait for its slot"
+        );
+        // And it must still be allowed to propose once that slot arrives,
+        // which is the liveness property: the chain does not wait for the
+        // absent in-turn validator.
+        assert!(
+            consensus.is_timely_proposal(height, &mine, earliest, parent_timestamp),
+            "the backup must be allowed to propose at its own slot"
+        );
+        assert!(
+            !consensus.is_timely_proposal(height, &mine, earliest - 1, parent_timestamp),
+            "the backup must not propose before its slot"
+        );
+        drop(consensus);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

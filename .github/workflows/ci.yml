@@ -1,0 +1,151 @@
+name: CI
+
+# Every push to main and every pull request runs the whole suite. Before this
+# workflow existed the repository had over a thousand test functions and
+# nothing ran them, so a regression could only be found by hand.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch makes the first run obsolete, so cancel it
+# rather than queue it behind work whose result nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The crates the node binary actually links, plus the standalone
+        # consensus engine. Each is its own workspace, so each is built
+        # separately.
+        crate: [crypto, state, evm, blockchain, consensus, node, network, precompile, quantum_crypto, bridge-engine]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache the build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+
+      - name: Build
+        working-directory: ${{ matrix.crate }}
+        run: cargo build --all-targets
+
+      - name: Test
+        working-directory: ${{ matrix.crate }}
+        run: cargo test
+
+      - name: Clippy
+        working-directory: ${{ matrix.crate }}
+        # Reported, not enforced. The tree predates this workflow and carries
+        # pre-existing lints; failing the build on them today would leave CI red
+        # and therefore ignored. Tighten this to `-D warnings` once the tree is
+        # clean, which is tracked as its own change.
+        continue-on-error: true
+        run: cargo clippy --all-targets
+
+      - name: Check formatting
+        working-directory: ${{ matrix.crate }}
+        # Formatting is reported but does not fail the build: the existing tree
+        # predates rustfmt and reformatting it is a separate change.
+        continue-on-error: true
+        run: cargo fmt --check
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: go_services/go.sum
+      - name: Build
+        working-directory: go_services
+        run: go build ./...
+      - name: Vet
+        working-directory: go_services
+        run: go vet ./...
+      - name: Test
+        working-directory: go_services
+        run: go test ./...
+
+  cpp:
+    name: C++ (crypto_cpp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the known-answer tests
+        working-directory: crypto_cpp
+        run: make test
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+      - name: Type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint --if-present
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  contracts:
+    name: Solidity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install
+        working-directory: contracts
+        run: npm ci
+      - name: Compile and test
+        working-directory: contracts
+        run: npm test --if-present
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject committed private keys and credentials
+        run: |
+          # A private key or credential committed once is compromised forever,
+          # so this fails the build rather than warning.
+          patterns='BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|-----BEGIN CERTIFICATE-----'
+          if git grep -nE "$patterns" -- . ':!*.md' ':!*.lock' ':!*test*' ':!*.example'; then
+            echo "::error::a credential appears to be committed"
+            exit 1
+          fi
+          echo "no committed credentials found"

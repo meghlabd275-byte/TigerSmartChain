@@ -173,9 +173,86 @@ impl PoSA {
         }
     }
 
-    /// Check if an address is an active validator
+    /// Check if an address is an active validator.
+    ///
+    /// Compared without regard to case: addresses reach this from headers, the
+    /// command line and the registry, all of which format them differently.
     pub fn is_validator(&self, address: &str) -> bool {
-        self.validators.iter().any(|v| v == address)
+        self.validators
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(address))
+    }
+
+    /// The validator whose turn it is to propose `block_number`.
+    ///
+    /// This is the "in-turn" proposer. It is an ordering hint, not an
+    /// authorisation: any active validator may propose, and the in-turn
+    /// validator simply gets the first slot of the height. See
+    /// [`PoSA::earliest_proposal_time`].
+    pub fn expected_proposer(&self, block_number: u64) -> Option<String> {
+        self.get_proposer(block_number)
+    }
+
+    /// How many slots after the in-turn validator `proposer` may propose.
+    ///
+    /// `0` for the in-turn validator, `1` for the next one in rotation, and so
+    /// on. Returns `None` when the address is not an active validator.
+    ///
+    /// This is what gives the chain liveness. With a strict in-turn rule an
+    /// offline validator would stall the chain until it came back; here the
+    /// next validator takes over one slot later, and the chain keeps producing.
+    pub fn proposer_turn_distance(&self, block_number: u64, proposer: &str) -> Option<usize> {
+        if self.validators.is_empty() {
+            return None;
+        }
+        let len = self.validators.len();
+        let in_turn = (block_number as usize) % len;
+        let position = self
+            .validators
+            .iter()
+            .position(|v| v.eq_ignore_ascii_case(proposer))?;
+        // Distance forward in the rotation, wrapping around.
+        Some((position + len - in_turn) % len)
+    }
+
+    /// The earliest timestamp at which `proposer` may propose `block_number`.
+    ///
+    /// The in-turn validator may propose one slot after the parent. Each
+    /// subsequent validator in the rotation waits one further slot, so a
+    /// proposer who is offline is skipped rather than waited for. The parent
+    /// timestamp is passed in rather than read from the header so this stays a
+    /// pure function of the inputs.
+    pub fn earliest_proposal_time(
+        &self,
+        block_number: u64,
+        proposer: &str,
+        parent_timestamp: u64,
+    ) -> Option<u64> {
+        let distance = self.proposer_turn_distance(block_number, proposer)?;
+        let slots = distance as u64 + 1;
+        Some(
+            parent_timestamp
+                .saturating_add(self.slot_duration.max(1).saturating_mul(slots)),
+        )
+    }
+
+    /// Whether a block from `proposer` at `block_number` with `timestamp` is
+    /// timely: not proposed before its slot.
+    ///
+    /// A block stamped earlier than its proposer's slot is refused, because
+    /// accepting it would let a validator ignore the rotation and propose every
+    /// block by simply backdating the timestamp.
+    pub fn is_timely_proposal(
+        &self,
+        block_number: u64,
+        proposer: &str,
+        timestamp: u64,
+        parent_timestamp: u64,
+    ) -> bool {
+        match self.earliest_proposal_time(block_number, proposer, parent_timestamp) {
+            Some(earliest) => timestamp >= earliest,
+            None => false,
+        }
     }
 
     /// Slash a validator for double signing or downtime
@@ -351,5 +428,69 @@ mod tests {
         posa.slash_validator("0x1", MIN_STAKE);
 
         assert!(!posa.is_validator("0x1"));
+    }
+
+    /// The liveness property that a strict in-turn rule would break: when the
+    /// in-turn validator is offline, the next one can still propose, and it
+    /// does so one slot later rather than never.
+    #[test]
+    fn a_backup_validator_can_propose_when_the_in_turn_one_is_offline() {
+        let mut posa = PoSA::new(6666, 200, 3);
+        posa.register_validator("0xa".into(), MIN_STAKE);
+        posa.register_validator("0xb".into(), MIN_STAKE);
+        posa.register_validator("0xc".into(), MIN_STAKE);
+        posa.update_epoch(0);
+
+        // Block 0 is 0xa's turn, block 1 is 0xb's, block 2 is 0xc's.
+        assert_eq!(posa.expected_proposer(0).as_deref(), Some("0xa"));
+        assert_eq!(posa.proposer_turn_distance(0, "0xa"), Some(0));
+        assert_eq!(posa.proposer_turn_distance(0, "0xb"), Some(1));
+        assert_eq!(posa.proposer_turn_distance(0, "0xc"), Some(2));
+
+        // The in-turn validator may go one slot after the parent.
+        assert_eq!(posa.earliest_proposal_time(0, "0xa", 1_000), Some(1_003));
+        // A backup waits longer, so the in-turn validator gets first refusal.
+        assert_eq!(posa.earliest_proposal_time(0, "0xb", 1_000), Some(1_006));
+        assert_eq!(posa.earliest_proposal_time(0, "0xc", 1_000), Some(1_009));
+
+        // If 0xa never proposes, 0xb's block at 1_006 is accepted.
+        assert!(!posa.is_timely_proposal(0, "0xb", 1_005, 1_000));
+        assert!(posa.is_timely_proposal(0, "0xb", 1_006, 1_000));
+    }
+
+    /// Backdating must not let a validator bypass the rotation entirely.
+    #[test]
+    fn a_block_stamped_before_its_proposers_slot_is_refused() {
+        let mut posa = PoSA::new(6666, 200, 3);
+        posa.register_validator("0xa".into(), MIN_STAKE);
+        posa.register_validator("0xb".into(), MIN_STAKE);
+        posa.update_epoch(0);
+
+        // 0xb is one slot out of turn at height 0, so it cannot propose at the
+        // in-turn time.
+        assert!(!posa.is_timely_proposal(0, "0xb", 1_003, 1_000));
+        assert!(posa.is_timely_proposal(0, "0xa", 1_003, 1_000));
+    }
+
+    /// An address outside the set has no slot at all.
+    #[test]
+    fn a_non_validator_has_no_proposal_slot() {
+        let mut posa = PoSA::new(6666, 200, 3);
+        posa.register_validator("0xa".into(), MIN_STAKE);
+        posa.update_epoch(0);
+        assert_eq!(posa.proposer_turn_distance(0, "0xdead"), None);
+        assert!(!posa.is_timely_proposal(0, "0xdead", u64::MAX, 0));
+    }
+
+    /// `is_validator` must not depend on how the caller capitalised the address.
+    #[test]
+    fn validator_lookup_ignores_address_case() {
+        let mut posa = PoSA::new(6666, 200, 3);
+        posa.register_validator("0xAbCdEf".into(), MIN_STAKE);
+        posa.update_epoch(0);
+        assert!(posa.is_validator("0xabcdef"));
+        assert!(posa.is_validator("0xABCDEF"));
+        assert!(posa.is_validator("0xAbCdEf"));
+        assert!(!posa.is_validator("0x123456"));
     }
 }

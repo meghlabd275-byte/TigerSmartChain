@@ -10,6 +10,11 @@ license = "MIT"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
+hex = "0.4"
+# Signature recovery for attestations. The consensus engine verifies votes with
+# the same secp256k1 implementation the chain uses for transactions, so a vote
+# and a transaction can never disagree about what a signature means.
+tiger-crypto = { path = "../crypto" }
 
 [profile.release]
 opt-level = 3
