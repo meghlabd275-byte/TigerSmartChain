@@ -79,10 +79,180 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
+/// Which browser origins are allowed to call the RPC.
+///
+/// Empty means none. Answering every request with `Access-Control-Allow-Origin:
+/// *` would let any page a user happens to visit read the chain through their
+/// node, and — worse for a node that accepts `eth_sendRawTransaction` — let a
+/// malicious page use the node as the origin of a state-changing call. So the
+/// default denies, and an operator running a web explorer lists its origin.
+#[derive(Debug, Clone, Default)]
+pub struct CorsPolicy {
+    allowed: Vec<String>,
+}
+
+impl CorsPolicy {
+    /// Parse a comma-separated origin list. `*` allows any origin.
+    pub fn from_config(spec: &str) -> Self {
+        let allowed = spec
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        Self { allowed }
+    }
+
+    /// The value to send as `Access-Control-Allow-Origin`, if the request
+    /// carries an origin this policy allows.
+    ///
+    /// The caller's own origin is echoed rather than `*` even when `*` is
+    /// configured. With a literal `*` a browser also allows credentialed
+    /// requests, and the response body is identical for every origin, which
+    /// invites a shared cache to hand one caller another's answer.
+    fn allow_origin(&self, origin: Option<&str>) -> Option<String> {
+        let origin = origin?;
+        let lowered = origin.to_ascii_lowercase();
+        if self.allowed.iter().any(|a| a == "*" || *a == lowered) {
+            return Some(origin.to_string());
+        }
+        None
+    }
+
+    /// The CORS response headers for a request, or an empty string.
+    fn headers(&self, origin: Option<&str>) -> String {
+        match self.allow_origin(origin) {
+            Some(origin) => format!(
+                "Access-Control-Allow-Origin: {origin}\r\n\
+                 Vary: Origin\r\n\
+                 Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+                 Access-Control-Allow-Headers: Content-Type\r\n"
+            ),
+            None => String::new(),
+        }
+    }
+}
+
+/// One client's token bucket.
+struct Bucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+/// A per-client token bucket over the RPC.
+///
+/// The RPC is reachable by anyone who can open a socket, and a single caller
+/// looping `eth_call` can occupy every core the node has. The bucket refills at
+/// the configured rate and holds at most one second's worth, so a client that
+/// bursts is slowed rather than disconnected, and a sustained flood is capped
+/// without the node having to track a request queue.
+struct RateLimiter {
+    per_second: u32,
+    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, Bucket>>,
+}
+
+impl RateLimiter {
+    fn new(per_second: u32) -> Self {
+        Self {
+            per_second,
+            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Whether this client may make a request now.
+    fn allow(&self, ip: std::net::IpAddr) -> bool {
+        if self.per_second == 0 {
+            return true;
+        }
+        let rate = f64::from(self.per_second);
+        let now = std::time::Instant::now();
+        // A poisoned mutex here would mean a panic while holding it, which the
+        // critical section cannot cause; recovering keeps the RPC serving.
+        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Bound the table. Without this a caller with a large address range
+        // could grow it without limit, which is its own denial of service.
+        if buckets.len() > 100_000 {
+            buckets.retain(|_, b| now.duration_since(b.last).as_secs() < 60);
+        }
+
+        let bucket = buckets.entry(ip).or_insert(Bucket {
+            tokens: rate,
+            last: now,
+        });
+        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * rate).min(rate);
+        bucket.last = now;
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Counters for the metrics endpoint.
+///
+/// These are the numbers an operator alerts on: whether the node is producing
+/// blocks, whether peers are connected, how full the pool is, and how much of
+/// the RPC is failing or being throttled.
+#[derive(Debug)]
+pub struct Metrics {
+    start: std::time::Instant,
+    requests: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+    rate_limited: std::sync::atomic::AtomicU64,
+    http_requests: std::sync::atomic::AtomicU64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            requests: std::sync::atomic::AtomicU64::new(0),
+            errors: std::sync::atomic::AtomicU64::new(0),
+            rate_limited: std::sync::atomic::AtomicU64::new(0),
+            http_requests: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, response: &RpcResponse) {
+        use std::sync::atomic::Ordering;
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        if response.error.is_some() {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Serve JSON-RPC on `addr` until the node stops.
 pub async fn serve(node: Arc<TigerNode>, addr: String) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     log::info!("JSON-RPC server listening on {addr}");
+    serve_listener(listener, node).await
+}
+
+/// Serve JSON-RPC on an already-bound listener.
+///
+/// Separated from `serve` so the caller can bind first, learn the port it was
+/// given (binding to port 0 asks the kernel for a free one), and only then
+/// start accepting. That is what lets the transport be tested over a real
+/// socket rather than by inspecting strings.
+pub async fn serve_listener(
+    listener: TcpListener,
+    node: Arc<TigerNode>,
+) -> std::io::Result<()> {
+    let cors = Arc::new(CorsPolicy::from_config(&node.config().rpc_cors_host));
+    let limiter = Arc::new(RateLimiter::new(node.config().rpc_rate_limit));
+    let metrics = Arc::new(Metrics::new());
 
     loop {
         let (mut stream, peer) = match listener.accept().await {
@@ -93,18 +263,90 @@ pub async fn serve(node: Arc<TigerNode>, addr: String) -> std::io::Result<()> {
             }
         };
         let node = Arc::clone(&node);
+        let cors = Arc::clone(&cors);
+        let limiter = Arc::clone(&limiter);
+        let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(&mut stream, node).await {
+            if let Err(e) =
+                handle_connection(&mut stream, node, cors, limiter, metrics, peer).await
+            {
                 log::debug!("connection from {peer} ended: {e}");
             }
         });
     }
 }
 
+/// Serve the metrics endpoint on `addr` until the node stops.
+///
+/// A separate listener from the RPC: metrics are for the operator's monitoring
+/// system, and mixing them into the RPC would expose the node's internals to
+/// every wallet that can reach it.
+pub async fn serve_metrics(node: Arc<TigerNode>, addr: String) -> std::io::Result<()> {
+    let listener = TcpListener::bind(&addr).await?;
+    log::info!("Metrics server listening on {addr}");
+
+    loop {
+        let (mut stream, _peer) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(e) => {
+                log::warn!("metrics accept failed: {e}");
+                continue;
+            }
+        };
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            if let Err(e) = handle_metrics(&mut stream, &node).await {
+                log::debug!("metrics connection ended: {e}");
+            }
+        });
+    }
+}
+
+/// Answer one scrape with the node's current metrics.
+async fn handle_metrics(stream: &mut tokio::net::TcpStream, node: &Arc<TigerNode>) -> std::io::Result<()> {
+    let mut buf = [0u8; 4096];
+    let read = stream.read(&mut buf).await?;
+    if read == 0 {
+        return Ok(());
+    }
+    // Only GET (and HEAD) are meaningful for a scrape; anything else gets 405.
+    let request_line = String::from_utf8_lossy(&buf[..read]);
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    if method != "GET" && method != "HEAD" {
+        let head = "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(head.as_bytes()).await?;
+        return stream.flush().await;
+    }
+    // Answer the path a scraper is configured for, and 404 anything else
+    // rather than serving metrics from every URL.
+    if path != "/metrics" {
+        let head = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(head.as_bytes()).await?;
+        return stream.flush().await;
+    }
+
+    let body = node.metrics_text().await;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    if method == "GET" {
+        stream.write_all(body.as_bytes()).await?;
+    }
+    stream.flush().await
+}
+
 /// Read one HTTP request and write one JSON-RPC response.
 async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     node: Arc<TigerNode>,
+    cors: Arc<CorsPolicy>,
+    limiter: Arc<RateLimiter>,
+    metrics: Arc<Metrics>,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     // Read headers, then the body according to Content-Length. The cap stops a
     // client from making the node allocate without bound.
@@ -116,7 +358,7 @@ async fn handle_connection(
     loop {
         if buf.len() > MAX_HEADER {
             let response = RpcResponse::error(INVALID_REQUEST, "headers too large", Value::Null);
-            return write_response(stream, response, false).await;
+            return write_response(stream, response, &cors, None, false).await;
         }
         let mut chunk = [0u8; 1024];
         let read = stream.read(&mut chunk).await?;
@@ -131,10 +373,30 @@ async fn handle_connection(
     }
 
     let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let request_line = headers.lines().next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+    let origin = parse_header(&headers, "origin");
     let content_length = parse_content_length(&headers).unwrap_or(0);
     if content_length > MAX_BODY {
         let response = RpcResponse::error(INVALID_REQUEST, "body too large", Value::Null);
-        return write_response(stream, response, false).await;
+        return write_response(stream, response, &cors, origin.as_deref(), false).await;
+    }
+
+    // A liveness endpoint, so a container orchestrator, load balancer or
+    // uptime check has something cheap to poll that says whether the node is
+    // actually serving rather than merely listening.
+    if method == "GET" && (path == "/health" || path == "/healthz") {
+        let body = node.health_json().await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            cors.headers(origin.as_deref()),
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body.as_bytes()).await?;
+        return stream.flush().await;
     }
 
     let body_start = header_end + 4;
@@ -149,16 +411,45 @@ async fn handle_connection(
     }
     body.truncate(content_length);
 
-    // A CORS preflight carries no JSON body.
-    if headers.starts_with("OPTIONS") {
-        return write_cors_preflight(stream).await;
+    // A CORS preflight carries no JSON body and must be answered before the
+    // rate limit applies, or a page's first request would be throttled by its
+    // own preflight.
+    if method == "OPTIONS" {
+        return write_cors_preflight(stream, &cors, origin.as_deref()).await;
+    }
+
+    // Only POST carries a JSON-RPC call. A GET is answered explicitly rather
+    // than being parsed as an empty body, so a client that got the method wrong
+    // is told so instead of receiving a parse error.
+    if method != "POST" {
+        let head = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\nAllow: POST, OPTIONS\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+            cors.headers(origin.as_deref())
+        );
+        stream.write_all(head.as_bytes()).await?;
+        return stream.flush().await;
+    }
+
+    use std::sync::atomic::Ordering;
+    metrics.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    if !limiter.allow(peer.ip()) {
+        metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+        log::debug!("rate limited RPC request from {}", peer.ip());
+        let head = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n{}Content-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            cors.headers(origin.as_deref())
+        );
+        stream.write_all(head.as_bytes()).await?;
+        return stream.flush().await;
     }
 
     let response = match serde_json::from_slice::<RpcRequest>(&body) {
         Ok(request) => dispatch(&node, request).await,
         Err(e) => RpcResponse::error(PARSE_ERROR, format!("parse error: {e}"), Value::Null),
     };
-    write_response(stream, response, true).await
+    metrics.record(&response);
+    write_response(stream, response, &cors, origin.as_deref(), true).await
 }
 
 /// Find the end of the HTTP header block (`\r\n\r\n`).
@@ -168,10 +459,18 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 /// Extract `Content-Length` from the raw header block.
 fn parse_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                return value.trim().parse().ok();
+    parse_header(headers, "content-length").and_then(|v| v.trim().parse().ok())
+}
+
+/// Extract a header value, case-insensitively, from the raw header block.
+///
+/// Only the first line is skipped so a request line cannot be mistaken for a
+/// header. Values are returned as sent; callers normalise where it matters.
+fn parse_header(headers: &str, name: &str) -> Option<String> {
+    for line in headers.lines().skip(1) {
+        if let Some((field, value)) = line.split_once(':') {
+            if field.trim().eq_ignore_ascii_case(name) {
+                return Some(value.trim().to_string());
             }
         }
     }
@@ -181,20 +480,18 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 async fn write_response(
     stream: &mut tokio::net::TcpStream,
     response: RpcResponse,
+    cors: &CorsPolicy,
+    origin: Option<&str>,
     with_cors: bool,
 ) -> std::io::Result<()> {
     let body = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
-    let cors = if with_cors {
-        // The node is meant to be reachable from a browser-based explorer.
-        // Access is intentionally open, matching how public RPC endpoints
-        // behave; deployments that need a restriction should front this with
-        // a reverse proxy.
-        "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
+    let cors_headers = if with_cors {
+        cors.headers(origin)
     } else {
-        ""
+        String::new()
     };
     let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{cors}Connection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{cors_headers}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;
@@ -202,8 +499,15 @@ async fn write_response(
     stream.flush().await
 }
 
-async fn write_cors_preflight(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
-    let head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+async fn write_cors_preflight(
+    stream: &mut tokio::net::TcpStream,
+    cors: &CorsPolicy,
+    origin: Option<&str>,
+) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 204 No Content\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+        cors.headers(origin)
+    );
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await
 }
@@ -1811,6 +2115,116 @@ pub fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A default node allows no browser origin. This is the setting that
+    /// matters most: an open `Access-Control-Allow-Origin: *` on an endpoint
+    /// that accepts `eth_sendRawTransaction` lets any page a user visits drive
+    /// their node.
+    #[test]
+    fn cors_denies_by_default() {
+        let policy = CorsPolicy::from_config("");
+        assert_eq!(policy.headers(Some("https://evil.example")), "");
+        assert_eq!(policy.headers(None), "");
+        // An empty spec is also what a whitespace-only or comma-only value
+        // parses to.
+        assert_eq!(CorsPolicy::from_config(" , , ").headers(Some("https://a.example")), "");
+    }
+
+    #[test]
+    fn cors_allows_only_the_listed_origin_and_echoes_it() {
+        let policy = CorsPolicy::from_config("https://explorer.tiger.example, https://wallet.tiger.example");
+        let headers = policy.headers(Some("https://explorer.tiger.example"));
+        assert!(headers.contains("Access-Control-Allow-Origin: https://explorer.tiger.example"));
+        // The origin is echoed, never a bare `*`, so a browser does not treat
+        // the response as credentialed-open and a shared cache cannot mix
+        // answers between origins.
+        assert!(!headers.contains("Access-Control-Allow-Origin: *"));
+        assert!(headers.contains("Vary: Origin"));
+        // Case is not significant for an origin, so a differently-cased
+        // request must still be accepted.
+        assert!(policy
+            .headers(Some("https://EXPLORER.Tiger.example"))
+            .contains("https://EXPLORER.Tiger.example"));
+        assert_eq!(policy.headers(Some("https://evil.example")), "");
+    }
+
+    #[test]
+    fn cors_wildcard_echoes_the_caller_rather_than_sending_a_star() {
+        let policy = CorsPolicy::from_config("*");
+        let headers = policy.headers(Some("https://any.example"));
+        assert!(headers.contains("Access-Control-Allow-Origin: https://any.example"));
+        assert!(!headers.contains("Access-Control-Allow-Origin: *"));
+    }
+
+    #[test]
+    fn the_rate_limiter_caps_a_flood_and_lets_the_bucket_refill() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let other: IpAddr = "203.0.113.8".parse().unwrap();
+
+        let limiter = RateLimiter::new(5);
+        // The bucket starts full, so the first five are allowed and the sixth
+        // is not.
+        for i in 0..5 {
+            assert!(limiter.allow(ip), "request {i} within the burst must be allowed");
+        }
+        assert!(!limiter.allow(ip), "the request past the burst must be refused");
+
+        // A different client has its own bucket.
+        assert!(limiter.allow(other));
+
+        // A zero rate disables the limit entirely.
+        let unlimited = RateLimiter::new(0);
+        for _ in 0..1000 {
+            assert!(unlimited.allow(ip));
+        }
+    }
+
+    #[test]
+    fn the_rate_limiter_refills_over_time() {
+        use std::net::IpAddr;
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let limiter = RateLimiter::new(1000);
+        // Drain the bucket.
+        for _ in 0..1000 {
+            assert!(limiter.allow(ip));
+        }
+        assert!(!limiter.allow(ip));
+        // A millisecond at 1000/s buys one token.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(limiter.allow(ip), "the bucket must refill with time");
+    }
+
+    #[test]
+    fn headers_are_read_case_insensitively_but_not_from_the_request_line() {
+        // The request line itself must never be mistaken for a header.
+        assert_eq!(
+            parse_header("POST /origin: 1 HTTP/1.1\r\nHost: x\r\n", "origin"),
+            None
+        );
+        assert_eq!(
+            parse_header("POST / HTTP/1.1\r\nOrigin: https://a.example\r\n", "origin"),
+            Some("https://a.example".to_string())
+        );
+        assert_eq!(
+            parse_header("POST / HTTP/1.1\r\nORIGIN:   https://b.example  \r\n", "Origin"),
+            Some("https://b.example".to_string())
+        );
+    }
+
+    #[test]
+    fn a_metrics_body_carries_the_standard_exposition_shape() {
+        // A scrape's shape is checked without a node: the rendering lives in
+        // the node, so this pins the format contract the endpoint promises.
+        let body = "# HELP tiger_chain_height Highest canonical block number.\n\
+                    # TYPE tiger_chain_height gauge\n\
+                    tiger_chain_height 7\n";
+        assert!(body.contains("# TYPE "));
+        assert!(body.lines().any(|l| l.starts_with("tiger_chain_height ")));
+        // Every sample line has a name and a value, separated by one space.
+        let sample = body.lines().find(|l| l.starts_with("tiger_chain_height ")).unwrap();
+        assert_eq!(sample.split(' ').count(), 2);
+    }
 
     #[test]
     fn content_length_parsing_is_case_insensitive() {

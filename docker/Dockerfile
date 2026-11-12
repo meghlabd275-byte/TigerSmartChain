@@ -1,53 +1,56 @@
-# Dockerfile for TigerSmartChain Node
+# TigerSmartChain node image.
+#
+# The node is the Rust binary in this repository, so the image is built from
+# the Rust sources. A multi-stage build keeps the toolchain out of the runtime
+# layer, and the runtime image carries only the binary, its CA bundle and curl
+# for the health check.
 
-FROM golang:1.21-alpine AS builder
+FROM rust:1.82-bookworm AS builder
 
-# Install build dependencies
-RUN apk add --no-cache gcc musl-dev linux-headers
+WORKDIR /src
 
-# Set working directory
-WORKDIR /app
+# The crates are standalone (no workspace), so each one the node depends on is
+# copied in. Manifests are copied before sources so Docker caches the
+# dependency build separately from the source build.
+COPY crypto/Cargo.toml crypto/Cargo.toml
+COPY state/Cargo.toml state/Cargo.toml
+COPY evm/Cargo.toml evm/Cargo.toml
+COPY consensus/Cargo.toml consensus/Cargo.toml
+COPY network/Cargo.toml network/Cargo.toml
+COPY blockchain/Cargo.toml blockchain/Cargo.toml
+COPY node/Cargo.toml node/Cargo.toml
 
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
+COPY crypto/ crypto/
+COPY state/ state/
+COPY evm/ evm/
+COPY consensus/ consensus/
+COPY network/ network/
+COPY blockchain/ blockchain/
+COPY node/ node/
 
-# Copy source code
-COPY . .
+RUN cargo build --release --manifest-path node/Cargo.toml \
+    && strip node/target/release/tigersmartchaind
 
-# Build the binary
-RUN CGO_ENABLED=1 GOOS=linux go build -o /tigersmartchaind ./cmd/tigersmartchaind
 
-# Final stage
-FROM alpine:latest
+FROM debian:bookworm-slim
 
-# Install required packages
-RUN apk add --no-cache ca-certificates curl iputils-openrc
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 tigersmartchain
 
-# Create non-root user
-RUN adduser -D -u 1000 tigersmartchain
+COPY --from=builder /src/node/target/release/tigersmartchaind /usr/local/bin/tigersmartchaind
 
-# Set working directory
-WORKDIR /app
-
-# Copy binary from builder
-COPY --from=builder /tigersmartchaind /usr/local/bin/
-
-# Copy configuration
-COPY --chown=tigersmartchain:tigersmartchain ./config /app/config
-
-# Set ownership
-RUN chown -R tigersmartchain:tigersmartchain /app
-
-# Switch to non-root user
+WORKDIR /home/tigersmartchain
 USER tigersmartchain
 
-# Expose ports
+# P2P, JSON-RPC, metrics.
 EXPOSE 30303 8545 9090
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8545/health || exit 1
+# The node serves /health on its RPC port and reports unhealthy when it is not
+# running or has no chain, so this check fails on a node that cannot serve.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8545/health || exit 1
 
-# Start the node
-CMD ["tigersmartchaind", "start"]
+ENTRYPOINT ["tigersmartchaind"]
+CMD ["--rpc-addr", "0.0.0.0:8545", "--listen-addr", "0.0.0.0:30303"]

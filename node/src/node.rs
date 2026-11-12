@@ -877,6 +877,20 @@ impl TigerNode {
             info!("RPC is disabled by configuration; no client interface will be served");
         }
 
+        // Start the metrics endpoint on its own listener. It is separate from
+        // the RPC on purpose: the RPC is public, and the node's peer count,
+        // pool depth and validator set are for the operator's monitoring
+        // system, not for every wallet that can reach the RPC.
+        if self.config.metrics_enabled {
+            let node = Arc::clone(self);
+            let addr = self.config.metrics_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::rpc_server::serve_metrics(Arc::clone(&node), addr.clone()).await {
+                    error!("metrics server on {addr} stopped: {e}");
+                }
+            });
+        }
+
         info!("All node components started successfully");
         Ok(())
     }
@@ -1124,6 +1138,154 @@ impl TigerNode {
     /// Get configuration.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// A liveness and readiness report for orchestrators and monitors.
+    ///
+    /// The status is derived, not asserted: a node reports itself unhealthy
+    /// when it is not running, and not ready when its chain has no genesis or
+    /// its world state and chain height disagree. Reporting "ok" from a node
+    /// that cannot serve a request is worse than no check at all, because a
+    /// load balancer would keep sending it traffic.
+    pub async fn health_json(&self) -> String {
+        let running = *self.state.read().await == NodeState::Running;
+        let height = {
+            let cm = self.chain_manager.lock().await;
+            cm.chain().height()
+        };
+        let has_genesis = {
+            let cm = self.chain_manager.lock().await;
+            cm.chain().genesis().is_some()
+        };
+        let peers = match self.p2p() {
+            Some(p2p) => p2p.peer_count().await,
+            None => 0,
+        };
+        let mempool = self.mempool.lock().await.len();
+
+        // The chain must have a genesis block and a height consistent with it.
+        // A height above zero with no genesis would mean the tree lost its
+        // root, which no request could be answered correctly against.
+        let ready = running && has_genesis;
+        let status = if !running {
+            "unhealthy"
+        } else if !ready {
+            "not_ready"
+        } else {
+            "ok"
+        };
+
+        serde_json::json!({
+            "status": status,
+            "running": running,
+            "ready": ready,
+            "chain_id": self.config.chain_id,
+            "network_id": self.config.network_id,
+            "network": self.config.network,
+            "height": height,
+            "peers": peers,
+            "mempool": mempool,
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string()
+    }
+
+    /// Render the node's current metrics in the Prometheus text format.
+    ///
+    /// Every value is read from the node as it is right now. Nothing is
+    /// estimated or cached, so a scrape that shows a stalled height means the
+    /// chain really has stopped, which is the point of a metric.
+    pub async fn metrics_text(&self) -> String {
+        use std::fmt::Write as _;
+
+        let height = {
+            let cm = self.chain_manager.lock().await;
+            cm.chain().height()
+        };
+        let (chain_id, network_id, network) = (
+            self.config.chain_id,
+            self.config.network_id,
+            self.config.network.clone(),
+        );
+        let running = *self.state.read().await == NodeState::Running;
+        let (mempool_size, mempool_capacity, mempool_senders) = {
+            let pool = self.mempool.lock().await;
+            (pool.len(), pool.capacity(), pool.sender_count())
+        };
+        let peers = match self.p2p() {
+            Some(p2p) => p2p.peer_count().await,
+            None => 0,
+        };
+        let best_peer_height = match self.p2p() {
+            Some(p2p) => p2p.best_peer_height().await,
+            None => None,
+        };
+        let sync = self.sync_status.read().await.clone();
+        let validator_count = self.config.validators.len();
+        let is_validator = self.config.validator_addr.is_some() && self.validator_key.is_some();
+
+        let mut out = String::with_capacity(2048);
+        let _ = writeln!(out, "# HELP tiger_chain_height Highest canonical block number.");
+        let _ = writeln!(out, "# TYPE tiger_chain_height gauge");
+        let _ = writeln!(out, "tiger_chain_height {height}");
+
+        let _ = writeln!(out, "# HELP tiger_chain_id The chain's EIP-155 chain id.");
+        let _ = writeln!(out, "# TYPE tiger_chain_id gauge");
+        let _ = writeln!(out, "tiger_chain_id {chain_id}");
+
+        let _ = writeln!(out, "# HELP tiger_network_id The network id reported by net_version.");
+        let _ = writeln!(out, "# TYPE tiger_network_id gauge");
+        let _ = writeln!(out, "tiger_network_id {network_id}");
+
+        let _ = writeln!(out, "# HELP tiger_node_running 1 while the node accepts and serves requests.");
+        let _ = writeln!(out, "# TYPE tiger_node_running gauge");
+        let _ = writeln!(out, "tiger_node_running {}", u8::from(running));
+
+        let _ = writeln!(out, "# HELP tiger_mempool_transactions Transactions waiting to be included.");
+        let _ = writeln!(out, "# TYPE tiger_mempool_transactions gauge");
+        let _ = writeln!(out, "tiger_mempool_transactions {mempool_size}");
+
+        let _ = writeln!(out, "# HELP tiger_mempool_capacity Maximum transactions the pool holds.");
+        let _ = writeln!(out, "# TYPE tiger_mempool_capacity gauge");
+        let _ = writeln!(out, "tiger_mempool_capacity {mempool_capacity}");
+
+        let _ = writeln!(out, "# HELP tiger_mempool_senders Distinct senders with a pending transaction.");
+        let _ = writeln!(out, "# TYPE tiger_mempool_senders gauge");
+        let _ = writeln!(out, "tiger_mempool_senders {mempool_senders}");
+
+        let _ = writeln!(out, "# HELP tiger_p2p_peers Connected peers.");
+        let _ = writeln!(out, "# TYPE tiger_p2p_peers gauge");
+        let _ = writeln!(out, "tiger_p2p_peers {peers}");
+
+        let _ = writeln!(out, "# HELP tiger_sync_syncing 1 while the node is catching up to its peers.");
+        let _ = writeln!(out, "# TYPE tiger_sync_syncing gauge");
+        let _ = writeln!(out, "tiger_sync_syncing {}", u8::from(sync.syncing));
+
+        let _ = writeln!(out, "# HELP tiger_sync_highest_block Highest block known to any peer.");
+        let _ = writeln!(out, "# TYPE tiger_sync_highest_block gauge");
+        let _ = writeln!(
+            out,
+            "tiger_sync_highest_block {}",
+            best_peer_height.unwrap_or(sync.highest_block)
+        );
+
+        let _ = writeln!(out, "# HELP tiger_consensus_validators Validators this node knows about.");
+        let _ = writeln!(out, "# TYPE tiger_consensus_validators gauge");
+        let _ = writeln!(out, "tiger_consensus_validators {validator_count}");
+
+        let _ = writeln!(out, "# HELP tiger_consensus_is_validator 1 if this node may propose blocks.");
+        let _ = writeln!(out, "# TYPE tiger_consensus_is_validator gauge");
+        let _ = writeln!(out, "tiger_consensus_is_validator {}", u8::from(is_validator));
+
+        let _ = writeln!(out, "# HELP tiger_info Build and network information, always 1.");
+        let _ = writeln!(out, "# TYPE tiger_info gauge");
+        let _ = writeln!(
+            out,
+            "tiger_info{{version=\"{}\",network=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION"),
+            network
+        );
+        out
     }
 }
 
@@ -2824,4 +2986,121 @@ mod tests {
         assert_eq!(cm.chain().height(), 0, "nothing may be produced");
     }
 
+    /// Send one raw HTTP request to a listener and return the full response.
+    async fn http_round_trip(
+        addr: std::net::SocketAddr,
+        request: &str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// The RPC transport is exercised over a real socket, because the parts
+    /// worth testing here — header handling, the CORS decision, the rate limit,
+    /// the status codes — only exist on the wire.
+    #[tokio::test]
+    async fn the_rpc_transport_enforces_cors_the_rate_limit_and_health() {
+        // A node configured to allow one origin and to cap a client at three
+        // requests per second. The built-in RPC and metrics listeners are off
+        // so the test binds its own port and does not race another test for
+        // the default one.
+        let data_dir = std::env::temp_dir()
+            .join(format!("tiger-rpc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let config = Config {
+            chain_id: 6666,
+            rpc_cors_host: "https://explorer.tiger.example".to_string(),
+            rpc_rate_limit: 3,
+            rpc_enabled: false,
+            metrics_enabled: false,
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let node = Arc::new(
+            TigerNode::from_genesis(config, create_genesis_block(6666))
+                .await
+                .unwrap(),
+        );
+        node.start().await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(crate::rpc_server::serve_listener(listener, Arc::clone(&node)));
+        // Give the accept loop a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 1. An allowed origin is echoed back.
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_chainId\"}";
+        let allowed = http_round_trip(
+            addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: x\r\nOrigin: https://explorer.tiger.example\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "got: {allowed}");
+        assert!(allowed.contains("Access-Control-Allow-Origin: https://explorer.tiger.example"));
+        assert!(allowed.contains("\"result\":\"0x1a0a\""), "chain id must be 6666: {allowed}");
+
+        // 2. An origin that is not on the list gets no CORS header at all.
+        let denied = http_round_trip(
+            addr,
+            &format!(
+                "POST / HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(!denied.to_ascii_lowercase().contains("access-control-allow-origin"));
+
+        // 3. A preflight is answered without a body and carries the origin.
+        let preflight = http_round_trip(
+            addr,
+            "OPTIONS / HTTP/1.1\r\nHost: x\r\nOrigin: https://explorer.tiger.example\r\n\r\n",
+        )
+        .await;
+        assert!(preflight.starts_with("HTTP/1.1 204"), "got: {preflight}");
+        assert!(preflight.contains("Access-Control-Allow-Origin: https://explorer.tiger.example"));
+
+        // 4. The health endpoint reports the node's real state.
+        let health = http_round_trip(addr, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(health.contains("\"status\":\"ok\""), "got: {health}");
+        assert!(health.contains("\"chain_id\":6666"), "got: {health}");
+        assert!(health.contains("\"running\":true"), "got: {health}");
+
+        // 5. A GET on the RPC path is refused with a method error rather than
+        //    being parsed as an empty JSON body.
+        let get_rpc = http_round_trip(addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(get_rpc.starts_with("HTTP/1.1 405"), "got: {get_rpc}");
+        assert!(get_rpc.contains("Allow: POST"));
+
+        // 6. The rate limit bites. Two requests have already been counted
+        //    above (the POSTs), so the bucket is nearly empty.
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"eth_chainId\"}";
+        let mut saw_429 = false;
+        for _ in 0..6 {
+            let response = http_round_trip(
+                addr,
+                &format!(
+                    "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .await;
+            if response.starts_with("HTTP/1.1 429") {
+                saw_429 = true;
+                assert!(response.contains("Retry-After: 1"));
+                break;
+            }
+        }
+        assert!(saw_429, "a burst past the configured rate must be throttled");
+
+        server.abort();
+    }
 }

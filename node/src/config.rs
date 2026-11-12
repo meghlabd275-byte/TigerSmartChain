@@ -10,6 +10,10 @@ pub const DEFAULT_BLOCK_REWARD: u128 = 2_000_000_000_000_000_000;
 pub const DEFAULT_MIN_GAS_PRICE: u64 = 1_000_000_000;
 /// Gas ceiling for read-only calls: 50 million.
 pub const DEFAULT_CALL_GAS_LIMIT: u64 = 50_000_000;
+/// Requests per second one client address may make. High enough for an
+/// explorer's polling and a wallet's refresh, low enough that a single client
+/// cannot exhaust the node's CPU.
+pub const DEFAULT_RPC_RATE_LIMIT: u32 = 100;
 
 /// Node configuration holding all settings for the TigerSmartChain node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +31,17 @@ pub struct Config {
     /// RPC settings
     pub rpc_enabled: bool,
     pub rpc_addr: String,
+    /// Comma-separated list of origins allowed to call the RPC from a browser.
+    ///
+    /// Empty means no browser origin is allowed, which is the safe default: a
+    /// public endpoint that answers `Access-Control-Allow-Origin: *` lets any
+    /// page a user visits read the chain through their own node, and lets a
+    /// malicious page issue state-changing calls with the user's node as the
+    /// source. Operators who want a web explorer set this to its origin.
     pub rpc_cors_host: String,
+    /// Maximum JSON-RPC requests per second from one client address. Zero
+    /// disables the limit.
+    pub rpc_rate_limit: u32,
 
     /// State settings
     pub data_dir: String,
@@ -70,6 +84,7 @@ impl Config {
         rpc_enabled: bool,
         rpc_addr: String,
         rpc_cors_host: String,
+        rpc_rate_limit: u32,
         data_dir: String,
         cache_size: usize,
         validator_addr: Option<String>,
@@ -91,6 +106,7 @@ impl Config {
             rpc_enabled,
             rpc_addr,
             rpc_cors_host,
+            rpc_rate_limit,
             data_dir,
             cache_size,
             validator_addr,
@@ -121,6 +137,7 @@ impl Config {
             rpc_enabled: true,
             rpc_addr: ":8545".to_string(),
             rpc_cors_host: String::new(),
+            rpc_rate_limit: DEFAULT_RPC_RATE_LIMIT,
             data_dir: "./data".to_string(),
             cache_size: 1024,
             validator_addr: None,
@@ -151,6 +168,7 @@ impl Config {
             rpc_enabled: true,
             rpc_addr: ":8545".to_string(),
             rpc_cors_host: String::new(),
+            rpc_rate_limit: DEFAULT_RPC_RATE_LIMIT,
             data_dir: "./data/testnet".to_string(),
             cache_size: 512,
             validator_addr: None,

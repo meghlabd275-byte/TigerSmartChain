@@ -38,6 +38,8 @@ pub const DEFAULT_EPOCH_LENGTH: u64 = 200;
 pub const DEFAULT_SLOT_DURATION_SECS: u64 = 3;
 /// Default data directory
 pub const DEFAULT_DATA_DIR: &str = "./data";
+/// Default per-client RPC request ceiling, in requests per second.
+pub const DEFAULT_RPC_RATE_LIMIT: u32 = config::DEFAULT_RPC_RATE_LIMIT;
 /// Default cache size in MB
 pub const DEFAULT_CACHE_SIZE: usize = 1024;
 
@@ -76,9 +78,15 @@ struct Args {
     #[arg(long, default_value = DEFAULT_RPC_ADDR)]
     rpc_addr: String,
 
-    /// RPC CORS host
+    /// Comma-separated browser origins allowed to call the RPC. Empty denies
+    /// every browser origin, which is the safe default.
     #[arg(long)]
     rpc_cors_host: Option<String>,
+
+    /// Maximum JSON-RPC requests per second from one client address. Zero
+    /// disables the limit.
+    #[arg(long, default_value_t = DEFAULT_RPC_RATE_LIMIT)]
+    rpc_rate_limit: u32,
 
     /// Data directory
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
@@ -171,6 +179,7 @@ async fn main() -> Result<()> {
         args.rpc_enabled,
         args.rpc_addr,
         rpc_cors_host,
+        args.rpc_rate_limit,
         args.data_dir,
         args.cache_size,
         args.validator_addr,
