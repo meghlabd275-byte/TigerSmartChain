@@ -46,3 +46,7 @@ node/data/
 # "build/" rule above would otherwise drop from the repository.
 !blob_processor/cpp/third_party/blst/build/
 !blob_processor/cpp/third_party/blst/build/**
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
