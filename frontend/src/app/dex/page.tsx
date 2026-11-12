@@ -18,8 +18,10 @@ interface DexPair {
 export default function DexPage() {
   const [pairs, setPairs] = useState<DexPair[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
+  const [total, setTotal] = useState(0)
   const limit = 25
 
   useEffect(() => {
@@ -28,22 +30,30 @@ export default function DexPage() {
 
   const fetchPairs = async () => {
     setLoading(true)
+    setError(null)
     try {
       const response = await api.getDexPairs({ page, limit })
       setPairs((response.items || []) as unknown as DexPair[])
-      setTotalPages(Math.ceil(response.total / limit))
-    } catch (error) {
-      // Mock data
-      setPairs([
-        { address: '0x58f876857a02d676309589037300a5d53ba1cbcb', token0_symbol: 'WBNB', token1_symbol: 'USDT', liquidity: 50000000, volume_24h: 10000000, volume_7d: 70000000 },
-        { address: '0x16b9a82891338fd9e241f1fa9afd6a7c4a4de52', token0_symbol: 'WBNB', token1_symbol: 'BUSD', liquidity: 30000000, volume_24h: 5000000, volume_7d: 35000000 },
-        { address: '0xa6cc3c2531fdaa6ae1c3d403ab9e7bfe7cf5e78', token0_symbol: 'CAKE', token1_symbol: 'WBNB', liquidity: 20000000, volume_24h: 3000000, volume_7d: 21000000 },
-      ])
-      setTotalPages(10)
+      setTotal(response.total || 0)
+      setTotalPages(Math.max(1, Math.ceil(response.total / limit)))
+    } catch (err) {
+      // Show the failure rather than substituting invented pairs, which would
+      // present fabricated liquidity and volume as if they were on chain.
+      setPairs([])
+      setTotal(0)
+      setTotalPages(1)
+      setError(err instanceof Error ? err.message : 'Failed to load DEX pairs')
     } finally {
       setLoading(false)
     }
   }
+
+  const pageLiquidity = pairs.reduce((sum, p) => sum + (p.liquidity || 0), 0)
+  const pageVolume24h = pairs.reduce((sum, p) => sum + (p.volume_24h || 0), 0)
+  const topPair = pairs.reduce<DexPair | null>(
+    (best, p) => (!best || p.volume_24h > best.volume_24h ? p : best),
+    null,
+  )
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-dark-900">
@@ -61,37 +71,45 @@ export default function DexPage() {
           </button>
         </div>
 
-        {/* Stats */}
+        {/* Stats — derived from the loaded pairs, not invented figures. */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <TrendingUp className="w-4 h-4" />
               <span className="text-sm">Total Pairs</span>
             </div>
-            <p className="text-2xl font-bold">{formatNumber(1234)}</p>
+            <p className="text-2xl font-bold">{formatNumber(total)}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <Coins className="w-4 h-4" />
-              <span className="text-sm">Total Liquidity</span>
+              <span className="text-sm">Liquidity (page)</span>
             </div>
-            <p className="text-2xl font-bold">{formatCurrency(500000000)}</p>
+            <p className="text-2xl font-bold">{formatCurrency(pageLiquidity)}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <Flame className="w-4 h-4" />
-              <span className="text-sm">Volume (24h)</span>
+              <span className="text-sm">Volume 24h (page)</span>
             </div>
-            <p className="text-2xl font-bold">{formatCurrency(100000000)}</p>
+            <p className="text-2xl font-bold">{formatCurrency(pageVolume24h)}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <TrendingUp className="w-4 h-4" />
               <span className="text-sm">Top Pair</span>
             </div>
-            <p className="text-2xl font-bold">WBNB/USDT</p>
+            <p className="text-2xl font-bold truncate">
+              {topPair ? `${topPair.token0_symbol}/${topPair.token1_symbol}` : '—'}
+            </p>
           </div>
         </div>
+
+        {error && (
+          <div className="mb-6 rounded-lg border border-red-300 bg-red-50 dark:border-red-800 dark:bg-red-950 px-4 py-3 text-sm text-red-700 dark:text-red-300">
+            {error}
+          </div>
+        )}
 
         {/* Pairs Table */}
         <div className="bg-white dark:bg-dark-800 rounded-xl border overflow-hidden">
@@ -113,6 +131,12 @@ export default function DexPage() {
                       <td colSpan={5} className="px-6 py-4"><div className="skeleton h-6 w-full rounded"></div></td>
                     </tr>
                   ))
+                ) : pairs.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-6 py-12 text-center text-gray-500 dark:text-gray-400">
+                      No DEX pairs have been indexed yet.
+                    </td>
+                  </tr>
                 ) : (
                   pairs.map((pair) => (
                     <tr key={pair.address} className="hover:bg-gray-50 dark:hover:bg-dark-700">

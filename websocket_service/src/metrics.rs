@@ -2,16 +2,17 @@
 //! Performance and monitoring metrics
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {
-    events_sent: AtomicU64,
-    events_received: AtomicU64,
-    connections_total: AtomicU64,
-    connections_active: AtomicU64,
-    messages_sent: AtomicU64,
-    messages_received: AtomicU64,
-    errors: AtomicU64,
+    events_sent: Arc<AtomicU64>,
+    events_received: Arc<AtomicU64>,
+    connections_total: Arc<AtomicU64>,
+    connections_active: Arc<AtomicU64>,
+    messages_sent: Arc<AtomicU64>,
+    messages_received: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
 }
 
 impl Metrics {

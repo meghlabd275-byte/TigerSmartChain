@@ -39,8 +39,8 @@ impl Server {
         Self {
             config: config.clone(),
             listener: None,
-            shutdown_tx: broadcast::channel().0,
-            event_tx: broadcast::channel().0,
+            shutdown_tx: broadcast::channel(16).0,
+            event_tx: broadcast::channel(1024).0,
             connection_manager,
             handler,
             heartbeat,
@@ -76,9 +76,10 @@ impl Server {
             None => return,
         };
         
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {
-                _ = self.shutdown_tx.recv() => {
+                _ = shutdown_rx.recv() => {
                     log::info!("Shutdown signal received");
                     break;
                 }
@@ -123,9 +124,10 @@ impl Server {
         connection.set_sender(tx);
         
         // Handle messages
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
             tokio::select! {
-                _ = self.shutdown_tx.recv() => {
+                _ = shutdown_rx.recv() => {
                     break;
                 }
                 msg = reader.next() => {
@@ -217,7 +219,7 @@ impl Clone for Server {
             listener: None,
             shutdown_tx: self.shutdown_tx.clone(),
             event_tx: self.event_tx.clone(),
-            connection_manager: ConnectionManager::new(self.config.clone()),
+            connection_manager: self.connection_manager.clone(),
             handler: self.handler.clone(),
             heartbeat: self.heartbeat.clone(),
             metrics: self.metrics.clone(),

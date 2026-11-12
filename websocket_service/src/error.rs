@@ -44,6 +44,9 @@ pub enum Error {
     
     #[error("Blockchain error: {0}")]
     Blockchain(String),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 /// Result type alias
@@ -114,6 +117,11 @@ impl Error {
     pub fn blockchain(msg: impl Into<String>) -> Self {
         Self::Blockchain(msg.into())
     }
+
+    /// Create a validation error
+    pub fn validation(msg: impl Into<String>) -> Self {
+        Self::Validation(msg.into())
+    }
     
     /// Check if error is retryable
     pub fn is_retryable(&self) -> bool {
@@ -145,6 +153,7 @@ impl Error {
             Self::Timeout(_) => 504,
             Self::Database(_) => 500,
             Self::Blockchain(_) => 502,
+            Self::Validation(_) => 400,
         }
     }
 }

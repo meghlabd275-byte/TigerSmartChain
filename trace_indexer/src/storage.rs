@@ -27,8 +27,8 @@ pub enum TraceStorageError {
 
 /// In-memory trace storage
 pub struct TraceStorage {
-    traces: Arc<RwLock<HashMap<String, Vec<IndexedTrace>>>,
-    state_diffs: Arc<RwLock<HashMap<String, Vec<IndexedStateDiff>>>,
+    traces: Arc<RwLock<HashMap<String, Vec<IndexedTrace>>>>,
+    state_diffs: Arc<RwLock<HashMap<String, Vec<IndexedStateDiff>>>>,
     creations: Arc<RwLock<HashMap<String, ContractCreation>>>,
     selfdestructs: Arc<RwLock<HashMap<String, SelfDestruct>>>,
 }

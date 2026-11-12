@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::events::EventType;
 
 /// Subscription channel
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
     /// Blocks channel
@@ -82,7 +82,7 @@ impl Channel {
 }
 
 /// Subscription filter
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Filter {
     /// Address filter (for contracts/tokens)
     pub address: Option<String>,
@@ -141,14 +141,45 @@ impl Filter {
     }
     
     /// Check if event matches filter
-    pub fn matches(&self, _event: &crate::events::Event) -> bool {
-        // Simplified matching - in production would check all filter fields
-        true
+    pub fn matches(&self, event: &crate::events::Event) -> bool {
+        use crate::events::EventData;
+
+        let in_block_range = |block: u64| {
+            self.from_block.map_or(true, |from| block >= from)
+                && self.to_block.map_or(true, |to| block <= to)
+        };
+
+        match &event.data {
+            EventData::Block(b) => {
+                in_block_range(b.block_number)
+                    && self.address.as_ref().map_or(true, |a| a.eq_ignore_ascii_case(&b.validator))
+            }
+            EventData::Tx(t) => {
+                self.from.as_ref().map_or(true, |f| f.eq_ignore_ascii_case(&t.from))
+                    && self.to.as_ref().map_or(true, |to| {
+                        t.to.as_ref().is_some_and(|x| x.eq_ignore_ascii_case(to))
+                    })
+                    && t.block_number.map_or(true, in_block_range)
+            }
+            EventData::TokenTransfer(tt) => {
+                self.address.as_ref().map_or(true, |a| a.eq_ignore_ascii_case(&tt.token))
+                    && self.from.as_ref().map_or(true, |f| f.eq_ignore_ascii_case(&tt.from))
+                    && self.to.as_ref().map_or(true, |to| to.eq_ignore_ascii_case(&tt.to))
+                    && in_block_range(tt.block_number)
+            }
+            EventData::Mempool(m) => {
+                self.from.as_ref().map_or(true, |f| f.eq_ignore_ascii_case(&m.from))
+                    && self.to.as_ref().map_or(true, |to| {
+                        m.to.as_ref().is_some_and(|x| x.eq_ignore_ascii_case(to))
+                    })
+            }
+            EventData::Custom(_) => true,
+        }
     }
 }
 
 /// Subscription entity
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Subscription {
     id: String,
     channel: Channel,
@@ -199,7 +230,7 @@ impl Subscription {
 /// Subscription manager
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionManager {
-    subscriptions: parking_lot::RwLock<HashSet<Subscription>>,
+    subscriptions: std::sync::Arc<parking_lot::RwLock<HashSet<Subscription>>>,
 }
 
 impl SubscriptionManager {

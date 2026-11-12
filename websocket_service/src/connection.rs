@@ -57,11 +57,24 @@ pub struct ConnectionInfo {
     pub protocol_version: Option<String>,
 }
 
+impl ConnectionInfo {
+    /// Connection ID
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Whether the connection is in the `Connected` state
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, ConnectionState::Connected)
+    }
+}
+
 /// Connection manager
+#[derive(Clone)]
 pub struct ConnectionManager {
     config: Config,
-    connections: RwLock<HashMap<String, Connection>>,
-    rate_limiters: RwLock<HashMap<String, RateLimiter>>,
+    connections: Arc<RwLock<HashMap<String, Connection>>>,
+    rate_limiters: Arc<RwLock<HashMap<String, RateLimiter>>>,
 }
 
 impl ConnectionManager {
@@ -69,8 +82,8 @@ impl ConnectionManager {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            connections: RwLock::new(HashMap::new()),
-            rate_limiters: RwLock::new(HashMap::new()),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            rate_limiters: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     
@@ -150,13 +163,13 @@ impl ConnectionManager {
 pub struct Connection {
     id: String,
     remote_addr: String,
-    state: RwLock<ConnectionState>,
-    subscriptions: RwLock<Vec<Subscription>>,
+    state: Arc<RwLock<ConnectionState>>,
+    subscriptions: Arc<RwLock<Vec<Subscription>>>,
     config: Config,
-    sender: RwLock<Option<mpsc::Sender<Vec<u8>>>>,
-    stats: RwLock<ConnectionStats>,
+    sender: Arc<RwLock<Option<mpsc::Sender<Vec<u8>>>>>,
+    stats: Arc<RwLock<ConnectionStats>>,
     created_at: Instant,
-    last_activity: RwLock<Instant>,
+    last_activity: Arc<RwLock<Instant>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,13 +186,13 @@ impl Connection {
         Self {
             id,
             remote_addr,
-            state: RwLock::new(ConnectionState::Connecting),
-            subscriptions: RwLock::new(Vec::new()),
+            state: Arc::new(RwLock::new(ConnectionState::Connecting)),
+            subscriptions: Arc::new(RwLock::new(Vec::new())),
             config,
-            sender: RwLock::new(None),
-            stats: RwLock::new(ConnectionStats::default()),
+            sender: Arc::new(RwLock::new(None)),
+            stats: Arc::new(RwLock::new(ConnectionStats::default())),
             created_at: Instant::now(),
-            last_activity: RwLock::new(Instant::now()),
+            last_activity: Arc::new(RwLock::new(Instant::now())),
         }
     }
     
@@ -227,13 +240,19 @@ impl Connection {
     
     /// Send message
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
-        let sender = self.sender.read();
-        if let Some(sender) = sender.as_ref() {
-            sender.send(data).await.map_err(|_| Error::connection("Channel closed"))?;
-            
+        // Clone the channel handle out of the lock: a `parking_lot` guard must not
+        // be held across an await point, or the caller's future stops being `Send`.
+        let sender = self.sender.read().clone();
+        if let Some(sender) = sender {
+            let size = data.len() as u64;
+            sender
+                .send(data)
+                .await
+                .map_err(|_| Error::connection("Channel closed"))?;
+
             let mut stats = self.stats.write();
             stats.messages_sent += 1;
-            stats.bytes_sent += data.len() as u64;
+            stats.bytes_sent += size;
         }
         Ok(())
     }
@@ -278,8 +297,8 @@ impl Connection {
 pub struct RateLimiter {
     limit: usize,
     window: Duration,
-    tokens: RwLock<usize>,
-    last_refill: RwLock<Instant>,
+    tokens: Arc<RwLock<usize>>,
+    last_refill: Arc<RwLock<Instant>>,
 }
 
 impl RateLimiter {
@@ -288,15 +307,15 @@ impl RateLimiter {
         Self {
             limit,
             window: Duration::from_secs(1),
-            tokens: RwLock::new(limit),
-            last_refill: RwLock::new(Instant::now()),
+            tokens: Arc::new(RwLock::new(limit)),
+            last_refill: Arc::new(RwLock::new(Instant::now())),
         }
     }
     
     /// Check if request is allowed
     pub fn check(&self) -> bool {
         self.refill();
-        let tokens = self.tokens.read();
+        let mut tokens = self.tokens.write();
         if *tokens > 0 {
             *tokens -= 1;
             true

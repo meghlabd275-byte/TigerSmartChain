@@ -55,7 +55,7 @@ impl IndexedTrace {
     ) -> Self {
         Self {
             id: format!("{}-{}-{}", tx_hash, block_number, subtrace_index),
-            transaction_hash: tx_hash,
+            transaction_hash: tx_hash.clone(),
             block_number,
             subtrace_index,
             call_type,
@@ -70,6 +70,7 @@ impl IndexedTrace {
             depth: 0,
             parent_index: None,
             trace_type: "call".to_string(),
+            tx_hash,
         }
     }
 }
