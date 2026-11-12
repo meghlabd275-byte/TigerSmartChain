@@ -1606,3 +1606,91 @@ CREATE INDEX IF NOT EXISTS idx_alert_subscriptions_address
 -- because the unique index below would then silently skip the real event.
 CREATE INDEX IF NOT EXISTS idx_logs_tx_hash_log_index
     ON logs(transaction_hash, log_index);
+
+-- ============================================================================
+-- DEX PAIR PROTOCOL AND YIELD COLUMNS
+-- ============================================================================
+-- `dex_pairs` is filled by the DEX indexer, which knows which factory emitted
+-- the PairCreated event and what the pool has earned. Both are needed by the
+-- DeFi analytics queries, so they are columns rather than derived values.
+
+ALTER TABLE dex_pairs ADD COLUMN IF NOT EXISTS protocol_name VARCHAR(128);
+ALTER TABLE dex_pairs ADD COLUMN IF NOT EXISTS apy NUMERIC(20, 8);
+ALTER TABLE dex_pairs ADD COLUMN IF NOT EXISTS fee_bps INTEGER NOT NULL DEFAULT 30;
+ALTER TABLE dex_pairs ADD COLUMN IF NOT EXISTS volume_7d NUMERIC(78, 0);
+
+CREATE INDEX IF NOT EXISTS idx_dex_pairs_apy ON dex_pairs(apy DESC NULLS LAST);
+
+-- ============================================================================
+-- DEFI TVL HISTORY
+-- ============================================================================
+-- `defi_tvl` holds the current TVL of each protocol. A range query needs the
+-- per-day snapshots, and the unique key is what makes the writer idempotent
+-- when the service restarts mid-day.
+
+CREATE TABLE IF NOT EXISTS defi_tvl_history (
+    id BIGSERIAL PRIMARY KEY,
+    protocol VARCHAR(128) NOT NULL,
+    tvl NUMERIC(78, 2) NOT NULL DEFAULT 0,
+    date DATE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(protocol, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_defi_tvl_history_protocol_date
+    ON defi_tvl_history(protocol, date DESC);
+
+-- ============================================================================
+-- FLASH LOANS
+-- ============================================================================
+-- A flash loan is a transaction that borrows and repays inside one call, so it
+-- is identified from the transaction trace: a borrow followed by a repayment
+-- of at least the borrowed amount. The unique key is the trace that proves it.
+
+CREATE TABLE IF NOT EXISTS flash_loans (
+    id BIGSERIAL PRIMARY KEY,
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    borrower VARCHAR(42) NOT NULL,
+    provider VARCHAR(42),
+    asset VARCHAR(42) NOT NULL,
+    amount NUMERIC(78, 0) NOT NULL,
+    fee NUMERIC(78, 0) NOT NULL DEFAULT 0,
+    profit_usd NUMERIC(78, 2),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(transaction_hash, asset)
+);
+
+CREATE INDEX IF NOT EXISTS idx_flash_loans_block ON flash_loans(block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_flash_loans_borrower ON flash_loans(borrower);
+
+-- ============================================================================
+-- NFT SALES
+-- ============================================================================
+-- A transfer of an NFT only becomes a sale when a payment for it is part of
+-- the same transaction. The marketplace indexer matches the two legs and writes
+-- the price here, which is what makes a floor price a measured value rather
+-- than an inferred one.
+
+CREATE TABLE IF NOT EXISTS nft_sales (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(42) NOT NULL,
+    token_id NUMERIC(78, 0) NOT NULL,
+    seller VARCHAR(42) NOT NULL,
+    buyer VARCHAR(42) NOT NULL,
+    price NUMERIC(78, 0) NOT NULL,
+    payment_token VARCHAR(42) NOT NULL,
+    marketplace VARCHAR(64),
+    transaction_hash VARCHAR(66) NOT NULL,
+    block_number BIGINT NOT NULL,
+    log_index INTEGER NOT NULL,
+    block_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(transaction_hash, log_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nft_sales_token ON nft_sales(token_address, block_number DESC);
+CREATE INDEX IF NOT EXISTS idx_nft_sales_time ON nft_sales(block_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_nft_sales_buyer ON nft_sales(buyer);
+CREATE INDEX IF NOT EXISTS idx_nft_sales_seller ON nft_sales(seller);
+

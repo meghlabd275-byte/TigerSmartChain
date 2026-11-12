@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Response, Server, StatusCode};
-use tracing::{error, info, Level};
+use tiny_http::{Response, StatusCode};
+use tokio::runtime::Runtime;
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use tigerscan_nft_metadata::{Collection, Config, NFTData, NFTMetadataService, RarityRank};
+use tigerscan_nft_metadata::{Config, NFTMetadataService};
 
 // ============================================================================
 // API Types
@@ -121,7 +122,7 @@ impl Handler {
         }
     }
 
-    pub fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    pub async fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         // Check rate limit
         if let Err(e) = self.rate_limiter.check(ip) {
             let response = ApiResponse {
@@ -247,7 +248,7 @@ impl Handler {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
@@ -260,16 +261,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create service
     let service = Arc::new(NFTMetadataService::new(config).await?);
 
+    // The polling loop keeps the metadata, floor prices and rarity current.
+    let updater = Arc::clone(&service);
+    tokio::spawn(async move {
+        updater.start().await;
+    });
+
     // Create handler
     let handler = Arc::new(Handler::new(service));
-
-    // Start HTTP server
-    let server = Server::http(addr)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8548));
     info!("Server listening on {}", addr);
 
-    tigerscan_service_http::serve_with_ip(addr, move |body, ip| handler.handle(body, ip))?;
+    // The serving loop is synchronous; the metadata lookups are not.
+    let runtime = Runtime::new()?;
+
+    tigerscan_service_http::serve_with_ip(addr, move |body, ip| {
+        runtime.block_on(handler.handle(body, ip))
+    })?;
 
     Ok(())
 }

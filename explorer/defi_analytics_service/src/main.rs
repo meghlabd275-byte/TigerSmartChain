@@ -6,13 +6,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Response, Server, StatusCode};
-use tracing::{error, info, Level};
+use tiny_http::{Response, StatusCode};
+use tokio::runtime::Runtime;
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use tigerscan_defi_analytics::{Config, DeFiAnalytics, PoolData, TVLData, YieldOpportunity};
+use tigerscan_defi_analytics::{Config, DeFiAnalyticsService};
 
 // ============================================================================
 // API Types
@@ -36,15 +36,15 @@ pub struct ApiResponse {
 // ============================================================================
 
 pub struct Handler {
-    analytics: Arc<DeFiAnalytics>,
+    analytics: Arc<DeFiAnalyticsService>,
 }
 
 impl Handler {
-    pub fn new(analytics: Arc<DeFiAnalytics>) -> Self {
+    pub fn new(analytics: Arc<DeFiAnalyticsService>) -> Self {
         Self { analytics }
     }
 
-    pub fn handle(&self, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
+    pub async fn handle(&self, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
         // Parse request
         let request: ApiRequest = match serde_json::from_slice(body) {
             Ok(r) => r,
@@ -61,9 +61,11 @@ impl Handler {
 
         // Handle method
         let result = match request.method.as_str() {
-            "tvl" => self.handle_tvl(request.params).await,
+            "tvl" => self.handle_tvl().await,
             "pools" => self.handle_pools(request.params).await,
             "yields" => self.handle_yields(request.params).await,
+            "lendingRates" => self.handle_lending_rates().await,
+            "tvlHistory" => self.handle_tvl_history(request.params).await,
             "search" => self.handle_search(request.params).await,
             _ => Err(format!("Unknown method: {}", request.method)),
         };
@@ -85,7 +87,7 @@ impl Handler {
             .with_status_code(StatusCode::from(200))
     }
 
-    async fn handle_tvl(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    async fn handle_tvl(&self) -> Result<serde_json::Value, String> {
         let protocols = self.analytics.get_tvl_data()
             .await
             .map_err(|e| e.to_string())?;
@@ -123,6 +125,34 @@ impl Handler {
         }))
     }
 
+    async fn handle_lending_rates(&self) -> Result<serde_json::Value, String> {
+        let rates = self.analytics.get_lending_rates()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "lendingRates": rates
+        }))
+    }
+
+    async fn handle_tvl_history(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+        let protocol = params.as_ref()
+            .and_then(|p| p.get("protocol").and_then(|v| v.as_str()))
+            .ok_or("Missing protocol")?;
+
+        let days = params.as_ref()
+            .and_then(|p| p.get("days").and_then(|v| v.as_i64()))
+            .unwrap_or(30);
+
+        let history = self.analytics.get_tvl_history(protocol, days as i32)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "history": history
+        }))
+    }
+
     async fn handle_search(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
         let query = params.as_ref()
             .and_then(|p| p.get("q").and_then(|v| v.as_str()))
@@ -146,7 +176,7 @@ impl Handler {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
@@ -157,18 +187,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default();
 
     // Create analytics service
-    let analytics = Arc::new(DeFiAnalytics::new(config).await?);
+    let analytics = Arc::new(DeFiAnalyticsService::new(config).await?);
+
+    // The polling loop keeps the tables current; the API serves the same rows.
+    let updater = Arc::clone(&analytics);
+    tokio::spawn(async move {
+        updater.start().await;
+    });
 
     // Create handler
     let handler = Arc::new(Handler::new(analytics));
 
-    // Start HTTP server
-    let server = Server::http(addr)?;
-
     let addr = SocketAddr::from(([0, 0, 0, 0], 8562));
     info!("Server listening on {}", addr);
 
-    tigerscan_service_http::serve(addr, move |body| handler.handle(body))?;
+    // The serving loop is synchronous; the analytics lookups are not.
+    let runtime = Runtime::new()?;
+
+    tigerscan_service_http::serve(addr, move |body| runtime.block_on(handler.handle(body)))?;
 
     Ok(())
 }
