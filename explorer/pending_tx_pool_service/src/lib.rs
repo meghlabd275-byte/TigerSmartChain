@@ -2,21 +2,20 @@
 //! Live transaction monitoring with WebSocket updates
 //! Uses Rust for maximum performance and low latency
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::cmp::Ordering;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use ethers::core::types::{Address, H256, U256};
+use chrono::Utc;
+use ethers::core::types::U256;
 use ethers::providers::{Http, Provider, StreamExt, Ws, Middleware};
-use ethers::types::{Block, Transaction, Eip1559TransactionRequest};
+use ethers::types::Transaction;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 // ============================================================================
 // Error Types
@@ -301,7 +300,7 @@ impl MempoolService {
                     let state = state.clone();
                     
                     // Fetch transaction details
-                    if let Ok(Some(tx)) = rpc.get_transaction(&tx_hash).await {
+                    if let Ok(Some(tx)) = rpc.get_transaction(tx_hash).await {
                         let pending = Self::convert_tx(tx);
                         
                         // Add to mempool
@@ -345,7 +344,11 @@ impl MempoolService {
         }
     }
 
-    /// Convert transaction to pending format
+    /// Convert a node transaction into the mempool representation.
+    ///
+    /// The wire size is the length of the RLP-encoded signed transaction, which
+    /// is what the mempool size limit is measured in. It used to be a made-up
+    /// sum of field widths, which bore no relation to the real encoding.
     fn convert_tx(tx: Transaction) -> PendingTransaction {
         let tx_type = if tx.max_fee_per_gas.is_some() {
             TxType::Eip1559
@@ -354,24 +357,29 @@ impl MempoolService {
         } else {
             TxType::Legacy
         };
-        
-        let data = format!("{:?}", tx.input);
-        let size = 4 + 4 + 32 + 32 + 32 + 4 + 32 + 32 + data.len() / 2;
-        
+
+        let encoded = tx.rlp();
+
         PendingTransaction {
-            hash: format!("{:?}", tx.hash()),
+            hash: format!("{:?}", tx.hash),
             from: format!("{:?}", tx.from),
             to: tx.to.map(|a| format!("{:?}", a)),
-            value: format!("{}", tx.value),
-            gas_price: format!("{}", tx.gas_price.unwrap_or_default()),
-            gas_limit: tx.gas.unwrap_or_default().as_u64(),
+            value: tx.value.to_string(),
+            // An EIP-1559 transaction has no `gasPrice`; the price it is willing
+            // to pay is `maxFeePerGas`.
+            gas_price: tx
+                .gas_price
+                .or(tx.max_fee_per_gas)
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            gas_limit: tx.gas.as_u64(),
             nonce: tx.nonce.as_u64(),
             data: hex::encode(&tx.input),
-            chain_id: tx.chain_id.unwrap_or_default().as_u64(),
+            chain_id: tx.chain_id.map(|c| c.as_u64()).unwrap_or_default(),
             timestamp: Utc::now().timestamp(),
             first_seen: Utc::now().timestamp(),
             tx_type,
-            size,
+            size: encoded.len(),
             propagated: false,
         }
     }
@@ -379,22 +387,25 @@ impl MempoolService {
     /// Add a transaction to the mempool
     pub fn add_transaction(&self, tx: PendingTransaction) {
         let mut state = self.state.write();
-        
-        // Check duplicate
+
         if self.config.filter_duplicates && state.pending.contains_key(&tx.hash) {
             return;
         }
-        
-        // Add to mempool
-        state.pending.insert(tx.hash.clone(), tx.clone());
-        state.heap.push(tx);
-        
-        // Track by sender
-        state.by_sender
-            .entry(tx.from.clone())
+
+        // Read the index fields before the transaction is moved into the map.
+        let sender = tx.from.clone();
+        let nonce = tx.nonce;
+        let hash = tx.hash.clone();
+
+        state.heap.push(tx.clone());
+        state.pending.insert(hash.clone(), tx.clone());
+
+        state
+            .by_sender
+            .entry(sender)
             .or_insert_with(HashMap::new)
-            .insert(tx.nonce, tx.hash.clone());
-        
+            .insert(nonce, hash);
+
         // Broadcast update
         let update = MempoolUpdate {
             update_type: UpdateType::Added,
@@ -656,7 +667,7 @@ impl MempoolService {
 // API Types
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolApiRequest {
     pub limit: Option<usize>,
     pub offset: Option<usize>,

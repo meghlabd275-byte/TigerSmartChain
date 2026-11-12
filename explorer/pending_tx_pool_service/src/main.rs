@@ -9,13 +9,10 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tiny_http::{Response, StatusCode};
-use tracing::{error, info, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use pending_tx_pool_service::{
-    Config, MempoolApiRequest, MempoolApiResponse, MempoolService, MempoolUpdate,
-    PoolStats,
-};
+use pending_tx_pool_service::{Config, MempoolApiRequest, MempoolService};
 
 // ============================================================================
 // API Types
@@ -117,6 +114,11 @@ impl Handler {
     }
 
     pub fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+        // The shared server calls this from a synchronous context; the gas
+        // oracle needs the runtime, so the work is driven on its handle.
+        let runtime = tokio::runtime::Handle::current();
+        let _guard = runtime.enter();
+
         // Check rate limit
         if let Err(e) = self.rate_limiter.check(ip) {
             let response = ApiResponse {
@@ -152,11 +154,12 @@ impl Handler {
             }
         };
         
-        // Handle method
-        let result = match request.method.as_str() {
+        // Handle method. Every arm yields the same type; the gas oracle is
+        // awaited because it reads the base fee from the node.
+        let result: Result<serde_json::Value, String> = match request.method.as_str() {
             "mempool_getPending" => self.handle_get_pending(request.params),
             "mempool_getStats" => self.handle_get_stats(),
-            "mempool_getGasOracle" => self.handle_gas_oracle().await,
+            "mempool_getGasOracle" => runtime.block_on(self.handle_gas_oracle()),
             "mempool_getBySender" => self.handle_get_by_sender(request.params),
             "mempool_subscribe" => self.handle_subscribe(),
             _ => Err(format!("Unknown method: {}", request.method)),
@@ -209,8 +212,8 @@ impl Handler {
         }))
     }
 
-    fn handle_get_stats(&self) -> Result<PoolStats, String> {
-        Ok(self.service.get_stats())
+    fn handle_get_stats(&self) -> Result<serde_json::Value, String> {
+        Ok(serde_json::to_value(self.service.get_stats()).map_err(|e| e.to_string())?)
     }
 
     async fn handle_gas_oracle(&self) -> Result<serde_json::Value, String> {
@@ -228,7 +231,9 @@ impl Handler {
 
     fn handle_get_by_sender(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
         let sender = params
-            .and_then(|p| p.get("sender").and_then(|s| s.as_str()))
+            .as_ref()
+            .and_then(|p| p.get("sender"))
+            .and_then(|s| s.as_str())
             .ok_or("Missing sender")?;
         
         let txs = self.service.get_by_sender(sender);
@@ -254,7 +259,7 @@ impl Handler {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    let _subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
