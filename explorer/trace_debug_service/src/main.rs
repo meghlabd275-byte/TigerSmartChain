@@ -174,15 +174,16 @@ impl Handler {
             }
         };
         
-        // Handle method
-        let result = match request.method.as_str() {
-            "debug_traceTransaction" => self.handle_trace(request.params).await,
-            "debug_traceCall" => self.handle_trace_call(request.params).await,
-            "trace_analyzeGas" => self.handle_gas_analysis(request.params).await,
-            "trace_getStateDiff" => self.handle_state_diff(request.params).await,
-            "trace_getCallTree" => self.handle_call_tree(request.params).await,
-            "trace_estimateGas" => self.handle_estimate_gas(request.params).await,
-            _ => Err(format!("Unknown method: {}", request.method)),
+        // The handlers are async and this is called from the synchronous HTTP
+        // loop, so a runtime has to drive them here. Reusing the ambient
+        // runtime keeps a request from nesting one inside another, which would
+        // panic; a fresh runtime is only built when there is none.
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(self.dispatch(&request.method, request.params)),
+            Err(_) => match tokio::runtime::Runtime::new() {
+                Ok(runtime) => runtime.block_on(self.dispatch(&request.method, request.params)),
+                Err(e) => Err(format!("cannot start a runtime to handle the request: {e}")),
+            },
         };
         
         let response = match result {
@@ -208,6 +209,33 @@ impl Handler {
             .with_status_code(StatusCode::from(200))
     }
 
+    /// Route a JSON-RPC method to its handler.
+    ///
+    /// Every handler is normalised to a `serde_json::Value` so the response
+    /// builder has one shape to serialise, rather than a `to_value` at each
+    /// call site that could silently fall back to null.
+    async fn dispatch(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        match method {
+            "debug_traceTransaction" => self
+                .handle_trace(params)
+                .await
+                .and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string())),
+            "debug_traceCall" => self.handle_trace_call(params).await,
+            "trace_analyzeGas" => self.handle_gas_analysis(params).await,
+            "trace_getStateDiff" => self.handle_state_diff(params).await,
+            "trace_getCallTree" => self.handle_call_tree(params).await,
+            "trace_estimateGas" => self
+                .handle_estimate_gas(params)
+                .await
+                .map(|gas| serde_json::json!(gas)),
+            _ => Err(format!("Unknown method: {method}")),
+        }
+    }
+
     async fn handle_trace(&self, params: Option<serde_json::Value>) -> Result<TraceResult, String> {
         let params: TraceApiRequest = params
             .and_then(|p| serde_json::from_value(p).ok())
@@ -225,11 +253,36 @@ impl Handler {
             .map_err(|e| e.to_string())
     }
 
-    async fn handle_trace_call(&self, params: Option<serde_json::Value>) -> Result<TraceResult, String> {
+    async fn handle_trace_call(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
         let params = params.ok_or("Missing params")?;
-        
-        // For now, return error - would need full tx data
-        Err("trace_call requires full transaction data".to_string())
+        // The first parameter is the call object, the second the block tag.
+        let call = if params.is_array() {
+            params
+                .get(0)
+                .cloned()
+                .ok_or("trace_call requires a call object")?
+        } else {
+            params.get("call").cloned().unwrap_or(params.clone())
+        };
+        if !call.is_object() {
+            return Err("trace_call requires a call object as its first parameter".to_string());
+        }
+        let block = params
+            .get(1)
+            .or_else(|| params.get("block"))
+            .and_then(|b| b.as_str())
+            .unwrap_or("latest")
+            .to_string();
+
+        let frames = self
+            .service
+            .trace_call(call, &block)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "calls": frames, "block": block }))
     }
 
     async fn handle_gas_analysis(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
@@ -302,9 +355,25 @@ impl Handler {
 
     async fn handle_estimate_gas(&self, params: Option<serde_json::Value>) -> Result<u64, String> {
         let params = params.ok_or("Missing params")?;
-        
-        // Would need to build transaction from params
-        Err("Gas estimation requires transaction data".to_string())
+        // `estimate_gas` takes the call object directly, or a wrapper around
+        // it, so both spellings are accepted.
+        let call = if params.is_array() {
+            params
+                .get(0)
+                .cloned()
+                .ok_or("estimate_gas requires a call object")?
+        } else {
+            params.get("call").cloned().unwrap_or(params.clone())
+        };
+        if !call.is_object() {
+            return Err("estimate_gas requires a call object".to_string());
+        }
+        let request: ethers::types::TransactionRequest = serde_json::from_value(call)
+            .map_err(|e| format!("could not read the call: {e}"))?;
+        self.service
+            .estimate_gas(&request)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -331,13 +400,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create handler
     let handler = Arc::new(Handler::new(service));
     
-    // Start HTTP server
-    let server = Server::http(addr)?;
-    
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8546));
+    // Start HTTP server. The address comes from TRACE_RPC_ADDR when set, so a
+    // deployment can move the port without a rebuild.
+    let addr: SocketAddr = std::env::var("TRACE_RPC_ADDR")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 8546)));
     info!("Server listening on {}", addr);
 
-    tigerscan_service_http::serve_with_ip(addr, move |body, ip| handler.handle(body, ip))?;
-    
+    tigerscan_service_http::serve_with_ip(addr, move |body, ip| handler.handle(body, ip))
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
     Ok(())
 }

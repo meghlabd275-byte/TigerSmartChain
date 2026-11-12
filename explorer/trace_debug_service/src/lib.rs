@@ -5,14 +5,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ethers::core::abi::{Abi, Function};
 use ethers::core::k256::sha2::Sha256;
 use ethers::core::types::{Address, H256, U256};
 use ethers::providers::{Http, Provider, StreamExt, Ws, Middleware};
-use ethers::types::{Block, Transaction, TransactionReceipt};
+use ethers::types::transaction::eip2718::TypedTransaction;
+use ethers::types::{Block, Transaction, TransactionReceipt, TransactionRequest};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -80,6 +81,37 @@ impl Default for Config {
             enable_state_diff: true,
             enable_gas_profiling: true,
             max_call_depth: 16,
+        }
+    }
+}
+
+/// Flattens a `callTracer` tree into the depth-first list `parse_traces`
+/// expects.
+///
+/// Each frame's `calls` are removed as the frame is taken, so a frame in the
+/// output carries only its own fields. `max_depth` bounds the walk: a
+/// contract that calls itself would otherwise recurse until the stack is
+/// exhausted, and the tracer's own tree can be deeper than the service is
+/// willing to display.
+fn flatten_call_tree(frame: &serde_json::Value, out: &mut Vec<serde_json::Value>, max_depth: usize) {
+    if max_depth == 0 || out.len() > 100_000 {
+        return;
+    }
+    let mut frame = frame.clone();
+    // The key is removed rather than emptied, so a flattened frame carries no
+    // `calls` field at all. Leaving `"calls": []` behind would still parse,
+    // but it misrepresents a leaf frame as one whose children were dropped.
+    let children = frame
+        .as_object_mut()
+        .and_then(|object| object.remove("calls"))
+        .and_then(|calls| match calls {
+            serde_json::Value::Array(calls) => Some(calls),
+            _ => None,
+        });
+    out.push(frame);
+    if let Some(children) = children {
+        for child in children {
+            flatten_call_tree(&child, out, max_depth.saturating_sub(1));
         }
     }
 }
@@ -249,13 +281,23 @@ impl MemoryInspector {
         self.size = memory.len();
     }
 
+    /// Number of bytes of memory currently inspected.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Whether no memory has been loaded.
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
     pub fn read(&self, offset: usize, length: usize) -> Option<String> {
         if offset + length > self.data.len() {
             return None;
         }
         
         let data = &self.data[offset..offset + length];
-        Some(hex::encode(data))
+        Some(format!("0x{}", hex::encode(data)))
     }
 
     pub fn read_string(&self, offset: usize, max_length: usize) -> Option<String> {
@@ -296,7 +338,7 @@ impl MemoryInspector {
 
     pub fn dump(&self, start: usize, length: usize) -> String {
         let end = (start + length).min(self.data.len());
-        hex::encode(&self.data[start..end])
+        format!("0x{}", hex::encode(&self.data[start..end]))
     }
 }
 
@@ -453,30 +495,51 @@ impl TraceService {
     pub async fn trace_transaction(&self, request: TraceRequest) -> Result<TraceResult> {
         info!("Tracing transaction: {}", request.transaction_hash);
         
+        // The hash arrives as a hex string and has to be parsed into H256.
+        // Parsing also rejects a malformed hash before a request is made.
+        let tx_hash: H256 = request
+            .transaction_hash
+            .parse()
+            .map_err(|_| TraceError::NotFound(request.transaction_hash.clone()))?;
+
         // Get transaction
-        let tx = self.rpc.get_transaction(&request.transaction_hash.clone().into())
+        let tx = self
+            .rpc
+            .get_transaction(tx_hash)
             .await?
             .ok_or_else(|| TraceError::NotFound(request.transaction_hash.clone()))?;
-        
+
         // Get receipt
-        let receipt = self.rpc.get_transaction_receipt(&request.transaction_hash.clone().into())
+        let receipt = self
+            .rpc
+            .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| TraceError::NotFound(request.transaction_hash.clone()))?;
-        
+
+        // A receipt without a block number is a pending transaction: it has
+        // not been mined, so there is no block to read and no trace to fetch.
+        let block_number = receipt
+            .block_number
+            .ok_or_else(|| TraceError::NotFound("transaction is not yet mined".to_string()))?;
+
         // Get block
-        let block = self.rpc.get_block(receipt.block_number.unwrap())
+        let block = self
+            .rpc
+            .get_block(block_number)
             .await?
-            .ok_or("Block not found")?;
+            .ok_or_else(|| TraceError::Rpc(format!("block {block_number} not found")))?;
         
-        // Get traces using debug_traceCall
-        let traces = self.get_traces(&tx, receipt.block_number.unwrap()).await?;
+        // Get traces from the node.
+        let traces = self
+            .get_traces(&request.transaction_hash, block_number.as_u64())
+            .await?;
         
         // Parse traces into call tree
         let call_traces = self.parse_traces(&traces)?;
         
         // Get state diff if enabled
         let state_diff = if request.enable_state_diff {
-            self.get_state_diff(&tx, receipt.block_number.unwrap()).await?
+            self.get_state_diff(&tx, block_number.as_u64()).await?
         } else {
             None
         };
@@ -504,14 +567,14 @@ impl TraceService {
         
         let result = TraceResult {
             transaction_hash: request.transaction_hash,
-            block_number: receipt.block_number.unwrap().as_u64(),
+            block_number: block_number.as_u64(),
             block_hash: format!("{:?}", receipt.block_hash.unwrap_or_default()),
             from: format!("{:?}", tx.from),
             to: format!("{:?}", tx.to.unwrap_or_default()),
             value: format!("{}", tx.value),
-            gas_used: receipt.gas_used.unwrap_or_default().as_u64(),
-            gas_limit: tx.gas.unwrap_or_default().as_u64(),
-            status: receipt.status.unwrap_or_default().as_u64() == 1,
+            gas_used: receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0),
+            gas_limit: tx.gas.as_u64(),
+            status: receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false),
             timestamp: block.timestamp.as_u64(),
             traces: call_traces,
             state_diff,
@@ -526,16 +589,122 @@ impl TraceService {
         Ok(result)
     }
 
-    /// Get traces from RPC
-    async fn get_traces(&self, tx: &Transaction, block_number: u64) -> Result<Vec<serde_json::Value>> {
-        // In production, this would call debug_traceCall or debug_traceBlockByNumber
-        // For now, return empty traces
-        Ok(vec![])
+    /// Fetch a transaction's execution traces from the node.
+    ///
+    /// This calls `debug_traceTransaction` and asks for the `callTracer`
+    /// tracer, whose output is a nested call tree. The struct logger would
+    /// return one entry per opcode — hundreds of megabytes for a large
+    /// transaction — when what a trace view needs is the call structure, which
+    /// is what `parse_traces` below consumes.
+    ///
+    /// The result is normalised to a flat list of frames: the tracer's tree is
+    /// walked depth-first and the nested `calls` arrays are spliced out, since
+    /// `parse_traces` assigns each frame an index in execution order and
+    /// expects that list rather than a tree.
+    async fn get_traces(
+        &self,
+        transaction_hash: &str,
+        _block_number: u64,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!([
+            transaction_hash,
+            { "tracer": "callTracer", "tracerConfig": { "withLog": false } }
+        ]);
+        let result = self
+            .rpc_debug_request("debug_traceTransaction", params)
+            .await?;
+
+        // A transaction that reverted before executing, or one the tracer
+        // returned nothing for, has a null result rather than an empty tree.
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+
+        let mut frames = Vec::new();
+        flatten_call_tree(&result, &mut frames, self.config.max_call_depth);
+        Ok(frames)
+    }
+
+    /// Trace a call that has not been mined, using `debug_traceCall`.
+    ///
+    /// This is the same `callTracer` as above, but against a transaction
+    /// request evaluated in the context of a block rather than an existing
+    /// transaction. It is what lets a caller see what a call would do before
+    /// paying to send it.
+    ///
+    /// @param call The call to evaluate, as a transaction request object.
+    /// @param block The block tag to evaluate against, such as `latest`.
+    pub async fn trace_call(
+        &self,
+        call: serde_json::Value,
+        block: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!([
+            call,
+            block,
+            { "tracer": "callTracer", "tracerConfig": { "withLog": false } }
+        ]);
+        let result = self.rpc_debug_request("debug_traceCall", params).await?;
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+        let mut frames = Vec::new();
+        flatten_call_tree(&result, &mut frames, self.config.max_call_depth);
+        Ok(frames)
+    }
+
+    /// Issue a `debug_*` JSON-RPC request and return its `result`.
+    ///
+    /// The error object is surfaced rather than swallowed: a node that does not
+    /// serve the debug namespace and a transaction with no calls are different
+    /// answers, and returning an empty trace for both would hide a
+    /// misconfigured node behind an apparently successful trace.
+    async fn rpc_debug_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.config.trace_timeout.max(1)))
+            .build()
+            .map_err(|e| anyhow!("http client: {e}"))?;
+
+        let response = client
+            .post(&self.config.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("{method} failed: {e}"))?;
+
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("{method} response was not JSON: {e}"))?;
+
+        if let Some(error) = value.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            return Err(anyhow!("{method}: {message}"));
+        }
+
+        value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow!("{method} response had no result"))
     }
 
     /// Parse raw traces into call tree
     fn parse_traces(&self, raw_traces: &[serde_json::Value]) -> Result<Vec<CallTrace>> {
-        let mut calls = Vec::new();
+        let mut calls: Vec<CallTrace> = Vec::new();
         let mut index = 0u32;
         
         for trace in raw_traces {
@@ -724,8 +893,11 @@ impl TraceService {
     }
 
     /// Estimate gas for a transaction
-    pub async fn estimate_gas(&self, tx: &Transaction) -> Result<u64> {
-        let gas = self.rpc.estimate_gas(tx).await?;
+    pub async fn estimate_gas(&self, tx: &TransactionRequest) -> Result<u64> {
+        // The middleware wants a typed transaction; a request converts into
+        // one, which is what lets a caller estimate before signing.
+        let typed: TypedTransaction = tx.clone().into();
+        let gas = self.rpc.estimate_gas(&typed, None).await?;
         Ok(gas.as_u64())
     }
 
@@ -887,6 +1059,118 @@ fn format_short_address(addr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `callTracer` result: a nested tree, as a node returns it.
+    fn nested_call_tree() -> serde_json::Value {
+        serde_json::json!({
+            "type": "CALL",
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": "0x2222222222222222222222222222222222222222",
+            "value": "0x0",
+            "gas": "0x1000",
+            "gasUsed": "0x100",
+            "input": "0x",
+            "output": "0x",
+            "calls": [
+                {
+                    "type": "STATICCALL",
+                    "from": "0x2222222222222222222222222222222222222222",
+                    "to": "0x3333333333333333333333333333333333333333",
+                    "gas": "0x800",
+                    "gasUsed": "0x50",
+                    "input": "0x",
+                    "output": "0x",
+                    "calls": [
+                        {
+                            "type": "DELEGATECALL",
+                            "from": "0x3333333333333333333333333333333333333333",
+                            "to": "0x4444444444444444444444444444444444444444",
+                            "gas": "0x400",
+                            "gasUsed": "0x20",
+                            "input": "0x",
+                            "output": "0x"
+                        }
+                    ]
+                },
+                {
+                    "type": "CALL",
+                    "from": "0x2222222222222222222222222222222222222222",
+                    "to": "0x5555555555555555555555555555555555555555",
+                    "gas": "0x300",
+                    "gasUsed": "0x30",
+                    "input": "0x",
+                    "output": "0x"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn a_nested_call_tree_is_flattened_in_execution_order() {
+        let mut frames = Vec::new();
+        flatten_call_tree(&nested_call_tree(), &mut frames, 16);
+        // Four frames: the root, the static call, its delegate call, and the
+        // second call. Depth-first is the order they executed in.
+        assert_eq!(frames.len(), 4);
+        let types: Vec<&str> = frames
+            .iter()
+            .map(|f| f.get("type").and_then(|t| t.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(types, vec!["CALL", "STATICCALL", "DELEGATECALL", "CALL"]);
+        let tos: Vec<&str> = frames
+            .iter()
+            .map(|f| f.get("to").and_then(|t| t.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            tos,
+            vec![
+                "0x2222222222222222222222222222222222222222",
+                "0x3333333333333333333333333333333333333333",
+                "0x4444444444444444444444444444444444444444",
+                "0x5555555555555555555555555555555555555555",
+            ],
+            "each frame must keep its own target"
+        );
+    }
+
+    #[test]
+    fn a_flattened_frame_does_not_carry_its_children() {
+        // A frame with a `calls` array would make `parse_traces` recurse a
+        // second time and emit the subtree twice.
+        let mut frames = Vec::new();
+        flatten_call_tree(&nested_call_tree(), &mut frames, 16);
+        for frame in &frames {
+            assert!(
+                frame.get("calls").is_none(),
+                "a flattened frame must not keep its children"
+            );
+        }
+    }
+
+    #[test]
+    fn the_flattening_depth_is_bounded() {
+        // A contract that calls itself must not recurse without limit.
+        let mut deep = serde_json::json!({ "type": "CALL" });
+        for _ in 0..50 {
+            deep = serde_json::json!({ "type": "CALL", "calls": [deep] });
+        }
+        let mut frames = Vec::new();
+        flatten_call_tree(&deep, &mut frames, 4);
+        assert!(
+            frames.len() <= 4,
+            "a depth limit of four must not yield more than four frames, got {}",
+            frames.len()
+        );
+    }
+
+    #[test]
+    fn a_leaf_frame_is_returned_unchanged() {
+        let leaf = serde_json::json!({ "type": "CALL", "to": "0xabc" });
+        let mut frames = Vec::new();
+        flatten_call_tree(&leaf, &mut frames, 16);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].get("to").and_then(|t| t.as_str()), Some("0xabc"));
+    }
 
     #[test]
     fn test_memory_inspector() {
