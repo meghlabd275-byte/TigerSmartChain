@@ -140,6 +140,8 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	api.GET("/contracts/:address/source", h.GetContractSource)
 	api.GET("/contracts/verified", h.GetVerifiedContracts)
 	api.GET("/contracts/verified/:address", h.GetVerifiedContract)
+	// Read-only JSON-RPC passthrough for in-browser simulation.
+	api.POST("/rpc", h.RPCPassthrough)
 	api.POST("/contracts/verify", h.VerifyContract)
 	api.POST("/contracts/verify-multi", h.VerifyContractMultiFile)
 	api.GET("/contracts/:address/read", h.ReadContract)
