@@ -270,8 +270,118 @@ func (h *Handler) GetBridgeTransfer(c *gin.Context) {
 	c.JSON(http.StatusOK, row)
 }
 
-// ==================== NFT APPROVALS ====================
+// ==================== TOKEN APPROVALS ====================
 
+// riskCase is the shared SQL expression that classifies a spender. It reads the
+// threat tables rather than guessing, so a spender is only marked dangerous
+// when the security indexer has actually flagged it. Unlimited allowances are
+// treated as a warning because they let a spender drain the balance later.
+const riskCase = `
+	CASE
+		WHEN a.spender IN (SELECT address FROM malicious_contracts WHERE is_active)
+		  OR a.spender IN (SELECT address FROM scam_tokens WHERE is_active)
+		THEN 'danger'
+		WHEN a.value >= 115792089237316195423570985008687907853269984665640564039457584007913129639935
+		THEN 'warning'
+		ELSE 'safe'
+	END`
+
+// GetApprovals lists token approvals across the chain with a real risk label.
+func (h *Handler) GetApprovals(c *gin.Context) {
+	ctx := c.Request.Context()
+	limit := paramInt(c, "limit", 100)
+	offset := paramOffset(c)
+	rows, err := h.queryRows(ctx, `
+		SELECT a.id, a.token_address, a.owner, a.spender, a.value,
+		       a.transaction_hash, a.block_number, a.log_index, a.created_at,
+		       `+riskCase+` AS risk
+		FROM token_approvals a
+		ORDER BY a.block_number DESC, a.log_index DESC
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	total, _ := h.countQuery(ctx, `SELECT count(*) FROM token_approvals`)
+	respondList(c, rows, int(total))
+}
+
+// GetApprovalsByOwner lists the approvals one owner has granted.
+func (h *Handler) GetApprovalsByOwner(c *gin.Context) {
+	owner := c.Param("address")
+	if owner == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	limit := paramInt(c, "limit", 100)
+	offset := paramOffset(c)
+	rows, err := h.queryRows(ctx, `
+		SELECT a.id, a.token_address, a.owner, a.spender, a.value,
+		       a.transaction_hash, a.block_number, a.log_index, a.created_at,
+		       `+riskCase+` AS risk
+		FROM token_approvals a
+		WHERE a.owner = $1
+		ORDER BY a.block_number DESC, a.log_index DESC
+		LIMIT $2 OFFSET $3
+	`, owner, limit, offset)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	total, _ := h.countQuery(ctx, `SELECT count(*) FROM token_approvals WHERE owner = $1`, owner)
+	respondList(c, rows, int(total))
+}
+
+// GetApprovalsBySpender lists the allowances granted to one spender. This is
+// the view a user needs to see who can move their tokens.
+func (h *Handler) GetApprovalsBySpender(c *gin.Context) {
+	spender := c.Param("address")
+	if spender == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address"})
+		return
+	}
+	ctx := c.Request.Context()
+	limit := paramInt(c, "limit", 100)
+	offset := paramOffset(c)
+	rows, err := h.queryRows(ctx, `
+		SELECT a.id, a.token_address, a.owner, a.spender, a.value,
+		       a.transaction_hash, a.block_number, a.log_index, a.created_at,
+		       `+riskCase+` AS risk
+		FROM token_approvals a
+		WHERE a.spender = $1
+		ORDER BY a.block_number DESC, a.log_index DESC
+		LIMIT $2 OFFSET $3
+	`, spender, limit, offset)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	total, _ := h.countQuery(ctx, `SELECT count(*) FROM token_approvals WHERE spender = $1`, spender)
+	respondList(c, rows, int(total))
+}
+
+// GetApprovalStats counts approvals by risk band, so the approvals page can
+// show a summary without loading every row.
+func (h *Handler) GetApprovalStats(c *gin.Context) {
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `
+		SELECT
+			COUNT(*) AS total,
+			COUNT(*) FILTER (WHERE `+riskCase+` = 'danger') AS danger,
+			COUNT(*) FILTER (WHERE `+riskCase+` = 'warning') AS warning,
+			COUNT(*) FILTER (WHERE `+riskCase+` = 'safe') AS safe
+		FROM token_approvals a
+	`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// ==================== NFT APPROVALS ====================
 // GetNFTApprovals lists NFT approval events.
 func (h *Handler) GetNFTApprovals(c *gin.Context) {
 	ctx := c.Request.Context()

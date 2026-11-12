@@ -327,6 +327,12 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	api.GET("/bridge/transfers/:id", h.GetBridgeTransfer)
 
 	// ==================== NFT APPROVALS (2 endpoints) ====================
+	// ==================== TOKEN APPROVALS (4 endpoints) ====================
+	api.GET("/approvals", h.GetApprovals)
+	api.GET("/approvals/stats", h.GetApprovalStats)
+	api.GET("/approvals/owner/:address", h.GetApprovalsByOwner)
+	api.GET("/approvals/spender/:address", h.GetApprovalsBySpender)
+
 	api.GET("/nft-approvals", h.GetNFTApprovals)
 	api.GET("/nft-approvals/:address", h.GetNFTApprovalsByOwner)
 }

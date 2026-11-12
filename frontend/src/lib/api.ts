@@ -496,6 +496,33 @@ class APIClient {
     const { data } = await this.client.get<any[]>(`/nft-approvals/${address}`, { params })
     return data
   }
+
+  // Token approvals. The risk label is derived by the gateway from the
+  // malicious-contract and scam-token tables.
+  async getApprovals(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/approvals', { params })
+    return data
+  }
+
+  async getApprovalStats(): Promise<{
+    total: number
+    safe: number
+    warning: number
+    danger: number
+  }> {
+    const { data } = await this.client.get('/approvals/stats')
+    return data
+  }
+
+  async getApprovalsByOwner(address: string, params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>(`/approvals/owner/${address}`, { params })
+    return data
+  }
+
+  async getApprovalsBySpender(address: string, params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>(`/approvals/spender/${address}`, { params })
+    return data
+  }
 }
 
 export const api = new APIClient()
