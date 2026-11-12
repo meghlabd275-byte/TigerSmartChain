@@ -317,6 +317,38 @@ pub async fn debug_trace_call(
     trace_response(&tracer)
 }
 
+/// `debug_traceBlockByHash`: trace every transaction in the block with this
+/// hash.
+///
+/// Resolving the hash to a height here keeps one tracing path: the by-number
+/// function already handles the execution, and duplicating it for the by-hash
+/// case would give the two a chance to disagree.
+pub async fn debug_trace_block_by_hash(
+    node: &Arc<TigerNode>,
+    block_hash: &str,
+    trace_config: Option<&Value>,
+) -> Result<Vec<Value>, String> {
+    let number = {
+        let manager = node.get_chain_manager().await;
+        let chain = manager.chain();
+        let mut found = None;
+        for height in (0..=chain.height()).rev() {
+            if let Some(block) = chain.get_block(height) {
+                if tiger_blockchain::block_hash(&block.header)
+                    .map(|hash| hash.eq_ignore_ascii_case(block_hash))
+                    .unwrap_or(false)
+                {
+                    found = Some(height);
+                    break;
+                }
+            }
+        }
+        found
+    };
+    let number = number.ok_or_else(|| format!("unknown block {block_hash}"))?;
+    debug_trace_block(node, &format!("0x{number:x}"), trace_config).await
+}
+
 /// `debug_traceBlockByNumber`: trace every transaction in a block.
 pub async fn debug_trace_block(
     node: &Arc<TigerNode>,

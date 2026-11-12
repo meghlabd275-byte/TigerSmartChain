@@ -3373,7 +3373,7 @@ mod tests {
         // so the test binds its own port and does not race another test for
         // the default one.
         let data_dir = std::env::temp_dir()
-            .join(format!("tiger-rpc-test-{}", std::process::id()));
+            .join(format!("tiger-node-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         let config = Config {
             chain_id: 6666,

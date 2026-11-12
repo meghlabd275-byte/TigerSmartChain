@@ -792,12 +792,29 @@ pub(crate) async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcR
             Ok(trace) => RpcResponse::success(trace, id),
             Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
         },
-        "debug_traceBlockByNumber" => match params.get(0).and_then(|v| v.as_str()) {
-            Some(tag) => match crate::debug_rpc::debug_trace_block(node, tag, params.get(1)).await {
+        // The three spellings of the same call. `debug_traceBlock` takes RLP
+        // on a real node, which no client uses in practice; treating it as an
+        // alias of the by-number form is what the other EVM clients do and is
+        // more useful than refusing it.
+        "debug_traceBlockByNumber" | "debug_traceBlock" => {
+            match params.get(0).and_then(|v| v.as_str()) {
+                Some(tag) => {
+                    match crate::debug_rpc::debug_trace_block(node, tag, params.get(1)).await {
+                        Ok(traces) => RpcResponse::success(Value::Array(traces), id),
+                        Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
+                    }
+                }
+                None => RpcResponse::error(INVALID_PARAMS, "missing block tag", id),
+            }
+        }
+        "debug_traceBlockByHash" => match params.get(0).and_then(|v| v.as_str()) {
+            Some(hash) => match crate::debug_rpc::debug_trace_block_by_hash(node, hash, params.get(1))
+                .await
+            {
                 Ok(traces) => RpcResponse::success(Value::Array(traces), id),
                 Err(e) => RpcResponse::error(INVALID_PARAMS, e, id),
             },
-            None => RpcResponse::error(INVALID_PARAMS, "missing block tag", id),
+            None => RpcResponse::error(INVALID_PARAMS, "missing block hash", id),
         },
         "web3_sha3" => match string_param(params, 0) {
             Some(data) => {
