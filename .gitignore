@@ -40,3 +40,9 @@ node/data/
 # Go compiled binaries
 /explorer/cli
 /explorer/tigerscan-api
+
+# Vendored third-party sources that must not be ignored. blst keeps its
+# per-format assembly under a directory called build/, which the general
+# "build/" rule above would otherwise drop from the repository.
+!blob_processor/cpp/third_party/blst/build/
+!blob_processor/cpp/third_party/blst/build/**
