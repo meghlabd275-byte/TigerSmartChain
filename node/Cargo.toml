@@ -44,6 +44,10 @@ chrono = { version = "0.4", features = ["serde"] }
 # CLI
 clap = { version = "4.0", features = ["derive"] }
 
+# WebSocket JSON-RPC, which is where eth_subscribe lives
+tokio-tungstenite = "0.21"
+futures = "0.3"
+
 [features]
 default = []
 test = ["tokio/rt-multi-thread"]

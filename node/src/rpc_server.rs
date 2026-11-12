@@ -10,6 +10,7 @@
 //! handle the payloads.
 
 use crate::filters::{FilterKind, LogFilter};
+use crate::limits::PerIpLimiter;
 use crate::node::TigerNode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -59,7 +60,7 @@ impl RpcResponse {
         }
     }
 
-    fn error(code: i64, message: impl Into<String>, id: Value) -> Self {
+    pub(crate) fn error(code: i64, message: impl Into<String>, id: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             result: None,
@@ -140,66 +141,6 @@ impl CorsPolicy {
     }
 }
 
-/// One client's token bucket.
-struct Bucket {
-    tokens: f64,
-    last: std::time::Instant,
-}
-
-/// A per-client token bucket over the RPC.
-///
-/// The RPC is reachable by anyone who can open a socket, and a single caller
-/// looping `eth_call` can occupy every core the node has. The bucket refills at
-/// the configured rate and holds at most one second's worth, so a client that
-/// bursts is slowed rather than disconnected, and a sustained flood is capped
-/// without the node having to track a request queue.
-struct RateLimiter {
-    per_second: u32,
-    buckets: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, Bucket>>,
-}
-
-impl RateLimiter {
-    fn new(per_second: u32) -> Self {
-        Self {
-            per_second,
-            buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    /// Whether this client may make a request now.
-    fn allow(&self, ip: std::net::IpAddr) -> bool {
-        if self.per_second == 0 {
-            return true;
-        }
-        let rate = f64::from(self.per_second);
-        let now = std::time::Instant::now();
-        // A poisoned mutex here would mean a panic while holding it, which the
-        // critical section cannot cause; recovering keeps the RPC serving.
-        let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Bound the table. Without this a caller with a large address range
-        // could grow it without limit, which is its own denial of service.
-        if buckets.len() > 100_000 {
-            buckets.retain(|_, b| now.duration_since(b.last).as_secs() < 60);
-        }
-
-        let bucket = buckets.entry(ip).or_insert(Bucket {
-            tokens: rate,
-            last: now,
-        });
-        let elapsed = now.duration_since(bucket.last).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * rate).min(rate);
-        bucket.last = now;
-
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// Counters for the metrics endpoint.
 ///
 /// These are the numbers an operator alerts on: whether the node is producing
@@ -258,7 +199,11 @@ pub async fn serve_listener(
     node: Arc<TigerNode>,
 ) -> std::io::Result<()> {
     let cors = Arc::new(CorsPolicy::from_config(&node.config().rpc_cors_host));
-    let limiter = Arc::new(RateLimiter::new(node.config().rpc_rate_limit));
+    // One bucket per client address. The burst is one second's worth of the
+    // configured rate, and a client may hold at most that many requests at
+    // once, so a slow client cannot accumulate unbounded work either.
+    let rate = f64::from(node.config().rpc_rate_limit);
+    let limiter = Arc::new(PerIpLimiter::new(rate, rate, rate.max(1.0) as usize));
     let metrics = Arc::new(Metrics::new());
 
     loop {
@@ -351,7 +296,7 @@ async fn handle_connection(
     stream: &mut tokio::net::TcpStream,
     node: Arc<TigerNode>,
     cors: Arc<CorsPolicy>,
-    limiter: Arc<RateLimiter>,
+    limiter: Arc<PerIpLimiter>,
     metrics: Arc<Metrics>,
     peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
@@ -440,7 +385,7 @@ async fn handle_connection(
     use std::sync::atomic::Ordering;
     metrics.http_requests.fetch_add(1, Ordering::Relaxed);
 
-    if !limiter.allow(peer.ip()) {
+    if !limiter.admit(peer.ip()) {
         metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
         log::debug!("rate limited RPC request from {}", peer.ip());
         let head = format!(
@@ -456,6 +401,7 @@ async fn handle_connection(
         Err(e) => RpcResponse::error(PARSE_ERROR, format!("parse error: {e}"), Value::Null),
     };
     metrics.record(&response);
+    limiter.release(peer.ip());
     write_response(stream, response, &cors, origin.as_deref(), true).await
 }
 
@@ -520,7 +466,7 @@ async fn write_cors_preflight(
 }
 
 /// Route a request to the matching method.
-async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
+pub(crate) async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcResponse {
     let id = request.id.clone().unwrap_or(Value::Null);
 
     // The specification requires the version to be exactly "2.0" when it is
@@ -1198,6 +1144,10 @@ async fn submit_raw_transaction(node: &Arc<TigerNode>, raw: &str) -> Result<Stri
         }
     }
     log::info!("accepted transaction {hash}");
+    // Tell subscribers, then the peers, so a transaction submitted to any node
+    // reaches both the wallets watching it and the validator that will include
+    // it.
+    node.publish_pending_transaction(&hash);
     // Tell the peers, so a transaction submitted to any node reaches the
     // validator that will include it.
     if let Some(p2p) = node.p2p() {
@@ -1263,7 +1213,7 @@ fn hex_quantity(bytes: &[u8]) -> String {
 /// When `full_transactions` is false the `transactions` array holds hashes;
 /// when it is true it holds full transaction objects. That distinction is part
 /// of the JSON-RPC contract and clients depend on it.
-fn block_to_json_with_receipts(
+pub(crate) fn block_to_json_with_receipts(
     block: &tiger_blockchain::types::Block,
     full_transactions: bool,
 ) -> Value {
@@ -1622,7 +1572,7 @@ async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, S
 }
 
 /// Turn a log filter's JSON body into a [`LogFilter`].
-fn parse_log_filter(filter: &Value, height: u64) -> Result<LogFilter, String> {
+pub(crate) fn parse_log_filter(filter: &Value, height: u64) -> Result<LogFilter, String> {
     let block_hash = filter
         .get("blockHash")
         .and_then(|v| v.as_str())
@@ -1694,7 +1644,7 @@ fn log_block_numbers(
 }
 
 /// Collect the logs of `numbers` that match `filter`.
-fn collect_logs(
+pub(crate) fn collect_logs(
     chain: &tiger_blockchain::Blockchain,
     filter: &LogFilter,
     numbers: &[u64],
@@ -2183,21 +2133,21 @@ mod tests {
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         let other: IpAddr = "203.0.113.8".parse().unwrap();
 
-        let limiter = RateLimiter::new(5);
+        let limiter = PerIpLimiter::new(5.0, 5.0, 100);
         // The bucket starts full, so the first five are allowed and the sixth
         // is not.
         for i in 0..5 {
-            assert!(limiter.allow(ip), "request {i} within the burst must be allowed");
+            assert!(limiter.admit(ip), "request {i} within the burst must be allowed");
         }
-        assert!(!limiter.allow(ip), "the request past the burst must be refused");
+        assert!(!limiter.admit(ip), "the request past the burst must be refused");
 
         // A different client has its own bucket.
-        assert!(limiter.allow(other));
+        assert!(limiter.admit(other));
 
         // A zero rate disables the limit entirely.
-        let unlimited = RateLimiter::new(0);
+        let unlimited = PerIpLimiter::new(0.0, 0.0, 1);
         for _ in 0..1000 {
-            assert!(unlimited.allow(ip));
+            assert!(unlimited.admit(ip));
         }
     }
 
@@ -2205,15 +2155,15 @@ mod tests {
     fn the_rate_limiter_refills_over_time() {
         use std::net::IpAddr;
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        let limiter = RateLimiter::new(1000);
+        let limiter = PerIpLimiter::new(1000.0, 1000.0, 100_000);
         // Drain the bucket.
         for _ in 0..1000 {
-            assert!(limiter.allow(ip));
+            assert!(limiter.admit(ip));
         }
-        assert!(!limiter.allow(ip));
+        assert!(!limiter.admit(ip));
         // A millisecond at 1000/s buys one token.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(limiter.allow(ip), "the bucket must refill with time");
+        assert!(limiter.admit(ip), "the bucket must refill with time");
     }
 
     #[test]

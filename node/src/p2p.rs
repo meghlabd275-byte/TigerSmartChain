@@ -560,9 +560,10 @@ impl P2pService {
                         match mempool.add(tx) {
                             Ok(()) => {
                                 debug!("accepted transaction {hash} from {peer_id}");
-                                // Pass it on, so it reaches the rest of the
-                                // network even if this node never proposes a
-                                // block.
+                                // Notify subscribers, then pass it on so it
+                                // reaches the rest of the network even if this
+                                // node never proposes a block.
+                                self.node.publish_pending_transaction(&hash);
                                 drop(mempool);
                                 let announce = PeerMessage::NewTransaction(hash);
                                 if let Ok(frame) = encode_message(&announce) {

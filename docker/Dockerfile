@@ -44,8 +44,8 @@ COPY --from=builder /src/node/target/release/tigersmartchaind /usr/local/bin/tig
 WORKDIR /home/tigersmartchain
 USER tigersmartchain
 
-# P2P, JSON-RPC, metrics.
-EXPOSE 30303 8545 9090
+# P2P, JSON-RPC, WebSocket JSON-RPC, metrics.
+EXPOSE 30303 8545 8546 9090
 
 # The node serves /health on its RPC port and reports unhealthy when it is not
 # running or has no chain, so this check fails on a node that cannot serve.
@@ -53,4 +53,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
   CMD curl -fsS http://localhost:8545/health || exit 1
 
 ENTRYPOINT ["tigersmartchaind"]
-CMD ["--rpc-addr", "0.0.0.0:8545", "--listen-addr", "0.0.0.0:30303"]
+CMD ["--rpc-addr", "0.0.0.0:8545", "--ws-addr", "0.0.0.0:8546", "--listen-addr", "0.0.0.0:30303"]

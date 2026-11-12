@@ -43,6 +43,11 @@ pub struct Config {
     /// disables the limit.
     pub rpc_rate_limit: u32,
 
+    /// Serve the WebSocket JSON-RPC endpoint, which is where `eth_subscribe`
+    /// and its push notifications live.
+    pub ws_enabled: bool,
+    pub ws_addr: String,
+
     /// State settings
     pub data_dir: String,
     pub cache_size: usize,
@@ -85,6 +90,8 @@ impl Config {
         rpc_addr: String,
         rpc_cors_host: String,
         rpc_rate_limit: u32,
+        ws_enabled: bool,
+        ws_addr: String,
         data_dir: String,
         cache_size: usize,
         validator_addr: Option<String>,
@@ -107,6 +114,8 @@ impl Config {
             rpc_addr,
             rpc_cors_host,
             rpc_rate_limit,
+            ws_enabled,
+            ws_addr,
             data_dir,
             cache_size,
             validator_addr,
@@ -138,6 +147,8 @@ impl Config {
             rpc_addr: ":8545".to_string(),
             rpc_cors_host: String::new(),
             rpc_rate_limit: DEFAULT_RPC_RATE_LIMIT,
+            ws_enabled: true,
+            ws_addr: ":8546".to_string(),
             data_dir: "./data".to_string(),
             cache_size: 1024,
             validator_addr: None,
@@ -169,6 +180,8 @@ impl Config {
             rpc_addr: ":8545".to_string(),
             rpc_cors_host: String::new(),
             rpc_rate_limit: DEFAULT_RPC_RATE_LIMIT,
+            ws_enabled: true,
+            ws_addr: ":8546".to_string(),
             data_dir: "./data/testnet".to_string(),
             cache_size: 512,
             validator_addr: None,

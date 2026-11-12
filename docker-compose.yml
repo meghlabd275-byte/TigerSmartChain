@@ -65,26 +65,37 @@ services:
       - tigerscan-network
     restart: unless-stopped
 
-  # Blockchain Node (Geth)
+  # TigerSmartChain node. Built from this repository, not an upstream client:
+  # the chain's consensus, gas rules and RPC are this node's own.
   node:
-    image: ethereum/client-go:stable
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: tigersmartchain/node:latest
     container_name: tigerscan-node
     command: >
-      --主网 --http --http.addr=0.0.0.0 --http.port=8545 
-      --http.api=eth,net,web3,debug,txpool 
-      --ws --ws.addr=0.0.0.0 --ws.port=8546 
-      --ws.api=eth,net,web3,debug,txpool 
-      --http.corsdomain="*" 
-      --ws.origins="*" 
-      --cache=2048 
-      --maxpeers=100
+      --network mainnet
+      --chain-id 6666
+      --rpc-addr 0.0.0.0:8545
+      --ws-addr 0.0.0.0:8546
+      --listen-addr 0.0.0.0:30303
+      --metrics-addr 0.0.0.0:9090
+      --metrics-enabled
+      --data-dir /data
+      --max-peers 100
     volumes:
-      - node_data:/geth
+      - node_data:/data
     ports:
       - "8545:8545"
       - "8546:8546"
       - "30303:30303"
       - "30303:30303/udp"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8545/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     networks:
       - tigerscan-network
     restart: unless-stopped

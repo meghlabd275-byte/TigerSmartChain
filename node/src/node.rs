@@ -80,6 +80,10 @@ pub struct TigerNode {
     /// is an optimisation and never a correctness dependency.
     recent_states: tokio::sync::Mutex<RecentStates>,
 
+    /// Push notifications for WebSocket subscribers. Publishing never blocks,
+    /// so block import is independent of how fast clients read.
+    events: crate::ws_server::EventBus,
+
     /// Network sync status
     sync_status: RwLock<SyncStatus>,
 
@@ -228,6 +232,7 @@ impl TigerNode {
             consensus: tokio::sync::Mutex::new(consensus),
             validator_key,
             recent_states: tokio::sync::Mutex::new(RecentStates::new()),
+            events: crate::ws_server::EventBus::new(),
             sync_status,
             tasks,
             storage,
@@ -356,6 +361,69 @@ impl TigerNode {
         };
         info!("Restored {block_count} block(s) from disk; chain height is {height}");
         Ok(block_count)
+    }
+
+    /// The node's event bus, for the WebSocket endpoint.
+    pub fn events(&self) -> &crate::ws_server::EventBus {
+        &self.events
+    }
+
+    /// Publish the events a newly imported or produced block implies.
+    ///
+    /// Every notification is rendered from the chain as it stands after the
+    /// block, so a subscriber sees the same objects `eth_getBlockByNumber` and
+    /// `eth_getLogs` would return rather than a reduced copy. Called after the
+    /// block is durable, so a client is never told about a block the node could
+    /// still lose.
+    pub async fn publish_block_events(&self, block: &tiger_blockchain::types::Block) {
+        use crate::ws_server::ChainEvent;
+
+        self.events.publish(ChainEvent::Head(
+            crate::rpc_server::block_to_json_with_receipts(block, false),
+        ));
+
+        let (chain_logs, syncing) = {
+            let cm = self.chain_manager.lock().await;
+            let chain = cm.chain();
+            let filter = crate::filters::LogFilter {
+                from_block: Some(block.header.number),
+                to_block: Some(block.header.number),
+                address: None,
+                topics: None,
+                block_hash: None,
+            };
+            let numbers = vec![block.header.number];
+            let logs = crate::rpc_server::collect_logs(chain, &filter, &numbers);
+            (logs, self.sync_status_json(chain.height()))
+        };
+
+        if !chain_logs.is_empty() {
+            self.events.publish(ChainEvent::Logs(chain_logs));
+        }
+        self.events.publish(ChainEvent::Syncing(syncing));
+    }
+
+    /// The sync status in the shape `eth_syncing` reports.
+    fn sync_status_json(&self, head: u64) -> serde_json::Value {
+        let status = self.sync_status.try_read().ok();
+        let syncing = status.as_ref().map(|s| s.syncing).unwrap_or(false);
+        if !syncing {
+            return serde_json::Value::Bool(false);
+        }
+        let highest = status.as_ref().map(|s| s.highest_block).unwrap_or(head);
+        let starting = status.as_ref().map(|s| s.starting_block).unwrap_or(0);
+        serde_json::json!({
+            "startingBlock": format!("0x{starting:x}"),
+            "currentBlock": format!("0x{head:x}"),
+            "highestBlock": format!("0x{highest:x}"),
+        })
+    }
+
+    /// Publish a transaction that has just been accepted into the pool.
+    pub fn publish_pending_transaction(&self, hash: &str) {
+        self.events.publish(crate::ws_server::ChainEvent::PendingTransaction(
+            hash.to_string(),
+        ));
     }
 
     /// Import a block received from a peer.
@@ -530,6 +598,9 @@ impl TigerNode {
 
         self.persist().await;
         info!("Imported block #{} from the network", declared_number);
+        // Notify subscribers only once the block is durable, so no client is
+        // told about a block the node could still lose in a crash.
+        self.publish_block_events(&block).await;
         Ok(true)
     }
 
@@ -891,6 +962,19 @@ impl TigerNode {
             });
         }
 
+        // Start the WebSocket endpoint, where `eth_subscribe` lives. A dApp
+        // that polls for new heads or logs holds the node open to the same
+        // load as a busy explorer; one subscription replaces that polling.
+        if self.config.ws_enabled {
+            let node = Arc::clone(self);
+            let addr = self.config.ws_addr.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::ws_server::serve(Arc::clone(&node), addr.clone()).await {
+                    error!("WebSocket server on {addr} stopped: {e}");
+                }
+            });
+        }
+
         info!("All node components started successfully");
         Ok(())
     }
@@ -993,7 +1077,12 @@ impl TigerNode {
                                             cm.chain().get_block(next_block).cloned()
                                         };
                                         if let Some(block) = produced {
-                                            p2p.announce_block(block).await;
+                                            p2p.announce_block(block.clone()).await;
+                                            // Subscribers are told after the
+                                            // block is durable and announced,
+                                            // so they never see a head that is
+                                            // not yet on the wire.
+                                            node.publish_block_events(&block).await;
                                         }
                                     }
                                     // Credit the proposer's pending reward.
@@ -1359,7 +1448,7 @@ fn hex_word(value: &str) -> Result<[u8; 32], String> {
 }
 
 /// Create a genesis block configuration for the given chain ID.
-fn create_genesis_block(chain_id: u64) -> Genesis {
+pub(crate) fn create_genesis_block(chain_id: u64) -> Genesis {
     use std::collections::HashMap;
 
     let config = ChainConfig {

@@ -12,9 +12,11 @@ use tokio::signal;
 mod config;
 mod debug_rpc;
 mod filters;
+mod limits;
 mod node;
 mod p2p;
 mod rpc_server;
+mod ws_server;
 mod storage;
 
 pub use config::Config;
@@ -30,6 +32,8 @@ pub const DEFAULT_LISTEN_ADDR: &str = ":30303";
 pub const DEFAULT_RPC_ADDR: &str = ":8545";
 /// Default metrics address
 pub const DEFAULT_METRICS_ADDR: &str = ":9090";
+/// Default WebSocket address
+pub const DEFAULT_WS_ADDR: &str = ":8546";
 /// Default max peers
 pub const DEFAULT_MAX_PEERS: usize = 50;
 /// Default epoch length
@@ -87,6 +91,14 @@ struct Args {
     /// disables the limit.
     #[arg(long, default_value_t = DEFAULT_RPC_RATE_LIMIT)]
     rpc_rate_limit: u32,
+
+    /// Serve the WebSocket JSON-RPC endpoint, which carries `eth_subscribe`.
+    #[arg(long, default_value = "true")]
+    ws_enabled: bool,
+
+    /// Address the WebSocket endpoint listens on.
+    #[arg(long, default_value = DEFAULT_WS_ADDR)]
+    ws_addr: String,
 
     /// Data directory
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
@@ -180,6 +192,8 @@ async fn main() -> Result<()> {
         args.rpc_addr,
         rpc_cors_host,
         args.rpc_rate_limit,
+        args.ws_enabled,
+        args.ws_addr,
         args.data_dir,
         args.cache_size,
         args.validator_addr,
