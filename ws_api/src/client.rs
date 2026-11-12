@@ -1,6 +1,7 @@
 //! WebSocket Client for TigerScan
 
 use crate::messages::*;
+use crate::subscriptions::Subscription;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;

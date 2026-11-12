@@ -25,6 +25,12 @@ pub enum WsError {
     Subscription(String),
 }
 
+impl From<serde_json::Error> for WsError {
+    fn from(e: serde_json::Error) -> Self {
+        WsError::Message(e.to_string())
+    }
+}
+
 /// WebSocket message handler
 pub struct WsServer {
     addr: SocketAddr,
@@ -73,7 +79,7 @@ impl WsServer {
                     let gas_rx = self.gas_tx.subscribe();
 
                     tokio::spawn(async move {
-                        if let Err(e) = self.handle_connection(
+                        if let Err(e) = WsServer::handle_connection(
                             stream,
                             addr,
                             subscribers,
@@ -96,7 +102,6 @@ impl WsServer {
 
     /// Handle a single connection
     async fn handle_connection(
-        &self,
         stream: TcpStream,
         addr: SocketAddr,
         subscribers: Arc<RwLock<HashMap<String, Vec<Subscription>>>>,
@@ -131,7 +136,7 @@ impl WsServer {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if let Err(e) = self.handle_message(&client_id, &text, &subscribers).await {
+                            if let Err(e) = WsServer::handle_message(&client_id, &text, &subscribers).await {
                                 error!("Message error: {}", e);
                             }
                         }
@@ -197,7 +202,6 @@ impl WsServer {
 
     /// Handle incoming message
     async fn handle_message(
-        &self,
         client_id: &str,
         text: &str,
         subscribers: &Arc<RwLock<HashMap<String, Vec<Subscription>>>>,

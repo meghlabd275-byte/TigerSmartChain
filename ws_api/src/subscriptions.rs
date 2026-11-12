@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::messages::SubscribeParams;
+
 // =============================================================================
 // SUBSCRIPTION
 // =============================================================================
@@ -17,17 +19,6 @@ pub struct Subscription {
     pub channel: String,
     /// Parameters
     pub params: Option<SubscribeParams>,
-}
-
-/// Subscribe parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscribeParams {
-    /// Address filter
-    pub address: Option<String>,
-    /// Topics filter
-    pub topics: Option<Vec<String>>,
-    /// From block
-    pub from_block: Option<u64>,
 }
 
 // =============================================================================

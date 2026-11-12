@@ -1,6 +1,7 @@
 //! TigerScan Token Service - High Performance Token Price Feed & Holder Tracking
 //! Production-grade Rust service for token prices, holder distribution, and DEX tracking
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,15 +44,17 @@ pub enum TokenServiceError {
 // ============================================================================
 
 /// Token information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Token {
     pub address: String,
     pub name: String,
     pub symbol: String,
-    pub decimals: u8,
+    pub decimals: i16,
     pub total_supply: String,
     pub circulating_supply: Option<String>,
+    #[sqlx(try_from = "i64")]
     pub holders: u64,
+    #[sqlx(try_from = "i64")]
     pub transfers_24h: u64,
     pub price_usd: f64,
     pub price_change_24h: f64,
@@ -62,21 +65,23 @@ pub struct Token {
 }
 
 /// Token holder information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TokenHolder {
     pub address: String,
     pub balance: String,
     pub balance_usd: f64,
     pub percentage: f64,
+    #[sqlx(try_from = "i64")]
     pub rank: u64,
     pub first_seen: DateTime<Utc>,
     pub last_updated: DateTime<Utc>,
 }
 
 /// Token transfer
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TokenTransfer {
     pub hash: String,
+    #[sqlx(try_from = "i64")]
     pub block_number: u64,
     pub timestamp: DateTime<Utc>,
     pub from: String,
@@ -87,7 +92,7 @@ pub struct TokenTransfer {
 }
 
 /// DEX pair information
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DEXPair {
     pub pair_address: String,
     pub dex_name: String,
@@ -105,7 +110,7 @@ pub struct DEXPair {
 }
 
 /// Price candle for charts
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PriceCandle {
     pub timestamp: DateTime<Utc>,
     pub open: f64,
@@ -116,7 +121,7 @@ pub struct PriceCandle {
 }
 
 /// Price history entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PriceHistory {
     pub token_address: String,
     pub timestamp: DateTime<Utc>,
@@ -234,13 +239,14 @@ pub struct HolderCache {
 
 #[derive(Default, Clone)]
 pub struct ServiceMetrics {
-    pub requests_total: parking_lot::RwLock<u64>,
-    pub requests_success: parking_lot::RwLock<u64>,
-    pub requests_failed: parking_lot::RwLock<u64>,
-    pub cache_hits: parking_lot::RwLock<u64>,
-    pub cache_misses: parking_lot::RwLock<u64>,
-    pub price_updates: parking_lot::RwLock<u64>,
-    pub holder_updates: parking_lot::RwLock<u64>,
+
+    pub requests_total: Arc<AtomicU64>,
+    pub requests_success: Arc<AtomicU64>,
+    pub requests_failed: Arc<AtomicU64>,
+    pub cache_hits: Arc<AtomicU64>,
+    pub cache_misses: Arc<AtomicU64>,
+    pub price_updates: Arc<AtomicU64>,
+    pub holder_updates: Arc<AtomicU64>,
 }
 
 impl TokenService {
@@ -325,7 +331,7 @@ impl TokenService {
         config: &PriceFeedConfig,
         cache: &Arc<RwLock<PriceCache>>,
         metrics: &Arc<ServiceMetrics>,
-    ) -> Result<()> {
+    ) -> Result<(), TokenServiceError> {
         let client = reqwest::Client::new();
         
         // Fetch prices from primary API
@@ -378,12 +384,30 @@ impl TokenService {
         }
         
         // Update metrics
-        metrics.price_updates.write().inc();
+        metrics.price_updates.fetch_add(1, Ordering::Relaxed);
         
-        // Save to database
-        let cache = cache.read();
-        if let Some(last_update) = cache.last_update {
-            for (symbol, price) in &cache.prices {
+        // Save to database. Snapshot under the lock, then release it: a `parking_lot`
+        // guard held across `.await` would make the spawned task future `!Send`.
+        let snapshot: Vec<(String, f64, f64, f64, f64, DateTime<Utc>)> = {
+            let cache = cache.read();
+            cache
+                .prices
+                .iter()
+                .map(|(symbol, p)| {
+                    (
+                        symbol.clone(),
+                        p.price,
+                        p.change_24h,
+                        p.volume,
+                        p.liquidity,
+                        p.updated_at,
+                    )
+                })
+                .collect()
+        };
+
+        {
+            for (symbol, price_usd, change_24h, volume, liquidity, updated_at) in &snapshot {
                 sqlx::query(
                     "INSERT INTO token_prices (symbol, price_usd, price_change_24h, volume_24h, liquidity, updated_at)
                      VALUES ($1, $2, $3, $4, $5, $6)
@@ -395,11 +419,11 @@ impl TokenService {
                         updated_at = EXCLUDED.updated_at"
                 )
                 .bind(symbol)
-                .bind(price.price)
-                .bind(price.change_24h)
-                .bind(price.volume)
-                .bind(price.liquidity)
-                .bind(price.updated_at)
+                .bind(price_usd)
+                .bind(change_24h)
+                .bind(volume)
+                .bind(liquidity)
+                .bind(updated_at)
                 .execute(pool)
                 .await?;
             }
@@ -413,9 +437,9 @@ impl TokenService {
         pool: &PgPool,
         cache: &Arc<RwLock<HolderCache>>,
         metrics: &Arc<ServiceMetrics>,
-    ) -> Result<()> {
+    ) -> Result<(), TokenServiceError> {
         // Get all token addresses
-        let tokens: Vec<(String, String)> = sqlx::query(
+        let tokens: Vec<(String, f64)> = sqlx::query(
             "SELECT address, price_usd FROM tokens WHERE verified = true"
         )
         .fetch_all(pool)
@@ -423,21 +447,21 @@ impl TokenService {
         .into_iter()
         .map(|row| {
             (
-                row.get::<String, "_("0"),
-                row.get::<String, "_("0"),
+                row.get::<String, _>("address"),
+                row.get::<f64, _>("price_usd"),
             )
         })
         .collect();
         
         // Update holders for each token
         for (address, price) in tokens {
-            let holders = Self::fetch_holders(pool, &address, &price).await?;
+            let holders = Self::fetch_holders(pool, &address, price).await?;
             
             let mut cache = cache.write();
             cache.holders.insert(address, holders);
         }
         
-        metrics.holder_updates.write().inc();
+        metrics.holder_updates.fetch_add(1, Ordering::Relaxed);
         
         Ok(())
     }
@@ -446,9 +470,11 @@ impl TokenService {
     async fn fetch_holders(
         pool: &PgPool,
         address: &str,
-        price: &str,
-    ) -> Result<Vec<TokenHolder>> {
-        let holders: Vec<TokenHolder> = sqlx::query_as(
+        price: f64,
+    ) -> Result<Vec<TokenHolder>, TokenServiceError> {
+        // The stored `balance_usd` can lag behind the latest price, so recompute it
+        // from the raw balance before returning the holder list.
+        let holders: Vec<TokenHolder> = sqlx::query_as::<_, TokenHolder>(
             "SELECT address, balance, balance_usd, percentage, rank, first_seen, last_updated
              FROM token_holders
              WHERE token_address = $1
@@ -457,18 +483,17 @@ impl TokenService {
         )
         .bind(address)
         .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| TokenHolder {
-            address: row.0,
-            balance: row.1,
-            balance_usd: row.2,
-            percentage: row.3,
-            rank: row.4,
-            first_seen: row.5,
-            last_updated: row.6,
-        })
-        .collect();
+        .await?;
+
+        let holders = holders
+            .into_iter()
+            .map(|mut h| {
+                if let Ok(raw) = h.balance.parse::<f64>() {
+                    h.balance_usd = raw * price;
+                }
+                h
+            })
+            .collect();
     
         Ok(holders)
     }
@@ -488,9 +513,9 @@ impl TokenService {
     
     /// Get token by address
     pub async fn get_token(&self, address: &str) -> Result<Token, TokenServiceError> {
-        self.metrics.requests_total.write().inc();
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         
-        let token = sqlx::query_as(
+        let token = sqlx::query_as::<_, Token>(
             "SELECT address, name, symbol, decimals, total_supply, circulating_supply,
                     holders, transfers_24h, price_usd, price_change_24h, market_cap,
                     volume_24h, liquidity, last_updated
@@ -502,7 +527,7 @@ impl TokenService {
         .await?
         .ok_or_else(|| TokenServiceError::NotFound(address.to_string()))?;
         
-        self.metrics.requests_success.write().inc();
+        self.metrics.requests_success.fetch_add(1, Ordering::Relaxed);
         Ok(token)
     }
     
@@ -517,13 +542,13 @@ impl TokenService {
                     .map(|d| d.num_seconds() < self.config.price_feed.cache_ttl as i64)
                     .unwrap_or(false)
                 {
-                    self.metrics.cache_hits.write().inc();
+                    self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(price.price);
                 }
             }
         }
         
-        self.metrics.cache_misses.write().inc();
+        self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         
         // Fetch from database
         let price: f64 = sqlx::query_scalar(
@@ -538,21 +563,21 @@ impl TokenService {
     
     /// Get token holders
     pub async fn get_holders(&self, address: &str, limit: usize) -> Result<Vec<TokenHolder>, TokenServiceError> {
-        self.metrics.requests_total.write().inc();
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         
         // Check cache
         {
             let cache = self.holder_cache.read();
             if let Some(holders) = cache.holders.get(address) {
-                self.metrics.cache_hits.write().inc();
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(holders.iter().take(limit).cloned().collect());
             }
         }
         
-        self.metrics.cache_misses.write().inc();
+        self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         
         // Fetch from database
-        let holders: Vec<TokenHolder> = sqlx::query_as(
+        let holders: Vec<TokenHolder> = sqlx::query_as::<_, TokenHolder>(
             "SELECT address, balance, balance_usd, percentage, rank, first_seen, last_updated
              FROM token_holders
              WHERE token_address = $1
@@ -562,20 +587,9 @@ impl TokenService {
         .bind(address)
         .bind(limit as i64)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| TokenHolder {
-            address: row.0,
-            balance: row.1,
-            balance_usd: row.2,
-            percentage: row.3,
-            rank: row.4,
-            first_seen: row.5,
-            last_updated: row.6,
-        })
-        .collect();
+        .await?;
     
-        self.metrics.requests_success.write().inc();
+        self.metrics.requests_success.fetch_add(1, Ordering::Relaxed);
         Ok(holders)
     }
     
@@ -586,7 +600,7 @@ impl TokenService {
         from_block: u64,
         limit: usize,
     ) -> Result<Vec<TokenTransfer>, TokenServiceError> {
-        let transfers: Vec<TokenTransfer> = sqlx::query_as(
+        let transfers: Vec<TokenTransfer> = sqlx::query_as::<_, TokenTransfer>(
             "SELECT hash, block_number, timestamp, from, to, value, value_usd, token_id
              FROM token_transfers
              WHERE token_address = $1 AND block_number > $2
@@ -597,26 +611,14 @@ impl TokenService {
         .bind(from_block as i64)
         .bind(limit as i64)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| TokenTransfer {
-            hash: row.0,
-            block_number: row.1,
-            timestamp: row.2,
-            from: row.3,
-            to: row.4,
-            value: row.5,
-            value_usd: row.6,
-            token_id: row.7,
-        })
-        .collect();
+        .await?;
     
         Ok(transfers)
     }
     
     /// Get DEX pairs for a token
     pub async fn get_dex_pairs(&self, address: &str) -> Result<Vec<DEXPair>, TokenServiceError> {
-        let pairs: Vec<DEXPair> = sqlx::query_as(
+        let pairs: Vec<DEXPair> = sqlx::query_as::<_, DEXPair>(
             "SELECT pair_address, dex_name, token0, token1, reserve0, reserve1,
                     total_supply, volume_24h, volume_7d, fees_24h, liquidity,
                     price, price_usd
@@ -626,24 +628,7 @@ impl TokenService {
         )
         .bind(address)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| DEXPair {
-            pair_address: row.0,
-            dex_name: row.1,
-            token0: row.2,
-            token1: row.3,
-            reserve0: row.4,
-            reserve1: row.5,
-            total_supply: row.6,
-            volume_24h: row.7,
-            volume_7d: row.8,
-            fees_24h: row.9,
-            liquidity: row.10,
-            price: row.11,
-            price_usd: row.12,
-        })
-        .collect();
+        .await?;
     
         Ok(pairs)
     }
@@ -655,7 +640,7 @@ impl TokenService {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<PriceHistory>, TokenServiceError> {
-        let history: Vec<PriceHistory> = sqlx::query_as(
+        let history: Vec<PriceHistory> = sqlx::query_as::<_, PriceHistory>(
             "SELECT token_address, timestamp, price_usd, volume_24h, liquidity
              FROM price_history
              WHERE token_address = $1 AND timestamp >= $2 AND timestamp <= $3
@@ -665,16 +650,7 @@ impl TokenService {
         .bind(from)
         .bind(to)
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| PriceHistory {
-            token_address: row.0,
-            timestamp: row.1,
-            price_usd: row.2,
-            volume_24h: row.3,
-            liquidity: row.4,
-        })
-        .collect();
+        .await?;
     
         Ok(history)
     }
@@ -708,22 +684,12 @@ impl TokenService {
             interval_sql
         );
         
-        let candles: Vec<PriceCandle> = sqlx::query_as(&query)
+        let candles: Vec<PriceCandle> = sqlx::query_as::<_, PriceCandle>(&query)
             .bind(address)
             .bind(from)
             .bind(to)
             .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| PriceCandle {
-                timestamp: row.0,
-                open: row.1,
-                high: row.2,
-                low: row.3,
-                close: row.4,
-                volume: row.5,
-            })
-            .collect();
+            .await?;
     
         Ok(candles)
     }
@@ -732,13 +698,13 @@ impl TokenService {
     pub fn get_metrics(&self) -> ServiceMetricsResponse {
         let m = &*self.metrics;
         ServiceMetricsResponse {
-            requests_total: *m.requests_total.read(),
-            requests_success: *m.requests_success.read(),
-            requests_failed: *m.requests_failed.read(),
-            cache_hits: *m.cache_hits.read(),
-            cache_misses: *m.cache_misses.read(),
-            price_updates: *m.price_updates.read(),
-            holder_updates: *m.holder_updates.read(),
+            requests_total: m.requests_total.load(Ordering::Relaxed),
+            requests_success: m.requests_success.load(Ordering::Relaxed),
+            requests_failed: m.requests_failed.load(Ordering::Relaxed),
+            cache_hits: m.cache_hits.load(Ordering::Relaxed),
+            cache_misses: m.cache_misses.load(Ordering::Relaxed),
+            price_updates: m.price_updates.load(Ordering::Relaxed),
+            holder_updates: m.holder_updates.load(Ordering::Relaxed),
         }
     }
     

@@ -1,6 +1,7 @@
 //! TigerScan DeFi Analytics Service
 //! Production-grade Rust service for protocol TVL, DEX volumes, lending rates, pool analytics
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{error, info};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // ============================================================================
 // Error Types
@@ -39,7 +41,7 @@ pub enum DefiServiceError {
 // ============================================================================
 
 /// DeFi Protocol
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DefiProtocol {
     pub id: String,
     pub name: String,
@@ -50,14 +52,16 @@ pub struct DefiProtocol {
     pub tvl: f64,
     pub tvl_change_24h: f64,
     pub volume_24h: f64,
+    #[sqlx(try_from = "i64")]
     pub users_24h: u64,
+    #[sqlx(try_from = "i64")]
     pub active_positions: u64,
     pub verified: bool,
     pub listed_at: DateTime<Utc>,
 }
 
 /// DEX Pool
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DefiPool {
     pub id: String,
     pub protocol: String,
@@ -130,32 +134,37 @@ pub struct TokenTVL {
 }
 
 /// Volume Data
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct VolumeData {
     pub timestamp: DateTime<Utc>,
     pub volume: f64,
+    #[sqlx(try_from = "i64")]
     pub transactions: u64,
+    #[sqlx(try_from = "i64")]
     pub users: u64,
 }
 
 /// Flash Loan Alert
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct FlashLoanAlert {
     pub transaction_hash: String,
+    #[sqlx(try_from = "i64")]
     pub block_number: u64,
     pub timestamp: DateTime<Utc>,
     pub pool: String,
     pub token: String,
     pub amount: f64,
     pub profit: f64,
+    #[sqlx(try_from = "i64")]
     pub gas_used: u64,
     pub gas_fee: f64,
 }
 
 /// Whale Transaction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct WhaleTransaction {
     pub hash: String,
+    #[sqlx(try_from = "i64")]
     pub block_number: u64,
     pub timestamp: DateTime<Utc>,
     pub from: String,
@@ -232,11 +241,11 @@ pub struct DefiService {
 
 #[derive(Default)]
 pub struct ServiceMetrics {
-    pub tvl_updates: parking_lot::RwLock<u64>,
-    pub pool_updates: parking_lot::RwLock<u64>,
-    pub flash_loan_alerts: parking_lot::RwLock<u64>,
-    pub whale_alerts: parking_lot::RwLock<u64>,
-    pub errors: parking_lot::RwLock<u64>,
+    pub tvl_updates: AtomicU64,
+    pub pool_updates: AtomicU64,
+    pub flash_loan_alerts: AtomicU64,
+    pub whale_alerts: AtomicU64,
+    pub errors: AtomicU64,
 }
 
 impl DefiService {
@@ -455,8 +464,8 @@ impl DefiService {
         
         *tvl_cache.write() = Some(data_point);
         
-        metrics.tvl_updates.write().inc();
-        metrics.pool_updates.write().inc();
+        metrics.tvl_updates.fetch_add(1, Ordering::Relaxed);
+        metrics.pool_updates.fetch_add(1, Ordering::Relaxed);
         
         Ok(())
     }
@@ -468,13 +477,13 @@ impl DefiService {
         metrics: &Arc<ServiceMetrics>,
     ) -> Result<()> {
         // Get recent large transactions
-        let transactions: Vec<(String, u64, String, String, f64)> = sqlx::query(
+        let transactions: Vec<(String, i64, String, String, f64)> = sqlx::query(
             "SELECT hash, block_number, from_address, to_address, value_usd
              FROM transactions
              WHERE block_number > (SELECT MAX(block_number) FROM blocks) - 10
              AND value_usd > $1"
         )
-        .bind(config.flash_loan_threshold)
+        .bind(config.flash_loan_threshold as i64)
         .fetch_all(pool)
         .await?
         .into_iter()
@@ -482,6 +491,7 @@ impl DefiService {
         .collect();
         
         for (hash, block, from, to, value) in transactions {
+            let block = block as u64;
             // Check if it looks like a flash loan
             // In production, check for:
             // 1. Borrow and repay in same block
@@ -506,18 +516,18 @@ impl DefiService {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
             )
             .bind(&alert.transaction_hash)
-            .bind(alert.block_number)
+            .bind(alert.block_number as i64)
             .bind(alert.timestamp)
             .bind(&alert.pool)
             .bind(&alert.token)
             .bind(alert.amount)
             .bind(alert.profit)
-            .bind(alert.gas_used)
+            .bind(alert.gas_used as i64)
             .bind(alert.gas_fee)
             .execute(pool)
             .await?;
             
-            metrics.flash_loan_alerts.write().inc();
+            metrics.flash_loan_alerts.fetch_add(1, Ordering::Relaxed);
         }
         
         Ok(())
@@ -529,7 +539,7 @@ impl DefiService {
         config: &DefiConfig,
         metrics: &Arc<ServiceMetrics>,
     ) -> Result<()> {
-        let transactions: Vec<(String, u64, String, String, String, f64)> = sqlx::query(
+        let transactions: Vec<(String, i64, String, String, String, f64)> = sqlx::query(
             "SELECT hash, block_number, from_address, to_address, token, value_usd
              FROM token_transfers
              WHERE value_usd > $1
@@ -545,6 +555,7 @@ impl DefiService {
         .collect();
         
         for (hash, block, from, to, token, value) in transactions {
+            let block = block as u64;
             let whale = WhaleTransaction {
                 hash,
                 block_number: block,
@@ -561,7 +572,7 @@ impl DefiService {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
             )
             .bind(&whale.hash)
-            .bind(whale.block_number)
+            .bind(whale.block_number as i64)
             .bind(whale.timestamp)
             .bind(&whale.from)
             .bind(&whale.to)
@@ -571,7 +582,7 @@ impl DefiService {
             .execute(pool)
             .await?;
             
-            metrics.whale_alerts.write().inc();
+            metrics.whale_alerts.fetch_add(1, Ordering::Relaxed);
         }
         
         Ok(())
@@ -679,11 +690,11 @@ impl DefiService {
     pub fn get_metrics(&self) -> ServiceMetricsResponse {
         let m = &*self.metrics;
         ServiceMetricsResponse {
-            tvl_updates: *m.tvl_updates.read(),
-            pool_updates: *m.pool_updates.read(),
-            flash_loan_alerts: *m.flash_loan_alerts.read(),
-            whale_alerts: *m.whale_alerts.read(),
-            errors: *m.errors.read(),
+            tvl_updates: m.tvl_updates.load(Ordering::Relaxed),
+            pool_updates: m.pool_updates.load(Ordering::Relaxed),
+            flash_loan_alerts: m.flash_loan_alerts.load(Ordering::Relaxed),
+            whale_alerts: m.whale_alerts.load(Ordering::Relaxed),
+            errors: m.errors.load(Ordering::Relaxed),
         }
     }
     
