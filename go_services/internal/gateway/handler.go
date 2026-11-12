@@ -538,10 +538,13 @@ func (h *Handler) HandleWebSocket(c *gin.Context) {
 // LoadConfig loads configuration from environment
 func LoadConfig() Config {
 	return Config{
-		Port:           getEnv("PORT", "8080"),
-		RedisURL:       getEnv("REDIS_URL", "localhost:6379"),
-		DatabaseURL:    getEnv("DATABASE_URL", "postgres://localhost:5432/tigerscan"),
-		RPCHTTPURL:     getEnv("RPC_HTTP_URL", "https://bsc-dataseed1.binance.org"),
+		Port:        getEnv("PORT", "8080"),
+		RedisURL:    getEnv("REDIS_URL", "localhost:6379"),
+		DatabaseURL: getEnv("DATABASE_URL", "postgres://localhost:5432/tigerscan"),
+		// The node's own JSON-RPC listener (node/src/config.rs defaults to
+		// :8545). Pointing this at a third-party network would make the
+		// explorer report another chain's data under this chain's name.
+		RPCHTTPURL:     getEnv("RPC_HTTP_URL", "http://127.0.0.1:8545"),
 		RateLimitRPS:   100,
 		RateLimitBurst: 200,
 	}

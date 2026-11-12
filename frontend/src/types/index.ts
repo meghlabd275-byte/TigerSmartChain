@@ -198,6 +198,12 @@ export interface Contract {
   license?: string
   isProxy?: boolean
   implementationAddress?: string
+  // Columns the verified-contracts listing returns from the contracts table.
+  contractName?: string
+  compiler?: string
+  evmVersion?: string
+  licenseType?: string
+  verifiedAt?: string
 }
 
 // Analytics Types

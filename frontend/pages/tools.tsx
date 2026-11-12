@@ -1,55 +1,178 @@
 /**
- * TigerScan - Developer Tools Page
- * 
- * Tools: Gas Calculator, ABI Encoder, Signature Lookup, etc.
+ * TigerScan - Developer Tools
+ *
+ * Three tools, all backed by the gateway rather than by tables in this file:
+ * a gas cost calculator priced off the live native rate, a keccak256 signature
+ * lookup, and an ABI call encoder.
  */
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Head from 'next/head';
-import { Box, Container, Grid, Card, CardContent, Typography, TextField, Button, Tabs, Tab, Paper, Divider, Alert, Table, TableBody, TableCell, TableHead, TableRow } from '@mui/material';
-import { Code, Calculate, Search, Description } from '@mui/icons-material';
+import {
+  Box, Container, Card, CardContent, Typography, TextField, Button, Tabs, Tab,
+  Paper, Divider, Alert,
+  InputAdornment, CircularProgress, Chip, IconButton, Tooltip,
+} from '@mui/material';
+import { Code, Calculate, Search, Description, ContentCopy, Check } from '@mui/icons-material';
+import api from '@/lib/api';
 
-const COMMON_SIGNATURES: Record<string, string> = {
-  '0xa9059cbb': 'ERC20 transfer(address,uint256)',
-  '0x23b872dd': 'ERC20 transferFrom(address,address,uint256)',
-  '0x095ea7b3': 'ERC20 approve(address,uint256)',
-  '0x40c10f19': 'ERC20 mint(address,uint256)',
-  '0x2e1a7d4d': 'ERC20 burn(uint256)',
-  '0x42842e0e': 'ERC721 safeTransferFrom(address,address,uint256)',
-  '0xb88d4fde': 'ERC721 safeTransferFrom(address,address,uint256,bytes)',
-  '0xf242432a': 'ERC1155 safeTransferFrom(address,address,uint256,uint256,bytes)',
-  '0x2eb2c2d6': 'ERC1155 safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)',
-};
+interface SignatureResult {
+  signature: string;
+  kind: string;
+  selector?: string;
+  topic?: string;
+}
 
 export default function ToolsPage() {
   const [tab, setTab] = useState(0);
-  const [gasPrice, setGasPrice] = useState('20');
+
+  // Gas calculator
+  const [gasPrice, setGasPrice] = useState('');
   const [gasLimit, setGasLimit] = useState('21000');
-  const [calculatedGas, setCalculatedGas] = useState<{total: string; usd: string} | null>(null);
-  const [signature, setSignature] = useState('');
-  const [signatureResult, setSignatureResult] = useState<string | null>(null);
-  const [abiInput, setAbiInput] = useState('');
-  const [abiOutput, setAbiOutput] = useState('');
-  
-  const calculateGas = () => {
-    const price = parseFloat(gasPrice) * 1e9;
-    const limit = parseFloat(gasLimit);
-    const total = (price * limit) / 1e18;
-    const usd = total * 3000;
-    setCalculatedGas({ total: total.toFixed(6), usd: usd.toFixed(2) });
+  const [gasResult, setGasResult] = useState<{ costNative: string; costUsd: string; symbol: string } | null>(null);
+  const [gasError, setGasError] = useState<string | null>(null);
+  const [nativeSymbol, setNativeSymbol] = useState('TGR');
+  const [gasPriceLoading, setGasPriceLoading] = useState(true);
+
+  // Signature lookup
+  const [signatureInput, setSignatureInput] = useState('');
+  const [signatureKind, setSignatureKind] = useState<'function' | 'event'>('function');
+  const [signatureResult, setSignatureResult] = useState<SignatureResult | null>(null);
+  const [signatureError, setSignatureError] = useState<string | null>(null);
+  const [signatureLoading, setSignatureLoading] = useState(false);
+
+  // ABI encoder
+  const [encodeSignature, setEncodeSignature] = useState('');
+  const [encodeArgs, setEncodeArgs] = useState('');
+  const [encodeResult, setEncodeResult] = useState<{ selector: string; calldata: string } | null>(null);
+  const [encodeError, setEncodeError] = useState<string | null>(null);
+  const [encodeLoading, setEncodeLoading] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // Seed the gas price from the live oracle rather than a fixed 20 gwei.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setGasPriceLoading(true);
+      try {
+        const oracle = await api.getGasOracle();
+        if (!cancelled) {
+          setGasPrice(oracle.standard || oracle.slow || '');
+        }
+      } catch {
+        if (!cancelled) setGasError('Could not read the current gas price. Enter one manually.');
+      } finally {
+        if (!cancelled) setGasPriceLoading(false);
+      }
+    };
+    load();
+
+    api.getNativePrice()
+      .then((p) => { if (!cancelled && p?.symbol) setNativeSymbol(p.symbol); })
+      .catch(() => { /* keep the default label */ });
+
+    return () => { cancelled = true; };
+  }, []);
+
+  // Cost = gasPrice(wei) * gasLimit, expressed in the native coin. The USD
+  // figure comes from the live native price; when that is unavailable the cost
+  // is shown in the native coin only rather than converted at a made-up rate.
+  const calculateGas = useCallback(async () => {
+    setGasError(null);
+    setGasResult(null);
+
+    const priceGwei = Number(gasPrice);
+    const limit = Number(gasLimit);
+    if (!Number.isFinite(priceGwei) || priceGwei < 0) {
+      setGasError('Gas price must be a non-negative number.');
+      return;
+    }
+    if (!Number.isFinite(limit) || limit <= 0) {
+      setGasError('Gas limit must be a positive number.');
+      return;
+    }
+
+    const costNative = (priceGwei * 1e-9) * limit;
+
+    let costUsd = '';
+    try {
+      const native = await api.getNativePrice();
+      const usd = Number(native.priceUsd);
+      if (Number.isFinite(usd) && usd > 0) {
+        costUsd = (costNative * usd).toFixed(2);
+      }
+    } catch {
+      // No indexed price yet: report the native amount and say why there is no
+      // dollar figure.
+      setGasError('Native coin price is not indexed yet, so no USD estimate is shown.');
+    }
+
+    setGasResult({
+      costNative: costNative.toFixed(9),
+      costUsd,
+      symbol: nativeSymbol,
+    });
+  }, [gasPrice, gasLimit, nativeSymbol]);
+
+  const lookupSignature = useCallback(async () => {
+    setSignatureLoading(true);
+    setSignatureError(null);
+    setSignatureResult(null);
+    try {
+      const result = await api.computeSignature(signatureInput, signatureKind);
+      setSignatureResult(result);
+    } catch (err: any) {
+      setSignatureError(err?.response?.data?.error || 'Could not compute the hash for that signature.');
+    } finally {
+      setSignatureLoading(false);
+    }
+  }, [signatureInput, signatureKind]);
+
+  const encodeCall = useCallback(async () => {
+    setEncodeLoading(true);
+    setEncodeError(null);
+    setEncodeResult(null);
+    try {
+      // Arguments are entered as a JSON array so each one keeps its type: a
+      // uint256 has to stay a string, and an address has to stay quoted.
+      let args: unknown[];
+      const trimmed = encodeArgs.trim();
+      if (trimmed === '') {
+        args = [];
+      } else {
+        try {
+          const parsed = JSON.parse(trimmed);
+          args = Array.isArray(parsed) ? parsed : [parsed];
+        } catch {
+          setEncodeError('Arguments must be a JSON array, e.g. ["0xabc...", "1000000000000000000"]');
+          setEncodeLoading(false);
+          return;
+        }
+      }
+      const result = await api.encodeCall(encodeSignature, args);
+      setEncodeResult({ selector: result.selector, calldata: result.calldata });
+    } catch (err: any) {
+      setEncodeError(err?.response?.data?.error || 'Could not encode that call.');
+    } finally {
+      setEncodeLoading(false);
+    }
+  }, [encodeSignature, encodeArgs]);
+
+  const copy = async (text: string) => {
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
   };
-  
-  const lookupSignature = () => {
-    const result = COMMON_SIGNATURES[signature.toLowerCase()] || 'Unknown function signature';
-    setSignatureResult(result);
-  };
-  
+
   return (
     <>
       <Head><title>Developer Tools | TigerScan</title></Head>
       <Container maxWidth="lg" sx={{ py: 4 }}>
-        <Typography variant="h4" gutterBottom><Code sx={{ mr: 1, verticalAlign: 'middle' }} />Developer Tools</Typography>
-        
+        <Typography variant="h4" gutterBottom>
+          <Code sx={{ mr: 1, verticalAlign: 'middle' }} />
+          Developer Tools
+        </Typography>
+
         <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 3 }}>
           <Tabs value={tab} onChange={(_, v) => setTab(v)}>
             <Tab icon={<Calculate />} label="Gas Calculator" />
@@ -57,75 +180,167 @@ export default function ToolsPage() {
             <Tab icon={<Description />} label="ABI Encoder" />
           </Tabs>
         </Box>
-        
-        {/* Gas Calculator */}
+
         {tab === 0 && (
           <Card>
             <CardContent>
               <Typography variant="h6" gutterBottom>Gas Calculator</Typography>
               <Divider sx={{ my: 2 }} />
-              <Grid container spacing={3}>
-                <Grid item xs={12} md={6}>
-                  <TextField fullWidth label="Gas Price (Gwei)" value={gasPrice} onChange={(e) => setGasPrice(e.target.value)} helperText="Current network gas price" />
-                </Grid>
-                <Grid item xs={12} md={6}>
-                  <TextField fullWidth label="Gas Limit" value={gasLimit} onChange={(e) => setGasLimit(e.target.value)} helperText="Estimated gas for transaction" />
-                </Grid>
-                <Grid item xs={12}>
-                  <Button variant="contained" size="large" onClick={calculateGas}>Calculate</Button>
-                </Grid>
-                {calculatedGas && (
-                  <Grid item xs={12}>
-                    <Alert severity="success">
-                      <Typography variant="h6">Total Gas Cost: {calculatedGas.total} ETH (${calculatedGas.usd} USD)</Typography>
-                    </Alert>
-                  </Grid>
-                )}
-              </Grid>
+              <Box sx={{ display: 'grid', gap: 3, gridTemplateColumns: { md: '1fr 1fr' } }}>
+                <TextField
+                  fullWidth
+                  label="Gas Price (Gwei)"
+                  value={gasPrice}
+                  onChange={(e) => setGasPrice(e.target.value)}
+                  disabled={gasPriceLoading}
+                  helperText={gasPriceLoading ? 'Reading the current gas price...' : 'Prefilled from the live gas oracle'}
+                />
+                <TextField
+                  fullWidth
+                  label="Gas Limit"
+                  value={gasLimit}
+                  onChange={(e) => setGasLimit(e.target.value)}
+                  helperText="21000 for a plain transfer"
+                />
+              </Box>
+              <Button variant="contained" size="large" sx={{ mt: 3 }} onClick={calculateGas}>
+                Calculate
+              </Button>
+
+              {gasError && <Alert severity="info" sx={{ mt: 3 }}>{gasError}</Alert>}
+
+              {gasResult && (
+                <Alert severity="success" sx={{ mt: 3 }}>
+                  <Typography variant="h6">
+                    {gasResult.costNative} {gasResult.symbol}
+                    {gasResult.costUsd && ` ($${gasResult.costUsd} USD)`}
+                  </Typography>
+                </Alert>
+              )}
             </CardContent>
           </Card>
         )}
-        
-        {/* Signature Lookup */}
+
         {tab === 1 && (
           <Card>
             <CardContent>
-              <Typography variant="h6" gutterBottom>Function Signature Lookup</Typography>
+              <Typography variant="h6" gutterBottom>Signature Hash</Typography>
+              <Typography variant="body2" color="text.secondary" gutterBottom>
+                keccak256 of the canonical signature. Functions give a 4-byte selector;
+                events give a 32-byte topic0.
+              </Typography>
               <Divider sx={{ my: 2 }} />
-              <TextField fullWidth label="Function Signature (4 bytes)" value={signature} onChange={(e) => setSignature(e.target.value)} placeholder="e.g., 0xa9059cbb" sx={{ mb: 2 }} />
-              <Button variant="contained" onClick={lookupSignature}>Lookup</Button>
+
+              <Box sx={{ display: 'flex', gap: 2, mb: 2, alignItems: 'center' }}>
+                <Button
+                  variant={signatureKind === 'function' ? 'contained' : 'outlined'}
+                  onClick={() => setSignatureKind('function')}
+                >
+                  Function
+                </Button>
+                <Button
+                  variant={signatureKind === 'event' ? 'contained' : 'outlined'}
+                  onClick={() => setSignatureKind('event')}
+                >
+                  Event
+                </Button>
+              </Box>
+
+              <TextField
+                fullWidth
+                label={signatureKind === 'function' ? 'Function signature' : 'Event signature'}
+                value={signatureInput}
+                onChange={(e) => setSignatureInput(e.target.value)}
+                placeholder={signatureKind === 'function'
+                  ? 'transfer(address,uint256)'
+                  : 'Transfer(address,address,uint256)'}
+                InputProps={{
+                  startAdornment: <InputAdornment position="start"><Search /></InputAdornment>,
+                }}
+                onKeyDown={(e) => { if (e.key === 'Enter') lookupSignature(); }}
+                sx={{ mb: 2 }}
+              />
+              <Button variant="contained" onClick={lookupSignature} disabled={signatureLoading}>
+                {signatureLoading ? <CircularProgress size={20} /> : 'Compute hash'}
+              </Button>
+
+              {signatureError && <Alert severity="error" sx={{ mt: 2 }}>{signatureError}</Alert>}
+
               {signatureResult && (
-                <Alert severity="info" sx={{ mt: 2 }}>
-                  <Typography variant="body1">{signatureResult}</Typography>
-                </Alert>
+                <Paper variant="outlined" sx={{ p: 2, mt: 2 }}>
+                  <Typography variant="caption" color="text.secondary">Canonical signature</Typography>
+                  <Typography variant="body1" sx={{ fontFamily: 'monospace', mb: 1 }}>
+                    {signatureResult.signature}
+                  </Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    {signatureResult.selector ? 'Selector (4 bytes)' : 'Topic0 (32 bytes)'}
+                  </Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Typography variant="body2" sx={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                      {signatureResult.selector || signatureResult.topic}
+                    </Typography>
+                    <Tooltip title={copied ? 'Copied' : 'Copy'}>
+                      <IconButton size="small" onClick={() => copy(signatureResult.selector || signatureResult.topic || '')}>
+                        {copied ? <Check fontSize="small" /> : <ContentCopy fontSize="small" />}
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+                </Paper>
               )}
-              <Divider sx={{ my: 3 }} />
-              <Typography variant="subtitle2" gutterBottom>Common Signatures</Typography>
-              <Table size="small">
-                <TableHead><TableRow><TableCell>Signature</TableCell><TableCell>Function</TableCell></TableRow></TableHead>
-                <TableBody>
-                  {Object.entries(COMMON_SIGNATURES).map(([sig, name]) => (
-                    <TableRow key={sig} sx={{ cursor: 'pointer' }} onClick={() => { setSignature(sig); lookupSignature(); }}>
-                      <TableCell sx={{ fontFamily: 'monospace' }}>{sig}</TableCell><TableCell>{name}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
             </CardContent>
           </Card>
         )}
-        
-        {/* ABI Encoder */}
+
         {tab === 2 && (
           <Card>
             <CardContent>
-              <Typography variant="h6" gutterBottom>ABI Encoder</Typography>
+              <Typography variant="h6" gutterBottom>ABI Call Encoder</Typography>
+              <Typography variant="body2" color="text.secondary" gutterBottom>
+                The selector followed by the ABI-encoded arguments.
+              </Typography>
               <Divider sx={{ my: 2 }} />
-              <TextField fullWidth multiline rows={6} label="JSON ABI" value={abiInput} onChange={(e) => setAbiInput(e.target.value)} placeholder='[{"name": "transfer", "type": "function", "inputs": [{"name": "to", "type": "address"}, {"name": "value", "type": "uint256"}]}]' sx={{ mb: 2 }} />
-              <Button variant="contained" onClick={() => setAbiOutput('Encoded data would appear here...')}>Encode</Button>
-              {abiOutput && (
+
+              <TextField
+                fullWidth
+                label="Function signature"
+                value={encodeSignature}
+                onChange={(e) => setEncodeSignature(e.target.value)}
+                placeholder="transfer(address,uint256)"
+                sx={{ mb: 2 }}
+              />
+              <TextField
+                fullWidth
+                multiline
+                rows={3}
+                label="Arguments (JSON array, in order)"
+                value={encodeArgs}
+                onChange={(e) => setEncodeArgs(e.target.value)}
+                placeholder='["0x000000000000000000000000000000000000dEaD", "1000000000000000000"]'
+                helperText="Large integers must be quoted strings so they keep full precision."
+                sx={{ mb: 2 }}
+              />
+              <Button variant="contained" onClick={encodeCall} disabled={encodeLoading}>
+                {encodeLoading ? <CircularProgress size={20} /> : 'Encode'}
+              </Button>
+
+              {encodeError && <Alert severity="error" sx={{ mt: 2 }}>{encodeError}</Alert>}
+
+              {encodeResult && (
                 <Paper variant="outlined" sx={{ p: 2, mt: 2 }}>
-                  <Typography variant="body2" sx={{ fontFamily: 'monospace', wordBreak: 'break-all' }}>{abiOutput}</Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                    <Chip label={`selector ${encodeResult.selector}`} size="small" />
+                  </Box>
+                  <Typography variant="caption" color="text.secondary">Calldata</Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 1 }}>
+                    <Typography variant="body2" sx={{ fontFamily: 'monospace', wordBreak: 'break-all', flex: 1 }}>
+                      {encodeResult.calldata}
+                    </Typography>
+                    <Tooltip title={copied ? 'Copied' : 'Copy'}>
+                      <IconButton size="small" onClick={() => copy(encodeResult.calldata)}>
+                        {copied ? <Check fontSize="small" /> : <ContentCopy fontSize="small" />}
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
                 </Paper>
               )}
             </CardContent>

@@ -651,6 +651,28 @@ CREATE INDEX IF NOT EXISTS idx_token_prices_time ON token_prices(timestamp DESC)
 CREATE INDEX IF NOT EXISTS idx_token_prices_composite ON token_prices(token_address, timestamp DESC);
 
 -- ============================================================================
+-- FUNCTION SIGNATURES
+-- ============================================================================
+
+-- Selectors (4 bytes) for functions and topic0 hashes (32 bytes) for events,
+-- both derived from keccak256 over the canonical signature. The `selector`
+-- column is wide enough for either. Rows with source 'canonical' are computed
+-- by the gateway at startup; rows with source 'abi' are learned from verified
+-- contract ABIs by the indexer.
+CREATE TABLE IF NOT EXISTS function_signatures (
+    id BIGSERIAL PRIMARY KEY,
+    selector VARCHAR(66) NOT NULL UNIQUE,
+    signature VARCHAR(512) NOT NULL,
+    kind VARCHAR(16) NOT NULL DEFAULT 'function',
+    source VARCHAR(32) NOT NULL DEFAULT 'abi',
+    contract_address VARCHAR(42),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_function_signatures_signature ON function_signatures(signature);
+CREATE INDEX IF NOT EXISTS idx_function_signatures_kind ON function_signatures(kind);
+
+-- ============================================================================
 -- GAS PRICES
 -- ============================================================================
 

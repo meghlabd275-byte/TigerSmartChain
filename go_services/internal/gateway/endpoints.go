@@ -170,6 +170,14 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 
 	// ==================== GAS (10 endpoints) ====================
 	api.GET("/gas/oracle", h.GetGasOracle)
+	api.GET("/gas/native-price", h.GetNativePrice)
+
+	// Developer tools. Selectors and event topics are computed from keccak256
+	// rather than read from a table, so they cannot be wrong.
+	api.GET("/tools/signature/:selector", h.GetSignature)
+	api.POST("/tools/signature", h.ComputeSignature)
+	api.POST("/tools/encode-call", h.EncodeCall)
+	api.POST("/tools/encode-event-topic", h.EncodeEventTopic)
 	api.GET("/gas/history", h.GetGasHistory)
 	api.GET("/gas/estimated", h.GetEstimatedGas)
 	api.GET("/gas/recommendation", h.GetGasRecommendation)
@@ -573,6 +581,37 @@ func (h *Handler) GetTokenPrice(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"price": rowValue(row, "price_usd")})
 }
+
+// GetNativePrice reports the USD price of the chain's native coin. Callers
+// that need to show a cost in both TGR and dollars read it from here rather
+// than carrying a hardcoded rate.
+func (h *Handler) GetNativePrice(c *gin.Context) {
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `
+		SELECT address, symbol, name, price_usd, price_change_24h
+		FROM tokens
+		WHERE is_native = true
+		ORDER BY id
+		LIMIT 1
+	`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	if row == nil {
+		// No native row indexed yet. Report that rather than inventing a rate.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "native coin price not indexed yet"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"address":        rowValue(row, "address"),
+		"symbol":         rowValue(row, "symbol"),
+		"name":           rowValue(row, "name"),
+		"priceUsd":       rowValue(row, "price_usd"),
+		"priceChange24h": rowValue(row, "price_change_24h"),
+	})
+}
+
 func (h *Handler) GetTokenMarketCap(c *gin.Context) {
 	ctx := c.Request.Context()
 	token := c.Param("address")

@@ -304,6 +304,35 @@ class APIClient {
     return data
   }
 
+  // Developer tools. Selectors and event topics are computed server-side from
+  // keccak256, so the client never carries a table that can go stale.
+  async computeSignature(signature: string, kind: 'function' | 'event' = 'function'):
+    Promise<{ signature: string; kind: string; selector?: string; topic?: string }> {
+    const { data } = await this.client.post('/tools/signature', { signature, kind })
+    return data
+  }
+
+  async lookupSignature(selector: string): Promise<{ selector: string; signature: string; source: string }> {
+    const { data } = await this.client.get(`/tools/signature/${encodeURIComponent(selector)}`)
+    return data
+  }
+
+  async encodeCall(signature: string, args: unknown[]):
+    Promise<{ signature: string; selector: string; calldata: string }> {
+    const { data } = await this.client.post('/tools/encode-call', { signature, args })
+    return data
+  }
+
+  async encodeEventTopic(signature: string): Promise<{ signature: string; topic0: string }> {
+    const { data } = await this.client.post('/tools/encode-event-topic', { signature })
+    return data
+  }
+
+  async getNativePrice(): Promise<{ symbol: string; name: string; priceUsd: string; priceChange24h: string }> {
+    const { data } = await this.client.get('/gas/native-price')
+    return data
+  }
+
   // Contract APIs
   async getContract(address: string): Promise<Contract> {
     const { data } = await this.client.get<Contract>(`/contracts/${address}`)
