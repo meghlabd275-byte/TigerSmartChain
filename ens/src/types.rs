@@ -36,44 +36,37 @@ pub enum EnsError {
 // NAMEHASH
 // =============================================================================
 
-/// ENS namehash algorithm for generating unique hashes from domain names
+/// EIP-137 namehash.
+///
+/// `node = keccak256(node || keccak256(label))`, applied to each label from the
+/// right, starting from 32 zero bytes. The previous implementation used
+/// `DefaultHasher` (SipHash) with a `0` byte separator, which is not the
+/// standard and produced a different hash from every other ENS implementation.
 pub fn namehash(name: &str) -> Vec<u8> {
+    let mut node = [0u8; 32];
+
     if name.is_empty() {
-        return vec![0u8; 32];
+        return node.to_vec();
     }
-    
-    // Split name by dots
-    let labels: Vec<&str> = name.split('.').collect();
-    
-    // Start with empty hash
-    let mut hash = vec![0u8; 32];
-    
-    // Process from end to start
-    for label in labels.iter().rev() {
-        // Label + existing hash
-        let mut data = label.as_bytes().to_vec();
-        data.push(0); // null separator
-        data.extend_from_slice(&hash);
-        
-        // Simple hash for demo - in production use SHA-256
-        hash = simple_hash(&data);
+
+    for label in name.split('.').rev() {
+        let label_hash = keccak256(label.as_bytes());
+        let mut data = [0u8; 64];
+        data[..32].copy_from_slice(&node);
+        data[32..].copy_from_slice(&label_hash);
+        node = keccak256(&data);
     }
-    
-    hash
+
+    node.to_vec()
 }
 
-/// Simple hash function
-fn simple_hash(data: &[u8]) -> Vec<u8> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    let hash = hasher.finish().to_le_bytes();
-    let mut result = [0u8; 32];
-    for (i, byte) in hash.iter().enumerate() {
-        result[i % 32] ^= byte;
-    }
-    result.to_vec()
+/// Keccak-256, the hash ENS and Ethereum use.
+pub fn keccak256(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let digest = Keccak256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 // =============================================================================
@@ -81,7 +74,7 @@ fn simple_hash(data: &[u8]) -> Vec<u8> {
 // =============================================================================
 
 /// ENS Record Types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecordType {
     #[serde(rename = "addr")]
     Addr,
@@ -254,7 +247,8 @@ impl Resolver {
                 RecordType::Abi,
                 RecordType::PubKey,
             ],
-            chain_id: 1, // Ethereum mainnet
+            // Records resolve against this chain's resolver, not mainnet's.
+            chain_id: crate::CHAIN_ID,
         }
     }
 
