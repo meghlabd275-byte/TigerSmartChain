@@ -625,18 +625,32 @@ class APIClient {
     return data
   }
 
-  async getMaliciousContracts(params?: { page?: number; limit?: number }): Promise<any[]> {
-    const { data } = await this.client.get<any[]>('/security/malicious-contracts', { params })
+  async getMaliciousContracts(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/security/malicious-contracts', { params })
     return data
   }
 
-  async getPhishingURLs(params?: { page?: number; limit?: number }): Promise<any[]> {
-    const { data } = await this.client.get<any[]>('/security/phishing-urls', { params })
+  async getPhishingURLs(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/security/phishing-urls', { params })
     return data
   }
 
-  async getScamTokens(params?: { page?: number; limit?: number }): Promise<any[]> {
-    const { data } = await this.client.get<any[]>('/security/scam-tokens', { params })
+  async getScamTokens(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/security/scam-tokens', { params })
+    return data
+  }
+
+  // Security centre aggregates: threat counts and this chain's own
+  // verification coverage.
+  async getSecurityOverview(): Promise<Record<string, any>> {
+    const { data } = await this.client.get('/security/overview')
+    return data
+  }
+
+  async getSecurityThreatSeries(params?: { days?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/security/threat-series', { params }
+    )
     return data
   }
 

@@ -336,6 +336,8 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 
 	// ==================== SECURITY (5 endpoints) ====================
 	api.GET("/security/stats", h.GetSecurityStats)
+	api.GET("/security/overview", h.GetSecurityOverview)
+	api.GET("/security/threat-series", h.GetSecurityThreatSeries)
 	api.GET("/security/malicious-contracts", h.GetMaliciousContracts)
 	api.GET("/security/phishing-urls", h.GetPhishingURLs)
 	api.GET("/security/scam-tokens", h.GetScamTokens)
