@@ -22,7 +22,12 @@ import type {
   InternalTransaction,
 } from '@/types'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'
+// The gateway registers every route under /api/v1 (see
+// go_services/internal/gateway/endpoints.go). Requests have to carry that
+// prefix, so it is appended here rather than at each call site. A deployment
+// that already includes the prefix in NEXT_PUBLIC_API_URL is left alone.
+const API_ROOT = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080').replace(/\/+$/, '')
+const API_URL = /\/api\/v1$/.test(API_ROOT) ? API_ROOT : `${API_ROOT}/api/v1`
 
 class APIClient {
   private client: AxiosInstance
@@ -168,8 +173,16 @@ class APIClient {
     return data
   }
 
-  async getNFTOwners(collectionAddress: string, tokenId: string): Promise<string[]> {
-    const { data } = await this.client.get<string[]>(`/nfts/${collectionAddress}/tokens/${tokenId}/owners`)
+  // The gateway exposes owners per collection (/nfts/:address/owners), not per
+  // token id, and returns rows rather than bare addresses.
+  async getNFTOwners(collectionAddress: string, params?: {
+    page?: number
+    limit?: number
+  }): Promise<{ token_id: string; owner: string }[]> {
+    const { data } = await this.client.get<{ token_id: string; owner: string }[]>(
+      `/nfts/${collectionAddress}/owners`,
+      { params }
+    )
     return data
   }
 
@@ -323,7 +336,7 @@ class APIClient {
   }
 
   async getStateDiff(txHash: string): Promise<any> {
-    const { data } = await this.client.get<any>(`/state-diff/${txHash}`)
+    const { data } = await this.client.get<any>(`/txs/${txHash}/state-diff`)
     return data
   }
 
