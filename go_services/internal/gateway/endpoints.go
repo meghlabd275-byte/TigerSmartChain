@@ -303,6 +303,32 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	api.GET("/watchlist", h.GetWatchlist)
 	api.DELETE("/watchlist/:address", h.RemoveFromWatchlist)
 	api.PUT("/watchlist/:address", h.UpdateWatchlistItem)
+
+	// ==================== WHALES (2 endpoints) ====================
+	api.GET("/whales", h.GetWhales)
+	api.GET("/whales/:address", h.GetWhalesByAddress)
+
+	// ==================== SECURITY (5 endpoints) ====================
+	api.GET("/security/stats", h.GetSecurityStats)
+	api.GET("/security/malicious-contracts", h.GetMaliciousContracts)
+	api.GET("/security/phishing-urls", h.GetPhishingURLs)
+	api.GET("/security/scam-tokens", h.GetScamTokens)
+	api.GET("/security/check/:address", h.GetSecurityCheck)
+
+	// ==================== STAKING (2 endpoints) ====================
+	api.GET("/staking/delegations", h.GetStakingDelegations)
+	api.GET("/staking/delegator/:address", h.GetStakingByDelegator)
+
+	// ==================== FLASH LOANS (1 endpoint) ====================
+	api.GET("/flash-loans", h.GetFlashLoans)
+
+	// ==================== BRIDGE (2 endpoints) ====================
+	api.GET("/bridge/transfers", h.GetBridgeTransfers)
+	api.GET("/bridge/transfers/:id", h.GetBridgeTransfer)
+
+	// ==================== NFT APPROVALS (2 endpoints) ====================
+	api.GET("/nft-approvals", h.GetNFTApprovals)
+	api.GET("/nft-approvals/:address", h.GetNFTApprovalsByOwner)
 }
 
 // ==================== ADDITIONAL HANDLERS ====================

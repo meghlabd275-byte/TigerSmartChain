@@ -356,6 +356,91 @@ class APIClient {
     const { data } = await this.client.get<PaginatedResponse<Transaction>>(`/blocks/${blockNumber}/transactions`)
     return data
   }
+
+  // Whale activity
+  async getWhales(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/whales', { params })
+    return data
+  }
+
+  async getWhalesByAddress(address: string, params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>(`/whales/${address}`, { params })
+    return data
+  }
+
+  // Security
+  async getSecurityStats(): Promise<{
+    malicious_contracts: number
+    phishing_urls: number
+    scam_tokens: number
+  }> {
+    const { data } = await this.client.get('/security/stats')
+    return data
+  }
+
+  async getMaliciousContracts(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/security/malicious-contracts', { params })
+    return data
+  }
+
+  async getPhishingURLs(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/security/phishing-urls', { params })
+    return data
+  }
+
+  async getScamTokens(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/security/scam-tokens', { params })
+    return data
+  }
+
+  async checkAddressSecurity(address: string): Promise<{
+    address: string
+    is_flagged: boolean
+    threat_count: number
+    threats: any[]
+  }> {
+    const { data } = await this.client.get(`/security/check/${address}`)
+    return data
+  }
+
+  // Staking
+  async getStakingDelegations(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/staking/delegations', { params })
+    return data
+  }
+
+  async getStakingByDelegator(address: string, params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>(`/staking/delegator/${address}`, { params })
+    return data
+  }
+
+  // Flash loans
+  async getFlashLoans(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/flash-loans', { params })
+    return data
+  }
+
+  // Bridge
+  async getBridgeTransfers(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/bridge/transfers', { params })
+    return data
+  }
+
+  async getBridgeTransfer(transferId: string): Promise<any> {
+    const { data } = await this.client.get<any>(`/bridge/transfers/${transferId}`)
+    return data
+  }
+
+  // NFT approvals
+  async getNFTApprovals(params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>('/nft-approvals', { params })
+    return data
+  }
+
+  async getNFTApprovalsByOwner(address: string, params?: { page?: number; limit?: number }): Promise<any[]> {
+    const { data } = await this.client.get<any[]>(`/nft-approvals/${address}`, { params })
+    return data
+  }
 }
 
 export const api = new APIClient()
