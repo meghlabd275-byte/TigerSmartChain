@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    let _subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(true)
         .with_thread_ids(true)
@@ -25,8 +25,8 @@ async fn main() -> Result<()> {
     // Create indexer service
     let mut indexer = IndexerService::new(config).await?;
 
-    // Handle shutdown
-    let indexer_ref = indexer.state().clone();
+    // Kept alive so the final progress can be reported after shutdown.
+    let state = indexer.state();
     
     tokio::select! {
         result = indexer.start() => {
@@ -40,7 +40,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("TigerScan Indexer Service stopped");
+    let state = state.read();
+    info!(
+        indexed_block = state.last_indexed_block,
+        current_block = state.current_block,
+        errors = state.errors.len(),
+        "TigerScan Indexer Service stopped"
+    );
 
     Ok(())
 }

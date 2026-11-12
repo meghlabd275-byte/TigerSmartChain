@@ -23,6 +23,7 @@ parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 
 anyhow = "1.0"
+hex = "0.4"
 [lib]
 name = "tigerscan_security"
 path = "src/lib.rs"

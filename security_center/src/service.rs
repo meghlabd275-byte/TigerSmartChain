@@ -95,7 +95,8 @@ impl SecurityCenter {
         }
         
         // Check for suspicious contract calls
-        if let Some(input) = &tx.input {
+        let input = tx.input.as_str();
+        {
             if input.len() > 10 {
                 let method = format!("0x{}", &input[2..10]);
                 
@@ -173,15 +174,16 @@ impl SecurityCenter {
         let code = self.get_code(address).await?;
         
         if code == "0x" {
+            let is_malicious = !threats.is_empty();
             return Ok(ContractScanResult {
                 address: address.to_string(),
                 threats,
                 is_verified: false,
                 is_open_source: false,
-                is_malicious: !threats.is_empty(),
+                is_malicious,
                 score: 100,
                 audit_status: AuditStatus::None,
-                last_updated: Utc::now().timestamp(),
+                last_scan: Utc::now().timestamp(),
             });
         }
         
@@ -254,7 +256,7 @@ impl SecurityCenter {
             is_malicious: score >= 80,
             score,
             audit_status: AuditStatus::None,
-            last_updated: Utc::now().timestamp(),
+            last_scan: Utc::now().timestamp(),
         })
     }
 
@@ -292,7 +294,7 @@ impl SecurityCenter {
             (0..=1, _, _) => RiskLevel::High,
             (_, true, _) => RiskLevel::Medium,
             (_, _, true) => RiskLevel::Medium,
-            (365..=, false, false) => RiskLevel::Low,
+            (365.., false, false) => RiskLevel::Low,
             _ => RiskLevel::Medium,
         };
         

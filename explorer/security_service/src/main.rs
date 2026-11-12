@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Response, Server, StatusCode};
-use tracing::{error, info, Level};
+use tiny_http::{Response, StatusCode};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use tigerscan_security::{Config, SecurityReport, SecurityService};
+use tigerscan_security::{Config, SecurityService};
 
 // ============================================================================
 // API Types
@@ -122,6 +122,11 @@ impl Handler {
     }
 
     pub fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+        // The shared server calls this from a synchronous context, so the async
+        // service methods are driven to completion on the runtime handle.
+        let runtime = tokio::runtime::Handle::current();
+        let _guard = runtime.enter();
+
         // Check rate limit
         if let Err(e) = self.rate_limiter.check(ip) {
             let response = ApiResponse {
@@ -151,9 +156,9 @@ impl Handler {
 
         // Handle method
         let result = match request.method.as_str() {
-            "check" => self.handle_check(request.params).await,
-            "honeypot" => self.handle_honeypot(request.params).await,
-            "threats" => self.handle_threats(request.params).await,
+            "check" => runtime.block_on(self.handle_check(request.params)),
+            "honeypot" => runtime.block_on(self.handle_honeypot(request.params)),
+            "threats" => runtime.block_on(self.handle_threats(request.params)),
             _ => Err(format!("Unknown method: {}", request.method)),
         };
 
@@ -202,7 +207,7 @@ impl Handler {
         }))
     }
 
-    async fn handle_threats(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    async fn handle_threats(&self, _params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
         let threats = self.service.get_recent_threats(10)
             .await
             .map_err(|e| e.to_string())?;
@@ -220,7 +225,7 @@ impl Handler {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    let subscriber = FmtSubscriber::builder()
+    let _subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
         .init();
@@ -237,12 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler = Arc::new(Handler::new(service));
 
     // Start HTTP server
-    let server = Server::http(addr)?;
-
     let addr = SocketAddr::from(([0, 0, 0, 0], 8550));
     info!("Server listening on {}", addr);
 
-    tigerscan_service_http::serve_with_ip(addr, move |body, ip| handler.handle(body, ip))?;
+    tigerscan_service_http::serve_with_ip(addr, move |body, ip| handler.handle(body, ip))
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
     Ok(())
 }

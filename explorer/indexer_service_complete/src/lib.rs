@@ -5,16 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use ethers::providers::{Http, Provider, StreamExt, Ws};
-use ethers::types::{Address, Block, Filter, H160, H256, Log, Transaction, U64};
+use ethers::providers::{Http, Middleware, Provider, StreamExt, Ws};
+use ethers::types::{Address, Block, H160, H256, Transaction, U256};
 use parking_lot::RwLock;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::{Row, Transaction as SqlxTransaction};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -120,13 +115,13 @@ pub struct BlockRecord {
     pub transactions_root: Option<String>,
     pub state_root: Option<String>,
     pub receipts_root: Option<String>,
-    pub miner: String,
+    pub miner: Option<String>,
     pub difficulty: Option<String>,
     pub total_difficulty: Option<String>,
     pub gas_limit: i64,
     pub gas_used: i64,
     pub timestamp: i64,
-    pub size: i64,
+    pub size: Option<i64>,
     pub extra_data: Option<String>,
     pub base_fee_per_gas: Option<i64>,
     pub tx_count: i32,
@@ -308,7 +303,7 @@ impl IndexerService {
         // Initialize WebSocket client
         let ws = if let Some(ws_url) = &config.ws_url {
             Some(
-                Provider::<Ws>::connect(ws_url.clone(), None)
+                Provider::<Ws>::connect(ws_url.clone())
                     .await
                     .map_err(|e| IndexerError::Rpc(e.to_string()))?,
             )
@@ -349,13 +344,15 @@ impl IndexerService {
             current_block, last_indexed, self.state.read().last_confirmed_block
         );
 
-        // Start block indexing
-        self.index_blocks_loop().await?;
+        // The two loops must run at the same time: backfilling history over
+        // HTTP and following the head over WebSocket. Running them in sequence
+        // meant the WebSocket loop never started, because the block loop only
+        // returns once indexing has been stopped.
+        let realtime = self.index_logs_loop();
 
-        // Start log indexing if WebSocket is available
-        if self.ws.is_some() {
-            self.index_logs_loop().await?;
-        }
+        let (historical, live) = tokio::join!(self.index_blocks_loop(), realtime);
+        historical?;
+        live?;
 
         Ok(())
     }
@@ -442,21 +439,29 @@ impl IndexerService {
 
         for block_num in start..=end {
             // Get block with transactions
-            let block = self.rpc.get_block_with_txs(block_num.into())
+            let block = self
+                .rpc
+                .get_block_with_txs(ethers::types::BlockId::Number(block_num.into()))
                 .await
                 .map_err(|e| IndexerError::Rpc(e.to_string()))?;
 
+            // A pending block has no number, so it cannot be indexed by height.
+            let Some(block_number) = block.as_ref().and_then(|b| b.number).map(|n| n.as_u64())
+            else {
+                continue;
+            };
+
             if let Some(block) = block {
                 // Insert block
-                self.insert_block(&block).await?;
+                self.insert_block(&block, block_number).await?;
 
                 // Index transactions
                 for tx in block.transactions {
-                    self.insert_transaction(&tx, block.number.as_u64()).await?;
+                    self.insert_transaction(&tx, block_number).await?;
                 }
 
                 // Update state
-                self.state.write().current_block = block.number.as_u64();
+                self.state.write().current_block = block_number;
             }
         }
 
@@ -465,24 +470,35 @@ impl IndexerService {
     }
 
     /// Insert a block into the database
-    async fn insert_block(&self, block: &Block<Transaction>) -> Result<(), IndexerError> {
+    async fn insert_block(
+        &self,
+        block: &Block<Transaction>,
+        block_number: u64,
+    ) -> Result<(), IndexerError> {
+        // `miner`, `nonce`, `logs_bloom`, `size` and `base_fee_per_gas` are all
+        // optional in the RPC reply: a pending block has none of them, and a
+        // pre-London block has no base fee. Each is stored as NULL rather than
+        // as a fabricated zero.
         let record = BlockRecord {
-            number: block.number.as_u64() as i64,
-            hash: block.hash.to_string(),
+            number: block_number as i64,
+            hash: block
+                .hash
+                .map(|h| h.to_string())
+                .ok_or_else(|| IndexerError::Parse("block has no hash".to_string()))?,
             parent_hash: block.parent_hash.to_string(),
             nonce: block.nonce.map(|n| format!("0x{}", hex::encode(n.0))),
             sha3_uncles: Some(block.uncles_hash.to_string()),
-            logs_bloom: Some(format!("0x{}", hex::encode(block.logs_bloom.0))),
+            logs_bloom: block.logs_bloom.map(|b| format!("0x{}", hex::encode(b.0))),
             transactions_root: Some(block.transactions_root.to_string()),
             state_root: Some(block.state_root.to_string()),
             receipts_root: Some(block.receipts_root.to_string()),
-            miner: block.author.to_string(),
+            miner: block.author.map(|a| a.to_string()),
             difficulty: Some(block.difficulty.to_string()),
             total_difficulty: block.total_difficulty.map(|d| d.to_string()),
             gas_limit: block.gas_limit.as_u64() as i64,
             gas_used: block.gas_used.as_u64() as i64,
             timestamp: block.timestamp.as_u64() as i64,
-            size: block.size.as_u64() as i64,
+            size: block.size.map(|s| s.as_u64() as i64),
             extra_data: Some(format!("0x{}", hex::encode(block.extra_data.clone()))),
             base_fee_per_gas: block.base_fee_per_gas.map(|b| b.as_u64() as i64),
             tx_count: block.transactions.len() as i32,
@@ -542,7 +558,7 @@ impl IndexerService {
             from_address: tx.from.to_string(),
             to_address: tx.to.map(|a| a.to_string()),
             value: tx.value.to_string(),
-            gas_price: tx.gas_price.as_u64() as i64,
+            gas_price: tx.gas_price.map(|p| p.as_u64() as i64).unwrap_or(0),
             gas_limit: tx.gas.as_u64() as i64,
             gas_used: None,
             input: Some(format!("0x{}", hex::encode(tx.input.clone()))),
@@ -603,9 +619,14 @@ impl IndexerService {
         Ok(())
     }
 
-    /// Index token transfers from a transaction
+    /// Index ERC-20 transfers from a transaction.
+    ///
+    /// `Transfer(address,address,uint256)` indexes the sender and recipient and
+    /// leaves the amount in `data`, so a token transfer log has exactly three
+    /// topics. A four-topic `Transfer` is the ERC-721 form and is handled by
+    /// `index_nft_transfers`; requiring four topics here, as this used to, meant
+    /// no ERC-20 transfer was ever recorded.
     async fn index_token_transfers(&self, tx: &Transaction, block_number: u64) -> Result<(), IndexerError> {
-        // Get transaction receipt for logs
         let receipt = self.rpc
             .get_transaction_receipt(tx.hash)
             .await
@@ -615,34 +636,18 @@ impl IndexerService {
             return Ok(());
         };
 
-        // Parse Transfer events (TEP20)
-        let transfer_signature = H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap());
-        
-        for (log_index, log) in receipt.logs.iter().enumerate() {
-            if log.topics.len() != 4 {
-                continue;
-            }
-            
-            // Check if it's a Transfer event
-            if log.topics[0] != transfer_signature {
+        for log in receipt.logs.iter() {
+            if log.topics.len() != 3 {
                 continue;
             }
 
-            // Parse Transfer event
-            let token_address = log.address.to_string();
-            let from_address = ethers::types::H160::from(log.topics[1]).to_string();
-            let to_address = ethers::types::H160::from(log.topics[2]).to_string();
-            let value = ethers::types::U256::from(log.data.0).to_string();
+            if log.topics[0] != transfer_topic() {
+                continue;
+            }
 
-            let transfer = TokenTransfer {
-                token_address,
-                from_address,
-                to_address,
-                value,
-                transaction_hash: tx.hash.to_string(),
-                block_number: block_number as i64,
-                log_index: log_index as i32,
-            };
+            let from_address = H160::from(log.topics[1]).to_string();
+            let to_address = H160::from(log.topics[2]).to_string();
+            let value = U256::from_big_endian(&log.data.0).to_string();
 
             sqlx::query(
                 r#"
@@ -650,15 +655,16 @@ impl IndexerService {
                     token_address, from_address, to_address, value,
                     transaction_hash, block_number, log_index
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (transaction_hash, log_index) DO NOTHING
                 "#,
             )
-            .bind(transfer.token_address)
-            .bind(transfer.from_address)
-            .bind(transfer.to_address)
-            .bind(transfer.value)
-            .bind(transfer.transaction_hash)
-            .bind(transfer.block_number)
-            .bind(transfer.log_index)
+            .bind(log.address.to_string())
+            .bind(from_address)
+            .bind(to_address)
+            .bind(value)
+            .bind(tx.hash.to_string())
+            .bind(block_number as i64)
+            .bind(log.log_index.map(|i| i.as_u32() as i32).unwrap_or(0))
             .execute(&self.db)
             .await?;
         }
@@ -666,9 +672,12 @@ impl IndexerService {
         Ok(())
     }
 
-    /// Index NFT transfers from a transaction
+    /// Index ERC-721 and ERC-1155 transfers from a transaction.
+    ///
+    /// ERC-721 `Transfer(address,address,uint256)` carries the token id in the
+    /// fourth topic and no data. ERC-1155 `TransferSingle` also has four topics
+    /// but the first is the operator and the id and amount both sit in `data`.
     async fn index_nft_transfers(&self, tx: &Transaction, block_number: u64) -> Result<(), IndexerError> {
-        // Get transaction receipt for logs
         let receipt = self.rpc
             .get_transaction_receipt(tx.hash)
             .await
@@ -678,39 +687,30 @@ impl IndexerService {
             return Ok(());
         };
 
-        // Parse Transfer events (TEP721/TEP1155)
-        let transfer_signature_721 = H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap());
-        
-        for (log_index, log) in receipt.logs.iter().enumerate() {
-            if log.topics.len() != 4 {
-                continue;
-            }
-            
-            // Check if it's a Transfer event
-            if log.topics[0] != transfer_signature_721 {
-                continue;
-            }
-
-            // Parse Transfer event
-            let token_address = log.address.to_string();
-            let from_address = ethers::types::H160::from(log.topics[1]).to_string();
-            let to_address = ethers::types::H160::from(log.topics[2]).to_string();
-            let token_id = ethers::types::U256::from(log.topics[3].0).to_string();
-            let value = if log.data.0.is_empty() {
-                "1".to_string()
+        for log in receipt.logs.iter() {
+            let (token_id, value) = if log.topics.len() == 4 && log.topics[0] == transfer_topic() {
+                // ERC-721: the whole id is in the last topic, one token moves.
+                (
+                    U256::from_big_endian(log.topics[3].as_bytes()).to_string(),
+                    "1".to_string(),
+                )
+            } else if log.topics.len() == 4 && log.topics[0] == transfer_single_topic() {
+                // ERC-1155: data is abi.encode(uint256 id, uint256 value).
+                if log.data.0.len() < 64 {
+                    continue;
+                }
+                let id = U256::from_big_endian(&log.data.0[..32]);
+                let amount = U256::from_big_endian(&log.data.0[32..64]);
+                (id.to_string(), amount.to_string())
             } else {
-                ethers::types::U256::from(log.data.0).to_string()
+                continue;
             };
 
-            let transfer = NftTransfer {
-                token_address,
-                from_address,
-                to_address,
-                token_id,
-                value: Some(value),
-                transaction_hash: tx.hash.to_string(),
-                block_number: block_number as i64,
-                log_index: log_index as i32,
+            // For ERC-1155 the recipient is topic 3; for ERC-721 it is topic 2.
+            let (from_topic, to_topic) = if log.topics[0] == transfer_single_topic() {
+                (2, 3)
+            } else {
+                (1, 2)
             };
 
             sqlx::query(
@@ -719,16 +719,17 @@ impl IndexerService {
                     token_address, from_address, to_address, token_id, value,
                     transaction_hash, block_number, log_index
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (transaction_hash, log_index) DO NOTHING
                 "#,
             )
-            .bind(transfer.token_address)
-            .bind(transfer.from_address)
-            .bind(transfer.to_address)
-            .bind(transfer.token_id)
-            .bind(transfer.value)
-            .bind(transfer.transaction_hash)
-            .bind(transfer.block_number)
-            .bind(transfer.log_index)
+            .bind(log.address.to_string())
+            .bind(H160::from(log.topics[from_topic]).to_string())
+            .bind(H160::from(log.topics[to_topic]).to_string())
+            .bind(token_id)
+            .bind(value)
+            .bind(tx.hash.to_string())
+            .bind(block_number as i64)
+            .bind(log.log_index.map(|i| i.as_u32() as i32).unwrap_or(0))
             .execute(&self.db)
             .await?;
         }
@@ -736,43 +737,65 @@ impl IndexerService {
         Ok(())
     }
 
-    /// Index logs in real-time using WebSocket
+    /// Follow pending transactions over WebSocket and index the transfers in
+    /// each one as soon as its receipt is available.
     async fn index_logs_loop(&self) -> Result<(), IndexerError> {
         let Some(ws) = &self.ws else {
             return Ok(());
         };
 
-        // Subscribe to logs
-        let filter = Filter::new().topic0(ethers::types::H256::from_slice(&hex::decode("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef").unwrap()));
-        
-        let mut stream = ws.subscribe_pending_txs().await
+        let mut stream = ws
+            .subscribe_pending_txs()
+            .await
             .map_err(|e| IndexerError::Rpc(e.to_string()))?;
 
-        info!("Starting log indexing via WebSocket");
+        info!("Starting real-time transfer indexing over WebSocket");
 
-        loop {
-            tokio::select! {
-                _ = async {
-                    if let Some(tx) = stream.next().await {
-                        // Get receipt
-                        if let Ok(Some(receipt)) = self.rpc.get_transaction_receipt(tx).await {
-                            let block_number = receipt.block_number.unwrap_or(U64::zero()).as_u64();
-                            
-                            // Index token transfers
-                            for (log_index, log) in receipt.logs.iter().enumerate() {
-                                // Process log
-                                info!("Processed log {} from tx {}", log_index, tx);
-                            }
-                        }
-                    }
-                } => {},
+        while let Some(tx) = stream.next().await {
+            let receipt = match self.rpc.get_transaction_receipt(tx).await {
+                Ok(Some(receipt)) => receipt,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%tx, %error, "cannot fetch receipt for pending transaction");
+                    continue;
+                }
+            };
+
+            let Some(block_number) = receipt.block_number.map(|n| n.as_u64()) else {
+                continue;
+            };
+
+            let tx_data = match self.rpc.get_transaction(tx).await {
+                Ok(Some(tx_data)) => tx_data,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%tx, %error, "cannot fetch pending transaction");
+                    continue;
+                }
+            };
+
+            // The same extraction the batch path uses, so a transfer seen here
+            // and one seen while backfilling the block cannot disagree.
+            if let Err(error) = self.index_token_transfers(&tx_data, block_number).await {
+                error!(%tx, %error, "failed to index token transfers");
+            }
+
+            if let Err(error) = self.index_nft_transfers(&tx_data, block_number).await {
+                error!(%tx, %error, "failed to index NFT transfers");
             }
         }
+
+        Ok(())
     }
 
     /// Get indexer state
     pub fn get_state(&self) -> IndexerState {
         self.state.read().clone()
+    }
+
+    /// Shared handle to the live indexer state, for reporting while `start` runs.
+    pub fn state(&self) -> Arc<RwLock<IndexerState>> {
+        self.state.clone()
     }
 
     /// Get metrics
@@ -826,6 +849,22 @@ pub struct IndexerMetrics {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// `keccak256("Transfer(address,address,uint256)")`.
+fn transfer_topic() -> H256 {
+    H256::from_slice(
+        &hex::decode("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+            .expect("the transfer topic is a valid 32 byte hex string"),
+    )
+}
+
+/// `keccak256("TransferSingle(address,address,address,uint256,uint256)")`.
+fn transfer_single_topic() -> H256 {
+    H256::from_slice(
+        &hex::decode("c3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62")
+            .expect("the TransferSingle topic is a valid 32 byte hex string"),
+    )
+}
 
 /// Parse an Ethereum address from string
 pub fn parse_address(s: &str) -> Option<Address> {

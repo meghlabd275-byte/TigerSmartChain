@@ -16,7 +16,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migra
 bb8 = "0.8"
 
 # RPC Client
-ethers = { version = "2.0", features = ["rustls", "abigen"] }
+ethers = { version = "2.0", features = ["rustls", "abigen", "ws"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

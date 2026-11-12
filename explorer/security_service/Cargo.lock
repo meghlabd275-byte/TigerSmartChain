@@ -3736,6 +3736,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ethers",
+ "hex",
  "parking_lot",
  "regex",
  "reqwest",
