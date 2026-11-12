@@ -167,18 +167,27 @@ impl TigerScanClient {{
 "#.to_string();
 
         for endpoint in &template.endpoints {
+            let method = endpoint.method.to_ascii_lowercase();
+            let fn_name = &endpoint.name;
+            let path = &endpoint.path;
+            let return_type = &endpoint.response;
+
+            // `&self` is part of the template, so only the declared parameters
+            // are interpolated here.
+            let params = endpoint
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.param_type))
+                .collect::<Vec<_>>()
+                .join(", ");
+
             code.push_str(&format!(r#"
-    pub async fn {}(&self, {}) -> Result<{}, reqwest::Error> {{
-        let url = format!("{{}}{}", self.base_url, "{}");
-        let response = self.client.{}(&url).await?;
+    pub async fn {fn_name}(&self, {params}) -> Result<{return_type}, reqwest::Error> {{
+        let url = format!("{{}}{path}", self.base_url);
+        let response = self.client.{method}(&url).await?;
         Ok(response.json().await?)
     }}
-"#,
-                endpoint.name,
-                if endpoint.params.is_empty() { String::new() } else { format!("&self, {}", endpoint.params.iter().map(|p| format!("{}: {}", p.name, p.param_type)).collect::<Vec<_>>().join(", ")) },
-                endpoint.response,
-                endpoint.method.to_lowercase()
-            ));
+"#));
         }
 
         code.push_str("}\n");

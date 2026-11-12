@@ -215,20 +215,26 @@ impl GovernanceService {
         
         let votes: Vec<_> = votes_map.values().cloned().collect();
         
-        let for_votes: U256 = votes.iter()
+        let for_votes: U256 = votes
+            .iter()
             .filter(|v| v.support == VoteChoice::For)
-            .map(|v| U256::from_dec_str(&v.votes).unwrap_or_default())
-            .sum();
+            .fold(U256::zero(), |total, v| {
+                total + U256::from_dec_str(&v.votes).unwrap_or_default()
+            });
         
-        let against_votes: U256 = votes.iter()
+        let against_votes: U256 = votes
+            .iter()
             .filter(|v| v.support == VoteChoice::Against)
-            .map(|v| U256::from_dec_str(&v.votes).unwrap_or_default())
-            .sum();
+            .fold(U256::zero(), |total, v| {
+                total + U256::from_dec_str(&v.votes).unwrap_or_default()
+            });
         
-        let abstain_votes: U256 = votes.iter()
+        let abstain_votes: U256 = votes
+            .iter()
             .filter(|v| v.support == VoteChoice::Abstain)
-            .map(|v| U256::from_dec_str(&v.votes).unwrap_or_default())
-            .sum();
+            .fold(U256::zero(), |total, v| {
+                total + U256::from_dec_str(&v.votes).unwrap_or_default()
+            });
         
         Some(ProposalVotes {
             proposal_id: id,

@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Response, Server, StatusCode};
-use tracing::{error, info, Level};
+use tiny_http::{Response, StatusCode};
+use tokio::runtime::Runtime;
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use price_feed::{Config, PriceFeedService, TokenPrice};
+use price_feed::{Config, PriceFeedService};
 
 // ============================================================================
 // API Types
@@ -121,7 +122,7 @@ impl Handler {
         }
     }
 
-    pub fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    pub async fn handle(&self, body: &[u8], ip: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         // Check rate limit
         if let Err(e) = self.rate_limiter.check(ip) {
             let response = ApiResponse {
@@ -180,17 +181,25 @@ impl Handler {
             .and_then(|p| p.get("address").and_then(|v| v.as_str()))
             .ok_or("Missing address")?;
 
-        let price = self.service.get_price(address)
-            .await
-            .map_err(|e| e.to_string())?;
+        let requested = vec![address.to_string()];
 
-        Ok(serde_json::json!({
-            "price": price
-        }))
+        let prices = self
+            .service
+            .get_prices(&requested)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let update = prices
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no price available for {address}"))?;
+
+        Ok(serde_json::json!(update))
     }
 
     async fn handle_prices(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
-        let addresses = params.as_ref()
+        let addresses: Vec<String> = params
+            .as_ref()
             .and_then(|p| p.get("addresses").and_then(|v| v.as_array()))
             .map(|arr| {
                 arr.iter()
@@ -200,13 +209,13 @@ impl Handler {
             })
             .ok_or("Missing addresses")?;
 
-        let prices = self.service.get_prices(&addresses)
+        let prices = self
+            .service
+            .get_prices(&addresses)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
 
-        Ok(serde_json::json!({
-            "prices": prices
-        }))
+        Ok(serde_json::json!({ "prices": prices }))
     }
 
     async fn handle_history(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
@@ -261,13 +270,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create handler
     let handler = Arc::new(Handler::new(service));
 
-    // Start HTTP server
-    let server = Server::http(addr)?;
-
     let addr = SocketAddr::from(([0, 0, 0, 0], 8549));
     info!("Server listening on {}", addr);
 
-    tigerscan_service_http::serve_with_ip(addr, move |body, ip| handler.handle(body, ip))?;
+    // The serving loop is synchronous; the price lookups are not.
+    let runtime = Runtime::new()?;
+
+    tigerscan_service_http::serve_with_ip(addr, move |body, ip| {
+        runtime.block_on(handler.handle(body, ip))
+    })?;
 
     Ok(())
 }

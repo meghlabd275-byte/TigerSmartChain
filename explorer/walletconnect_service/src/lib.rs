@@ -168,9 +168,9 @@ impl WalletConnectService {
         let session = self.sessions.get_mut(topic)
             .ok_or("Session not found")?;
         
-        session.accounts = accounts;
+        session.accounts = accounts.clone();
         session.chain_id = chain_id;
-        session.state = SessionState { accounts: accounts.clone(), chain_id };
+        session.state = SessionState { accounts, chain_id };
         
         Ok(session.clone())
     }

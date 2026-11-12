@@ -88,7 +88,7 @@ impl Default for Config {
 // Data Types
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingTransaction {
     pub hash: String,
     pub from: String,
