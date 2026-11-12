@@ -3,10 +3,10 @@
 import { useState, useEffect } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
-import { Copy, Check, Image, TrendingUp, Users, Flame, Hash, ExternalLink } from 'lucide-react'
+import { Copy, Check, Image, TrendingUp, Users, Flame, ArrowRight } from 'lucide-react'
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts'
 import api from '@/lib/api'
-import { formatNumber, formatCurrency, copyToClipboard, formatTimestamp } from '@/lib/utils'
+import { formatNumber, formatCurrency, copyToClipboard, formatAddress } from '@/lib/utils'
 
 export default function NFTCollectionPage() {
   const params = useParams<{ address: string }>()
@@ -19,6 +19,10 @@ export default function NFTCollectionPage() {
   const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'overview' | 'holders' | 'transfers'>('overview')
   const [copied, setCopied] = useState(false)
+  const [holders, setHolders] = useState<any[]>([])
+  const [transfers, setTransfers] = useState<any[]>([])
+  const [tabLoading, setTabLoading] = useState(false)
+  const [tabError, setTabError] = useState<string | null>(null)
 
   useEffect(() => {
     if (address) fetchData()
@@ -28,13 +32,27 @@ export default function NFTCollectionPage() {
     setLoading(true)
     setError(null)
     try {
-      const [col, floor] = await Promise.all([
+      // floor-history and volume-history are separate series; the old code
+      // hardcoded both to [] so the two charts always rendered "No data
+      // available" even when the gateway had rows.
+      const [col, floorHist, volHist] = await Promise.all([
         api.getNFTCollection(address),
-        api.getNFTFloorPrice(address)
+        api.getNFTFloorHistory(address, { limit: 90 }),
+        api.getNFTVolumeHistory(address, { limit: 90 }),
       ])
       setCollection(col)
-      setFloorHistory([])
-      setVolumeHistory([])
+      setFloorHistory(
+        (floorHist.items || []).map((r: any) => ({
+          date: r.updatedAt ? String(r.updatedAt).slice(0, 10) : '',
+          floor: Number(r.floorPrice ?? 0),
+        }))
+      )
+      setVolumeHistory(
+        (volHist.items || []).map((r: any) => ({
+          date: r.date || (r.updatedAt ? String(r.updatedAt).slice(0, 10) : ''),
+          volume: Number(r.volume ?? 0),
+        }))
+      )
     } catch (error) {
       setCollection(null)
       setFloorHistory([])
@@ -44,6 +62,36 @@ export default function NFTCollectionPage() {
       setLoading(false)
     }
   }
+
+  // Load the active tab's data. The holders and transfers panels used to
+  // render the literal strings "Owner data loading..." and "Transfer history
+  // loading..." forever, because nothing ever fetched either list.
+  useEffect(() => {
+    if (!address || activeTab === 'overview') return
+
+    let cancelled = false
+    const load = async () => {
+      setTabLoading(true)
+      setTabError(null)
+      try {
+        if (activeTab === 'holders') {
+          const res = await api.getNFTOwners(address, { limit: 100 })
+          if (!cancelled) setHolders(res || [])
+        } else {
+          const res = await api.getNFTTransfers(address, { limit: 100 })
+          if (!cancelled) setTransfers(res.items || [])
+        }
+      } catch (err) {
+        if (!cancelled) setTabError(err instanceof Error ? err.message : 'Failed to load')
+      } finally {
+        if (!cancelled) setTabLoading(false)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [address, activeTab])
 
   const handleCopy = async () => {
     await copyToClipboard(address)
@@ -195,10 +243,53 @@ export default function NFTCollectionPage() {
               </div>
             )}
             {activeTab === 'holders' && (
-              <div className="text-center py-12 text-gray-500">Owner data loading...</div>
+              tabLoading ? (
+                <p className="text-center py-12 text-gray-500">Loading owners…</p>
+              ) : tabError ? (
+                <p className="text-center py-12 text-red-500">{tabError}</p>
+              ) : holders.length === 0 ? (
+                <p className="text-center py-12 text-gray-500">No owner records for this collection.</p>
+              ) : (
+                <div className="divide-y divide-gray-200 dark:divide-dark-700">
+                  {holders.map((h: any) => (
+                    <div key={h.id} className="py-3 flex items-center justify-between">
+                      <Link href={`/address/${h.owner}`} className="font-mono text-primary-500 hover:underline">
+                        {h.owner}
+                      </Link>
+                      <span className="text-sm text-gray-500">Token #{h.tokenId}</span>
+                    </div>
+                  ))}
+                </div>
+              )
             )}
             {activeTab === 'transfers' && (
-              <div className="text-center py-12 text-gray-500">Transfer history loading...</div>
+              tabLoading ? (
+                <p className="text-center py-12 text-gray-500">Loading transfers…</p>
+              ) : tabError ? (
+                <p className="text-center py-12 text-red-500">{tabError}</p>
+              ) : transfers.length === 0 ? (
+                <p className="text-center py-12 text-gray-500">No transfers recorded for this collection.</p>
+              ) : (
+                <div className="divide-y divide-gray-200 dark:divide-dark-700">
+                  {transfers.map((t: any) => (
+                    <div key={t.id} className="py-3 flex flex-wrap items-center gap-3 text-sm">
+                      <Link href={`/nft/${address}/${t.tokenId}`} className="font-mono text-primary-500 hover:underline">
+                        #{t.tokenId}
+                      </Link>
+                      <Link href={`/address/${t.fromAddress}`} className="font-mono text-gray-500 hover:text-primary-500">
+                        {formatAddress(t.fromAddress || '')}
+                      </Link>
+                      <ArrowRight className="w-4 h-4 text-gray-400" />
+                      <Link href={`/address/${t.toAddress}`} className="font-mono text-gray-500 hover:text-primary-500">
+                        {formatAddress(t.toAddress || '')}
+                      </Link>
+                      <Link href={`/tx/${t.transactionHash}`} className="ml-auto font-mono text-gray-500 hover:text-primary-500">
+                        {formatAddress(t.transactionHash || '')}
+                      </Link>
+                    </div>
+                  ))}
+                </div>
+              )
             )}
           </div>
         </div>

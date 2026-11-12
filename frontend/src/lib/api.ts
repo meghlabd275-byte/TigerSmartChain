@@ -223,12 +223,12 @@ class APIClient {
   async getNFTOwners(collectionAddress: string, params?: {
     page?: number
     limit?: number
-  }): Promise<{ token_id: string; owner: string }[]> {
-    const { data } = await this.client.get<{ token_id: string; owner: string }[]>(
+  }): Promise<{ tokenId: string; owner: string }[]> {
+    const { data } = await this.client.get<PaginatedResponse<{ tokenId: string; owner: string }>>(
       `/nfts/${collectionAddress}/owners`,
       { params }
     )
-    return data
+    return data.items
   }
 
   async getNFTTransfers(collectionAddress: string, params?: {
@@ -245,6 +245,61 @@ class APIClient {
   async getNFTFloorPrice(collectionAddress: string): Promise<{ floor: number; average: number }> {
     const { data } = await this.client.get<{ floor: number; average: number }>(
       `/nfts/${collectionAddress}/floor`
+    )
+    return data
+  }
+
+  async getNFTFloorHistory(collectionAddress: string, params?: { limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>(
+      `/nfts/${collectionAddress}/floor-history`,
+      { params }
+    )
+    return data
+  }
+
+  async getNFTVolumeHistory(collectionAddress: string, params?: { limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>(
+      `/nfts/${collectionAddress}/volume-history`,
+      { params }
+    )
+    return data
+  }
+
+  // Transfers of one token, rather than of the whole collection.
+  async getNFTTokenHistory(
+    collectionAddress: string,
+    tokenId: string,
+    params?: { limit?: number }
+  ): Promise<PaginatedResponse<NFTTransfer>> {
+    const { data } = await this.client.get<PaginatedResponse<NFTTransfer>>(
+      `/nfts/${collectionAddress}/tokens/${tokenId}/history`,
+      { params }
+    )
+    return data
+  }
+
+  async getNFTTokenTransfers(
+    collectionAddress: string,
+    tokenId: string,
+    params?: { limit?: number }
+  ): Promise<PaginatedResponse<NFTTransfer>> {
+    const { data } = await this.client.get<PaginatedResponse<NFTTransfer>>(
+      `/nfts/${collectionAddress}/tokens/${tokenId}/transfers`,
+      { params }
+    )
+    return data
+  }
+
+  async getNFTTokenOwner(collectionAddress: string, tokenId: string): Promise<{ owner: string }> {
+    const { data } = await this.client.get<{ owner: string }>(
+      `/nfts/${collectionAddress}/tokens/${tokenId}/owner`
+    )
+    return data
+  }
+
+  async getNFTRarity(collectionAddress: string, tokenId: string): Promise<any> {
+    const { data } = await this.client.get<any>(
+      `/nfts/${collectionAddress}/rarity/${tokenId}`
     )
     return data
   }

@@ -214,7 +214,9 @@ func (h *Handler) GetVMTrace(c *gin.Context) {
 	ctx := c.Request.Context()
 	raw, err := h.rpcCall(ctx, "debug_traceTransaction", []interface{}{hash})
 	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"trace": nil, "note": "debug RPC unavailable"})
+		// A 200 with a null trace reads as "this transaction has no trace".
+		// It means the node could not be reached, so say so.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "RPC call failed", "detail": err.Error()})
 		return
 	}
 	c.Data(http.StatusOK, "application/json", raw)
@@ -417,6 +419,27 @@ func (h *Handler) GetNFTTokens(c *gin.Context) {
 
 func (h *Handler) GetNFTTokenTransfers(c *gin.Context) {
 	h.listByAddress(c, "address", `SELECT * FROM nft_transfers WHERE token_address = $1 ORDER BY block_number DESC LIMIT $2`)
+}
+
+// GetNFTTokenHistory lists the transfer history of one token, not the whole
+// collection. Routing both through GetNFTTokenTransfers would have returned
+// every transfer in the collection for a single-token request.
+func (h *Handler) GetNFTTokenHistory(c *gin.Context) {
+	collection := c.Param("address")
+	tokenID := c.Param("token_id")
+	if collection == "" || tokenID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing address or token_id"})
+		return
+	}
+	ctx := c.Request.Context()
+	limit := paramInt(c, "limit", 50)
+	rows, err := h.queryRows(ctx, `SELECT * FROM nft_transfers WHERE token_address = $1 AND token_id = $2 ORDER BY block_number DESC, log_index DESC LIMIT $3`, collection, tokenID, limit)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	total, _ := h.countQuery(ctx, `SELECT count(*) FROM nft_transfers WHERE token_address = $1 AND token_id = $2`, collection, tokenID)
+	respondList(c, rows, int(total))
 }
 
 func (h *Handler) GetNFTVolumeHistory(c *gin.Context) {
