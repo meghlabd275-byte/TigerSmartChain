@@ -13,6 +13,7 @@ export default function TransactionPage() {
   
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'overview' | 'logs' | 'internal'>('overview')
   const [copied, setCopied] = useState(false)
 
@@ -21,28 +22,16 @@ export default function TransactionPage() {
   }, [hash])
 
   const fetchData = async () => {
+    setLoading(true)
+    setError(null)
     try {
       const txData = await api.getTransaction(hash)
       setData(txData)
-    } catch (error) {
-      setData({
-        hash,
-        blockNumber: 45678900,
-        blockHash: '0x1234567890abcdef',
-        timestamp: Math.floor(Date.now() / 1000),
-        from: '0x742d35Cc6634C0532925a3b844Bc9e7595f0eB1E',
-        to: '0x8Ba1f109551bD432803012645Ac136ddd64DBA72',
-        value: '1000000000000000000',
-        gasPrice: '5000000000',
-        gasUsed: '21000',
-        gasLimit: '21000',
-        nonce: 12345,
-        transactionIndex: 0,
-        input: '0x',
-        status: 'success',
-        logs: [],
-        tokenTransfers: []
-      })
+    } catch (err) {
+      // An unreachable indexer must surface as an error. Inventing a "successful"
+      // transfer with plausible hashes and amounts misreports chain state.
+      setData(null)
+      setError(err instanceof Error ? err.message : 'Failed to load transaction')
     } finally {
       setLoading(false)
     }
@@ -62,7 +51,22 @@ export default function TransactionPage() {
     )
   }
 
-  const gasFee = data ? (parseFloat(data.gasUsed) * parseFloat(data.gasPrice)) / 1e18 : 0
+  if (error || !data) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center px-4">
+        <div className="max-w-md text-center">
+          <h1 className="text-xl font-semibold text-gray-900 dark:text-white mb-2">
+            Transaction unavailable
+          </h1>
+          <p className="text-gray-500 dark:text-gray-400">
+            {error ?? 'Transaction not found.'}
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  const gasFee = (parseFloat(data.gasUsed) * parseFloat(data.gasPrice)) / 1e18
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-dark-900">

@@ -9,9 +9,9 @@ import { Toaster } from 'react-hot-toast'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'TigerSmartChain | BNB Smart Chain Explorer',
-  description: 'A comprehensive blockchain explorer for BNB Smart Chain with real-time data, analytics, and advanced search capabilities.',
-  keywords: ['BNB', 'BSC', 'Blockchain', 'Explorer', 'Crypto', 'Web3', 'DeFi'],
+  title: 'TigerScan | TigerSmartChain Explorer',
+  description: 'Block explorer for TigerSmartChain: real-time blocks, transactions, tokens, NFTs and analytics.',
+  keywords: ['TigerSmartChain', 'TGR', 'Blockchain', 'Explorer', 'Crypto', 'Web3', 'DeFi'],
 }
 
 export default function RootLayout({

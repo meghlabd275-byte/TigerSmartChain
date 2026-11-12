@@ -1,6 +1,6 @@
 'use client'
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 
 interface Web3ContextType {
   address: string | null
@@ -9,6 +9,7 @@ interface Web3ContextType {
   connect: () => Promise<void>
   disconnect: () => void
   isConnecting: boolean
+  error: string | null
 }
 
 const Web3Context = createContext<Web3ContextType>({
@@ -18,10 +19,22 @@ const Web3Context = createContext<Web3ContextType>({
   connect: async () => {},
   disconnect: () => {},
   isConnecting: false,
+  error: null,
 })
 
 export function useWeb3() {
   return useContext(Web3Context)
+}
+
+interface Eip1193Provider {
+  request(args: { method: string; params?: unknown[] }): Promise<unknown>
+  on?(event: string, handler: (...args: never[]) => void): void
+  removeListener?(event: string, handler: (...args: never[]) => void): void
+}
+
+function getInjectedProvider(): Eip1193Provider | null {
+  if (typeof window === 'undefined') return null
+  return (window as unknown as { ethereum?: Eip1193Provider }).ethereum ?? null
 }
 
 export function Web3Provider({ children }: { children: ReactNode }) {
@@ -29,31 +42,93 @@ export function Web3Provider({ children }: { children: ReactNode }) {
   const [chainId, setChainId] = useState<number | null>(null)
   const [balance, setBalance] = useState<string | null>(null)
   const [isConnecting, setIsConnecting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
-  const connect = async () => {
+  const refresh = useCallback(async (account: string) => {
+    const provider = getInjectedProvider()
+    if (!provider) return
+    const hexChainId = (await provider.request({ method: 'eth_chainId' })) as string
+    const hexBalance = (await provider.request({
+      method: 'eth_getBalance',
+      params: [account, 'latest'],
+    })) as string
+    setChainId(parseInt(hexChainId, 16))
+    setBalance(BigInt(hexBalance).toString())
+  }, [])
+
+  const connect = useCallback(async () => {
+    const provider = getInjectedProvider()
+    if (!provider) {
+      setError('No EVM wallet detected. Install MetaMask or another injected wallet.')
+      return
+    }
     setIsConnecting(true)
+    setError(null)
     try {
-      // In production, use actual wallet connection
-      // For now, simulate connection
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      setAddress('0x742d35Cc6634C0532925a3b844Bc9e7595f0fEb1')
-      setChainId(56)
-      setBalance('1.5')
-    } catch (error) {
-      console.error('Failed to connect:', error)
+      const accounts = (await provider.request({ method: 'eth_requestAccounts' })) as string[]
+      const account = accounts[0]
+      if (!account) {
+        setError('Wallet returned no accounts.')
+        return
+      }
+      setAddress(account)
+      await refresh(account)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to connect wallet')
     } finally {
       setIsConnecting(false)
     }
-  }
+  }, [refresh])
 
-  const disconnect = () => {
+  const disconnect = useCallback(() => {
     setAddress(null)
     setChainId(null)
     setBalance(null)
-  }
+    setError(null)
+  }, [])
+
+  // Re-attach to an already-authorised wallet and follow account/chain changes.
+  useEffect(() => {
+    const provider = getInjectedProvider()
+    if (!provider) return
+
+    let cancelled = false
+    provider
+      .request({ method: 'eth_accounts' })
+      .then(async (accounts) => {
+        const account = (accounts as string[])[0]
+        if (cancelled || !account) return
+        setAddress(account)
+        await refresh(account)
+      })
+      .catch(() => undefined)
+
+    const onAccountsChanged = (...args: never[]) => {
+      const accounts = args[0] as unknown as string[]
+      if (accounts.length === 0) {
+        disconnect()
+      } else {
+        setAddress(accounts[0])
+        refresh(accounts[0]).catch(() => undefined)
+      }
+    }
+    const onChainChanged = (...args: never[]) => {
+      setChainId(parseInt(args[0] as unknown as string, 16))
+    }
+
+    provider.on?.('accountsChanged', onAccountsChanged)
+    provider.on?.('chainChanged', onChainChanged)
+    return () => {
+      cancelled = true
+      provider.removeListener?.('accountsChanged', onAccountsChanged)
+      provider.removeListener?.('chainChanged', onChainChanged)
+    }
+  }, [refresh, disconnect])
 
   return (
-    <Web3Context.Provider value={{ address, chainId, balance, connect, disconnect, isConnecting }}>
+    <Web3Context.Provider
+      value={{ address, chainId, balance, connect, disconnect, isConnecting, error }}
+    >
       {children}
     </Web3Context.Provider>
   )

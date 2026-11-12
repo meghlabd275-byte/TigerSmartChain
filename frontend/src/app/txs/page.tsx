@@ -4,8 +4,7 @@ import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { 
   RefreshCw, 
-  ArrowUpRight, 
-  ArrowDownRight,
+  FileText,
   ChevronLeft,
   ChevronRight,
   Clock,
@@ -193,14 +192,15 @@ export default function TransactionsPage() {
 }
 
 function TransactionRow({ tx }: { tx: Transaction }) {
-  const isOutgoing = Math.random() > 0.5
+  // Direction is only knowable relative to an address; this list is global, so
+  // no per-row direction is claimed. It previously flipped a coin per render.
   
   return (
     <tr className="hover:bg-gray-50 dark:hover:bg-dark-700 transition-colors">
       <td className="px-6 py-4">
         <Link href={`/tx/${tx.hash}`} className="flex items-center space-x-2 group">
-          <div className={`w-8 h-8 rounded-full flex items-center justify-center ${isOutgoing ? 'bg-red-100 text-red-500' : 'bg-green-100 text-green-500'}`}>
-            {isOutgoing ? <ArrowUpRight className="w-4 h-4" /> : <ArrowDownRight className="w-4 h-4" />}
+          <div className="w-8 h-8 rounded-full flex items-center justify-center bg-gray-100 text-gray-500 dark:bg-dark-700 dark:text-gray-300">
+            <FileText className="w-4 h-4" />
           </div>
           <span className="font-mono text-sm text-primary-500 group-hover:underline hash-truncate max-w-[200px]">
             {tx.hash.slice(0, 20)}...

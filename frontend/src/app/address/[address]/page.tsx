@@ -26,6 +26,7 @@ export default function AddressPage() {
   const [tokens, setTokens] = useState<Token[]>([])
   const [nfts, setNfts] = useState<NFTToken[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'transactions' | 'tokens' | 'nfts'>('transactions')
   const [copied, setCopied] = useState(false)
 
@@ -45,17 +46,14 @@ export default function AddressPage() {
       setTransactions(txs.items || [])
       setTokens(tokenList)
       setNfts(nftList)
-    } catch (error) {
-      setData({
-        address,
-        balance: '1000000000000000000',
-        isContract: false,
-        txCount: 1234,
-        firstSeenBlock: 10000000,
-        lastSeenBlock: 45678901,
-        totalReceived: '5000000000000000000',
-        totalSent: '4000000000000000000'
-      })
+    } catch (err) {
+      // Never substitute placeholder balances/transaction counts: a fabricated
+      // account view is indistinguishable from real chain data to the reader.
+      setData(null)
+      setTransactions([])
+      setTokens([])
+      setNfts([])
+      setError(err instanceof Error ? err.message : 'Failed to load address')
     } finally {
       setLoading(false)
     }
@@ -75,7 +73,28 @@ export default function AddressPage() {
     )
   }
 
-  const balance = data ? parseFloat(data.balance) / 1e18 : 0
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center px-4">
+        <div className="max-w-md text-center">
+          <h1 className="text-xl font-semibold text-gray-900 dark:text-white mb-2">
+            Address unavailable
+          </h1>
+          <p className="text-gray-500 dark:text-gray-400">{error}</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!data) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center">
+        <p className="text-gray-500 dark:text-gray-400">Address not found.</p>
+      </div>
+    )
+  }
+
+  const balance = parseFloat(data.balance) / 1e18
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-dark-900">

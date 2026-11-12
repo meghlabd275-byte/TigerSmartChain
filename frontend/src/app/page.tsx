@@ -308,13 +308,15 @@ function GasItem({ label, value, color }: { label: string; value: string; color:
 }
 
 function TransactionRow({ tx }: { tx: Transaction }) {
-  const isOutgoing = tx.from.toLowerCase() === '0x742d35Cc6634C0532925a3b844Bc9e7595f0eB1E'.toLowerCase()
+  // There is no "current user" on a public explorer, so a fixed watch address
+  // was being compared against every transaction. Show the transfer itself.
+  const hasContractCall = tx.input && tx.input !== '0x'
   
   return (
     <Link href={`/tx/${tx.hash}`} className="flex items-center justify-between p-4 hover:bg-gray-50 dark:hover:bg-dark-700 transition-colors">
       <div className="flex items-center space-x-3">
-        <div className={`w-10 h-10 rounded-full flex items-center justify-center ${isOutgoing ? 'bg-red-100 text-red-500' : 'bg-green-100 text-green-500'}`}>
-          {isOutgoing ? <ArrowUpRight className="w-5 h-5" /> : <ArrowDownRight className="w-5 h-5" />}
+        <div className="w-10 h-10 rounded-full flex items-center justify-center bg-primary-100 text-primary-500 dark:bg-primary-900/30">
+          {hasContractCall ? <FileText className="w-5 h-5" /> : <Coins className="w-5 h-5" />}
         </div>
         <div>
           <p className="font-medium text-gray-900 dark:text-white hash-truncate max-w-xs">

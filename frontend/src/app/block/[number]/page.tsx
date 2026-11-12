@@ -14,6 +14,7 @@ export default function BlockPage() {
   const [data, setData] = useState<any>(null)
   const [transactions, setTransactions] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [activeTab, setActiveTab] = useState<'transactions' | 'uncles'>('transactions')
   const [copied, setCopied] = useState(false)
 
@@ -22,6 +23,8 @@ export default function BlockPage() {
   }, [number])
 
   const fetchData = async () => {
+    setLoading(true)
+    setError(null)
     try {
       const [blockData, txs] = await Promise.all([
         api.getBlock(number),
@@ -29,26 +32,12 @@ export default function BlockPage() {
       ])
       setData(blockData)
       setTransactions(txs.items || [])
-    } catch (error) {
-      setData({
-        number,
-        hash: '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd',
-        parentHash: '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef123456',
-        timestamp: Math.floor(Date.now() / 1000),
-        transactions: [],
-        gasUsed: '12500000',
-        gasLimit: '30000000',
-        miner: '0x1234567890abcdef1234567890abcdef12345678',
-        difficulty: '0',
-        totalDifficulty: '0',
-        size: 54200,
-        nonce: '0x1234567890abcdef',
-        extraData: '0x',
-        baseFeePerGas: '5000000000',
-        transactionsCount: 156,
-        unclesCount: 0
-      })
+    } catch (err) {
+      // Fabricated hashes, gas figures and transaction counts previously stood in
+      // for a failed lookup, presenting an invented block as a real one.
+      setData(null)
       setTransactions([])
+      setError(err instanceof Error ? err.message : 'Failed to load block')
     } finally {
       setLoading(false)
     }
@@ -64,6 +53,21 @@ export default function BlockPage() {
     return (
       <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-500"></div>
+      </div>
+    )
+  }
+
+  if (error || !data) {
+    return (
+      <div className="min-h-screen bg-gray-50 dark:bg-dark-900 flex items-center justify-center px-4">
+        <div className="max-w-md text-center">
+          <h1 className="text-xl font-semibold text-gray-900 dark:text-white mb-2">
+            Block unavailable
+          </h1>
+          <p className="text-gray-500 dark:text-gray-400">
+            {error ?? 'Block not found.'}
+          </p>
+        </div>
       </div>
     )
   }

@@ -12,6 +12,7 @@ export default function SearchPage() {
   const [results, setResults] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
   const [searched, setSearched] = useState(false)
+  const [error, setError] = useState<string | null>(null)
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -19,25 +20,16 @@ export default function SearchPage() {
 
     setLoading(true)
     setSearched(true)
+    setError(null)
 
     try {
       const searchResults = await api.search(query)
       setResults(searchResults)
-    } catch (error) {
-      const q = query.toLowerCase()
-      
-      if (q.startsWith('0x') && q.length === 42) {
-        setResults([{ type: 'address', address: query, balance: '1000000000000000000' }])
-      } else if (q.startsWith('0x') && q.length === 66) {
-        setResults([{ type: 'transaction', hash: query, value: '1000000000000000000' }])
-      } else if (/^\d+$/.test(q)) {
-        setResults([{ type: 'block', number: parseInt(q) }])
-      } else {
-        setResults([
-          { type: 'token', address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b095c', name: 'Wrapped BNB', symbol: 'WBNB' },
-          { type: 'token', address: '0x55d398326f99059fF775485246999027B3197955', name: 'Tether USD', symbol: 'USDT' },
-        ])
-      }
+    } catch (err) {
+      // Guessed results were previously returned on failure, including token
+      // contracts the query never matched, so a failed lookup looked successful.
+      setResults([])
+      setError(err instanceof Error ? err.message : 'Search failed')
     } finally {
       setLoading(false)
     }
@@ -69,7 +61,7 @@ export default function SearchPage() {
     <div className="min-h-screen bg-gray-50 dark:bg-dark-900">
       <div className="max-w-4xl mx-auto px-4 py-16">
         <h1 className="text-3xl font-bold text-center text-gray-900 dark:text-white mb-8">
-          Search BNB Smart Chain
+          Search TigerSmartChain
         </h1>
 
         <form onSubmit={handleSearch} className="mb-8">
@@ -91,7 +83,13 @@ export default function SearchPage() {
           </div>
         )}
 
-        {searched && !loading && results.length === 0 && (
+        {error && !loading && (
+          <div className="mb-6 rounded-xl border border-red-200 bg-red-50 dark:border-red-900/40 dark:bg-red-900/20 p-4 text-sm text-red-700 dark:text-red-300">
+            {error}
+          </div>
+        )}
+
+        {searched && !loading && !error && results.length === 0 && (
           <div className="text-center py-8 text-gray-500">No results found</div>
         )}
 

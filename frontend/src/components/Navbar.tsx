@@ -20,6 +20,7 @@ import {
   Globe
 } from 'lucide-react'
 import { useThemeStore, useSearchStore } from '@/lib/store'
+import { WalletConnect } from '@/components/providers'
 import { formatAddress, isValidAddress, isValidHash } from '@/lib/utils'
 import { SearchAutocomplete } from './SearchAutocomplete'
 
@@ -142,6 +143,11 @@ export function Navbar() {
                   onClose={() => setShowSearch(false)}
                 />
               )}
+            </div>
+
+            {/* Wallet */}
+            <div className="hidden sm:block">
+              <WalletConnect />
             </div>
 
             {/* Theme Toggle */}
