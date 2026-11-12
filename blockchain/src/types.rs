@@ -156,11 +156,19 @@ pub struct Genesis {
 }
 
 /// Account
+///
+/// Only `balance` is required. A genesis file written for any Ethereum-family
+/// chain omits `nonce`, `code` and `storage` for ordinary funded accounts, so
+/// those default rather than failing the parse: a required field here would
+/// reject every standard genesis file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub balance: String,
+    #[serde(default)]
     pub nonce: Option<u64>,
+    #[serde(default)]
     pub code: Option<String>,
+    #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
 }
 

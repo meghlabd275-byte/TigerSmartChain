@@ -9,7 +9,6 @@ license = "MIT"
 [dependencies]
 # Trie and state
 keccak-hash = "0.10"
-hasher = "0.2"
 
 # Database
 rocksdb = "0.21"

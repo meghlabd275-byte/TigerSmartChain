@@ -798,8 +798,40 @@ pub fn state_from_genesis(genesis: &Genesis) -> WorldState {
                 world_state.set_code(&parsed, bytes);
             }
         }
+        // Pre-deployed contracts and proxy implementations carry their initial
+        // storage in genesis. Skipping it would leave a contract whose code is
+        // present but whose owner, implementation pointer or supply reads as
+        // zero, so every call against it would misbehave.
+        for (slot, value) in &account.storage {
+            let (Ok(slot), Ok(value)) = (
+                hex_word(slot),
+                hex_word(value),
+            ) else {
+                warn!("skipping genesis storage slot {slot} for {address}: not a 32-byte word");
+                continue;
+            };
+            world_state.set_storage(&parsed, slot, value);
+        }
     }
     world_state
+}
+
+/// Decode a 32-byte word from a genesis `0x`-prefixed string, left-padding a
+/// shorter value the way a JSON-RPC quantity would be.
+fn hex_word(value: &str) -> Result<[u8; 32], String> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    let padded = if hex.len() % 2 != 0 {
+        format!("0{hex}")
+    } else {
+        hex.to_string()
+    };
+    let bytes = hex_decode_checked(&padded)?;
+    if bytes.len() > 32 {
+        return Err("value wider than 32 bytes".to_string());
+    }
+    let mut out = [0u8; 32];
+    out[32 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(out)
 }
 
 /// Create a genesis block configuration for the given chain ID.
@@ -830,6 +862,12 @@ fn create_genesis_block(chain_id: u64) -> Genesis {
 /// malformed file is a fatal error rather than a silent fall back to the
 /// built-in genesis, because starting a chain with the wrong genesis would
 /// fork it from every other node.
+///
+/// Genesis files in the wild are written for geth, BSC and other clients, and
+/// use camelCase keys (`extraData`, `gasLimit`, `mixHash`) and an `alloc`
+/// whose account entries carry only a balance. Normalising those spellings
+/// here means an operator can point the node at the genesis file they already
+/// have instead of hand-editing it into this crate's struct layout.
 fn load_genesis(config: &Config) -> Result<Genesis> {
     let Some(path) = &config.genesis_file else {
         return Ok(create_genesis_block(config.chain_id));
@@ -837,7 +875,12 @@ fn load_genesis(config: &Config) -> Result<Genesis> {
 
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read genesis file {path}"))?;
-    let genesis: Genesis = serde_json::from_str(&contents)
+
+    let mut value: serde_json::Value = serde_json::from_str(&contents)
+        .with_context(|| format!("cannot parse genesis file {path}"))?;
+    normalise_genesis_keys(&mut value);
+
+    let genesis: Genesis = serde_json::from_value(value)
         .with_context(|| format!("cannot parse genesis file {path}"))?;
 
     if genesis.config.chain_id != config.chain_id {
@@ -849,6 +892,73 @@ fn load_genesis(config: &Config) -> Result<Genesis> {
     }
     info!("Loaded genesis from {path}");
     Ok(genesis)
+}
+
+/// Rewrite the camelCase keys geth-family clients emit into the snake_case
+/// keys this crate's structs use, at the genesis root and in every alloc
+/// entry. Unknown keys are left alone.
+fn normalise_genesis_keys(value: &mut serde_json::Value) {
+    const ROOT_ALIASES: &[(&str, &str)] = &[
+        ("extraData", "extra_data"),
+        ("gasLimit", "gas_limit"),
+        ("mixHash", "mix_hash"),
+        ("baseFeePerGas", "base_fee_per_gas"),
+    ];
+    const CONFIG_ALIASES: &[(&str, &str)] = &[
+        ("chainId", "chain_id"),
+        ("homesteadBlock", "homestead_block"),
+        ("daoForkBlock", "dao_fork_block"),
+        ("eip150Block", "eip150_block"),
+        ("eip150Hash", "eip150_hash"),
+        ("eip155Block", "eip155_block"),
+        ("eip158Block", "eip158_block"),
+        ("byzantiumBlock", "byzantium_block"),
+        ("constantinopleBlock", "constantinople_block"),
+        ("petersburgBlock", "petersburg_block"),
+        ("istanbulBlock", "istanbul_block"),
+        ("eip1283Block", "eip1283_block"),
+        ("berlinBlock", "berlin_block"),
+        ("londonBlock", "london_block"),
+        ("mergeForkBlock", "merge_fork_block"),
+        ("shanghaiBlock", "shanghai_block"),
+        ("cancelDeneb", "cancel_deneb"),
+    ];
+
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    rename_keys(root, ROOT_ALIASES);
+
+    if let Some(config) = root.get_mut("config").and_then(|c| c.as_object_mut()) {
+        rename_keys(config, CONFIG_ALIASES);
+    }
+
+    if let Some(alloc) = root.get_mut("alloc").and_then(|a| a.as_object_mut()) {
+        for account in alloc.values_mut() {
+            if let Some(account) = account.as_object_mut() {
+                // `code` and `storage` are also spelled `code`/`storage` by
+                // every client, but a storage map's values must be strings;
+                // a non-string value is dropped so the parse error names the
+                // account rather than an anonymous type mismatch.
+                if let Some(storage) = account.get_mut("storage").and_then(|s| s.as_object_mut()) {
+                    storage.retain(|_, v| v.is_string());
+                }
+            }
+        }
+    }
+}
+
+/// Move each `from` key of `map` to its `to` spelling, leaving an existing
+/// `to` key untouched so an explicitly snake_case file still wins.
+fn rename_keys(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    aliases: &[(&str, &str)],
+) {
+    for (from, to) in aliases {
+        if let Some(value) = map.remove(*from) {
+            map.entry((*to).to_string()).or_insert(value);
+        }
+    }
 }
 
 /// Parse a genesis balance, accepting both decimal and `0x`-prefixed hex.
@@ -906,16 +1016,46 @@ fn hex_decode_checked(value: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Build the genesis block from its configuration.
+/// Build the genesis block (number 0) from a genesis definition.
 ///
-/// The genesis header is a real header: its transactions root is the empty
-/// trie root and its state root is the root of the (empty) world state, so it
-/// hashes consistently with every other client.
+/// The header's `state_root` is computed from the genesis allocation, not
+/// hardcoded to the empty-trie root. The world state the node starts from is
+/// exactly that allocation, so a block 0 claiming an empty trie would put the
+/// chain's very first header out of step with its own state: an explorer,
+/// light client or peer re-executing genesis would derive a different root and
+/// reject the chain. `miner`, `difficulty`, `gas_limit`, `extra_data` and
+/// `mix_hash` are likewise taken from the definition rather than invented, so
+/// two nodes given the same file agree on the genesis hash.
 pub fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
     use tiger_blockchain::types::{Block, BlockHeader};
     use tiger_blockchain::EMPTY_TRIE_ROOT;
 
-    let state_root = WorldState::new().state_root();
+    let state_root = state_from_genesis(genesis).state_root();
+
+    // The genesis definition stores the gas limit as a string that may be
+    // decimal or 0x-hex; anything unparseable falls back to the chain limit
+    // rather than producing a block with a zero gas limit, which every
+    // transaction would then fail against.
+    let gas_limit = genesis
+        .gas_limit
+        .parse()
+        .ok()
+        .or_else(|| {
+            genesis
+                .gas_limit
+                .strip_prefix("0x")
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        })
+        .unwrap_or(BLOCK_GAS_LIMIT);
+
+    let difficulty = if genesis.difficulty.starts_with("0x") {
+        genesis.difficulty.clone()
+    } else {
+        format!(
+            "0x{:x}",
+            genesis.difficulty.parse::<u64>().unwrap_or(0)
+        )
+    };
 
     Block {
         header: BlockHeader {
@@ -929,9 +1069,9 @@ pub fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
             transactions_root: format!("0x{}", tiger_blockchain::hex_encode(&EMPTY_TRIE_ROOT)),
             receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&EMPTY_TRIE_ROOT)),
             logs_bloom: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 256])),
-            difficulty: "0x0".to_string(),
+            difficulty,
             number: 0,
-            gas_limit: genesis.gas_limit.parse().unwrap_or(BLOCK_GAS_LIMIT),
+            gas_limit,
             gas_used: 0,
             timestamp: 0,
             extra_data: format!("0x{}", tiger_blockchain::hex_encode(genesis.extra_data.as_bytes())),
