@@ -243,5 +243,5 @@ func FormatGas(wei uint64) string {
 	if gwei >= 1 {
 		return fmt.Sprintf("%.2f Gwei", gwei)
 	}
-	return fmt.Sprintf("%.0f Wei", wei)
+	return fmt.Sprintf("%d Wei", wei)
 }

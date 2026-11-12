@@ -23,6 +23,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/tigersmartchain/wsauth"
 )
 
 // PriceConfig configures the price feed.
@@ -1128,7 +1129,7 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     wsauth.Check,
 }
 
 // PriceWsHub fans price updates out to connected WebSocket clients.

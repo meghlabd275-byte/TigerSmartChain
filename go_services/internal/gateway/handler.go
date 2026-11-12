@@ -14,10 +14,11 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tigersmartchain/wsauth"
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: wsauth.Check,
 }
 
 // Config holds configuration

@@ -20,6 +20,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+	"github.com/tigersmartchain/wsauth"
 )
 
 // Configuration
@@ -832,7 +833,7 @@ func (s *CommentsService) handleRemoveFromWatchlist(c *gin.Context) {
 
 func (s *CommentsService) handleWebSocket(c *gin.Context) {
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: wsauth.Check,
 	}
 
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)

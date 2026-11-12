@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/redis/go-redis/v9"
 	"github.com/gorilla/websocket"
+	"github.com/tigersmartchain/wsauth"
 )
 
 // Configuration
@@ -677,9 +678,7 @@ func (t *MevTracker) handleSearch(w http.ResponseWriter, r *http.Request) {
 
 func (t *MevTracker) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
+		CheckOrigin: wsauth.Check,
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)

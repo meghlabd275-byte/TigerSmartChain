@@ -33,6 +33,7 @@ import (
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
+	"github.com/tigersmartchain/wsauth"
 )
 
 // Configuration
@@ -86,9 +87,7 @@ var redisClient *redis.Client
 
 // WebSocket upgrader
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
+	CheckOrigin: wsauth.Check,
 }
 
 // Main handler

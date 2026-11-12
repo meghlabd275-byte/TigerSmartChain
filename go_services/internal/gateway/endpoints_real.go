@@ -265,7 +265,7 @@ func (h *Handler) GetTokenApprovals(c *gin.Context) {
 }
 
 func (h *Handler) GetTokenAllowances(c *gin.Context) {
-	h.listByAddress(c, "address", `SELECT * FROM token_approvals WHERE token_address = $1 AND amount > 0 ORDER BY id DESC LIMIT $2`)
+	h.listByAddress(c, "address", `SELECT * FROM token_approvals WHERE token_address = $1 AND value > 0 ORDER BY id DESC LIMIT $2`)
 }
 
 func (h *Handler) GetTopTokenHolders(c *gin.Context) {
@@ -439,7 +439,7 @@ func (h *Handler) GetNFTAnalytics(c *gin.Context) {
 			COUNT(*) AS token_count,
 			COALESCE(volume_24h, 0) AS volume_24h
 		FROM nft_collections nc
-		LEFT JOIN nfts n ON n.collection_address = nc.address
+		LEFT JOIN nfts n ON n.token_address = nc.address
 		WHERE nc.address = $1
 		GROUP BY nc.address, nc.volume_24h
 	`, collection)

@@ -16,6 +16,7 @@ import (
 	"github.com/graphql-go/graphql/language/parser"
 	"github.com/graphql-go/graphql/language/source"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tigersmartchain/wsauth"
 )
 
 const (
@@ -359,10 +360,10 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	Subprotocols:    []string{"graphql-transport-ws", "graphql-ws"},
-	CheckOrigin: func(r *http.Request) bool {
-		// Origin validation happens in the CORS middleware.
-		return true
-	},
+	// The CORS middleware is not in this route's chain, so the origin is
+	// checked here. A cross-site socket would otherwise carry the user's
+	// cookies and be readable by the page that opened it.
+	CheckOrigin: wsauth.Check,
 }
 
 // ServeWebSocket upgrades the connection and runs the subscription protocol.
