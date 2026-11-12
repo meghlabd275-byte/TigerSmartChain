@@ -11,6 +11,9 @@ name = "tigersmartchaind"
 path = "src/main.rs"
 
 [dependencies]
+# Embedded key/value store: a copy-on-write B-tree, so a block flush writes
+# only what changed rather than the whole chain.
+redb = "4.5"
 # Blockchain core - use existing TigerSmartChain crates
 tiger-blockchain = { path = "../blockchain" }
 tiger-state = { path = "../state" }

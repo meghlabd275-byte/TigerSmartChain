@@ -148,7 +148,6 @@ impl CorsPolicy {
 /// the RPC is failing or being throttled.
 #[derive(Debug)]
 pub struct Metrics {
-    start: std::time::Instant,
     requests: std::sync::atomic::AtomicU64,
     errors: std::sync::atomic::AtomicU64,
     rate_limited: std::sync::atomic::AtomicU64,
@@ -164,7 +163,6 @@ impl Default for Metrics {
 impl Metrics {
     pub fn new() -> Self {
         Self {
-            start: std::time::Instant::now(),
             requests: std::sync::atomic::AtomicU64::new(0),
             errors: std::sync::atomic::AtomicU64::new(0),
             rate_limited: std::sync::atomic::AtomicU64::new(0),

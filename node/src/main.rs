@@ -22,6 +22,42 @@ mod storage;
 pub use config::Config;
 pub use node::TigerNode;
 
+/// Resolve the validator key from the flag or from the file it names.
+///
+/// A key given on the command line is visible in the process list to every
+/// account on the host, so the file form is the one to prefer; both are
+/// accepted because a container that injects the key as an argument has no
+/// other option. Naming both is a configuration error rather than a silent
+/// preference, so a node never seals with a key other than the one the
+/// operator intended.
+fn resolve_validator_key(
+    validator_key: Option<String>,
+    validator_key_file: Option<&str>,
+) -> Result<Option<String>> {
+    match (validator_key, validator_key_file) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "--validator-key and --validator-key-file are mutually exclusive;              pass only the file so the key stays out of the process list"
+        ),
+        (Some(key), None) => {
+            log::warn!(
+                "--validator-key is set on the command line, so the sealing key is \
+                 visible to other accounts on this host; use --validator-key-file"
+            );
+            Ok(Some(key))
+        }
+        (None, Some(path)) => {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read the validator key file {path}"))?;
+            let key = contents.trim();
+            if key.is_empty() {
+                anyhow::bail!("the validator key file {path} is empty");
+            }
+            Ok(Some(key.to_string()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 /// Default network ID
 pub const DEFAULT_NETWORK_ID: u64 = 1;
 /// Default chain ID
@@ -117,9 +153,19 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     validators: Vec<String>,
 
-    /// Validator private key (hex)
+    /// Validator private key (hex).
+    ///
+    /// Passing a key here exposes it to every account on the host through the
+    /// process list. Prefer `--validator-key-file`.
     #[arg(long)]
     validator_key: Option<String>,
+
+    /// File holding the validator private key as hex.
+    ///
+    /// Read at startup and never written back. The file should be readable
+    /// only by the account that runs the node.
+    #[arg(long)]
+    validator_key_file: Option<String>,
 
     /// Epoch length
     #[arg(long, default_value_t = DEFAULT_EPOCH_LENGTH)]
@@ -165,6 +211,13 @@ async fn main() -> Result<()> {
     info!("Starting TigerSmartChain Node v{}", env!("CARGO_PKG_VERSION"));
     info!("Network: {}, Chain ID: {}", args.network, args.chain_id);
 
+    // Resolved before the config is built, because reading the key file can
+    // fail and a node must not come up half-configured.
+    let validator_key = resolve_validator_key(
+        args.validator_key.clone(),
+        args.validator_key_file.as_deref(),
+    )?;
+
     // Build boot nodes list
     let boot_nodes: Vec<String> = args
         .boot_nodes
@@ -197,7 +250,7 @@ async fn main() -> Result<()> {
         args.data_dir,
         args.cache_size,
         args.validator_addr,
-        args.validator_key,
+        validator_key,
         args.validators,
         args.epoch_length,
         args.slot_duration_secs,
@@ -269,4 +322,63 @@ async fn main() -> Result<()> {
 
     info!("TigerSmartChain node stopped successfully");
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("tiger-key-{}-{name}", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    /// A key file is the way to keep the sealing key out of the process list,
+    /// so the flag has to actually load it.
+    #[test]
+    fn the_validator_key_is_read_from_the_file() {
+        let path = temp_file("read", "0xabcd\n");
+        let key = resolve_validator_key(None, Some(path.to_str().unwrap()))
+            .unwrap()
+            .expect("a key file must yield a key");
+        assert_eq!(key, "0xabcd", "the trailing newline must be trimmed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Naming both sources is ambiguous. Choosing one silently would let a
+    /// node seal with a key the operator did not intend, so it is refused.
+    #[test]
+    fn naming_both_key_sources_is_refused() {
+        let path = temp_file("both", "0x01");
+        let error = resolve_validator_key(Some("0x02".to_string()), Some(path.to_str().unwrap()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mutually exclusive"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An unreadable or empty key file must fail the startup rather than let
+    /// the node run without the key it was told to use.
+    #[test]
+    fn a_missing_or_empty_key_file_is_fatal() {
+        let missing = std::env::temp_dir().join("tiger-key-does-not-exist");
+        let _ = std::fs::remove_file(&missing);
+        assert!(resolve_validator_key(None, Some(missing.to_str().unwrap())).is_err());
+
+        let empty = temp_file("empty", "   \n");
+        let error = resolve_validator_key(None, Some(empty.to_str().unwrap()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty"), "unexpected error: {error}");
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    /// A node with no key configured is a follower, not a misconfiguration.
+    #[test]
+    fn no_key_configured_yields_no_key() {
+        assert!(resolve_validator_key(None, None).unwrap().is_none());
+    }
 }

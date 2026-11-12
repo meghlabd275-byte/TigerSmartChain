@@ -331,6 +331,49 @@ impl Blockchain {
     pub fn block_count(&self) -> usize {
         self.blocks.len()
     }
+
+    /// The canonical hash at `number`, if the branch reaches it.
+    pub fn canonical_hash(&self, number: u64) -> Option<&str> {
+        self.canonical.get(&number).map(|h| h.as_str())
+    }
+
+    /// Every block in the tree with its hash, canonical and side branches
+    /// alike. A persistent store writes the whole tree, because a side branch
+    /// that is not on disk cannot be built on after a restart.
+    pub fn all_blocks(&self) -> Vec<(String, &Block)> {
+        self.blocks.iter().map(|(h, b)| (h.clone(), b)).collect()
+    }
+
+    /// Cumulative work up to and including the block named by `hash`.
+    pub fn total_difficulty_of(&self, hash: &str) -> Option<u128> {
+        self.total_difficulty
+            .get(&hash.to_ascii_lowercase())
+            .copied()
+    }
+
+    /// Replace the canonical branch with `entries`.
+    ///
+    /// Used when loading a chain from disk, where the stored map is the
+    /// authority on which branch was canonical. Re-deriving it by re-running
+    /// fork choice would depend on the order blocks are offered in and could
+    /// pick a different branch than the one the node was following.
+    pub fn restore_canonical(&mut self, entries: &[(u64, String)]) {
+        self.canonical.clear();
+        for (height, hash) in entries {
+            self.canonical
+                .insert(*height, hash.to_ascii_lowercase());
+        }
+    }
+
+    /// Restore a block's cumulative work, for a chain being loaded from disk.
+    ///
+    /// Fork choice compares branches by this value, so a reloaded chain that
+    /// did not restore it would score every block at zero and could pick a
+    /// different branch than the one it had before the restart.
+    pub fn set_total_difficulty(&mut self, hash: &str, work: u128) {
+        self.total_difficulty
+            .insert(hash.to_ascii_lowercase(), work);
+    }
 }
 
 /// Decode a header's `difficulty` field, which may be decimal or hex.

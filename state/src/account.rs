@@ -303,6 +303,127 @@ pub fn decode_account(encoded: &[u8]) -> Option<Account> {
     })
 }
 
+/// Encode an account in the full form a store needs: the four trie fields
+/// plus the contract code and storage slots that the trie only commits to by
+/// hash.
+///
+/// [`encode_account`] alone is not enough to restore an account: it carries
+/// the storage root and code hash but neither the slots nor the code behind
+/// them, so a state rebuilt from it could not execute a contract or answer
+/// `eth_getStorageAt`. The roots are stored as well so a corrupt record is
+/// detected rather than read as a different account.
+pub fn encode_account_record(account: &Account) -> Vec<u8> {
+    let mut slots: Vec<&[u8; 32]> = account.storage.keys().collect();
+    slots.sort_unstable();
+    let storage = slots
+        .into_iter()
+        .map(|slot| {
+            RlpItem::list(vec![
+                RlpItem::Bytes(slot.to_vec()),
+                RlpItem::Bytes(account.storage[slot].to_vec()),
+            ])
+        })
+        .collect();
+
+    RlpItem::list(vec![
+        RlpItem::from_u64(account.nonce),
+        RlpItem::Bytes(account.balance.to_vec()),
+        RlpItem::Bytes(account.storage_root.to_vec()),
+        RlpItem::Bytes(account.code_hash.to_vec()),
+        RlpItem::Bytes(account.code.clone()),
+        RlpItem::list(storage),
+    ])
+    .encode()
+}
+
+/// Decode a record produced by [`encode_account_record`].
+///
+/// Returns `None` when the record is malformed, and also when the recorded
+/// storage root or code hash does not match what the slots and code recompute
+/// to. A record that fails either check describes an account the chain never
+/// had, so it is rejected instead of being loaded.
+pub fn decode_account_record(encoded: &[u8]) -> Option<Account> {
+    let items = match crate::rlp::decode(encoded).ok()? {
+        RlpItem::List(items) => items,
+        _ => return None,
+    };
+    if items.len() != 6 {
+        return None;
+    }
+
+    let nonce = match &items[0] {
+        RlpItem::Bytes(b) if b.len() <= 8 => {
+            let mut value = 0u64;
+            for &byte in b {
+                value = (value << 8) | byte as u64;
+            }
+            value
+        }
+        _ => return None,
+    };
+
+    let mut balance = [0u8; 32];
+    match &items[1] {
+        RlpItem::Bytes(b) if b.len() <= 32 => balance[32 - b.len()..].copy_from_slice(b),
+        _ => return None,
+    }
+
+    let recorded_storage_root = fixed32(&items[2])?;
+    let recorded_code_hash = fixed32(&items[3])?;
+
+    let code = match &items[4] {
+        RlpItem::Bytes(b) => b.clone(),
+        _ => return None,
+    };
+
+    let mut storage = HashMap::new();
+    match &items[5] {
+        RlpItem::List(entries) => {
+            for entry in entries {
+                let pair = match entry {
+                    RlpItem::List(pair) if pair.len() == 2 => pair,
+                    _ => return None,
+                };
+                let slot = fixed32(&pair[0])?;
+                let value = fixed32(&pair[1])?;
+                if value != [0u8; 32] {
+                    storage.insert(slot, value);
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    let recomputed_storage_root = storage_root(&storage);
+    if recomputed_storage_root != recorded_storage_root {
+        return None;
+    }
+    if keccak256(&code) != recorded_code_hash {
+        return None;
+    }
+
+    Some(Account {
+        nonce,
+        balance,
+        storage_root: recorded_storage_root,
+        code_hash: recorded_code_hash,
+        code,
+        storage,
+    })
+}
+
+/// A 32-byte RLP string, or `None` when it is not exactly that.
+fn fixed32(item: &RlpItem) -> Option<[u8; 32]> {
+    match item {
+        RlpItem::Bytes(b) if b.len() == 32 => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(b);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Decode a storage slot value from the trie's RLP string form.
 ///
 /// Values are stored as RLP strings with leading zeros stripped, so this pads
@@ -326,6 +447,21 @@ pub fn decode_storage_value(encoded: &[u8]) -> [u8; 32] {
 #[derive(Debug, Clone, Default)]
 pub struct WorldState {
     accounts: HashMap<Address, Account>,
+    /// Addresses written or removed since they were last persisted, each with
+    /// the stamp of its most recent write.
+    ///
+    /// A persistent store only needs to write what changed. Without this the
+    /// whole account set would have to be compared against the last snapshot
+    /// after every block, which costs more than the block itself once the
+    /// state is large.
+    ///
+    /// The stamp lets a store that has written a snapshot release exactly the
+    /// writes it captured. A write that arrives while the snapshot is being
+    /// written carries a higher stamp and survives, so a concurrent change
+    /// cannot be dropped from the next snapshot.
+    dirty: HashMap<Address, u64>,
+    /// Stamp of the most recent write, incremented on every touch.
+    stamp: u64,
 }
 
 impl WorldState {
@@ -333,7 +469,38 @@ impl WorldState {
     pub fn new() -> Self {
         Self {
             accounts: HashMap::new(),
+            dirty: HashMap::new(),
+            stamp: 0,
         }
+    }
+
+    /// Record that `address` was written, so a store can persist just it.
+    fn touch(&mut self, address: &Address) {
+        self.stamp += 1;
+        self.dirty.insert(*address, self.stamp);
+    }
+
+    /// Addresses written since they were last persisted, each with the stamp of
+    /// its latest write, sorted by address so a store writes them in a
+    /// deterministic order.
+    pub fn dirty_entries(&self) -> Vec<(Address, u64)> {
+        let mut out: Vec<(Address, u64)> = self.dirty.iter().map(|(a, s)| (*a, *s)).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether any account has been written since it was last persisted.
+    pub fn has_dirty(&self) -> bool {
+        !self.dirty.is_empty()
+    }
+
+    /// Forget the writes with a stamp at or below `mark`.
+    ///
+    /// `mark` is the highest stamp a store captured. A write that happened
+    /// after the capture carries a higher stamp and is kept, so it is written
+    /// by the next snapshot rather than being lost.
+    pub fn clear_dirty_up_to(&mut self, mark: u64) {
+        self.dirty.retain(|_, stamp| *stamp > mark);
     }
 
     /// Read an account, if it exists.
@@ -343,6 +510,7 @@ impl WorldState {
 
     /// Mutable access to an account, creating a default one when absent.
     pub fn account_mut(&mut self, address: &Address) -> &mut Account {
+        self.touch(address);
         self.accounts.entry(*address).or_default()
     }
 
@@ -490,15 +658,19 @@ impl WorldState {
     /// Restore a previously captured snapshot.
     pub fn restore(&mut self, snapshot: WorldState) {
         self.accounts = snapshot.accounts;
+        self.dirty = snapshot.dirty;
+        self.stamp = snapshot.stamp;
     }
 
     /// Insert a fully formed account.
     pub fn insert_account(&mut self, address: Address, account: Account) {
+        self.touch(&address);
         self.accounts.insert(address, account);
     }
 
     /// Remove an account entirely.
     pub fn remove_account(&mut self, address: &Address) {
+        self.touch(address);
         self.accounts.remove(address);
     }
 
@@ -988,5 +1160,64 @@ mod tests {
             Trie::verify_proof(&later_root, &keccak256(&addr(0x01)), &proof.account_proof),
             None
         );
+    }
+
+    #[test]
+    fn an_account_record_round_trips_code_and_storage() {
+        let mut account = Account::default();
+        account.nonce = 42;
+        account.balance = u256_from_u64(9_000);
+        account.code = vec![0x60, 0x00, 0x60, 0x00, 0xf3];
+        account.code_hash = keccak256(&account.code);
+        account.storage.insert([0x01u8; 32], [0xaa; 32]);
+        account.storage.insert([0x02u8; 32], [0xbb; 32]);
+        account.storage_root = storage_root(&account.storage);
+
+        let decoded = decode_account_record(&encode_account_record(&account))
+            .expect("a record the encoder produced must decode");
+        assert_eq!(decoded, account);
+    }
+
+    #[test]
+    fn an_account_record_with_a_wrong_storage_root_is_rejected() {
+        let mut account = Account::default();
+        account.storage.insert([0x01u8; 32], [0xaa; 32]);
+        account.storage_root = storage_root(&account.storage);
+
+        // A record whose slots do not hash to its recorded storage root
+        // describes an account the chain never had.
+        account.storage_root = [0xffu8; 32];
+        assert!(decode_account_record(&encode_account_record(&account)).is_none());
+    }
+
+    #[test]
+    fn an_account_record_with_a_wrong_code_hash_is_rejected() {
+        let mut account = Account::default();
+        account.code = vec![0x60, 0x00];
+        account.code_hash = keccak256(&account.code);
+        account.code_hash = [0x11u8; 32];
+        assert!(decode_account_record(&encode_account_record(&account)).is_none());
+    }
+
+    #[test]
+    fn dirty_tracking_follows_writes() {
+        let mut state = WorldState::new();
+        assert!(!state.has_dirty());
+
+        state.set_balance(&[0x01u8; 20], u256_from_u64(1));
+        state.set_nonce(&[0x02u8; 20], 3);
+        let entries = state.dirty_entries();
+        assert_eq!(entries.len(), 2);
+        let mark = entries.iter().map(|(_, s)| *s).max().unwrap();
+
+        // A write after the mark survives a release up to it.
+        state.set_balance(&[0x03u8; 20], u256_from_u64(4));
+        state.clear_dirty_up_to(mark);
+        let remaining = state.dirty_entries();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, [0x03u8; 20]);
+
+        state.clear_dirty_up_to(u64::MAX);
+        assert!(!state.has_dirty());
     }
 }

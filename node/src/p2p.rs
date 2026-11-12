@@ -714,10 +714,41 @@ fn load_or_create_identity(node: &Arc<TigerNode>) -> Identity {
             return identity;
         }
     }
-    if let Err(e) = std::fs::write(&path, identity.secret_bytes()) {
+    // The identity is a private key. Writing it with the process umask would
+    // usually leave it readable by every account on the host, which lets
+    // anyone impersonate this node to its peers.
+    if let Err(e) = write_private_file(&path, &identity.secret_bytes()) {
         warn!("cannot persist the P2P identity to {}: {e}", path.display());
     }
     identity
+}
+
+/// Write a secret to `path` with owner-only permissions.
+///
+/// The file is created with mode 0600 from the start rather than written and
+/// then narrowed, so there is no window in which the secret is readable by
+/// others.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // `mode` on `open` only applies when the file is created; a file that
+        // already existed keeps its old permissions, so they are set again.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Turn a listen string into something `TcpListener::bind` accepts.
@@ -841,5 +872,37 @@ mod tests {
             admission.admit(honest),
             "a flood from one address must not deny a different address"
         );
+    }
+
+    /// The node's P2P identity is a private key. It must not be readable by
+    /// other accounts on the host, or anyone with a shell could impersonate
+    /// the node to its peers.
+    #[cfg(unix)]
+    #[test]
+    fn the_p2p_identity_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("tiger-p2p-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p2p-identity.key");
+
+        write_private_file(&path, &[0x11u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the identity file must be owner-only");
+
+        // A file that already existed with looser permissions must be
+        // tightened rather than left as it was found.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&path, &[0x22u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing file must be tightened");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            vec![0x22u8; 32],
+            "the file must hold the bytes that were written"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

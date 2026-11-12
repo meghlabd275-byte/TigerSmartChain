@@ -95,6 +95,17 @@ pub struct TigerNode {
     /// in memory and says so.
     storage: Option<crate::storage::Storage>,
 
+    /// Block hashes already written to the store, so a flush writes each block
+    /// once instead of re-writing the chain after every block.
+    persisted: tokio::sync::Mutex<std::collections::HashSet<String>>,
+
+    /// The canonical branch as the store last saw it, so a flush can write the
+    /// heights that changed rather than the whole map.
+    canonical_mark: tokio::sync::Mutex<std::collections::HashMap<u64, String>>,
+
+    /// When the node was constructed, for the uptime metric.
+    started_at: std::time::Instant,
+
     /// The peer-to-peer service, once it is listening. `None` before startup
     /// or when the listen address could not be bound.
     p2p: std::sync::OnceLock<Arc<crate::p2p::P2pService>>,
@@ -115,8 +126,29 @@ impl TigerNode {
     /// [`TigerNode::new`] reads the genesis from disk and delegates here, so a
     /// caller that already holds a genesis (a test, or a node started from an
     /// embedded chain spec) builds exactly the same node.
-    pub async fn from_genesis(config: Config, genesis: Genesis) -> Result<Self> {
+    pub async fn from_genesis(mut config: Config, genesis: Genesis) -> Result<Self> {
         info!("Initializing TigerSmartChain node...");
+
+        // Fill in the proposer address from the sealing key when the operator
+        // gave a key but no address. The address is derived from the key, so
+        // requiring it separately would let a correctly configured validator
+        // come up and silently never propose a block.
+        if config.validator_addr.is_none() {
+            if let Some(raw) = &config.validator_key {
+                match parse_private_key(raw) {
+                    Ok(key) => match tiger_crypto::private_key_to_address(&key) {
+                        Ok(address) => {
+                            let address =
+                                format!("0x{}", tiger_blockchain::hex_encode(&address));
+                            info!("Validator address derived from the sealing key: {address}");
+                            config.validator_addr = Some(address);
+                        }
+                        Err(e) => warn!("cannot derive an address from the sealing key: {e}"),
+                    },
+                    Err(e) => warn!("cannot read the sealing key to derive an address: {e}"),
+                }
+            }
+        }
 
         // Validate configuration
         Self::validate_config(&config)?;
@@ -215,7 +247,20 @@ impl TigerNode {
         // to open the directory is reported and the node runs in memory, so a
         // read-only filesystem does not stop a follower from serving.
         let storage = match crate::storage::Storage::open(&config.data_dir) {
-            Ok(storage) => Some(storage),
+            Ok(storage) => match storage.initialise(config.chain_id) {
+                Ok(()) => Some(storage),
+                Err(e) => {
+                    // A store that belongs to another chain, or that was
+                    // written by a build with a different layout, is refused
+                    // rather than written to: continuing would mix two chains
+                    // in one directory.
+                    warn!(
+                        "refusing to use the data directory {}: {e}; running without persistence",
+                        config.data_dir
+                    );
+                    None
+                }
+            },
             Err(e) => {
                 warn!("cannot open data directory {}: {e}; running without persistence", config.data_dir);
                 None
@@ -236,6 +281,9 @@ impl TigerNode {
             sync_status,
             tasks,
             storage,
+            persisted: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            canonical_mark: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            started_at: std::time::Instant::now(),
             p2p: std::sync::OnceLock::new(),
             filters: tokio::sync::Mutex::new(crate::filters::FilterRegistry::new()),
         })
@@ -276,79 +324,101 @@ impl TigerNode {
             .unwrap_or_default()
     }
 
-    /// Restore the chain and world state from disk, if a snapshot exists.
+    /// Restore the chain and world state from disk.
     ///
-    /// Returns the number of blocks restored. A snapshot that cannot be read
-    /// or that fails its integrity check is a fatal error: continuing with a
-    /// fresh chain would silently discard the ledger and, worse, restart from
-    /// genesis while other nodes are at a later height.
+    /// Returns the number of blocks restored. A store that cannot be read, or
+    /// that fails an integrity check, is a fatal error: continuing with a
+    /// fresh chain would silently discard the ledger and restart from genesis
+    /// while every peer is at a later height.
     async fn restore_from_disk(&self) -> Result<u64> {
         let Some(storage) = &self.storage else {
             return Ok(0);
         };
 
-        let restored_state = match storage.load_state() {
-            Ok(state) => state,
-            Err(e) => anyhow::bail!("cannot restore world state: {e}"),
-        };
-
-        let chain = match storage.load_chain() {
-            Ok(chain) => chain,
-            Err(e) => anyhow::bail!("cannot restore chain: {e}"),
-        };
-
-        let Some(snapshot) = chain else {
-            if restored_state.is_some() {
-                info!("Found a stored world state but no chain; ignoring the state");
-            }
+        if storage.is_empty()? {
             return Ok(0);
-        };
-        debug_assert!(storage.chain_exists());
+        }
 
         // The stored chain must belong to the chain this node was configured
-        // for. Loading a snapshot from a different chain would attach
-        // unrelated blocks to this genesis.
-        let expected_chain_id = self.genesis.config.chain_id;
-        if snapshot.config.chain_id != expected_chain_id {
-            anyhow::bail!(
-                "stored chain is for chain id {}, but this node is configured for {expected_chain_id}",
-                snapshot.config.chain_id
-            );
-        }
-        if let Some(ref stored_genesis) = snapshot.genesis {
-            if stored_genesis.config.chain_id != expected_chain_id {
-                anyhow::bail!(
-                    "stored genesis is for chain id {}, but this node is configured for {expected_chain_id}",
-                    stored_genesis.config.chain_id
-                );
-            }
-        }
+        // for. Loading a store from a different chain would attach unrelated
+        // blocks to this genesis. `initialise` checks this at open time; this
+        // is the second half, for a store whose meta was written before the
+        // chain id was recorded.
+        let blocks = storage
+            .load_blocks()
+            .map_err(|e| anyhow::anyhow!("cannot restore the chain: {e}"))?;
+        let receipts = storage
+            .load_receipts()
+            .map_err(|e| anyhow::anyhow!("cannot restore the receipts: {e}"))?;
+        let canonical = storage
+            .load_canonical()
+            .map_err(|e| anyhow::anyhow!("cannot restore the canonical map: {e}"))?;
+        let work = storage
+            .load_work()
+            .map_err(|e| anyhow::anyhow!("cannot restore the cumulative work: {e}"))?;
 
-        let block_count = snapshot.blocks.len() as u64;
+        // The head block's stateRoot is what the restored state must hash to.
+        let head_root = canonical
+            .iter()
+            .max_by_key(|(height, _)| *height)
+            .and_then(|(_, hash)| {
+                blocks
+                    .iter()
+                    .find(|(stored, _)| stored.eq_ignore_ascii_case(hash))
+                    .map(|(_, block)| block.header.state_root.clone())
+            });
 
+        let restored_state = storage
+            .load_state(head_root.as_deref())
+            .map_err(|e| anyhow::anyhow!("cannot restore the world state: {e}"))?;
+
+        let block_count = blocks.len() as u64;
+        let stored_hashes: Vec<String> = blocks
+            .iter()
+            .map(|(hash, _)| hash.to_ascii_lowercase())
+            .collect();
         {
             let mut cm = self.chain_manager.lock().await;
             let chain = cm.chain_mut();
-            if let Some(genesis) = snapshot.genesis.clone() {
-                chain.set_genesis(genesis);
-            }
-            // Blocks are inserted in order so each one's parent is already
-            // present; the header maps are rebuilt from the blocks.
-            let mut blocks = snapshot.blocks;
-            blocks.sort_by_key(|b| b.header.number);
-            for block in blocks {
+
+            // Blocks are offered in ascending order so each one's parent is
+            // already present, which is what `insert_block` links on. The
+            // canonical map is then restored from the store rather than
+            // re-derived, because re-running fork choice over an unordered set
+            // could pick a branch the node was not following.
+            let mut ordered: Vec<(String, tiger_blockchain::types::Block)> = blocks;
+            ordered.sort_by_key(|(_, block)| block.header.number);
+            for (hash, block) in ordered {
                 let number = block.header.number;
                 if let Err(e) = chain.insert_block(block) {
-                    warn!("persisted block #{number} could not be re-inserted: {e}");
+                    warn!("stored block #{number} ({hash}) could not be re-inserted: {e}");
                 }
             }
-            for (number, receipts) in snapshot.receipts {
-                chain.set_receipts(number, receipts);
+            for (hash, list) in receipts {
+                chain.set_receipts_by_hash(&hash, list);
             }
+            for (hash, total) in work {
+                chain.set_total_difficulty(&hash, total);
+            }
+            chain.restore_canonical(&canonical);
         }
 
-        if let Some(state) = restored_state {
-            *self.world_state.lock().await = state;
+        *self.world_state.lock().await = restored_state;
+
+        // Every block just loaded is already on disk, canonical or not, so a
+        // flush must not write it again. The canonical map is recorded as the
+        // store's view, so the next flush writes only the heights that change.
+        {
+            let mut written = self.persisted.lock().await;
+            written.clear();
+            for hash in &stored_hashes {
+                written.insert(hash.clone());
+            }
+            let mut mark = self.canonical_mark.lock().await;
+            mark.clear();
+            for (height, hash) in &canonical {
+                mark.insert(*height, hash.to_ascii_lowercase());
+            }
         }
 
         // The states cached before the reload describe a chain that has just
@@ -361,6 +431,35 @@ impl TigerNode {
         };
         info!("Restored {block_count} block(s) from disk; chain height is {height}");
         Ok(block_count)
+    }
+
+    /// The durable store, when the node has one.
+    pub fn storage(&self) -> Option<&crate::storage::Storage> {
+        self.storage.as_ref()
+    }
+
+    /// How many blocks the chain holds that have not been written to disk yet.
+    ///
+    /// A number that keeps climbing means flushes are failing, which is the
+    /// one storage condition an operator has to be told about.
+    pub async fn pending_flush_count(&self) -> usize {
+        let cm = self.chain_manager.lock().await;
+        let written = self.persisted.lock().await;
+        cm.chain()
+            .all_blocks()
+            .into_iter()
+            .filter(|(hash, _)| !written.contains(&hash.to_ascii_lowercase()))
+            .count()
+    }
+
+    /// Build a node whose only live components are the chain and the world
+    /// state, for a test that exercises execution and persistence directly.
+    ///
+    /// The consensus engine and the transaction pool are created but no
+    /// background task is spawned, so nothing seals a block behind the test's
+    /// back.
+    pub async fn for_test(config: Config, genesis: Genesis) -> Result<Self> {
+        Self::from_genesis(config, genesis).await
     }
 
     /// The node's event bus, for the WebSocket endpoint.
@@ -818,34 +917,105 @@ impl TigerNode {
             return;
         };
 
-        // Snapshot under the locks, then write without holding them, so block
-        // production is not blocked on disk I/O.
-        let (config, genesis, blocks, receipts) = {
+        // Which blocks still need writing, and their cumulative work. Tracked
+        // by hash so a reorg that replaces a branch does not re-write the
+        // blocks it abandoned, and no block is written twice.
+        let (pending, canonical_update) = {
+            let mut written = self.persisted.lock().await;
+            let mut last = self.canonical_mark.lock().await;
             let cm = self.chain_manager.lock().await;
             let chain = cm.chain();
-            let blocks: Vec<_> = (0..=chain.height())
-                .filter_map(|n| chain.get_block(n).cloned())
+
+            let mut pending = Vec::new();
+            for (hash, block) in chain.all_blocks() {
+                let key = hash.to_ascii_lowercase();
+                if written.insert(key.clone()) {
+                    let total_difficulty = chain.total_difficulty_of(&key).unwrap_or(0);
+                    pending.push(crate::storage::BlockWrite {
+                        hash: key,
+                        block: block.clone(),
+                        receipts: chain
+                            .receipts_by_hash(&hash)
+                            .map(|r| r.to_vec())
+                            .unwrap_or_default(),
+                        total_difficulty,
+                        canonical_height: None,
+                    });
+                }
+            }
+            // Deterministic order so a batch is applied the same way twice.
+            pending.sort_by(|a, b| a.hash.cmp(&b.hash));
+
+            // The canonical map as a delta: which heights changed, and which
+            // heights no longer name a block.
+            let current: std::collections::HashMap<u64, String> = chain
+                .canonical_blocks()
+                .into_iter()
+                .map(|(number, block)| {
+                    let hash = tiger_blockchain::block_hash(&block.header)
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    (number, hash)
+                })
                 .collect();
-            let receipts: Vec<_> = blocks
-                .iter()
-                .filter_map(|b| chain.receipts(b.header.number).map(|r| (b.header.number, r.to_vec())))
-                .collect();
+            let mut update = crate::storage::CanonicalUpdate {
+                set: current
+                    .iter()
+                    .filter(|(height, hash)| {
+                        last.get(*height)
+                            .map(|previous| !previous.eq_ignore_ascii_case(hash))
+                            .unwrap_or(true)
+                    })
+                    .map(|(height, hash)| (*height, hash.clone()))
+                    .collect(),
+                remove: last
+                    .keys()
+                    .copied()
+                    .filter(|height| !current.contains_key(height))
+                    .collect(),
+            };
+            update.set.sort_unstable();
+            update.remove.sort_unstable();
+            *last = current;
+
+            (pending, update)
+        };
+
+        // The accounts the blocks wrote, and the state they now hold. The
+        // world state tracks what changed, so a flush touches only that rather
+        // than the whole ledger.
+        let (state, dirty, mark) = {
+            let state = self.world_state.lock().await;
+            let entries = state.dirty_entries();
+            let mark = entries.iter().map(|(_, stamp)| *stamp).max().unwrap_or(0);
             (
-                chain.config().clone(),
-                chain.genesis().cloned(),
-                blocks,
-                receipts,
+                state.clone(),
+                entries
+                    .into_iter()
+                    .map(|(address, _)| address)
+                    .collect::<Vec<tiger_state::account::Address>>(),
+                mark,
             )
         };
-        let state = self.world_state.lock().await.clone();
 
-        let chain_snapshot =
-            crate::storage::Storage::snapshot_chain(config, genesis, blocks, receipts);
-        if let Err(e) = storage.save_chain(&chain_snapshot) {
-            error!("cannot persist chain: {e}");
-        }
-        if let Err(e) = storage.save_state(&state) {
-            error!("cannot persist world state: {e}");
+        // The blocks and the state they produced commit together, so a crash
+        // cannot leave a block without the accounts it wrote.
+        match storage.write_batch(&pending, &state, &dirty, Some(&canonical_update)) {
+            Ok(()) => {
+                // Only now are the writes durable, so only now may they be
+                // forgotten. A write that arrived while the batch was being
+                // written carries a higher stamp and stays pending.
+                self.world_state.lock().await.clear_dirty_up_to(mark);
+            }
+            Err(e) => {
+                error!("cannot persist the chain: {e}");
+                // Nothing was committed, so every block in the batch is still
+                // pending and the next flush retries it.
+                let mut written = self.persisted.lock().await;
+                for entry in &pending {
+                    written.remove(&entry.hash);
+                }
+            }
         }
     }
 
@@ -877,7 +1047,16 @@ impl TigerNode {
     /// and sync status monitoring. The node must be wrapped in Arc for shared ownership.
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         info!("Starting node components...");
+        self.open().await?;
+        self.serve().await
+    }
 
+    /// Bring the chain up: restore from disk if there is anything there, and
+    /// install genesis otherwise.
+    ///
+    /// Separated from [`TigerNode::serve`] so a test can open a chain and
+    /// close it again without binding any listener.
+    pub async fn open(&self) -> Result<()> {
         // Restore any persisted chain before installing genesis. Without
         // this the node would restart from block 0 and lose every block it
         // had produced, and would re-apply the genesis allocation on top of a
@@ -924,6 +1103,14 @@ impl TigerNode {
             }
         }
 
+        Ok(())
+    }
+
+    /// Start the background tasks and the listeners.
+    ///
+    /// [`TigerNode::open`] must have run first: serving a chain that has not
+    /// been loaded would answer every query from an empty state.
+    pub async fn serve(self: &Arc<Self>) -> Result<()> {
         // Update state to Running
         *self.state.write().await = NodeState::Running;
         info!("Node state set to Running");
@@ -1037,7 +1224,7 @@ impl TigerNode {
 
                 if let Some(proposer) = proposer {
                     if let Some(ref my_addr) = node.config.validator_addr {
-                        if proposer == *my_addr {
+                        if proposer.eq_ignore_ascii_case(my_addr) {
                             info!("Proposing block #{}", next_block);
                             // Collect pending transactions from mempool
                             let pending_txs = {
@@ -1365,6 +1552,39 @@ impl TigerNode {
         let _ = writeln!(out, "# HELP tiger_consensus_is_validator 1 if this node may propose blocks.");
         let _ = writeln!(out, "# TYPE tiger_consensus_is_validator gauge");
         let _ = writeln!(out, "tiger_consensus_is_validator {}", u8::from(is_validator));
+
+        let _ = writeln!(
+            out,
+            "# HELP tiger_uptime_seconds Seconds since the node was constructed."
+        );
+        let _ = writeln!(out, "# TYPE tiger_uptime_seconds gauge");
+        let _ = writeln!(out, "tiger_uptime_seconds {}", self.started_at.elapsed().as_secs());
+
+        let _ = writeln!(
+            out,
+            "# HELP tiger_storage_enabled 1 when the node is writing to a durable store."
+        );
+        let _ = writeln!(out, "# TYPE tiger_storage_enabled gauge");
+        let _ = writeln!(out, "tiger_storage_enabled {}", u8::from(self.storage.is_some()));
+
+        let _ = writeln!(
+            out,
+            "# HELP tiger_storage_pending_blocks Blocks written by the chain but not yet flushed."
+        );
+        let _ = writeln!(out, "# TYPE tiger_storage_pending_blocks gauge");
+        let _ = writeln!(
+            out,
+            "tiger_storage_pending_blocks {}",
+            self.pending_flush_count().await
+        );
+
+        let _ = writeln!(out, "# HELP tiger_storage_pending_accounts Accounts written since the last flush.");
+        let _ = writeln!(out, "# TYPE tiger_storage_pending_accounts gauge");
+        let _ = writeln!(
+            out,
+            "tiger_storage_pending_accounts {}",
+            self.world_state.lock().await.dirty_entries().len()
+        );
 
         let _ = writeln!(out, "# HELP tiger_info Build and network information, always 1.");
         let _ = writeln!(out, "# TYPE tiger_info gauge");
@@ -3191,5 +3411,256 @@ mod tests {
         assert!(saw_429, "a burst past the configured rate must be throttled");
 
         server.abort();
+    }
+
+    /// A fresh data directory, unique per call so tests cannot see each
+    /// other's chains.
+    fn unique_data_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "tiger-node-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn restartable_config(dir: &std::path::Path) -> Config {
+        Config {
+            chain_id: 6666,
+            validators: vec![],
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        }
+    }
+
+    /// The chain a node holds must survive a restart: the blocks, their
+    /// receipts, the canonical branch and the world state are all written
+    /// incrementally, and a second node opened on the same directory has to
+    /// rebuild exactly the chain the first one had.
+    #[tokio::test]
+    async fn the_chain_survives_a_restart() {
+        let dir = unique_data_dir("restart");
+        let genesis = create_genesis_block(6666);
+
+        // --- first run: import two blocks, including a real transfer ---
+        let (head_hash, expected_root, balance_after) = {
+            let node = Arc::new(
+                TigerNode::from_genesis(restartable_config(&dir), genesis.clone())
+                    .await
+                    .unwrap(),
+            );
+            node.open().await.unwrap();
+
+            let mut producer_cm = chain_manager();
+            producer_cm.process_block(genesis_block_from(&genesis)).unwrap();
+            let mut producer_world = state_from_genesis(&genesis);
+            let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+
+            // Fund a sender in the producer's genesis-derived state so the
+            // transfer has a balance to spend.
+            let sender_key = [0x51u8; 32];
+            let sender = tiger_crypto::private_key_to_address(&sender_key).unwrap();
+            let recipient = [0x77u8; 20];
+            let funded = u256_from_u64(1_000_000_000_000_000_000);
+            producer_world.set_balance(&sender, funded);
+            // The node's own state must match, because a block is only
+            // accepted when its state root matches a re-execution.
+            {
+                let mut world = node.world_state().lock().await;
+                world.set_balance(&sender, funded);
+            }
+
+            let tx = signed_transfer(sender_key, 0, recipient, 1_000);
+            let block1 = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[tx]);
+            assert!(node.import_block(block1).await.unwrap());
+            let block2 = build_block(&mut producer_cm, &mut producer_world, 2, &miner, &[]);
+            assert!(node.import_block(block2.clone()).await.unwrap());
+
+            let head_hash = tiger_blockchain::block_hash(&block2.header).unwrap();
+            let expected_root = block2.header.state_root.clone();
+            let balance = producer_world.balance(&recipient);
+            assert_ne!(balance, u256_from_u64(0), "the transfer must have credited the recipient");
+
+            (head_hash, expected_root, balance)
+        };
+
+        // --- second run: a new node on the same directory ---
+        let node = Arc::new(
+            TigerNode::from_genesis(restartable_config(&dir), genesis.clone())
+                .await
+                .unwrap(),
+        );
+        let restored = node.restore_from_disk().await.unwrap();
+        assert_eq!(restored, 3, "genesis plus the two imported blocks");
+
+        let cm = node.get_chain_manager().await;
+        assert_eq!(cm.chain().height(), 2, "the head height must survive");
+        let head = cm.chain().get_block(2).expect("block 2 must be restored");
+        assert_eq!(
+            tiger_blockchain::block_hash(&head.header).unwrap(),
+            head_hash,
+            "the restored head must be the same block"
+        );
+        assert_eq!(head.header.state_root, expected_root);
+
+        // The transaction was in block 1, so it is there that it must have
+        // survived, along with the receipts the block produced, which is what
+        // `eth_getTransactionReceipt` depends on.
+        let first = cm.chain().get_block(1).expect("block 1 must be restored");
+        assert_eq!(
+            first.transactions.len(),
+            1,
+            "the block's transaction must survive"
+        );
+        let tx_hash = first.transactions[0].hash.clone();
+        assert!(
+            cm.chain().receipts(1).is_some(),
+            "the receipt list for block 1 must be restored"
+        );
+        let found = cm.chain().find_transaction(&tx_hash);
+        assert!(found.is_some(), "the transaction must be locatable after a restart");
+        drop(cm);
+
+        // The world state must hash to the head block's committed root, which
+        // is the strongest statement that no account was lost.
+        let world = node.world_state().lock().await;
+        assert_eq!(
+            hex32(&world.state_root()),
+            expected_root,
+            "the restored state must hash to the head block's stateRoot"
+        );
+        assert_eq!(
+            world.balance(&[0x77u8; 20]),
+            balance_after,
+            "the recipient's balance must survive the restart"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A validator that supplies only a key must still propose blocks. The
+    /// address is derivable from the key, so requiring it separately would let
+    /// a correctly configured validator come up and never seal anything.
+    #[tokio::test]
+    async fn the_proposer_address_is_derived_from_the_sealing_key() {
+        let dir = unique_data_dir("derive-addr");
+        let key = [0x33u8; 32];
+        let expected = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&key).unwrap()
+            )
+        );
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![expected.clone()],
+            validator_key: Some(format!("0x{}", tiger_blockchain::hex_encode(&key))),
+            validator_addr: None,
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let node = TigerNode::from_genesis(config, create_genesis_block(6666))
+            .await
+            .unwrap();
+        assert_eq!(
+            node.config().validator_addr.as_deref(),
+            Some(expected.as_str()),
+            "the address must be derived from the key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store written for one chain must not be opened by a node configured
+    /// for another, because the blocks would attach to the wrong genesis.
+    #[tokio::test]
+    async fn a_store_from_another_chain_is_not_opened() {
+        let dir = unique_data_dir("wrong-chain");
+        let genesis = create_genesis_block(6666);
+        {
+            let node = Arc::new(
+                TigerNode::from_genesis(restartable_config(&dir), genesis.clone())
+                    .await
+                    .unwrap(),
+            );
+            node.open().await.unwrap();
+            assert!(node.storage().is_some(), "the store must be open");
+        }
+
+        // A node configured for a different chain id must refuse the store and
+        // fall back to running without persistence rather than mixing chains.
+        let mut config = restartable_config(&dir);
+        config.chain_id = 7777;
+        let other_genesis = create_genesis_block(7777);
+        let node = Arc::new(
+            TigerNode::from_genesis(config, other_genesis).await.unwrap(),
+        );
+        assert!(
+            node.storage().is_none(),
+            "a store from another chain must not be used"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing is announced before it is durable. After a block is imported,
+    /// the store must already hold it, so a crash at that instant cannot lose
+    /// a block a client has been told about.
+    #[tokio::test]
+    async fn a_block_is_durable_before_it_is_announced() {
+        let dir = unique_data_dir("durable");
+        let genesis = create_genesis_block(6666);
+        let node = Arc::new(
+            TigerNode::from_genesis(restartable_config(&dir), genesis.clone())
+                .await
+                .unwrap(),
+        );
+        node.open().await.unwrap();
+
+        let mut producer_cm = chain_manager();
+        producer_cm.process_block(genesis_block_from(&genesis)).unwrap();
+        let mut producer_world = state_from_genesis(&genesis);
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        let block = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[]);
+        let hash = tiger_blockchain::block_hash(&block.header).unwrap();
+        assert!(node.import_block(block).await.unwrap());
+
+        // The store holds an exclusive lock on the directory — two nodes must
+        // never write the same chain — so it is closed before the file is read
+        // back. That the read succeeds at all is part of the point: the data
+        // is in the file, not only in the process that wrote it.
+        drop(node);
+
+        // `import_block` flushes before it returns, so the block is on disk by
+        // now.
+        let store = crate::storage::Storage::open(&dir).unwrap();
+        let stored = store.load_blocks().unwrap();
+        assert!(
+            stored.iter().any(|(h, _)| h.eq_ignore_ascii_case(&hash)),
+            "the imported block must already be in the store"
+        );
+        assert_eq!(
+            store.head_hash().unwrap().unwrap().to_ascii_lowercase(),
+            hash.to_ascii_lowercase()
+        );
+        // The state the block committed to must be restorable, and must hash
+        // back to the root the block carries. A block whose state cannot be
+        // reconstructed is a block a client could not query.
+        let root = store
+            .load_blocks()
+            .unwrap()
+            .into_iter()
+            .find(|(h, _)| h.eq_ignore_ascii_case(&hash))
+            .map(|(_, block)| block.header.state_root)
+            .expect("the head block must be in the store");
+        let state = store.load_state(Some(&root)).unwrap();
+        assert_eq!(
+            hex32(&state.state_root()),
+            root,
+            "the restored state must hash to the head block's stateRoot"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -209,7 +209,7 @@ left-padded. `blockchain/src/block.rs` has separate `decode_hex_field` and
 
 ### Chain persistence (WAS COMPLETELY MISSING)
 - `data_dir` was accepted by the CLI and never used. Every restart lost the
-  whole chain. Now `node/src/storage.rs` writes `chain.json` + `state.json`
+  whole chain. Now `node/src/storage.rs` writes an embedded redb store
   into the data dir.
 - Atomic write: temp file → `sync_all()` → `rename()`. Version-tagged
   (`STORAGE_VERSION`). The state snapshot records `state_root`; `load_state`
@@ -361,3 +361,61 @@ crypto 22, state 28, evm 72, blockchain 40, consensus 15, precompile 20, node 47
 Earlier notes in this file said `blockchain` had 21 tests; it now has 50.
 The `TransactionRequest` (evm) and `Transaction` (blockchain) structs both
 carry `max_priority_fee_per_gas`; any new literal must set it.
+
+## Session 2026-11-12 — durable incremental chain persistence (VERIFIED live)
+
+### Storage layer rewritten on redb (replaces sled)
+`node/src/storage.rs` now persists to a single embedded `chain.redb` (redb 4.5)
+with tables: `blocks`, `receipts`, `accounts`, `canonical`, `meta`.
+- One atomic transaction per flush (`write_batch`) writes the block(s), their
+  receipts, the accounts they dirtied, and the canonical-map **delta**.
+- `WorldState` (`state/src/account.rs`) carries a stamped dirty set, so a flush
+  touches only changed accounts. `encode_account_record`/`decode_account_record`
+  carry the 4 trie fields **plus** contract code and storage slots (the trie
+  only commits to code/storage by hash, so a replay needs them stored).
+- `Storage::open(dir)` takes the chain id and **refuses** a store written for a
+  different chain; redb takes an exclusive lock, so two nodes cannot share a dir.
+- `node/src/node.rs` tracks unpersisted blocks by hash (`persisted`) and the
+  canonical map the store last saw (`canonical_mark`), so reorgs write only the
+  heights that changed. `persist()` runs **before** announce/publish, so nothing
+  is reported that is not yet durable.
+
+### Restore path
+`TigerNode::start` was split into `open()` (restore-or-install-genesis) and
+`serve()` (tasks + listeners), so a test can open a chain without binding ports.
+`restore_from_disk()` loads blocks/receipts/accounts/canonical map, replays
+non-canonical branches, and marks every loaded block as already written.
+
+### Bugs found and fixed this session
+1. **`--data-dir` was accepted and ignored** — every restart discarded all
+   blocks. Now restored; verified live (restart at height 17 reproduced the
+   identical head hash and continued sealing).
+2. **P2P identity key was world-readable** (`p2p.rs` used `fs::write`). Now
+   `write_private_file` creates it 0600 from the start and re-tightens an
+   existing file. Live: `stat` shows 600 (was 644).
+3. **A validator given only a key never sealed.** `spawn_block_production`
+   compared the proposer against `config.validator_addr`, which was `None`
+   unless passed explicitly. Now `from_genesis` derives the address from the
+   sealing key, and the comparison is case-insensitive.
+4. `--validator-key` on the command line leaks the key through `ps`; added
+   `--validator-key-file` (mutually exclusive with the flag) and a warning when
+   the inline form is used.
+
+### Test counts (all passing)
+crypto 22, state 36, evm 77, blockchain 62, node 106 (incl. restart/durability
+integration tests: `the_chain_survives_a_restart`,
+`a_block_is_durable_before_it_is_announced`,
+`a_store_from_another_chain_is_not_opened`,
+`the_proposer_address_is_derived_from_the_sealing_key`,
+`the_p2p_identity_is_written_owner_only`).
+
+### Live measurements
+581 KiB store held 113 blocks (~5 KiB/block); file size is flat between heights
+because redb reuses freed pages — growth is genuinely incremental, not a
+whole-chain rewrite.
+
+### Build env
+`source /tmp/rustenv.sh`; linking a node bin/test needs OpenSSL dev symlinks:
+`mkdir -p /tmp/ossllibs && ln -sf /usr/lib/x86_64-linux-gnu/libssl.so.3 /tmp/ossllibs/libssl.so
+ && ln -sf /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /tmp/ossllibs/libcrypto.so`
+then `LIBRARY_PATH=/tmp/ossllibs cargo test`.
