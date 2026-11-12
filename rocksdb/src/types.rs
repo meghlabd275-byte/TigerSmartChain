@@ -365,12 +365,15 @@ impl Database {
     }
 
     /// Get range
-    pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>) {
-        let data = self.data.get("default").unwrap();
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(data) = self.data.get("default") else {
+            return Vec::new();
+        };
+
         let mut result = vec![];
         
         for (k, v) in data.iter() {
-            if k >= start && k < end {
+            if k.as_slice() >= start && k.as_slice() < end {
                 result.push((k.clone(), v.clone()));
             }
         }
