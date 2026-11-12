@@ -123,11 +123,11 @@ impl Executor {
                 None => (ctx.caller.clone(), EvmWord::from_u64(ctx.value)),
             };
             let enter = crate::trace::FrameEnter {
-                kind: if is_outermost {
-                    crate::types::FrameKind::Call
-                } else {
-                    ctx.frame_kind
-                },
+                // The context carries the kind, so a transaction that deploys a
+                // contract reports itself as a creation rather than as a call
+                // to nowhere. A context built without one defaults to `Call`,
+                // which is the ordinary transaction frame.
+                kind: ctx.frame_kind,
                 code_address: ctx
                     .code_address
                     .clone()

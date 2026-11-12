@@ -403,6 +403,11 @@ pub fn apply_transaction_traced(
         }
     };
     ctx.address = crate::Address(exec_address);
+    // A transaction with no recipient deploys a contract, and its own frame is
+    // the creation. A trace that called it a call would name no target.
+    if is_creation {
+        ctx.frame_kind = crate::types::FrameKind::Create;
+    }
 
     // 6 and 7. Every host write the transaction performs goes through the
     // recorder, so the recorded before/after values are the real transitions

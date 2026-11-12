@@ -1006,6 +1006,21 @@ pub(crate) async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcR
                 id,
             )
         }
+        // The `trace_` namespace lives in its own module; it returns `None` for
+        // a method that is not one of its own.
+        other if other.starts_with("trace_") => {
+            match crate::trace_rpc::handle(node, other, params).await {
+                Some(Ok(result)) => RpcResponse::success(result, id),
+                Some(Err(e)) => RpcResponse::error(INVALID_PARAMS, e, id),
+                // `trace_*` is the namespace, so an unimplemented method in it
+                // is a method that does not exist rather than a bad argument.
+                None => RpcResponse::error(
+                    METHOD_NOT_FOUND,
+                    format!("method not found: {other}"),
+                    id,
+                ),
+            }
+        }
         _ => RpcResponse::error(METHOD_NOT_FOUND, format!("method not found: {method}"), id),
     }
 }

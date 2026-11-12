@@ -434,6 +434,25 @@ pub struct CallTraceFrame {
 }
 
 impl CallTraceFrame {
+    /// Every frame in this subtree, depth first, paired with its depth.
+    ///
+    /// Depth one is the frame itself. This is the order the `trace_` namespace
+    /// reports frames in, and the depth is what a caller needs to rebuild the
+    /// nesting, since that namespace is a flat list.
+    pub fn walk<'a>(&'a self, depth: u32, out: &mut Vec<(&'a CallTraceFrame, u32)>) {
+        out.push((self, depth));
+        for child in &self.calls {
+            child.walk(depth + 1, out);
+        }
+    }
+
+    /// The frame's subtree as a flat list, depth first.
+    pub fn flattened(&self) -> Vec<(&CallTraceFrame, u32)> {
+        let mut out = Vec::new();
+        self.walk(1, &mut out);
+        out
+    }
+
     /// Render the frame as the JSON a `callTracer` returns.
     pub fn to_json(&self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();

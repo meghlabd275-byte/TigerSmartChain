@@ -25,7 +25,7 @@ const MAX_CALL_FRAMES: usize = 4_096;
 /// The two are dispatched through one enum so `debug_traceTransaction` and
 /// `debug_traceCall` pass a single `&mut dyn StepTracer` to the interpreter
 /// whatever was requested.
-enum Tracer {
+pub(crate) enum Tracer {
     Opcodes(StepTracerBuffer),
     Calls(CallTracer),
 }
@@ -86,7 +86,7 @@ impl StepTracer for Tracer {
 /// An unknown tracer name is an error rather than a silent fallback: a client
 /// that asks for a tracer this node does not implement would otherwise receive
 /// a struct log while believing it held a call tree.
-fn build_tracer(trace_config: Option<&Value>) -> Result<Tracer, String> {
+pub(crate) fn build_tracer(trace_config: Option<&Value>) -> Result<Tracer, String> {
     match tracer_name(trace_config) {
         "opcodeLogger" | "structLogger" => Ok(Tracer::Opcodes(if wants_memory(trace_config) {
             StepTracerBuffer::with_memory(MAX_TRACE_STEPS)
@@ -109,7 +109,7 @@ fn render_trace(tracer: &Tracer) -> Result<Value, String> {
 }
 
 /// Whether the trace is a call tree rather than a struct log.
-fn is_call_tracer(tracer: &Tracer) -> bool {
+pub(crate) fn is_call_tracer(tracer: &Tracer) -> bool {
     matches!(tracer, Tracer::Calls(_))
 }
 
@@ -233,12 +233,38 @@ async fn state_at_block_start(node: &Arc<TigerNode>, block_number: u64) -> tiger
     state
 }
 
-/// `debug_traceTransaction`.
-pub async fn debug_trace_transaction(
+/// What a replay produced, for the callers that render their own response.
+pub(crate) struct Replay {
+    /// The tracer the request asked for, after the replay ran.
+    pub(crate) tracer: Tracer,
+    /// Gas consumed, including the intrinsic charge the interpreter never sees.
+    pub(crate) gas_used: u64,
+    /// The state writes the transaction performed.
+    pub(crate) diffs: tiger_evm::transition::TraceDiffs,
+    /// The transaction's return data, or its revert payload.
+    pub(crate) output: Vec<u8>,
+    /// The transaction's hash, as the chain records it.
+    pub(crate) tx_hash: String,
+    /// The block the transaction belongs to.
+    pub(crate) block_number: u64,
+    /// That block's hash, as the chain computes it.
+    pub(crate) block_hash: String,
+    /// The transaction's position within its block.
+    pub(crate) tx_index: usize,
+}
+
+/// Replay one transaction through the traced transition path.
+///
+/// The state the transaction observed is rebuilt exactly: the genesis
+/// allocation, then every transaction of every earlier block, then the
+/// transactions preceding it within its own block. This is the single place
+/// that replay happens, so `debug_traceTransaction`, the `trace_` namespace and
+/// the block tracers all describe the same execution.
+pub(crate) async fn replay_transaction(
     node: &Arc<TigerNode>,
     tx_hash: &str,
-    trace_config: Option<&Value>,
-) -> Result<Value, String> {
+    tracer: Tracer,
+) -> Result<Replay, String> {
     let chain_id = node.config().chain_id;
 
     // Locate the transaction and the block it belongs to.
@@ -292,9 +318,7 @@ pub async fn debug_trace_transaction(
         }
     }
 
-    // Execute the target through the traced transition path.
-    let mut tracer = build_tracer(trace_config)?;
-
+    let mut tracer = tracer;
     let outcome = tiger_evm::transition::apply_transaction_traced(
         &mut state,
         &request,
@@ -304,24 +328,58 @@ pub async fn debug_trace_transaction(
     .map_err(|e| format!("trace replay failed: {e}"))?;
 
     let (outcome, diffs) = outcome;
-    let mut response = render_trace(&tracer)?;
+
+    // The block hash and the transaction's position are read after the replay
+    // so the response describes the block as it is stored.
+    let (block_hash, tx_index) = {
+        let manager = node.get_chain_manager().await;
+        let chain = manager.chain();
+        match chain.get_block(block_number) {
+            Some(block) => (
+                tiger_blockchain::block_hash(&block.header).unwrap_or_default(),
+                tx_index,
+            ),
+            None => (String::new(), tx_index),
+        }
+    };
+
+    Ok(Replay {
+        tracer,
+        gas_used: outcome.gas_used,
+        diffs,
+        output: outcome.output,
+        tx_hash: target.hash.clone(),
+        block_number,
+        block_hash,
+        tx_index,
+    })
+}
+
+/// `debug_traceTransaction`.
+pub async fn debug_trace_transaction(
+    node: &Arc<TigerNode>,
+    tx_hash: &str,
+    trace_config: Option<&Value>,
+) -> Result<Value, String> {
+    let replay = replay_transaction(node, tx_hash, build_tracer(trace_config)?).await?;
+    let mut response = render_trace(&replay.tracer)?;
 
     // `gas` is the transaction's total consumption, which includes the
     // intrinsic charge the interpreter never sees. A call tree reports it per
     // frame, so the total is not written over it.
-    if !is_call_tracer(&tracer) {
-        response["gas"] = json!(format!("0x{:x}", outcome.gas_used));
+    if !is_call_tracer(&replay.tracer) {
+        response["gas"] = json!(format!("0x{:x}", replay.gas_used));
     }
 
     // The state writes the transaction performed, which `debug_traceTransaction`
     // reports separately from the opcode log.
-    response["stateDiff"] = state_diff_to_json(&diffs);
+    response["stateDiff"] = state_diff_to_json(&replay.diffs);
 
     Ok(response)
 }
 
 /// Render state writes as a `stateDiff` object keyed by address.
-fn state_diff_to_json(diffs: &tiger_evm::transition::TraceDiffs) -> Value {
+pub(crate) fn state_diff_to_json(diffs: &tiger_evm::transition::TraceDiffs) -> Value {
     use std::collections::BTreeMap;
 
     let mut by_address: BTreeMap<String, Value> = BTreeMap::new();
@@ -475,12 +533,12 @@ pub async fn debug_trace_block(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tiger_blockchain::types::{Account, Genesis, Transaction};
     use tiger_blockchain::ChainConfig;
 
-    fn test_genesis(alloc: Vec<(&str, Account)>) -> Genesis {
+    pub(crate) fn test_genesis(alloc: Vec<(&str, Account)>) -> Genesis {
         Genesis {
             config: ChainConfig {
                 chain_id: 6666,
@@ -501,7 +559,7 @@ mod tests {
         }
     }
 
-    fn account_with_balance(balance: u64) -> Account {
+    pub(crate) fn account_with_balance(balance: u64) -> Account {
         Account {
             balance: format!("0x{balance:x}"),
             nonce: Some(0),
@@ -510,7 +568,7 @@ mod tests {
         }
     }
 
-    fn account_with_code(balance: u64, code: &[u8]) -> Account {
+    pub(crate) fn account_with_code(balance: u64, code: &[u8]) -> Account {
         Account {
             balance: format!("0x{balance:x}"),
             nonce: Some(0),
@@ -533,7 +591,7 @@ mod tests {
 
     /// Sign a transaction whose `from` is deliberately wrong, so the test also
     /// proves the trace uses the recovered sender rather than the wire field.
-    fn signed_tx(key: &[u8; 32], nonce: u64, to: &str, value: &str, gas: u64, data: &[u8]) -> Transaction {
+    pub(crate) fn signed_tx(key: &[u8; 32], nonce: u64, to: &str, value: &str, gas: u64, data: &[u8]) -> Transaction {
         let mut tx = Transaction {
             hash: String::new(),
             nonce,
@@ -541,7 +599,8 @@ mod tests {
             block_number: None,
             transaction_index: None,
             from: format!("0x{}", "00".repeat(20)),
-            to: Some(to.to_string()),
+            // An empty recipient is how a caller spells a contract creation.
+            to: if to.is_empty() { None } else { Some(to.to_string()) },
             value: value.to_string(),
             gas_price: 1,
             gas,
@@ -558,7 +617,7 @@ mod tests {
         tx
     }
 
-    fn address_of(key: &[u8; 32]) -> String {
+    pub(crate) fn address_of(key: &[u8; 32]) -> String {
         format!(
             "0x{}",
             tiger_blockchain::hex_encode(&tiger_crypto::private_key_to_address(key).unwrap())
@@ -566,7 +625,7 @@ mod tests {
     }
 
     /// A node whose genesis pre-funds `alloc`, with the given blocks appended.
-    async fn node_with_blocks(
+    pub(crate) async fn node_with_blocks(
         alloc: Vec<(&str, Account)>,
         blocks: Vec<Vec<Transaction>>,
     ) -> Arc<TigerNode> {
@@ -1011,3 +1070,4 @@ mod tests {
         assert!(memory.ends_with("2a"), "memory was {memory}");
     }
 }
+

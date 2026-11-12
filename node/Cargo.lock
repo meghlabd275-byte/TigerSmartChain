@@ -1582,6 +1582,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures",
+ "hex",
  "log",
  "redb",
  "serde",

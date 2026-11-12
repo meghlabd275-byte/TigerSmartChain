@@ -18,6 +18,7 @@ mod p2p;
 mod rpc_server;
 mod ws_server;
 mod storage;
+mod trace_rpc;
 
 pub use config::Config;
 pub use node::TigerNode;
