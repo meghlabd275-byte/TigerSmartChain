@@ -1,6 +1,5 @@
 //! Indexer Types for TigerScan
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -209,7 +208,7 @@ pub struct IndexerConfig {
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
-            chain_id: 9001, // TigerChain
+            chain_id: 6666,
             rpc_url: "http://localhost:8545".to_string(),
             ws_url: "ws://localhost:8546".to_string(),
             start_block: 0,

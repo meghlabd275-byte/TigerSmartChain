@@ -2,6 +2,7 @@
 
 use crate::types::*;
 use chrono::Utc;
+use sqlx::postgres::PgPool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
@@ -23,6 +24,22 @@ pub enum IndexerError {
     NotRunning,
 }
 
+
+/// Decode a `0x`-prefixed hex quantity.
+///
+/// Every numeric field in a JSON-RPC reply arrives as hex, and the previous
+/// code indexed `[2..]` without checking the prefix, so a value that did not
+/// start with `0x` panicked instead of being rejected.
+pub(crate) fn parse_hex_u64(value: &str) -> Result<u64, IndexerError> {
+    let trimmed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+
+    u64::from_str_radix(trimmed, 16)
+        .map_err(|e| IndexerError::ParseError(format!("{value} is not a hex quantity: {e}")))
+}
+
 // =============================================================================
 // INDEXER
 // =============================================================================
@@ -35,6 +52,9 @@ pub struct Indexer {
     current_block: Arc<RwLock<u64>>,
     /// RPC URL for connecting to Ethereum node
     rpc_url: String,
+    /// Database pool. `None` until `connect` succeeds, so a misconfigured
+    /// database is reported once instead of failing every insert.
+    pool: Option<PgPool>,
 }
 
 impl Indexer {
@@ -55,11 +75,43 @@ impl Indexer {
             running: Arc::new(RwLock::new(false)),
             current_block: Arc::new(RwLock::new(config.start_block)),
             rpc_url: config.rpc_url.clone(),
+            pool: None,
         }
+    }
+
+    /// Attach a database pool.
+    ///
+    /// Without a pool the indexer can read the chain but cannot store anything,
+    /// so `start` fails rather than reporting progress it is not making.
+    pub fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Connect to the database named by `DATABASE_URL`.
+    pub async fn connect_database(&mut self) -> Result<(), IndexerError> {
+        let url = std::env::var("DATABASE_URL").map_err(|_| {
+            IndexerError::DatabaseError("DATABASE_URL is not set".to_string())
+        })?;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect(&url)
+            .await
+            .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
+
+        self.pool = Some(pool);
+        Ok(())
     }
 
     /// Start indexing
     pub async fn start(&self) -> Result<(), IndexerError> {
+        if self.pool.is_none() {
+            return Err(IndexerError::DatabaseError(
+                "no database pool; call connect_database() first".to_string(),
+            ));
+        }
+
         *self.running.write().await = true;
         
         log::info!("Starting indexer from block {}", self.config.start_block);
@@ -92,11 +144,7 @@ impl Indexer {
     /// Process blocks in a loop
     async fn process_blocks_loop(&self) -> Result<(), IndexerError> {
         let mut current = self.config.start_block;
-        let mut poll_interval = interval(Duration::from_secs(12)); // ~12 second block time
-
-        while !*self.running.read().await {
-            return Err(IndexerError::NotRunning);
-        }
+        let mut poll_interval = interval(Duration::from_secs(12));
 
         while self.is_running().await {
             poll_interval.tick().await;
@@ -168,10 +216,7 @@ impl Indexer {
             .ok_or_else(|| IndexerError::RPCError("Invalid block number".to_string()))?;
 
         // Parse hex
-        let num = u64::from_str_radix(&hex[2..], 16)
-            .map_err(|e| IndexerError::ParseError(e.to_string()))?;
-
-        Ok(num)
+        parse_hex_u64(hex)
     }
 
     /// Process single block
@@ -181,6 +226,9 @@ impl Indexer {
         // Fetch block data from RPC
         let block = self.fetch_block_data(block_number).await?;
         
+        // Persist the block first so the transactions it owns have a parent row.
+        self.index_block(&block).await?;
+
         // Process transactions
         for tx in &block.transactions {
             self.index_transaction(tx).await?;
@@ -188,7 +236,7 @@ impl Indexer {
 
         // Process logs
         for log_entry in &block.logs {
-            self.index_log(log_entry).await?;
+            self.index_log(log_entry, block.timestamp).await?;
         }
 
         // Update statistics
@@ -270,18 +318,28 @@ impl Indexer {
                             block_hash: tx_obj.get("blockHash")?.as_str()?.to_string(),
                             from: tx_obj.get("from")?.as_str()?.to_string(),
                             to: tx_obj.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            transaction_index: parse_hex_u64(
+                                tx_obj.get("transactionIndex").and_then(|v| v.as_str()).unwrap_or("0x0"),
+                            )
+                            .unwrap_or(0),
                             value: tx_obj.get("value").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
-                            gas_price: tx_obj.get("gasPrice").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
-                            gas_limit: u64::from_str_radix(
-                                tx_obj.get("gas").and_then(|v| v.as_str()).unwrap_or("0x0").trim_start_matches("0x"), 16
-                            ).unwrap_or(21000),
-                            nonce: tx_obj.get("nonce").and_then(|v| v.as_str()).map(|s| {
-                                u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-                            }).unwrap_or(0),
-                            input_data: tx_obj.get("input").and_then(|v| v.as_str()).unwrap_or("0x").to_string(),
-                            timestamp: block_data.get("timestamp").and_then(|v| v.as_str()).map(|s| {
-                                u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-                            }).unwrap_or(0),
+                            gas_price: parse_hex_u64(
+                                tx_obj.get("gasPrice").and_then(|v| v.as_str()).unwrap_or("0x0"),
+                            )
+                            .unwrap_or(0),
+                            gas_used: parse_hex_u64(
+                                tx_obj.get("gas").and_then(|v| v.as_str()).unwrap_or("0x0"),
+                            )
+                            .unwrap_or(0),
+                            nonce: parse_hex_u64(
+                                tx_obj.get("nonce").and_then(|v| v.as_str()).unwrap_or("0x0"),
+                            )
+                            .unwrap_or(0),
+                            input: tx_obj.get("input").and_then(|v| v.as_str()).unwrap_or("0x").to_string(),
+                            // The receipt carries the final status; a transaction
+                            // seen inside a block is not pending.
+                            status: TransactionStatus::Success,
+                            logs: Vec::new(),
                         })
                     })
                     .collect()
@@ -299,6 +357,10 @@ impl Indexer {
                         .map(|arr| arr.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect())
                         .unwrap_or_default(),
                     data: log_obj.get("data").and_then(|v| v.as_str()).unwrap_or("0x").to_string(),
+                    log_index: parse_hex_u64(
+                        log_obj.get("logIndex").and_then(|v| v.as_str()).unwrap_or("0x0"),
+                    )
+                    .unwrap_or(0),
                     block_number,
                     transaction_hash: log_obj.get("transactionHash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 })
@@ -306,64 +368,180 @@ impl Indexer {
             .collect();
 
         // Parse block info
-        let number = u64::from_str_radix(
-            block_data.get("number").and_then(|v| v.as_str()).unwrap_or("0x0").trim_start_matches("0x"), 16
-        ).unwrap_or(block_number);
+        let number = block_data
+            .get("number")
+            .and_then(|v| v.as_str())
+            .map(parse_hex_u64)
+            .transpose()?
+            .unwrap_or(block_number);
 
         Ok(IndexedBlock {
             number,
             hash: block_data.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             parent_hash: block_data.get("parentHash").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            timestamp: block_data.get("timestamp").and_then(|v| v.as_str()).map(|s| {
-                u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-            }).unwrap_or(0),
+            timestamp: block_data
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(parse_hex_u64)
+                .transpose()?
+                .unwrap_or(0) as i64,
             transactions,
             logs,
             internal_txs: vec![],
             miner: block_data.get("miner").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             difficulty: block_data.get("difficulty").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
             total_difficulty: block_data.get("totalDifficulty").and_then(|v| v.as_str()).unwrap_or("0x0").to_string(),
-            size: block_data.get("size").and_then(|v| v.as_str()).map(|s| {
-                u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-            }).unwrap_or(0),
-            gas_used: block_data.get("gasUsed").and_then(|v| v.as_str()).map(|s| {
-                u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-            }).unwrap_or(0),
-            gas_limit: block_data.get("gasLimit").and_then(|v| v.as_str()).map(|s| {
-                u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0)
-            }).unwrap_or(0),
-            base_fee_per_gas: block_data.get("baseFeePerGas").and_then(|v| v.as_str()).map(|s| {
-                u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
-            }),
+            size: block_data
+                .get("size")
+                .and_then(|v| v.as_str())
+                .map(parse_hex_u64)
+                .transpose()?
+                .unwrap_or(0),
+            gas_used: block_data
+                .get("gasUsed")
+                .and_then(|v| v.as_str())
+                .map(parse_hex_u64)
+                .transpose()?
+                .unwrap_or(0),
+            gas_limit: block_data
+                .get("gasLimit")
+                .and_then(|v| v.as_str())
+                .map(parse_hex_u64)
+                .transpose()?
+                .unwrap_or(0),
+            base_fee_per_gas: block_data
+                .get("baseFeePerGas")
+                .and_then(|v| v.as_str())
+                .map(parse_hex_u64)
+                .transpose()?,
         })
     }
 
-    /// Index a transaction
+    /// Persist a block.
+    ///
+    /// The block is written before its transactions because `transactions`
+    /// references `blocks(number)`; writing the children first would violate
+    /// the foreign key.
+    async fn index_block(&self, block: &IndexedBlock) -> Result<(), IndexerError> {
+        let pool = self.pool.as_ref().ok_or(IndexerError::NotRunning)?;
+
+        sqlx::query(
+            "INSERT INTO blocks (number, hash, parent_hash, miner, difficulty, \
+             total_difficulty, size, gas_limit, gas_used, timestamp, base_fee_per_gas, tx_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             ON CONFLICT (number) DO UPDATE SET \
+                 hash = EXCLUDED.hash, gas_used = EXCLUDED.gas_used, \
+                 tx_count = EXCLUDED.tx_count, updated_at = NOW()",
+        )
+        .bind(block.number as i64)
+        .bind(&block.hash)
+        .bind(&block.parent_hash)
+        .bind(&block.miner)
+        .bind(&block.difficulty)
+        .bind(&block.total_difficulty)
+        .bind(block.size as i64)
+        .bind(block.gas_limit as i64)
+        .bind(block.gas_used as i64)
+        .bind(block.timestamp)
+        .bind(block.base_fee_per_gas.map(|v| v as i64))
+        .bind(block.transactions.len() as i32)
+        .execute(pool)
+        .await
+        .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Persist a transaction.
     pub async fn index_transaction(&self, tx: &IndexedTransaction) -> Result<(), IndexerError> {
+        let pool = self.pool.as_ref().ok_or(IndexerError::NotRunning)?;
+
+        let status = match tx.status {
+            TransactionStatus::Pending => "pending",
+            TransactionStatus::Success => "success",
+            TransactionStatus::Failed => "failed",
+        };
+
+        sqlx::query(
+            "INSERT INTO transactions (hash, nonce, block_hash, block_number, transaction_index, \
+             from_address, to_address, value, gas_price, gas_limit, gas_used, input, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             ON CONFLICT (hash) DO UPDATE SET block_number = EXCLUDED.block_number, \
+                 status = EXCLUDED.status",
+        )
+        .bind(&tx.hash)
+        .bind(tx.nonce as i64)
+        .bind(&tx.block_hash)
+        .bind(tx.block_number as i64)
+        .bind(tx.transaction_index as i32)
+        .bind(&tx.from)
+        .bind(&tx.to)
+        .bind(&tx.value)
+        .bind(tx.gas_price as i64)
+        .bind(tx.gas_used as i64)
+        .bind(tx.gas_used as i64)
+        .bind(&tx.input)
+        .bind(status)
+        .execute(pool)
+        .await
+        .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
+
         let mut stats = self.stats.write().await;
         stats.indexed_transactions += 1;
-        
-        // Here we would insert into database
-        log::debug!("Indexed tx: {}", tx.hash);
-        
+
         Ok(())
     }
 
-    /// Index a log
-    pub async fn index_log(&self, log_entry: &IndexedLog) -> Result<(), IndexerError> {
+    /// Persist a log.
+    pub async fn index_log(
+        &self,
+        log_entry: &IndexedLog,
+        block_timestamp: i64,
+    ) -> Result<(), IndexerError> {
+        let pool = self.pool.as_ref().ok_or(IndexerError::NotRunning)?;
+
+        sqlx::query(
+            "INSERT INTO logs (transaction_hash, block_number, address, topics, data, log_index, timestamp) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (transaction_hash, log_index) DO NOTHING",
+        )
+        .bind(&log_entry.transaction_hash)
+        .bind(log_entry.block_number as i64)
+        .bind(&log_entry.address)
+        .bind(serde_json::json!(&log_entry.topics))
+        .bind(&log_entry.data)
+        .bind(log_entry.log_index as i32)
+        .bind(block_timestamp)
+        .execute(pool)
+        .await
+        .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
+
         let mut stats = self.stats.write().await;
         stats.indexed_logs += 1;
-        
-        // Here we would insert into database
-        log::debug!("Indexed log: {} from {}", log_entry.transaction_hash, log_entry.address);
-        
+
         Ok(())
     }
 
-    /// Index a token
+    /// Persist a token.
     pub async fn index_token(&self, token: IndexedToken) -> Result<(), IndexerError> {
+        let pool = self.pool.as_ref().ok_or(IndexerError::NotRunning)?;
+
+        sqlx::query(
+            "INSERT INTO tokens (address, name, symbol, decimals, total_supply) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (address) DO NOTHING",
+        )
+        .bind(&token.address)
+        .bind(&token.name)
+        .bind(&token.symbol)
+        .bind(token.decimals as i16)
+        .bind(&token.total_supply)
+        .execute(pool)
+        .await
+        .map_err(|e| IndexerError::DatabaseError(e.to_string()))?;
+
         let mut stats = self.stats.write().await;
         stats.indexed_tokens += 1;
+
         Ok(())
     }
 }
@@ -429,18 +607,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_indexer_creation() {
+    fn parses_prefixed_hex_quantities() {
+        assert_eq!(parse_hex_u64("0x0").unwrap(), 0);
+        assert_eq!(parse_hex_u64("0x1").unwrap(), 1);
+        assert_eq!(parse_hex_u64("0xde0b6b3a7640000").unwrap(), 1_000_000_000_000_000_000);
+        assert_eq!(parse_hex_u64("0xffffffffffffffff").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn rejects_values_that_are_not_quantities() {
+        // An empty quantity, a non-hex digit and a value wider than u64 all have
+        // to be reported; silently substituting a default is what hid these
+        // fields before.
+        assert!(parse_hex_u64("0x").is_err());
+        assert!(parse_hex_u64("0xzz").is_err());
+        assert!(parse_hex_u64("0x1ffffffffffffffff").is_err());
+    }
+
+    #[test]
+    fn accepts_quantities_without_a_prefix() {
+        assert_eq!(parse_hex_u64("ff").unwrap(), 255);
+    }
+
+    #[test]
+    fn default_chain_id_is_tigersmartchain() {
+        assert_eq!(IndexerConfig::default().chain_id, 6666);
+    }
+
+    #[test]
+    fn builder_overrides_configuration() {
+        let indexer = IndexerBuilder::new()
+            .chain_id(6666)
+            .rpc_url("http://localhost:8545")
+            .start_block(42)
+            .batch_size(10)
+            .build();
+
+        assert_eq!(indexer.config.chain_id, 6666);
+        assert_eq!(indexer.config.start_block, 42);
+        assert_eq!(indexer.config.batch_size, 10);
+    }
+
+    #[tokio::test]
+    async fn a_new_indexer_is_not_running() {
         let indexer = Indexer::new(IndexerConfig::default());
         assert!(!indexer.is_running().await);
     }
 
-    #[test]
-    fn test_builder() {
-        let indexer = IndexerBuilder::new()
-            .chain_id(56)
-            .rpc_url("http://localhost:8545")
-            .build();
-        
-        assert_eq!(indexer.config.chain_id, 56);
+    #[tokio::test]
+    async fn starting_without_a_database_is_refused() {
+        // Reporting progress without anywhere to write it is worse than failing,
+        // so `start` must refuse rather than pretend.
+        let indexer = Indexer::new(IndexerConfig::default());
+        let error = indexer.start().await.expect_err("start must fail without a pool");
+
+        assert!(matches!(error, IndexerError::DatabaseError(_)));
     }
 }

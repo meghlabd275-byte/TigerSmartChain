@@ -1,7 +1,7 @@
 //! RPC Client for Indexer
 
+use crate::indexer::parse_hex_u64;
 use crate::types::*;
-use std::sync::Arc;
 
 // =============================================================================
 // RPC CLIENT
@@ -44,7 +44,7 @@ impl RPCClient {
             .as_str()
             .ok_or("Invalid response")?;
         
-        Ok(u64::from_str_radix(&number[2..], 16).map_err(|e| e.to_string())?)
+        parse_hex_u64(number).map_err(|e| e.to_string())
     }
 
     /// Get block by number
@@ -68,26 +68,81 @@ impl RPCClient {
         let data: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
         
         // Parse block data
+        // Every quantity below is a `0x` hex string in the JSON-RPC reply and is
+        // decoded through `parse_hex_u64`, which checks the prefix first; the
+        // previous `[2..]` slice panicked on any value that lacked it.
+        let result = &data["result"];
+        let quantity = |field: &str| -> Result<u64, String> {
+            parse_hex_u64(result[field].as_str().unwrap_or("0x0")).map_err(|e| e.to_string())
+        };
+
         Ok(IndexedBlock {
             number,
-            hash: data["result"]["hash"].as_str().unwrap_or("").to_string(),
-            parent_hash: data["result"]["parentHash"].as_str().unwrap_or("").to_string(),
-            timestamp: i64::from_str_radix(
-                data["result"]["timestamp"].as_str().unwrap_or("0x0")[2..], 16
-            ).unwrap_or(0) as i64,
+            hash: result["hash"].as_str().unwrap_or("").to_string(),
+            parent_hash: result["parentHash"].as_str().unwrap_or("").to_string(),
+            timestamp: quantity("timestamp")? as i64,
             transactions: vec![],
             logs: vec![],
             internal_txs: vec![],
-            miner: data["result"]["miner"].as_str().unwrap_or("").to_string(),
-            difficulty: data["result"]["difficulty"].as_str().unwrap_or("0").to_string(),
-            total_difficulty: data["result"]["totalDifficulty"].as_str().unwrap_or("0").to_string(),
-            size: data["result"]["size"].as_str().unwrap_or("0x0")[2..].parse().unwrap_or(0),
-            gas_used: data["result"]["gasUsed"].as_str().unwrap_or("0x0")[2..].parse().unwrap_or(0),
-            gas_limit: data["result"]["gasLimit"].as_str().unwrap_or("0x0")[2..].parse().unwrap_or(0),
-            base_fee_per_gas: data["result"]["baseFeePerGas"]
+            miner: result["miner"].as_str().unwrap_or("").to_string(),
+            difficulty: result["difficulty"].as_str().unwrap_or("0x0").to_string(),
+            total_difficulty: result["totalDifficulty"].as_str().unwrap_or("0x0").to_string(),
+            size: quantity("size")?,
+            gas_used: quantity("gasUsed")?,
+            gas_limit: quantity("gasLimit")?,
+            base_fee_per_gas: result["baseFeePerGas"]
                 .as_str()
-                .map(|s| u64::from_str_radix(&s[2..], 16).ok())
-                .flatten(),
+                .map(parse_hex_u64)
+                .transpose()
+                .map_err(|e| e.to_string())?,
+        })
+    }
+
+    /// Get a transaction by hash.
+    ///
+    /// A receipt reports the gas *used*, not the gas *limit* the sender set;
+    /// the limit only appears on the transaction itself.
+    pub async fn get_transaction(&self, hash: &str) -> Result<IndexedTransaction, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionByHash",
+            "params": [hash],
+            "id": 1
+        });
+
+        let response = self
+            .client
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let data: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
+
+        let result = data["result"]
+            .as_object()
+            .ok_or_else(|| format!("transaction {hash} is not known to the node"))?;
+
+        let result = serde_json::Value::Object(result.clone());
+        let quantity = |field: &str| -> Result<u64, String> {
+            parse_hex_u64(result[field].as_str().unwrap_or("0x0")).map_err(|e| e.to_string())
+        };
+
+        Ok(IndexedTransaction {
+            hash: result["hash"].as_str().unwrap_or(hash).to_string(),
+            block_number: quantity("blockNumber")?,
+            block_hash: result["blockHash"].as_str().unwrap_or("").to_string(),
+            transaction_index: quantity("transactionIndex")?,
+            from: result["from"].as_str().unwrap_or("").to_string(),
+            to: result["to"].as_str().map(|s| s.to_string()),
+            value: result["value"].as_str().unwrap_or("0x0").to_string(),
+            gas_price: quantity("gasPrice")?,
+            gas_used: quantity("gas")?,
+            nonce: quantity("nonce")?,
+            input: result["input"].as_str().unwrap_or("0x").to_string(),
+            status: TransactionStatus::Pending,
+            logs: Vec::new(),
         })
     }
 
@@ -117,27 +172,21 @@ impl RPCClient {
             TransactionStatus::Failed
         };
 
+        let quantity = |field: &str| -> Result<u64, String> {
+            parse_hex_u64(result[field].as_str().unwrap_or("0x0")).map_err(|e| e.to_string())
+        };
+
         Ok(IndexedTransaction {
             hash: hash.to_string(),
-            block_number: u64::from_str_radix(
-                result["blockNumber"].as_str().unwrap_or("0x0")[2..], 16
-            ).unwrap_or(0),
+            block_number: quantity("blockNumber")?,
             block_hash: result["blockHash"].as_str().unwrap_or("").to_string(),
-            transaction_index: u64::from_str_radix(
-                result["transactionIndex"].as_str().unwrap_or("0x0")[2..], 16
-            ).unwrap_or(0),
+            transaction_index: quantity("transactionIndex")?,
             from: result["from"].as_str().unwrap_or("").to_string(),
             to: result["to"].as_str().map(|s| s.to_string()),
             value: result["value"].as_str().unwrap_or("0x0").to_string(),
-            gas_price: u64::from_str_radix(
-                result["gasPrice"].as_str().unwrap_or("0x0")[2..], 16
-            ).unwrap_or(0),
-            gas_used: u64::from_str_radix(
-                result["gasUsed"].as_str().unwrap_or("0x0")[2..], 16
-            ).unwrap_or(0),
-            nonce: u64::from_str_radix(
-                result["nonce"].as_str().unwrap_or("0x0")[2..], 16
-            ).unwrap_or(0),
+            gas_price: quantity("effectiveGasPrice")?,
+            gas_used: quantity("gasUsed")?,
+            nonce: quantity("nonce")?,
             input: result["input"].as_str().unwrap_or("").to_string(),
             status,
             logs: vec![],
