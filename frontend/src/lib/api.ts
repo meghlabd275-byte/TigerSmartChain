@@ -171,6 +171,29 @@ class APIClient {
     return data
   }
 
+  // Chain-wide transfer feed, used by the transfer tracker page.
+  async getRecentTransfers(params?: {
+    page?: number
+    limit?: number
+  }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/transfers', { params }
+    )
+    return data
+  }
+
+  async getTransferStats(): Promise<Record<string, any>> {
+    const { data } = await this.client.get('/transfers/stats')
+    return data
+  }
+
+  async getTransferSeries(params?: { hours?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/transfers/series', { params }
+    )
+    return data
+  }
+
   async getTokenPriceHistory(tokenAddress: string, params?: {
     timeframe?: '1h' | '24h' | '7d' | '30d' | '1y'
   }): Promise<ChartData[]> {

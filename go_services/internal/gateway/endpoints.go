@@ -85,6 +85,9 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 
 	// ==================== TOKENS (25 endpoints) ====================
 	api.GET("/tokens", h.GetTokens)
+	api.GET("/transfers", h.GetRecentTokenTransfers)
+	api.GET("/transfers/stats", h.GetTokenTransferStats)
+	api.GET("/transfers/series", h.GetTokenTransferSeries)
 	api.GET("/tokens/:address", h.GetToken)
 	api.GET("/tokens/:address/holders", h.GetTokenHolders)
 	api.GET("/tokens/:address/holders/count", h.GetTokenHoldersCount)
