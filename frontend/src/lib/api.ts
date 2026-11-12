@@ -270,6 +270,21 @@ class APIClient {
     return response
   }
 
+  // Contract ABI, as stored by the verifier. Returns [] when the address is
+  // not a verified contract.
+  async getContractABI(address: string): Promise<{ abi: any[] }> {
+    const { data } = await this.client.get<{ abi: any[] }>(`/contracts/${address}/abi`)
+    return data
+  }
+
+  // Read-only JSON-RPC passthrough. The gateway forwards only methods on its
+  // allow-list (eth_call, eth_estimateGas, debug_trace*, trace_*); anything
+  // else is refused with 403.
+  async rpcCall(method: string, params: unknown[]): Promise<any> {
+    const { data } = await this.client.post('/rpc', { method, params })
+    return data
+  }
+
   async getVerifiedContracts(params?: {
     page?: number
     limit?: number
