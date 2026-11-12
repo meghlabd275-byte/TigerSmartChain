@@ -92,6 +92,17 @@ std::string MetadataFetcher::get(const std::string& url,
     return result;
 }
 
+std::string MetadataFetcher::post(const std::string& url,
+                                  const std::string& body,
+                                  const std::map<std::string, std::string>& headers,
+                                  int timeout_ms) {
+    int old_timeout = default_timeout_;
+    default_timeout_ = timeout_ms;
+    std::string result = perform_request(url, "POST", body, headers);
+    default_timeout_ = old_timeout;
+    return result;
+}
+
 // RarityCalculator Implementation
 RarityCalculator::RarityCalculator() 
     : interpolation_factor_(1.0), use_logarithmic_(true) {}
@@ -788,15 +799,331 @@ std::optional<NFTMetadata> NFTRarityService::fetch_nft_metadata(
     return metadata;
 }
 
+namespace {
+
+// The metadata selectors an ERC-721 or ERC-1155 collection exposes. These are
+// fixed by the standards, so they are written out rather than hashed at run
+// time.
+constexpr const char* RARITY_SELECTOR_TOTAL_SUPPLY = "18160ddd";   // totalSupply()
+constexpr const char* RARITY_SELECTOR_TOKEN_BY_INDEX = "4f6ccce7"; // tokenByIndex(uint256)
+constexpr const char* RARITY_SELECTOR_TOKEN_URI = "c87b56dd";      // tokenURI(uint256)
+constexpr const char* RARITY_SELECTOR_URI = "0e89341c";            // uri(uint256)
+
+// Strip an optional `0x` prefix, returning the hex digits.
+std::string rarity_strip_prefix(const std::string& value) {
+    if (value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        return value.substr(2);
+    }
+    return value;
+}
+
+int rarity_hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Decode hex into bytes. A malformed string yields an empty vector rather than
+// a partial decode, so a caller cannot read garbage as a value.
+std::vector<unsigned char> rarity_hex_to_bytes(const std::string& value) {
+    std::string digits = rarity_strip_prefix(value);
+    if (digits.size() % 2 != 0) {
+        return {};
+    }
+    std::vector<unsigned char> out;
+    out.reserve(digits.size() / 2);
+    for (size_t i = 0; i < digits.size(); i += 2) {
+        int high = rarity_hex_digit(digits[i]);
+        int low = rarity_hex_digit(digits[i + 1]);
+        if (high < 0 || low < 0) {
+            return {};
+        }
+        out.push_back(static_cast<unsigned char>((high << 4) | low));
+    }
+    return out;
+}
+
+// Read a uint256 return as a size, or nothing when it does not fit. A supply
+// wider than the platform's size_t cannot be enumerated, so it is refused
+// rather than wrapped into a small number.
+std::optional<size_t> rarity_decode_uint(const std::string& hex) {
+    std::vector<unsigned char> data = rarity_hex_to_bytes(hex);
+    if (data.size() < 32) {
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < 32 - sizeof(size_t); ++i) {
+        if (data[i] != 0) {
+            return std::nullopt;
+        }
+    }
+    size_t value = 0;
+    for (size_t i = 32 - sizeof(size_t); i < 32; ++i) {
+        value = (value << 8) | data[i];
+    }
+    return value;
+}
+
+// A left-padded 32-byte argument.
+std::string rarity_encode_word(const std::string& hex_digits) {
+    if (hex_digits.size() > 64) {
+        return "";
+    }
+    return std::string(64 - hex_digits.size(), '0') + hex_digits;
+}
+
+// The hex digits of a size_t, without leading zeros, ready to be padded into a
+// word.
+std::string rarity_to_hex_digits(size_t value) {
+    static const char* digits = "0123456789abcdef";
+    if (value == 0) {
+        return "0";
+    }
+    std::string out;
+    while (value > 0) {
+        out.push_back(digits[value & 0x0f]);
+        value >>= 4;
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+// Decode a dynamic ABI string: an offset word, a length word, then the padded
+// payload. A return that is not shaped that way yields an empty string.
+std::string rarity_decode_abi_string(const std::string& hex) {
+    std::vector<unsigned char> data = rarity_hex_to_bytes(hex);
+    if (data.size() < 64) {
+        return "";
+    }
+
+    size_t offset = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        if (i < 24 && data[i] != 0) {
+            return "";
+        }
+        if (i >= 24) {
+            offset = (offset << 8) | data[i];
+        }
+    }
+    if (offset + 32 > data.size()) {
+        return "";
+    }
+
+    size_t length = 0;
+    for (size_t i = offset; i < offset + 32; ++i) {
+        if (i < offset + 24 && data[i] != 0) {
+            return "";
+        }
+        if (i >= offset + 24) {
+            length = (length << 8) | data[i];
+        }
+    }
+    if (length == 0 || offset + 32 + length > data.size()) {
+        return "";
+    }
+
+    return std::string(reinterpret_cast<const char*>(&data[offset + 32]), length);
+}
+
+// A JSON-RPC call returning the `result` value, or nullptr on any error. The
+// caller owns the returned reference.
+json_t* rarity_rpc_call(MetadataFetcher& fetcher, const std::string& rpc_url,
+                        const std::string& method, json_t* params) {
+    json_t* request = json_object();
+    json_object_set_new(request, "jsonrpc", json_string("2.0"));
+    json_object_set_new(request, "id", json_integer(1));
+    json_object_set_new(request, "method", json_string(method.c_str()));
+    json_object_set_new(request, "params", params ? params : json_array());
+
+    char* encoded = json_dumps(request, JSON_COMPACT);
+    json_decref(request);
+    if (!encoded) {
+        return nullptr;
+    }
+    std::string body(encoded);
+    free(encoded);
+
+    std::map<std::string, std::string> headers = {
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json"}
+    };
+
+    std::string response = fetcher.post(rpc_url, body, headers, 5000);
+    if (response.empty()) {
+        return nullptr;
+    }
+
+    json_error_t error;
+    json_t* root = json_loads(response.c_str(), 0, &error);
+    if (!root) {
+        return nullptr;
+    }
+
+    if (json_object_get(root, "error")) {
+        json_decref(root);
+        return nullptr;
+    }
+
+    json_t* result = json_object_get(root, "result");
+    if (!result) {
+        json_decref(root);
+        return nullptr;
+    }
+
+    json_incref(result);
+    json_decref(root);
+    return result;
+}
+
+// A JSON-RPC call returning a hex string, or an empty string on any error.
+std::string rarity_rpc_hex(MetadataFetcher& fetcher, const std::string& rpc_url,
+                           const std::string& method, json_t* params) {
+    json_t* result = rarity_rpc_call(fetcher, rpc_url, method, params);
+    if (!result) {
+        return "";
+    }
+    std::string value = json_is_string(result) ? json_string_value(result) : "";
+    json_decref(result);
+    return value;
+}
+
+} // namespace
+
 std::vector<NFTMetadata> NFTRarityService::fetch_collection_metadata(
     const std::string& collection_address,
     int limit
 ) {
     std::vector<NFTMetadata> nfts;
-    
-    // This would fetch all NFTs in a collection - placeholder
-    // In production, this would iterate through all token IDs or use pagination
-    
+
+    if (rpc_url_.empty() || limit <= 0) {
+        return nfts;
+    }
+
+    // A JSON-RPC `to` field must be a 20-byte address. Anything else would be
+    // sent to the node as a malformed request, so it is refused here.
+    std::string address_digits = rarity_strip_prefix(collection_address);
+    if (address_digits.size() != 40) {
+        return nfts;
+    }
+    for (char c : address_digits) {
+        if (rarity_hex_digit(c) < 0) {
+            return nfts;
+        }
+    }
+    std::string address_field = "0x" + address_digits;
+
+    auto make_call = [&](const std::string& data) {
+        json_t* call = json_object();
+        json_object_set_new(call, "to", json_string(address_field.c_str()));
+        json_object_set_new(call, "data", json_string(("0x" + data).c_str()));
+        json_t* params = json_array();
+        json_array_append_new(params, call);
+        json_array_append_new(params, json_string("latest"));
+        return params;
+    };
+
+    auto eth_call = [&](const std::string& data) {
+        return rarity_rpc_hex(*metadata_fetcher_, rpc_url_, "eth_call", make_call(data));
+    };
+
+    // The collection's size bounds the walk. A collection that does not report
+    // one cannot be enumerated, and inventing a bound would truncate silently.
+    auto supply_opt = rarity_decode_uint(eth_call(RARITY_SELECTOR_TOTAL_SUPPLY));
+    if (!supply_opt) {
+        return nfts;
+    }
+    size_t supply = *supply_opt;
+
+    // tokenByIndex is the optional ERC-721 enumeration extension. A collection
+    // that omits it is walked by sequential token id instead, which is what
+    // most modern collections use.
+    bool enumeration_supported = true;
+    {
+        std::string probe = eth_call(
+            std::string(RARITY_SELECTOR_TOKEN_BY_INDEX) + rarity_encode_word("0"));
+        if (probe.empty()) {
+            enumeration_supported = false;
+        }
+    }
+
+    size_t wanted = std::min<size_t>(static_cast<size_t>(limit), supply);
+    for (size_t index = 0; index < wanted; ++index) {
+        std::string token_id_hex;
+        if (enumeration_supported) {
+            std::string by_index = eth_call(std::string(RARITY_SELECTOR_TOKEN_BY_INDEX) +
+                                            rarity_encode_word(rarity_to_hex_digits(index)));
+            auto decoded = rarity_decode_uint(by_index);
+            if (!decoded) {
+                // The enumeration stopped answering part-way through, so the
+                // walk ends rather than substituting a guessed id.
+                break;
+            }
+            token_id_hex = rarity_to_hex_digits(*decoded);
+        } else {
+            token_id_hex = rarity_to_hex_digits(index + 1);
+        }
+        std::string token_id = token_id_hex;
+
+        std::string uri_hex = eth_call(std::string(RARITY_SELECTOR_TOKEN_URI) +
+                                       rarity_encode_word(token_id_hex));
+        if (uri_hex.empty()) {
+            // ERC-1155 names its collection-wide template with `uri`.
+            uri_hex = eth_call(std::string(RARITY_SELECTOR_URI) +
+                               rarity_encode_word(token_id_hex));
+        }
+        std::string uri = rarity_decode_abi_string(uri_hex);
+
+        // The URI is usually a template; a token id fills the placeholder.
+        if (!uri.empty()) {
+            size_t placeholder = uri.find("{id}");
+            if (placeholder != std::string::npos) {
+                uri.replace(placeholder, 4, token_id);
+            }
+        }
+
+        NFTMetadata metadata;
+        metadata.token_id = token_id;
+        metadata.collection_address = collection_address;
+        metadata.image_url = uri;
+        metadata.last_updated = std::chrono::system_clock::now();
+
+        // The token's own document carries the traits. A token whose document
+        // cannot be read is skipped: a record with no traits would count as a
+        // real NFT and skew every frequency it appears in.
+        if (!uri.empty()) {
+            std::map<std::string, std::string> doc_headers = {{"Accept", "application/json"}};
+            std::string document = metadata_fetcher_->get(uri, doc_headers, 5000);
+            if (!document.empty()) {
+                json_error_t error;
+                json_t* root = json_loads(document.c_str(), 0, &error);
+                if (root) {
+                    json_t* name = json_object_get(root, "name");
+                    if (name && json_is_string(name)) {
+                        metadata.name = json_string_value(name);
+                    }
+                    json_t* image = json_object_get(root, "image");
+                    if (image && json_is_string(image)) {
+                        metadata.image_url = json_string_value(image);
+                    }
+                    json_t* description = json_object_get(root, "description");
+                    if (description && json_is_string(description)) {
+                        metadata.description = json_string_value(description);
+                    }
+                    json_t* attributes = json_object_get(root, "attributes");
+                    if (attributes && json_is_array(attributes)) {
+                        metadata.traits = trait_parser_->parse_traits_from_json(attributes);
+                    }
+                    json_decref(root);
+                }
+            }
+        }
+
+        if (metadata.traits.empty()) {
+            continue;
+        }
+        nfts.push_back(std::move(metadata));
+    }
+
     return nfts;
 }
 
@@ -804,13 +1131,28 @@ void NFTRarityService::update_loop() {
     while (running_) {
         std::this_thread::sleep_for(std::chrono::hours(1));
         
-        // Periodically update collection statistics
-        std::lock_guard lock(nfts_mutex_);
-        for (const auto& [address, _] : collection_nfts_) {
-            auto nfts = fetch_collection_metadata(address, 1000);
-            if (!nfts.empty()) {
-                calculator_->update_collection_stats(address, nfts);
+        // Snapshot the collections to refresh. Holding the lock across the
+        // reads below would block every reader for as long as the network
+        // takes, so it is released before any request is made.
+        std::vector<std::string> addresses;
+        {
+            std::lock_guard lock(nfts_mutex_);
+            addresses.reserve(collection_nfts_.size());
+            for (const auto& [address, _] : collection_nfts_) {
+                addresses.push_back(address);
             }
+        }
+
+        for (const auto& address : addresses) {
+            auto nfts = fetch_collection_metadata(address, 1000);
+            if (nfts.empty()) {
+                continue;
+            }
+            {
+                std::lock_guard lock(nfts_mutex_);
+                collection_nfts_[address] = nfts;
+            }
+            calculator_->update_collection_stats(address, nfts);
         }
     }
 }

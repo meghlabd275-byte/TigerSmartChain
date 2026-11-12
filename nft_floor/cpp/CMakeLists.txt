@@ -3,7 +3,11 @@ project(TigerScanNFTFloor)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -flto")
+# Tuned for a generic x86-64 baseline rather than the build host, so a binary
+# built here runs on any deployment target. `-march=native` would let the
+# compiler emit instructions the target may not have, which fails at run time
+# with an illegal instruction rather than at build time.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -flto -DNDEBUG")
 
 # Find required packages
 find_package(PkgConfig REQUIRED)
@@ -17,21 +21,26 @@ include_directories(${CURL_INCLUDE_DIRS})
 include_directories(${JSON_INCLUDE_DIRS})
 include_directories(${OPENSSL_INCLUDE_DIRS})
 
-# Source files
+# Both translation units are part of the library. The rarity calculator holds
+# the on-chain enumeration the floor service relies on, so leaving it out would
+# link a library whose metadata walk is missing.
 set(SOURCES
     src/floor_calculator.cpp
+    src/rarity_calculator.cpp
 )
 
 # Create library
 add_library(tigerscan_nft_floor STATIC ${SOURCES})
 
 # Link libraries
+find_package(Threads REQUIRED)
+
 target_link_libraries(tigerscan_nft_floor
     ${CURL_LIBRARIES}
     ${JSON_LIBRARIES}
     ${OPENSSL_LIBRARIES}
-    pthread
-    dl
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
 )
 
 # Installation
@@ -41,5 +50,6 @@ install(TARGETS tigerscan_nft_floor
 )
 
 install(FILES src/floor_calculator.hpp
+              src/rarity_calculator.hpp
     DESTINATION include
 )

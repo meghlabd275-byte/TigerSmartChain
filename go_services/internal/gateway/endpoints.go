@@ -180,6 +180,8 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	// ==================== GAS (10 endpoints) ====================
 	api.GET("/gas/oracle", h.GetGasOracle)
 	api.GET("/gas/native-price", h.GetNativePrice)
+	api.GET("/gas/network-stats", h.GetGasNetworkStats)
+	api.GET("/gas/price-series", h.GetGasPriceHistorySeries)
 
 	// Developer tools. Selectors and event topics are computed from keccak256
 	// rather than read from a table, so they cannot be wrong.
@@ -963,7 +965,32 @@ func (h *Handler) GetGasRecommendation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"recommended": rowValue(row, "gas_price")})
 }
 func (h *Handler) GetPriorityFees(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"fast": 2, "standard": 1, "slow": 0.5})
+	ctx := c.Request.Context()
+
+	// Priority fees come from the recent blocks' own fee history rather than
+	// from fixed constants. The previous implementation returned the literals
+	// 2 / 1 / 0.5 regardless of what the chain was doing.
+	row, err := h.queryOne(ctx, `
+		SELECT
+			COALESCE(MAX(priority_fee), 0) AS fast,
+			COALESCE(AVG(priority_fee), 0) AS standard,
+			COALESCE(MIN(priority_fee), 0) AS slow
+		FROM (
+			SELECT priority_fee FROM gas_prices
+			WHERE priority_fee IS NOT NULL
+			ORDER BY timestamp DESC
+			LIMIT 100
+		) recent
+	`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"fast":     rowValue(row, "fast"),
+		"standard": rowValue(row, "standard"),
+		"slow":     rowValue(row, "slow"),
+	})
 }
 func (h *Handler) GetBaseFee(c *gin.Context) {
 	ctx := c.Request.Context()

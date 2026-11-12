@@ -390,6 +390,19 @@ class APIClient {
     return data
   }
 
+  // Gas network statistics and the sampled price series behind the tracker.
+  async getGasNetworkStats(): Promise<Record<string, any>> {
+    const { data } = await this.client.get('/gas/network-stats')
+    return data
+  }
+
+  async getGasPriceSeries(params?: { limit?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/gas/price-series', { params }
+    )
+    return data
+  }
+
   // Contract APIs
   async getContract(address: string): Promise<Contract> {
     const { data } = await this.client.get<Contract>(`/contracts/${address}`)

@@ -1,152 +1,66 @@
 /**
- * Advanced Gas Tracker Page - Real-time gas prices and predictions
- * Built with complete logic for Ethereum-compatible gas estimation
+ * Gas Tracker
+ *
+ * Every figure on this page comes from indexed chain data: the blocks table for
+ * the latest block's fill and base fee, and the gas_prices samples the tracker
+ * service writes for current fees, averages, volatility and the history chart.
+ *
+ * The page previously generated its own data. It built 24 hours of price
+ * history with Math.random, forecast two hours ahead with the same, and printed
+ * a "Gas Prices by Chain" table with invented prices and volumes for Ethereum,
+ * Base, Arbitrum, Optimism and Polygon. That table is gone: TigerScan measures
+ * TigerSmartChain, and it has no basis for quoting another chain's fees.
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import api from '@/lib/api';
 
-// Types for gas data
+const NATIVE_SYMBOL = 'TGR';
+
 interface GasPrice {
   timestamp: number;
-  slow: number;
-  standard: number;
-  fast: number;
-  baseFee: number;
-  priorityFee: number;
-}
-
-interface GasPrediction {
-  timestamp: number;
-  predicted: number;
-  confidence: number;
+  gasPrice: string;
+  baseFee: string;
+  priorityFee: string;
+  gasUsed: string | null;
+  gasLimit: string | null;
 }
 
 interface GasStats {
-  current: {
-    slow: number;
-    standard: number;
-    fast: number;
-  };
-  average24h: number;
-  average7d: number;
+  current: { slow: string; standard: string; fast: string };
+  average24h: string;
+  average7d: string;
+  volatility: string;
   trend: 'up' | 'down' | 'stable';
-  volatility: number;
-  nextBlock: {
-    baseFee: number;
-    gasLimit: number;
-    gasUsed: number;
+  samples: string | number | null;
+  latestBlock: {
+    number: number | null;
+    gasUsed: string | null;
+    gasLimit: string | null;
+    baseFee: string;
+    utilization: number;
+    timestamp: number | null;
   };
 }
 
-interface GasMarket {
-  name: string;
-  price: number;
-  change24h: number;
-  volume24h: number;
-}
-
-// Advanced gas oracle for real-time prices
 const useGasOracle = () => {
   const [prices, setPrices] = useState<GasPrice[]>([]);
-  const [predictions, setPredictions] = useState<GasPrediction[]>([]);
   const [stats, setStats] = useState<GasStats | null>(null);
-  const [markets, setMarkets] = useState<GasMarket[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Simulate fetching real gas data from network
   const fetchGasData = useCallback(async () => {
     try {
-      setLoading(true);
-      
-      // Generate realistic gas price data
-      const now = Date.now();
-      const newPrices: GasPrice[] = [];
-      
-      // Generate 24 hours of historical data (every 5 minutes)
-      for (let i = 288; i >= 0; i--) {
-        const timestamp = now - i * 5 * 60 * 1000;
-        const baseFee = Math.max(10, 50 + Math.sin(i / 10) * 20 + (Math.random() - 0.5) * 15);
-        const priorityFee = Math.max(1, 5 + Math.random() * 10);
-        
-        newPrices.push({
-          timestamp,
-          slow: Math.round(baseFee * 0.8 + priorityFee * 0.5),
-          standard: Math.round(baseFee + priorityFee),
-          fast: Math.round(baseFee * 1.5 + priorityFee * 2),
-          baseFee: Math.round(baseFee),
-          priorityFee: Math.round(priorityFee),
-        });
-      }
-      
-      setPrices(newPrices);
-      
-      // Generate predictions for next 2 hours
-      const newPredictions: GasPrediction[] = [];
-      for (let i = 1; i <= 24; i++) {
-        const timestamp = now + i * 5 * 60 * 1000;
-        const lastPrice = newPrices[newPrices.length - 1].standard;
-        const trend = Math.sin(i / 5) * 5;
-        const noise = (Math.random() - 0.5) * 10;
-        
-        newPredictions.push({
-          timestamp,
-          predicted: Math.round(Math.max(10, lastPrice + trend + noise)),
-          confidence: Math.max(0.5, 0.9 - i * 0.02),
-        });
-      }
-      
-      setPredictions(newPredictions);
-      
-      // Calculate comprehensive stats
-      const recentPrices = newPrices.slice(-288);
-      const sum24h = recentPrices.reduce((acc, p) => acc + p.standard, 0) / recentPrices.length;
-      const allPrices = newPrices.slice(0, 2016);
-      const sum7d = allPrices.reduce((acc, p) => acc + p.standard, 0) / allPrices.length;
-      
-      // Calculate volatility (standard deviation)
-      const mean = sum24h;
-      const variance = recentPrices.reduce((acc, p) => acc + Math.pow(p.standard - mean, 2), 0) / recentPrices.length;
-      const volatility = Math.sqrt(variance);
-      
-      // Calculate trend
-      const firstHalf = recentPrices.slice(0, 144).reduce((acc, p) => acc + p.standard, 0) / 144;
-      const secondHalf = recentPrices.slice(144).reduce((acc, p) => acc + p.standard, 0) / 144;
-      const trend: 'up' | 'down' | 'stable' = secondHalf > firstHalf * 1.1 ? 'up' : secondHalf < firstHalf * 0.9 ? 'down' : 'stable';
-      
-      const current = newPrices[newPrices.length - 1];
-      
-      setStats({
-        current: {
-          slow: current.slow,
-          standard: current.standard,
-          fast: current.fast,
-        },
-        average24h: Math.round(sum24h),
-        average7d: Math.round(sum7d),
-        trend,
-        volatility: Math.round(volatility * 100) / 100,
-        nextBlock: {
-          baseFee: current.baseFee,
-          gasLimit: 30000000,
-          gasUsed: Math.round(15000000 + Math.random() * 10000000),
-        },
-      });
-      
-      // Gas markets data
-      setMarkets([
-        { name: 'Ethereum', price: current.standard, change24h: Math.round((secondHalf - firstHalf) / firstHalf * 100), volume24h: Math.round(500000000 + Math.random() * 100000000) },
-        { name: 'Base', price: Math.round(current.standard * 0.3), change24h: Math.round((Math.random() - 0.5) * 10), volume24h: Math.round(100000000 + Math.random() * 50000000) },
-        { name: 'Arbitrum', price: Math.round(current.standard * 0.1), change24h: Math.round((Math.random() - 0.5) * 8), volume24h: Math.round(200000000 + Math.random() * 100000000) },
-        { name: 'Optimism', price: Math.round(current.standard * 0.15), change24h: Math.round((Math.random() - 0.5) * 6), volume24h: Math.round(150000000 + Math.random() * 80000000) },
-        { name: 'Polygon', price: Math.round(current.standard * 0.05), change24h: Math.round((Math.random() - 0.5) * 5), volume24h: Math.round(80000000 + Math.random() * 40000000) },
+      const [statsResponse, seriesResponse] = await Promise.all([
+        api.getGasNetworkStats(),
+        api.getGasPriceSeries({ limit: 288 }),
       ]);
-      
+      setStats(statsResponse as unknown as GasStats);
+      setPrices((seriesResponse.items as unknown as GasPrice[]));
       setError(null);
-    } catch (err) {
-      setError('Failed to fetch gas data');
-      console.error('Gas data error:', err);
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Could not load gas data.');
     } finally {
       setLoading(false);
     }
@@ -154,33 +68,34 @@ const useGasOracle = () => {
 
   useEffect(() => {
     fetchGasData();
-    const interval = setInterval(fetchGasData, 30000); // Update every 30 seconds
+    const interval = setInterval(fetchGasData, 30000);
     return () => clearInterval(interval);
   }, [fetchGasData]);
 
-  return { prices, predictions, stats, markets, loading, error, refetch: fetchGasData };
+  return { prices, stats, loading, error, refetch: fetchGasData };
 };
+
 
 // Gas speed selector component
 interface GasSpeedSelectorProps {
   onSelect: (speed: 'slow' | 'standard' | 'fast') => void;
-  prices: { slow: number; standard: number; fast: number };
+  prices: { slow: string; standard: string; fast: string };
 }
 
 const GasSpeedSelector: React.FC<GasSpeedSelectorProps> = ({ onSelect, prices }) => {
   const [selected, setSelected] = useState<'slow' | 'standard' | 'fast'>('standard');
-  
+
   const handleSelect = (speed: 'slow' | 'standard' | 'fast') => {
     setSelected(speed);
     onSelect(speed);
   };
-  
+
   const speedConfig = {
-    slow: { label: 'Slow', desc: '~10+ min', color: '#10b981' },
-    standard: { label: 'Standard', desc: '~3-5 min', color: '#3b82f6' },
-    fast: { label: 'Fast', desc: '< 1 min', color: '#ef4444' },
+    slow: { label: 'Slow', desc: 'lower fee, less urgent', color: '#10b981' },
+    standard: { label: 'Standard', desc: 'next few blocks', color: '#3b82f6' },
+    fast: { label: 'Fast', desc: 'next block', color: '#ef4444' },
   };
-  
+
   return (
     <div className="gas-speed-selector">
       {(['slow', 'standard', 'fast'] as const).map((speed) => (
@@ -201,65 +116,41 @@ const GasSpeedSelector: React.FC<GasSpeedSelectorProps> = ({ onSelect, prices })
         </button>
       ))}
       <style>{`
-        .gas-speed-selector {
-          display: flex;
-          gap: 12px;
-          margin: 20px 0;
-        }
+        .gas-speed-selector { display: flex; gap: 12px; margin: 20px 0; }
         .speed-btn {
-          flex: 1;
-          padding: 16px;
-          border: 2px solid transparent;
-          border-radius: 12px;
-          background: #1e293b;
-          cursor: pointer;
-          transition: all 0.2s;
-          text-align: center;
+          flex: 1; padding: 16px; border: 2px solid transparent; border-radius: 12px;
+          background: #1e293b; cursor: pointer; transition: all 0.2s; text-align: center;
         }
-        .speed-btn:hover {
-          transform: translateY(-2px);
-        }
-        .speed-label {
-          font-weight: 600;
-          font-size: 14px;
-          margin-bottom: 4px;
-        }
-        .speed-price {
-          font-size: 20px;
-          font-weight: 700;
-          color: #e2e8f0;
-        }
-        .speed-desc {
-          font-size: 12px;
-          color: #94a3b8;
-          margin-top: 4px;
-        }
+        .speed-btn:hover { transform: translateY(-2px); }
+        .speed-label { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+        .speed-price { font-size: 20px; font-weight: 700; color: #e2e8f0; }
+        .speed-desc { font-size: 12px; color: #94a3b8; margin-top: 4px; }
       `}</style>
     </div>
   );
 };
 
-// Gas prediction chart
+// Gas history chart. Only measured samples are plotted; there is no forecast
+// series, because the explorer has no model that would justify one.
 interface GasChartProps {
   data: GasPrice[];
-  predictions: GasPrediction[];
 }
 
-const GasChart: React.FC<GasChartProps> = ({ data, predictions }) => {
-  const chartData = [
-    ...data.slice(-48).map(p => ({
-      time: new Date(p.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      gas: p.standard,
-      type: 'actual',
-    })),
-    ...predictions.map(p => ({
-      time: new Date(p.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      gas: p.predicted,
-      confidence: p.confidence,
-      type: 'predicted',
-    })),
-  ];
-  
+const GasChart: React.FC<GasChartProps> = ({ data }) => {
+  if (data.length === 0) {
+    return (
+      <div className="gas-chart">
+        <p style={{ color: '#94a3b8' }}>No gas price samples have been indexed yet.</p>
+      </div>
+    );
+  }
+
+  const chartData = data.map((p) => ({
+    time: new Date(Number(p.timestamp) * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    gas: Number(p.gasPrice),
+    baseFee: Number(p.baseFee),
+  }));
+
   return (
     <div className="gas-chart">
       <ResponsiveContainer width="100%" height={300}>
@@ -272,27 +163,14 @@ const GasChart: React.FC<GasChartProps> = ({ data, predictions }) => {
           </defs>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
           <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} />
-          <YAxis stroke="#94a3b8" fontSize={12} tickFormatter={(v) => `${v}`} />
-          <Tooltip
-            contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }}
-            labelStyle={{ color: '#e2e8f0' }}
-          />
-          <Area
-            type="monotone"
-            dataKey="gas"
-            stroke="#3b82f6"
-            fill="url(#gasGradient)"
-            strokeWidth={2}
-          />
+          <YAxis stroke="#94a3b8" fontSize={12} tickFormatter={(v) => `${v} Gwei`} />
+          <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }} />
+          <Area type="monotone" dataKey="gas" stroke="#3b82f6" fill="url(#gasGradient)" strokeWidth={2} name="Gas price" />
+          <Line type="monotone" dataKey="baseFee" stroke="#8b5cf6" dot={false} name="Base fee" />
         </AreaChart>
       </ResponsiveContainer>
       <style>{`
-        .gas-chart {
-          background: #0f172a;
-          border-radius: 12px;
-          padding: 20px;
-          margin: 20px 0;
-        }
+        .gas-chart { background: #0f172a; border-radius: 12px; padding: 20px; margin: 20px 0; }
       `}</style>
     </div>
   );
@@ -304,15 +182,25 @@ interface StatsCardsProps {
 }
 
 const StatsCards: React.FC<StatsCardsProps> = ({ stats }) => {
+  const utilization = stats.latestBlock?.utilization ?? 0;
   const statCards = [
     { label: 'Current', value: `${stats.current.standard} Gwei`, subtext: 'Standard' },
     { label: '24h Average', value: `${stats.average24h} Gwei`, subtext: 'Last 24 hours' },
     { label: '7d Average', value: `${stats.average7d} Gwei`, subtext: 'Last 7 days' },
-    { label: 'Trend', value: stats.trend === 'up' ? '↑ Rising' : stats.trend === 'down' ? '↓ Falling' : '→ Stable', subtext: '24h change', color: stats.trend === 'up' ? '#ef4444' : stats.trend === 'down' ? '#10b981' : '#94a3b8' },
-    { label: 'Volatility', value: `${stats.volatility}`, subtext: 'Standard deviation' },
-    { label: 'Next Block', value: `${stats.nextBlock.gasUsed.toLocaleString()}`, subtext: `Gas used / ${stats.nextBlock.gasLimit.toLocaleString()}` },
+    {
+      label: 'Trend',
+      value: stats.trend === 'up' ? 'Rising' : stats.trend === 'down' ? 'Falling' : 'Stable',
+      subtext: '12h vs previous 12h',
+      color: stats.trend === 'up' ? '#ef4444' : stats.trend === 'down' ? '#10b981' : '#94a3b8',
+    },
+    { label: 'Volatility', value: `${stats.volatility}`, subtext: 'Std deviation, Gwei' },
+    {
+      label: 'Latest Block',
+      value: stats.latestBlock?.number != null ? `#${stats.latestBlock.number}` : '-',
+      subtext: `${utilization}% full, base fee ${stats.latestBlock?.baseFee ?? '0'} Gwei`,
+    },
   ];
-  
+
   return (
     <div className="stats-grid">
       {statCards.map((card, i) => (
@@ -323,168 +211,52 @@ const StatsCards: React.FC<StatsCardsProps> = ({ stats }) => {
         </div>
       ))}
       <style>{`
-        .stats-grid {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-          gap: 16px;
-          margin: 20px 0;
-        }
-        .stat-card {
-          background: #1e293b;
-          border-radius: 12px;
-          padding: 16px;
-          text-align: center;
-        }
-        .stat-label {
-          font-size: 12px;
-          color: #94a3b8;
-          text-transform: uppercase;
-          margin-bottom: 8px;
-        }
-        .stat-value {
-          font-size: 24px;
-          font-weight: 700;
-          color: #e2e8f0;
-        }
-        .stat-subtext {
-          font-size: 11px;
-          color: #64748b;
-          margin-top: 4px;
-        }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin: 20px 0; }
+        .stat-card { background: #1e293b; border-radius: 12px; padding: 16px; text-align: center; }
+        .stat-label { font-size: 12px; color: #94a3b8; text-transform: uppercase; margin-bottom: 8px; }
+        .stat-value { font-size: 24px; font-weight: 700; color: #e2e8f0; }
+        .stat-subtext { font-size: 11px; color: #64748b; margin-top: 4px; }
       `}</style>
     </div>
   );
 };
 
-// Market comparison component
-interface MarketsProps {
-  markets: GasMarket[];
-}
-
-const Markets: React.FC<MarketsProps> = ({ markets }) => {
-  return (
-    <div className="markets-section">
-      <h3>Gas Prices by Chain</h3>
-      <div className="markets-table">
-        <div className="table-header">
-          <span>Chain</span>
-          <span>Price</span>
-          <span>24h Change</span>
-          <span>Volume</span>
-        </div>
-        {markets.map((market) => (
-          <div key={market.name} className="table-row">
-            <span className="chain-name">{market.name}</span>
-            <span className="chain-price">{market.price} Gwei</span>
-            <span className={`chain-change ${market.change24h >= 0 ? 'positive' : 'negative'}`}>
-              {market.change24h >= 0 ? '+' : ''}{market.change24h}%
-            </span>
-            <span className="chain-volume">${(market.volume24h / 1000000).toFixed(1)}M</span>
-          </div>
-        ))}
-      </div>
-      <style>{`
-        .markets-section {
-          margin-top: 30px;
-        }
-        .markets-section h3 {
-          color: #e2e8f0;
-          margin-bottom: 16px;
-        }
-        .markets-table {
-          background: #1e293b;
-          border-radius: 12px;
-          overflow: hidden;
-        }
-        .table-header, .table-row {
-          display: grid;
-          grid-template-columns: 2fr 1fr 1fr 1fr;
-          padding: 14px 20px;
-          align-items: center;
-        }
-        .table-header {
-          background: #0f172a;
-          color: #94a3b8;
-          font-size: 12px;
-          text-transform: uppercase;
-        }
-        .table-row {
-          border-bottom: 1px solid #334155;
-        }
-        .table-row:last-child {
-          border-bottom: none;
-        }
-        .chain-name {
-          font-weight: 600;
-          color: #e2e8f0;
-        }
-        .chain-price {
-          color: #e2e8f0;
-        }
-        .chain-change.positive {
-          color: #10b981;
-        }
-        .chain-change.negative {
-          color: #ef4444;
-        }
-        .chain-volume {
-          color: #94a3b8;
-        }
-      `}</style>
-    </div>
-  );
-};
-
-// Transaction time estimator
+// Transaction time estimator. The bands describe what each fee tier means for
+// inclusion, not a measured confirmation time; the chain does not publish one.
 interface TxTimeEstimatorProps {
-  gasPrice: number;
+  gasPrice: string;
 }
 
 const TxTimeEstimator: React.FC<TxTimeEstimatorProps> = ({ gasPrice }) => {
-  const estimateTime = (price: number): string => {
-    if (price < 20) return '10-30 minutes';
-    if (price < 40) return '3-10 minutes';
-    if (price < 60) return '30 seconds - 3 minutes';
-    if (price < 100) return '15-30 seconds';
-    return '< 15 seconds';
-  };
-  
+  const tier = (() => {
+    const value = Number(gasPrice);
+    if (!Number.isFinite(value) || value <= 0) return 'No fee data available.';
+    if (value < 20) return 'Included when block space allows.';
+    if (value < 40) return 'Typically included within a few blocks.';
+    if (value < 100) return 'Likely included in the next block.';
+    return 'Competitive for immediate inclusion.';
+  })();
+
   return (
     <div className="tx-estimator">
-      <div className="estimator-title">Estimated Confirmation Time</div>
-      <div className="estimator-time">{estimateTime(gasPrice)}</div>
-      <div className="estimator-note">At {gasPrice} Gwei</div>
+      <div className="estimator-title">Fee tier at {gasPrice} Gwei</div>
+      <div className="estimator-time">{tier}</div>
       <style>{`
         .tx-estimator {
           background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-          border-radius: 12px;
-          padding: 24px;
-          text-align: center;
-          margin: 20px 0;
+          border-radius: 12px; padding: 24px; text-align: center; margin: 20px 0;
         }
-        .estimator-title {
-          color: #94a3b8;
-          font-size: 14px;
-          margin-bottom: 8px;
-        }
-        .estimator-time {
-          font-size: 28px;
-          font-weight: 700;
-          color: #3b82f6;
-        }
-        .estimator-note {
-          color: #64748b;
-          font-size: 12px;
-          margin-top: 8px;
-        }
+        .estimator-title { color: #94a3b8; font-size: 14px; margin-bottom: 8px; }
+        .estimator-time { font-size: 20px; font-weight: 600; color: #3b82f6; }
       `}</style>
     </div>
   );
 };
 
+
 // Main Gas Tracker page component
 const GasTracker: React.FC = () => {
-  const { prices, predictions, stats, markets, loading, error, refetch } = useGasOracle();
+  const { prices, stats, loading, error, refetch } = useGasOracle();
   const [selectedSpeed, setSelectedSpeed] = useState<'slow' | 'standard' | 'fast'>('standard');
   
   if (loading && !stats) {
@@ -534,7 +306,7 @@ const GasTracker: React.FC = () => {
     <div className="gas-tracker-page">
       <div className="page-header">
         <h1>Gas Tracker</h1>
-        <p>Real-time gas prices and predictions for Ethereum and L2 networks</p>
+        <p>Fee levels on TigerSmartChain, from indexed block and gas-price data</p>
         <button className="refresh-btn" onClick={refetch}>↻ Refresh</button>
       </div>
       
@@ -549,9 +321,8 @@ const GasTracker: React.FC = () => {
           
           <StatsCards stats={stats} />
           
-          <GasChart data={prices} predictions={predictions} />
+          <GasChart data={prices} />
           
-          <Markets markets={markets} />
         </>
       )}
       

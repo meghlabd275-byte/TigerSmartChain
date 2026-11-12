@@ -752,12 +752,335 @@ std::optional<CollectionMetadata> CollectionMetadataFetcher::fetch_from_opensea(
     return metadata;
 }
 
+namespace {
+
+/// Function selectors for the ERC-721 and ERC-1155 metadata surface.
+///
+/// These are the first four bytes of the Keccak-256 hash of the signature, and
+/// they are fixed by the standards, so they are written out rather than hashed
+/// at run time.
+constexpr const char* SELECTOR_NAME          = "06fdde03"; // name()
+constexpr const char* SELECTOR_SYMBOL        = "95d89b41"; // symbol()
+constexpr const char* SELECTOR_TOTAL_SUPPLY  = "18160ddd"; // totalSupply()
+constexpr const char* SELECTOR_SUPPORTS_IFACE = "01ffc9a7"; // supportsInterface(bytes4)
+constexpr const char* SELECTOR_TOKEN_URI     = "c87b56dd"; // tokenURI(uint256)
+constexpr const char* SELECTOR_URI           = "0e89341c"; // uri(uint256)
+
+constexpr const char* ERC721_INTERFACE_ID  = "80ac58cd";
+constexpr const char* ERC1155_INTERFACE_ID = "d9b67a26";
+
+/// Strip an optional `0x` prefix and return the lower-case hex digits.
+std::string strip_hex_prefix(const std::string& value) {
+    if (value.size() >= 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        return value.substr(2);
+    }
+    return value;
+}
+
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/// Decode a hex string into bytes, ignoring a leading `0x`. A malformed string
+/// yields an empty vector rather than a partially decoded one, so a caller
+/// cannot mistake garbage for a short value.
+std::vector<unsigned char> hex_to_bytes(const std::string& value) {
+    std::string digits = strip_hex_prefix(value);
+    if (digits.size() % 2 != 0) {
+        return {};
+    }
+    std::vector<unsigned char> out;
+    out.reserve(digits.size() / 2);
+    for (size_t i = 0; i < digits.size(); i += 2) {
+        int high = hex_digit(digits[i]);
+        int low = hex_digit(digits[i + 1]);
+        if (high < 0 || low < 0) {
+            return {};
+        }
+        out.push_back(static_cast<unsigned char>((high << 4) | low));
+    }
+    return out;
+}
+
+/// A JSON-RPC call that returns the `result` value, or `nullptr` when the node
+/// reported an error, the transport failed, or the response was not shaped like
+/// a JSON-RPC reply. The caller owns the returned reference.
+json_t* rpc_call(HTTPClient& client, const std::string& rpc_url,
+                 const std::string& method, json_t* params) {
+    json_t* request = json_object();
+    json_object_set_new(request, "jsonrpc", json_string("2.0"));
+    json_object_set_new(request, "id", json_integer(1));
+    json_object_set_new(request, "method", json_string(method.c_str()));
+    // `params` is adopted by the object, so a null params becomes an empty list
+    // rather than a JSON null, which some nodes reject.
+    json_object_set_new(request, "params", params ? params : json_array());
+
+    char* encoded = json_dumps(request, JSON_COMPACT);
+    json_decref(request);
+    if (!encoded) {
+        return nullptr;
+    }
+    std::string body(encoded);
+    free(encoded);
+
+    auto headers = std::map<std::string, std::string>{
+        {"Content-Type", "application/json"},
+        {"Accept", "application/json"}
+    };
+
+    std::string response = client.post(rpc_url, body, headers, 5000);
+    if (response.empty()) {
+        return nullptr;
+    }
+
+    json_error_t error;
+    json_t* root = json_loads(response.c_str(), 0, &error);
+    if (!root) {
+        return nullptr;
+    }
+
+    // A node that could not answer sets `error` and leaves `result` out.
+    if (json_object_get(root, "error")) {
+        json_decref(root);
+        return nullptr;
+    }
+
+    json_t* result = json_object_get(root, "result");
+    if (!result) {
+        json_decref(root);
+        return nullptr;
+    }
+
+    // The caller takes ownership of the result alone.
+    json_incref(result);
+    json_decref(root);
+    return result;
+}
+
+/// A JSON-RPC call that returns a hex string, or an empty string on any error.
+std::string rpc_hex(HTTPClient& client, const std::string& rpc_url,
+                    const std::string& method, json_t* params) {
+    json_t* result = rpc_call(client, rpc_url, method, params);
+    if (!result) {
+        return "";
+    }
+    std::string value = json_is_string(result) ? json_string_value(result) : "";
+    json_decref(result);
+    return value;
+}
+
+/// An ABI string is offset, length, then UTF-8 bytes padded to a word. A
+/// contract that returns something else yields an empty string rather than a
+/// decoded fragment.
+std::string decode_abi_string(const std::string& hex) {
+    std::vector<unsigned char> data = hex_to_bytes(hex);
+    // A dynamic string needs the offset word and the length word before any
+    // payload can be read.
+    if (data.size() < 64) {
+        return "";
+    }
+
+    // Read the offset, which is the byte position of the length word.
+    size_t offset = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        // A real offset never exceeds the payload, so a high byte is malformed.
+        if (i < 24 && data[i] != 0) {
+            return "";
+        }
+        if (i >= 24) {
+            offset = (offset << 8) | data[i];
+        }
+    }
+    if (offset + 32 > data.size()) {
+        return "";
+    }
+
+    size_t length = 0;
+    for (size_t i = offset; i < offset + 32; ++i) {
+        if (i < offset + 24 && data[i] != 0) {
+            return "";
+        }
+        if (i >= offset + 24) {
+            length = (length << 8) | data[i];
+        }
+    }
+    if (length == 0 || offset + 32 + length > data.size()) {
+        return "";
+    }
+
+    return std::string(reinterpret_cast<const char*>(&data[offset + 32]), length);
+}
+
+/// A string that is not length-prefixed: a `bytes32` returned by the older
+/// `name`/`symbol` implementations, where the text runs up to the first zero
+/// byte. A dynamic return is also accepted, in which case the payload follows
+/// the offset and length words.
+std::string decode_short_string(const std::string& hex) {
+    std::vector<unsigned char> data = hex_to_bytes(hex);
+    if (data.size() < 32) {
+        return "";
+    }
+
+    // When a second word is present this is a dynamic return, so the payload
+    // starts after it; otherwise the first word holds the text itself.
+    size_t start = data.size() >= 64 ? 32 : 0;
+    size_t end = std::min(start + 32, data.size());
+
+    std::string out;
+    for (size_t i = start; i < end; ++i) {
+        if (data[i] == 0) {
+            break;
+        }
+        out.push_back(static_cast<char>(data[i]));
+    }
+    return out;
+}
+
+/// A uint256 return value, clamped to `int`. A metadata count larger than
+/// `INT_MAX` is not representable in the struct, so it saturates.
+int decode_abi_uint(const std::string& hex) {
+    std::vector<unsigned char> data = hex_to_bytes(hex);
+    if (data.size() < 32) {
+        return 0;
+    }
+    // Anything above the low four bytes exceeds `INT_MAX` and saturates.
+    for (size_t i = 0; i < 28; ++i) {
+        if (data[i] != 0) {
+            return INT_MAX;
+        }
+    }
+    long long value = 0;
+    for (size_t i = 28; i < 32; ++i) {
+        value = (value << 8) | data[i];
+    }
+    return static_cast<int>(value);
+}
+
+/// A left-padded 32-byte argument, as an ABI call encodes an address or an
+/// interface id.
+std::string encode_word(const std::string& hex_digits) {
+    if (hex_digits.size() > 64) {
+        return "";
+    }
+    return std::string(64 - hex_digits.size(), '0') + hex_digits;
+}
+
+/// The selector plus one left-padded argument.
+std::string encode_call_with_word(const char* selector, const std::string& argument_hex) {
+    return std::string(selector) + encode_word(argument_hex);
+}
+
+} // namespace
+
 std::optional<CollectionMetadata> CollectionMetadataFetcher::fetch_from_contract(
     const std::string& collection_address,
     const std::string& rpc_url
 ) {
-    // This would require an RPC client - placeholder for now
-    return std::nullopt;
+    if (rpc_url.empty()) {
+        return std::nullopt;
+    }
+
+    // A JSON-RPC `to` field must be a 20-byte address. Anything else would be
+    // sent to the node as a malformed request, so it is rejected here.
+    std::string address_digits = strip_hex_prefix(collection_address);
+    if (address_digits.size() != 40) {
+        return std::nullopt;
+    }
+    for (char c : address_digits) {
+        if (hex_digit(c) < 0) {
+            return std::nullopt;
+        }
+    }
+    std::string address_field = "0x" + address_digits;
+
+    // Build the request once: `eth_call` against the collection address.
+    auto make_params = [&](const std::string& data) {
+        json_t* call = json_object();
+        json_object_set_new(call, "to", json_string(address_field.c_str()));
+        json_object_set_new(call, "data", json_string(("0x" + data).c_str()));
+        json_t* params = json_array();
+        json_array_append_new(params, call);
+        json_array_append_new(params, json_string("latest"));
+        return params;
+    };
+
+    auto eth_call = [&](const std::string& data) {
+        return rpc_hex(*client_, rpc_url, "eth_call", make_params(data));
+    };
+
+    CollectionMetadata metadata;
+    metadata.address = address_field;
+
+    // The contract type decides how the rest of the surface is read, so it is
+    // probed first. A contract that answers neither probe is not a token.
+    bool is_721 = false;
+    bool is_1155 = false;
+    std::string iface_721 = eth_call(
+        encode_call_with_word(SELECTOR_SUPPORTS_IFACE, ERC721_INTERFACE_ID));
+    if (!iface_721.empty() && decode_abi_uint(iface_721) == 1) {
+        is_721 = true;
+    }
+    std::string iface_1155 = eth_call(
+        encode_call_with_word(SELECTOR_SUPPORTS_IFACE, ERC1155_INTERFACE_ID));
+    if (!iface_1155.empty() && decode_abi_uint(iface_1155) == 1) {
+        is_1155 = true;
+    }
+
+    if (!is_721 && !is_1155) {
+        // `supportsInterface` is optional on ERC-721. A contract that does not
+        // implement it is still a token if it answers `totalSupply`, so that is
+        // the fallback rather than rejecting it outright.
+        std::string supply = eth_call(SELECTOR_TOTAL_SUPPLY);
+        if (supply.empty()) {
+            return std::nullopt;
+        }
+        is_721 = true;
+    }
+
+    metadata.contract_type = is_1155 ? "ERC1155" : "ERC721";
+    metadata.schema_name = metadata.contract_type;
+
+    std::string name = decode_abi_string(eth_call(SELECTOR_NAME));
+    if (name.empty()) {
+        // Some early contracts returned a `bytes32` rather than a string.
+        name = decode_short_string(eth_call(SELECTOR_NAME));
+    }
+    metadata.name = name;
+
+    std::string symbol = decode_abi_string(eth_call(SELECTOR_SYMBOL));
+    if (symbol.empty()) {
+        symbol = decode_short_string(eth_call(SELECTOR_SYMBOL));
+    }
+    metadata.symbol = symbol;
+
+    // `totalSupply` is not part of the ERC-721 standard, so a contract that
+    // omits it leaves the count at zero rather than failing the whole fetch.
+    std::string supply_hex = eth_call(SELECTOR_TOTAL_SUPPLY);
+    if (!supply_hex.empty()) {
+        metadata.total_supply = decode_abi_uint(supply_hex);
+    }
+
+    // The collection's own metadata URI. ERC-721 exposes it per token, so token
+    // one is the representative; ERC-1155 exposes a collection-wide template.
+    std::string uri_hex;
+    if (is_1155) {
+        uri_hex = eth_call(SELECTOR_URI);
+    } else {
+        std::string token_one = encode_word("1");
+        uri_hex = eth_call(std::string(SELECTOR_TOKEN_URI) + token_one);
+    }
+    if (!uri_hex.empty()) {
+        std::string uri = decode_abi_string(uri_hex);
+        if (uri.empty()) {
+            uri = decode_short_string(uri_hex);
+        }
+        metadata.external_url = uri;
+    }
+
+    return metadata;
 }
 
 // NFTFloorService Implementation

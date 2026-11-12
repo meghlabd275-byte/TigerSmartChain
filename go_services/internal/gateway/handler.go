@@ -462,18 +462,56 @@ func (h *Handler) GetAddressChart(c *gin.Context) {
 
 func (h *Handler) GetGasOracle(c *gin.Context) {
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `SELECT gas_price, gas_used, gas_limit, base_fee FROM gas_prices ORDER BY id DESC LIMIT 1`)
-	if err != nil || row == nil {
-		c.JSON(http.StatusOK, gin.H{"slow": "0", "standard": "0", "fast": "0", "baseFee": "0"})
+
+	// The three speeds are percentiles of the last 100 sampled gas prices, not
+	// the latest price repeated. Reporting the latest price for "slow" and
+	// twice it for "fast" is a guess dressed up as an estimate.
+	row, err := h.queryOne(ctx, `
+		SELECT
+			COALESCE(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY gas_price), 0) AS slow,
+			COALESCE(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY gas_price), 0) AS standard,
+			COALESCE(PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY gas_price), 0) AS fast,
+			COALESCE(MAX(base_fee), 0) AS base_fee,
+			COALESCE(AVG(priority_fee), 0) AS priority_fee
+		FROM (
+			SELECT gas_price, base_fee, priority_fee
+			FROM gas_prices
+			ORDER BY timestamp DESC
+			LIMIT 100
+		) recent
+	`)
+	if err != nil {
+		dbError(c, err)
 		return
 	}
-	gp, _ := row["gas_price"].(int64)
+
+	// An empty gas_prices table yields zeros, which is honest: the explorer has
+	// no fee data yet. Returning a plausible-looking number would not be.
 	c.JSON(http.StatusOK, gin.H{
-		"slow":     fmt.Sprintf("%d", gp),
-		"standard": fmt.Sprintf("%d", gp),
-		"fast":     fmt.Sprintf("%d", gp*2),
-		"baseFee":  fmt.Sprintf("%v", row["base_fee"]),
+		"slow":        formatGasValue(rowValue(row, "slow")),
+		"standard":    formatGasValue(rowValue(row, "standard")),
+		"fast":        formatGasValue(rowValue(row, "fast")),
+		"baseFee":     formatGasValue(rowValue(row, "base_fee")),
+		"priorityFee": formatGasValue(rowValue(row, "priority_fee")),
 	})
+}
+
+// formatGasValue renders a numeric column as a decimal string. Postgres returns
+// PERCENTILE_CONT as a float and the integer columns as int64; both need to
+// reach the client as a string so that wei-sized values survive JSON.
+func formatGasValue(v interface{}) string {
+	switch value := v.(type) {
+	case nil:
+		return "0"
+	case string:
+		return value
+	case float64:
+		return strconv.FormatFloat(value, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(value), 'f', -1, 32)
+	default:
+		return fmt.Sprintf("%v", value)
+	}
 }
 
 // Search endpoints

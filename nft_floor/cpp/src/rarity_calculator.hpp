@@ -108,6 +108,13 @@ public:
                    int timeout_ms = 5000);
     
     void set_api_key(const std::string& key);
+
+    /// Send a request body and return the response, for the JSON-RPC calls
+    /// that read metadata from a node.
+    std::string post(const std::string& url,
+                     const std::string& body,
+                     const std::map<std::string, std::string>& headers = {},
+                     int timeout_ms = 5000);
     
 private:
     CURL* curl_;
@@ -309,18 +316,31 @@ public:
         const std::string& chain = "ethereum"
     );
     
+    /// Point the service at a JSON-RPC endpoint. Every on-chain metadata read
+    /// goes through it, so it must be set before a collection can be
+    /// enumerated; with none set, an on-chain read fails rather than returning
+    /// an invented record.
+    void set_rpc_url(const std::string& rpc_url) { rpc_url_ = rpc_url; }
+
+    /// The endpoint currently in use, or an empty string when none is set.
+    const std::string& rpc_url() const { return rpc_url_; }
+
 private:
     std::unique_ptr<RarityCalculator> calculator_;
     std::unique_ptr<MetadataFetcher> metadata_fetcher_;
     std::unique_ptr<TraitParser> trait_parser_;
-    
+
     std::unordered_map<std::string, std::vector<NFTMetadata>> collection_nfts_;
     mutable std::mutex nfts_mutex_;
-    
+
     std::atomic<bool> running_{false};
     std::thread update_thread_;
-    
+
+    /// The JSON-RPC endpoint that on-chain metadata reads go to.
+    std::string rpc_url_;
+
     void update_loop();
+
     
     // Fetch NFT metadata from various sources
     std::optional<NFTMetadata> fetch_nft_metadata(
