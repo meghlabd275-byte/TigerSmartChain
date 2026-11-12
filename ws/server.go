@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,6 +27,13 @@ type Config struct {
 	RedisURL          string
 	HeartbeatInterval time.Duration
 	MaxMessageSize    int64
+
+	// AllowedOrigins lists the origins permitted to open a WebSocket.
+	// A browser sends Origin on every WebSocket handshake, and without a check
+	// any site a user visits could open a socket to this server with the user's
+	// cookies attached. Same-origin requests are always permitted; a request
+	// with no Origin did not come from a browser and is allowed through.
+	AllowedOrigins []string
 }
 
 // Server represents the WebSocket server
@@ -89,18 +98,36 @@ type PendingTXMessage struct {
 	Timestamp uint64 `json:"timestamp"`
 }
 
-// NewServer creates a new WebSocket server
-func NewServer(cfg *Config) (*Server, error) {
+// NewServer creates a new WebSocket server.
+//
+// Every failure path releases what has already been opened: an earlier version
+// returned without cancelling the context or closing the pool, so a server
+// that failed to start left a goroutine and a connection pool behind, and a
+// supervisor restarting it would leak one of each per attempt.
+func NewServer(cfg *Config) (_ *Server, err error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	var pool *pgxpool.Pool
+	var rdb *redis.Client
+	defer func() {
+		if err != nil {
+			if pool != nil {
+				pool.Close()
+			}
+			if rdb != nil {
+				_ = rdb.Close()
+			}
+			cancel()
+		}
+	}()
 
 	// Database connection
-	pool, err := pgxpool.New(ctx, cfg.DBURL)
+	pool, err = pgxpool.New(ctx, cfg.DBURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
 	// Redis connection
-	rdb := redis.NewClient(&redis.Options{
+	rdb = redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisURL,
 		Password: "",
 		DB:       0,
@@ -123,12 +150,40 @@ func NewServer(cfg *Config) (*Server, error) {
 	srv.upgrader = websocket.Upgrader{
 		ReadBufferSize:  cfg.ReadBufferSize,
 		WriteBufferSize: cfg.WriteBufferSize,
-		CheckOrigin: func(r *http.Request) bool {
-			return true // In production, implement proper origin checking
-		},
+		CheckOrigin:     srv.checkOrigin,
 	}
 
 	return srv, nil
+}
+
+// checkOrigin decides whether a WebSocket handshake may proceed.
+//
+// A browser always sends Origin, so a mismatched one is a cross-site request
+// and is refused. A missing Origin means the client is not a browser (an
+// indexer, the CLI, a test), and those are allowed because a hostile page
+// cannot drive them.
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	// Same origin: host and port match. The scheme is compared only when the
+	// request arrived over TLS directly, because behind a TLS-terminating proxy
+	// r.TLS is nil and the server cannot know which scheme the client used.
+	if strings.EqualFold(u.Host, r.Host) {
+		return r.TLS == nil || strings.EqualFold(u.Scheme, "https")
+	}
+	for _, allowed := range s.cfg.AllowedOrigins {
+		if strings.EqualFold(allowed, origin) {
+			return true
+		}
+	}
+	return false
 }
 
 // Start starts the WebSocket server
