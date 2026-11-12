@@ -1,4 +1,4 @@
-//! Migrator Errors
+//! Migrator errors.
 
 use thiserror::Error;
 
@@ -6,12 +6,15 @@ use thiserror::Error;
 pub enum Error {
     #[error("RPC error: {0}")]
     Rpc(String),
-    
-    #[error("Not found: {0}")]
+
+    #[error("not found: {0}")]
     NotFound(String),
-    
-    #[error("Migration error: {0}")]
+
+    #[error("migration error: {0}")]
     Migration(String),
+
+    #[error("invalid input: {0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

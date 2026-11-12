@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ethers::core::types::{Address, H256, U256};
-use ethers::providers::{Http, Provider, StreamExt, Ws};
+use ethers::providers::{Http, Provider, StreamExt, Ws, Middleware};
 use ethers::types::{Block, Transaction, Eip1559TransactionRequest};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -88,7 +88,7 @@ impl Default for Config {
 // Data Types
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTransaction {
     pub hash: String,
     pub from: String,
@@ -174,8 +174,8 @@ pub struct BlockInfo {
 impl Ord for PendingTransaction {
     fn cmp(&self, other: &Self) -> Ordering {
         // Compare by gas price (higher first)
-        let self_gas = U256::from_dec_str(&self.gas_price).unwrap_or_default();
-        let other_gas = U256::from_dec_str(&other.gas_price).unwrap_or_default();
+        let self_gas = U256::from_dec_str(&self.gas_price).unwrap_or_else(|_| U256::zero());
+        let other_gas = U256::from_dec_str(&other.gas_price).unwrap_or_else(|_| U256::zero());
         
         other_gas.cmp(&self_gas)
     }
@@ -256,9 +256,11 @@ impl MempoolService {
         let state = self.state.clone();
         let config = self.config.clone();
         let broadcast_tx = self.broadcast_tx.clone();
-        
+        let rpc = self.rpc.clone();
+        let ws = self.ws.clone();
+
         tokio::spawn(async move {
-            Self::run_loop(state, config, broadcast_tx, shutdown_rx).await;
+            Self::run_loop(state, config, broadcast_tx, rpc, ws, shutdown_rx).await;
         });
     }
 
@@ -274,15 +276,10 @@ impl MempoolService {
         state: Arc<RwLock<MempoolState>>,
         config: Config,
         broadcast_tx: broadcast::Sender<MempoolUpdate>,
+        rpc: Provider<Http>,
+        ws: Provider<Ws>,
         shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
-        let mut ws = match Provider::<Ws>::connect(&config.ws_url).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                error!("Failed to connect to WebSocket: {}", e);
-                return;
-            }
-        };
         
         // Subscribe to pending transactions
         let mut pending_stream = match ws.subscribe_pending_txs().await {
@@ -304,7 +301,7 @@ impl MempoolService {
                     let state = state.clone();
                     
                     // Fetch transaction details
-                    if let Ok(Some(tx)) = state.read().rpc.get_transaction(&tx_hash).await {
+                    if let Ok(Some(tx)) = rpc.get_transaction(&tx_hash).await {
                         let pending = Self::convert_tx(tx);
                         
                         // Add to mempool

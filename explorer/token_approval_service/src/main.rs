@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Response, StatusCode};
+use tiny_http::{Response, StatusCode};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -189,34 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = ApprovalService::new(config).await?;
     let handler = Arc::new(Handler::new(service));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8548));
-    let server = tiny_http::Server::http(addr)?;
-
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8561));
     info!("Server listening on {}", addr);
 
-    for request in server.incoming_requests() {
-        let handler = handler.clone();
-
-        tokio::spawn(async move {
-            let body = request.as_vec();
-            let response = handler.handle(&body);
-
-            let mut resp = request.respond(response)?;
-
-            let headers = vec![
-                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-                Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
-                Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap(),
-                Header::from_bytes(&b"Strict-Transport-Security"[..], &b"max-age=31536000"[..]).unwrap(),
-            ];
-
-            for header in headers {
-                resp.add_header(header);
-            }
-
-            Ok(())
-        });
-    }
+    tigerscan_service_http::serve(addr, move |body| handler.handle(body))?;
 
     Ok(())
 }

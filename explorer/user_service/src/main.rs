@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Response, StatusCode};
+use tiny_http::{Response, StatusCode};
 use tracing::info;
 
 use user_service::{AuthService, WatchlistService, NotesService, AlertsService, DashboardService, Config};
@@ -95,14 +95,10 @@ impl Handler {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting User Service");
     let handler = Arc::new(Handler::new());
-    let server = tiny_http::Server::http(SocketAddr::from(([0, 0, 0, 0], 9001))?;
     info!("Server listening on port 9001");
-    for request in server.incoming_requests() {
-        let handler = handler.clone();
-        tokio::spawn(async move {
-            let mut resp = request.respond(handler.handle(&request.as_vec())).unwrap();
-            for h in [Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(), Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap()] { resp.add_header(h); }
-        });
-    }
+    let addr = SocketAddr::from(([0, 0, 0, 0], 9001));
+    info!("Server listening on {}", addr);
+
+    tigerscan_service_http::serve(addr, move |body| handler.handle(body))?;
     Ok(())
 }

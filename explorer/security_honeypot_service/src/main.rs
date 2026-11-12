@@ -6,7 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Response, StatusCode};
+use tiny_http::{Response, StatusCode};
+use tokio::runtime::Runtime;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -51,7 +52,7 @@ impl Handler {
         Self { scanner }
     }
 
-    pub fn handle(&self, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
+    pub async fn handle(&self, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
         let request: ApiRequest = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(e) => {
@@ -68,7 +69,7 @@ impl Handler {
 
         let result = match request.method.as_str() {
             "security_analyze" => self.handle_analyze(request.params).await,
-            "security_checkAddress" => self.handle_check_address(request.params),
+            "security_checkAddress" => self.handle_check_address(request.params).await,
             _ => Err(format!("Unknown method: {}", request.method)),
         };
 
@@ -92,7 +93,7 @@ impl Handler {
     }
 
     async fn handle_analyze(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
-        let address = params.and_then(|p| p.get("address").and_then(|a| a.as_str()))
+        let address = params.as_ref().and_then(|p| p.get("address")).and_then(|a| a.as_str())
             .ok_or("Missing address")?;
         
         let report = self.scanner.analyze(address).await
@@ -101,12 +102,27 @@ impl Handler {
         Ok(serde_json::to_value(report).unwrap_or_default())
     }
 
-    fn handle_check_address(&self, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
-        let address = params.and_then(|p| p.get("address").and_then(|a| a.as_str()))
-            .ok_or("Missing address")?;
-        
-        // Simplified check
-        Ok(serde_json::json!({ "address": address, "is_malicious": false }))
+    async fn handle_check_address(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let address = params
+            .as_ref()
+            .and_then(|p| p.get("address"))
+            .and_then(|a| a.as_str())
+            .ok_or("missing address")?;
+
+        let report = self
+            .scanner
+            .analyze(address)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(serde_json::json!({
+            "address": report.address,
+            "is_malicious": report.is_malicious,
+            "risk_level": report.risk_level,
+        }))
     }
 }
 
@@ -128,27 +144,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler = Arc::new(Handler::new(scanner));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8553));
-    let server = tiny_http::Server::http(addr)?;
-
     info!("Server listening on {}", addr);
 
-    for request in server.incoming_requests() {
-        let handler = handler.clone();
-        tokio::spawn(async move {
-            let body = request.as_vec();
-            let response = handler.handle(&body);
-            let mut resp = request.respond(response)?;
-            
-            let headers = vec![
-                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-                Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap(),
-                Header::from_bytes(&b"Strict-Transport-Security"[..], &b"max-age=31536000"[..]).unwrap(),
-            ];
-            
-            for header in headers { resp.add_header(header); }
-            Ok(())
-        });
-    }
+    // The serving loop is synchronous; the node calls are not.
+    let runtime = Runtime::new()?;
+
+    tigerscan_service_http::serve(addr, move |body| {
+        runtime.block_on(handler.handle(body))
+    })?;
 
     Ok(())
 }

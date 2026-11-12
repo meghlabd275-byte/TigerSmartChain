@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};

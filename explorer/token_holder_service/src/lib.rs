@@ -250,10 +250,11 @@ impl HolderTracker {
         let result: serde_json::Value = response.json().await
             .map_err(|e| HolderError::ParseError(e.to_string()))?;
         
-        let logs = result["result"].as_array()
-            .map_err(|e| HolderError::ParseError(e.to_string()))?;
+        let logs = result["result"].as_array().ok_or_else(|| {
+            HolderError::ParseError("eth_getLogs returned no result array".to_string())
+        })?;
         
-        let mut holders: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut holders: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut first_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         
         for log in logs.iter().take(1000) {
@@ -267,34 +268,34 @@ impl HolderTracker {
                 .map(|s| format!("0x{}", &s[26..64]))
                 .unwrap_or_default();
             
-            let block = log["blockNumber"]
-                .and_then(|b| b.as_str())
-                .map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0))
+            let block = log["blockNumber"].as_str()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(0);
+
             
             if !from.is_empty() && from.len() == 42 {
-                *holders.entry(from.clone()).or_insert("0x0").clone();
-                first_seen.entry(from.clone()).or_insert(block);
+                holders.insert(from.clone());
+                first_seen.entry(from).or_insert(block);
             }
-            
+
             if !to.is_empty() && to.len() == 42 {
-                *holders.entry(to.clone()).or_insert("0x0").clone();
-                first_seen.entry(to.clone()).or_insert(block);
+                holders.insert(to.clone());
+                first_seen.entry(to).or_insert(block);
             }
         }
         
         let mut result_holders = Vec::new();
-        for (addr, _) in holders {
+        for addr in &holders {
             if let Ok(balance) = self.get_token_balance(token, &addr).await {
                 let is_contract = self.is_contract(&addr).await.unwrap_or(false);
                 
                 result_holders.push(TokenHolder {
-                    address: addr,
+                    address: addr.clone(),
                     balance,
                     percentage: 0.0,
                     rank: 0,
                     is_contract,
-                    first_seen: 0,
+                    first_seen: *first_seen.get(addr).unwrap_or(&0),
                     last_update: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()

@@ -1728,7 +1728,7 @@ fn validate_token_id(raw: &str) -> Result<String, NFTServiceError> {
 
 /// Read an optional `limit`, clamped to a sane page size.
 fn optional_limit(params: Option<&serde_json::Value>) -> Result<usize, RpcError> {
-    match params.and_then(|p| p.get("limit")).and_then(|value| value.as_i64()) {
+    match params.as_ref().and_then(|p| p.get("limit")).and_then(|value| value.as_i64()) {
         None => Ok(100),
         Some(value) if value <= 0 => Err(RpcError {
             code: INVALID_PARAMS,

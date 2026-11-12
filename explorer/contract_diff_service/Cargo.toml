@@ -6,7 +6,8 @@ authors = ["TigerScan Team"]
 description = "Contract Diff Viewer and Version Comparison"
 
 [dependencies]
-ethers = { version = "2.0", features = [] }
+tigerscan-service-http = { path = "../../tigerscan-service-http" }
+ethers = { version = "2.0", features = ["rustls", "ws"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }

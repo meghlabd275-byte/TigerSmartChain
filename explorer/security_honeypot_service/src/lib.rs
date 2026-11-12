@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ethers::core::types::{Address, H256, U256};
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as Sha256Digest, Sha256 as Sha256Hasher};
@@ -62,6 +62,10 @@ impl Default for Config {
 pub struct SecurityReport {
     pub address: String,
     pub is_malicious: bool,
+    /// keccak256 of the analysed runtime code, so a caller can pin it.
+    pub code_hash: String,
+    /// The 4-byte dispatch selectors found in the runtime code.
+    pub selectors: Vec<String>,
     pub risk_level: RiskLevel,
     pub honeypot_score: f64,
     pub phishing_score: f64,
@@ -191,23 +195,33 @@ impl HoneypotDetector {
         Ok(detector)
     }
 
-    /// Load known honeypot patterns
+    /// Load the selectors this detector recognises.
+    ///
+    /// Each value is the real `keccak256(signature)[..4]` of a function whose
+    /// presence in a dispatcher indicates owner-controlled behaviour.
     fn load_patterns(&mut self) {
         let mut patterns = self.known_patterns.write();
-        
-        // Common honeypot patterns in bytecode
-        let honeypot_patterns = vec![
-            ("honeypot_1", "0x146t4m", "Critical", "Trick bytecode that appears to transfer but doesn't"),
-            ("honeypot_2", "0x5ac6e90a", "Critical", "Hidden require that always fails"),
-            ("honeypot_3", "0xcdfead2e", "High", "Impersonation of popular token"),
-            ("honeypot_4", "0x531ea3d8", "High", "Fake transfer mechanism"),
-            ("honeypot_5", "0x2e1a7d4d", "Medium", "Return true on transfer"),
+
+        let rules: Vec<(&str, &str, &str, &str)> = vec![
+            ("setMaxTxAmount", "0xec28438a", "Medium", "Owner can cap the size of a single transfer"),
+            ("blacklist", "0xf9f92be4", "High", "Owner can block an address from transferring"),
+            ("addBotToBlackList", "0x4303443d", "High", "Owner can block an address from transferring"),
+            ("_isBlacklisted", "0x1cdd3be3", "High", "Transfer path consults a blacklist"),
+            ("setTradingEnabled", "0xc2e5ec04", "Medium", "Owner can switch trading on and off"),
+            ("enableTrading", "0x8a8c523c", "Low", "Trading is disabled until the owner enables it"),
+            ("setTaxFee", "0xc4081a4c", "Medium", "Owner can raise the transfer fee after launch"),
+            ("setFees", "0x0b78f9c0", "Medium", "Owner can raise transfer fees after launch"),
+            ("removeAllFee", "0x301370af", "Low", "Fees can be removed entirely"),
+            ("transferOwnership", "0xf2fde38b", "Low", "Ownership can be transferred to another account"),
+            ("renounceOwnership", "0x715018a6", "Low", "Owner can renounce control"),
+            ("mint", "0x40c10f19", "Medium", "Supply is not fixed; new tokens can be minted"),
+            ("setSwapAndLiquifyEnabled", "0xc49b9a80", "Low", "Owner can switch automatic swaps on and off"),
         ];
-        
-        for (name, pattern, severity, desc) in honeypot_patterns {
+
+        for (name, selector, severity, desc) in rules {
             patterns.insert(name.to_string(), HoneypotPattern {
                 name: name.to_string(),
-                pattern: pattern.to_string(),
+                pattern: selector.to_string(),
                 severity: match severity {
                     "Critical" => FindingSeverity::Critical,
                     "High" => FindingSeverity::High,
@@ -219,55 +233,96 @@ impl HoneypotDetector {
         }
     }
 
-    /// Analyze bytecode for honeypot patterns
-    pub fn analyze_bytecode(&self, bytecode: &str) -> Vec<SecurityFinding> {
-        let mut findings = Vec::new();
+    /// Findings for a runtime bytecode blob.
+    ///
+    /// Selectors are decoded first, then matched against the known rules, so a
+    /// coincidental byte sequence cannot raise a finding on its own.
+    pub fn analyze_bytecode(&self, bytecode: &[u8]) -> Vec<SecurityFinding> {
+        let selectors = extract_selectors(bytecode);
+        let present: std::collections::HashSet<String> = selectors.into_iter().collect();
         let patterns = self.known_patterns.read();
-        
-        for pattern in patterns.values() {
-            if bytecode.contains(&pattern.pattern) {
-                findings.push(SecurityFinding {
-                    category: FindingCategory::Honeypot,
-                    severity: pattern.severity,
-                    description: pattern.description.clone(),
-                    evidence: format!("Found pattern: {}", pattern.pattern),
-                    cwe_id: Some("CWE-912".to_string()),
-                });
-            }
-        }
-        
+
+        let mut findings: Vec<SecurityFinding> = patterns
+            .values()
+            .filter(|pattern| present.contains(pattern.pattern.trim_start_matches("0x")))
+            .map(|pattern| SecurityFinding {
+                category: FindingCategory::Honeypot,
+                severity: pattern.severity,
+                description: pattern.description.clone(),
+                evidence: format!(
+                    "selector {} ({}) is in the dispatch table",
+                    pattern.pattern, pattern.name
+                ),
+                cwe_id: Some("CWE-284".to_string()),
+            })
+            .collect();
+
+        findings.sort_by(|a, b| a.evidence.cmp(&b.evidence));
         findings
     }
 
-    /// Check for honeypot in transfer logic
-    pub fn check_transfer_logic(&self, bytecode: &str) -> Option<SecurityFinding> {
-        // Check for common honeypot transfer patterns
-        
-        // Pattern 1: Transfer that returns true but doesn't actually transfer
-        if bytecode.contains("0x42842e0e") && bytecode.contains("0x095ea7b3") {
-            // Check for fake approval + transfer
+
+    /// Whether a transfer path is gated by an owner-controlled switch.
+    ///
+    /// `selectors` are the 4-byte dispatch entries decoded from runtime code.
+    pub fn check_transfer_logic(&self, selectors: &[String]) -> Option<SecurityFinding> {
+        let present: std::collections::HashSet<&str> =
+            selectors.iter().map(String::as_str).collect();
+
+        let blacklist = present.contains("f9f92be4")
+            || present.contains("4303443d")
+            || present.contains("1cdd3be3");
+
+        let trading_switch = present.contains("c2e5ec04") || present.contains("8a8c523c");
+
+        if blacklist && trading_switch {
             return Some(SecurityFinding {
                 category: FindingCategory::Honeypot,
                 severity: FindingSeverity::Critical,
-                description: "Suspicious approval + transfer pattern detected".to_string(),
-                evidence: "Contract may execute fake transfers".to_string(),
-                cwe_id: Some("CWE-912".to_string()),
+                description:
+                    "Transfers can be blocked and trading can be switched off by the owner"
+                        .to_string(),
+                evidence: "blacklist selector together with a trading switch".to_string(),
+                cwe_id: Some("CWE-284".to_string()),
             });
         }
-        
-        // Pattern 2: Require that always fails for certain addresses
-        if bytecode.contains("0x09b5a3b1") {
+
+        if blacklist {
             return Some(SecurityFinding {
                 category: FindingCategory::Honeypot,
-                severity: FindingSeverity::Critical,
-                description: "Hidden require that blocks specific addresses".to_string(),
-                evidence: "Conditional require pattern detected".to_string(),
-                cwe_id: Some("CWE-863".to_string()),
+                severity: FindingSeverity::High,
+                description: "The owner can block an address from transferring".to_string(),
+                evidence: "blacklist selector in the dispatch table".to_string(),
+                cwe_id: Some("CWE-284".to_string()),
             });
         }
-        
+
         None
     }
+}
+
+/// Decode the 4-byte selectors in a contract's dispatch table.
+///
+/// A selector appears in runtime code as `PUSH4 <selector>`. Scanning for that
+/// pattern finds the dispatcher entries and, in practice, little else.
+pub fn extract_selectors(bytecode: &[u8]) -> Vec<String> {
+    let mut selectors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut index = 0;
+    while index + 4 < bytecode.len() {
+        if bytecode[index] == 0x63 {
+            let hexed = hex::encode(&bytecode[index + 1..index + 5]);
+            if seen.insert(hexed.clone()) {
+                selectors.push(hexed);
+            }
+            index += 5;
+        } else {
+            index += 1;
+        }
+    }
+
+    selectors
 }
 
 // ============================================================================
@@ -398,34 +453,52 @@ impl SecurityScanner {
     pub async fn analyze(&self, address: &str) -> Result<SecurityReport> {
         info!("Analyzing contract: {}", address);
         
-        // Get bytecode
-        let code = self.rpc.get_code(address.parse().unwrap(), None).await?;
-        let bytecode = format!("{:?}", code);
-        
-        let mut findings = Vec::new();
+        let address: Address = address
+            .trim()
+            .parse()
+            .map_err(|error| SecurityError::Analysis(format!("invalid address: {error}")))?;
+
+        let code = self
+            .rpc
+            .get_code(address, None)
+            .await
+            .map_err(|error| SecurityError::Rpc(error.to_string()))?;
+
+        if code.is_empty() {
+            return Err(anyhow::anyhow!("{address:#x} has no deployed bytecode"));
+        }
+
+        let bytecode: &[u8] = code.as_ref();
+        let selectors = extract_selectors(bytecode);
+
+        let mut findings = self.honeypot_detector.analyze_bytecode(bytecode);
         let mut indicators = Vec::new();
-        
-        // Check honeypot patterns
-        findings.extend(self.honeypot_detector.analyze_bytecode(&bytecode));
-        
-        if let Some(finding) = self.honeypot_detector.check_transfer_logic(&bytecode) {
+
+        if let Some(finding) = self.honeypot_detector.check_transfer_logic(&selectors) {
             findings.push(finding);
         }
+
         
+        let address_hex = format!("{address:#x}");
+
         // Check threat database
-        if let Some(threat) = self.phishing_detector.check_address(address) {
+        if let Some(threat) = self.phishing_detector.check_address(&address_hex) {
             findings.push(SecurityFinding {
                 category: FindingCategory::Scam,
                 severity: FindingSeverity::Critical,
-                description: format!("Address found in threat database: {}", threat.threat_type),
-                evidence: format!("Reports: {}, Confidence: {}%", threat.reports, threat.confidence * 100.0),
+                description: format!("Address is on the threat list: {}", threat.threat_type),
+                evidence: format!(
+                    "{} reports, confidence {:.0}%",
+                    threat.reports,
+                    threat.confidence * 100.0
+                ),
                 cwe_id: None,
             });
             
             indicators.push(ThreatIndicator {
                 indicator_type: IndicatorType::Address,
-                value: address.to_string(),
-                source: "Threat Database".to_string(),
+                value: format!("{address:#x}"),
+                source: "threat list".to_string(),
                 confidence: threat.confidence,
             });
         }
@@ -435,15 +508,18 @@ impl SecurityScanner {
         let phishing_score = self.calculate_phishing_score(&findings);
         let scam_score = self.calculate_scam_score(&findings);
         
-        let is_malicious = honeypot_score > 0.7 || phishing_score > 0.7 || scam_score > 0.7;
+        let is_malicious = honeypot_score >= 0.75 || phishing_score >= 0.75 || scam_score >= 0.75;
         
-        let risk_level = match () {
-            _ if honeypot_score > 0.9 => RiskLevel::Critical,
-            _ if honeypot_score > 0.7 => RiskLevel::High,
-            _ if scam_score > 0.7 => RiskLevel::High,
-            _ if phishing_score > 0.5 => RiskLevel::Medium,
-            _ if scam_score > 0.5 => RiskLevel::Medium,
-            _ => RiskLevel::Safe,
+        let risk_level = if honeypot_score >= 1.0 {
+            RiskLevel::Critical
+        } else if honeypot_score.max(phishing_score).max(scam_score) >= 0.75 {
+            RiskLevel::High
+        } else if honeypot_score.max(phishing_score).max(scam_score) >= 0.5 {
+            RiskLevel::Medium
+        } else if honeypot_score.max(phishing_score).max(scam_score) > 0.0 {
+            RiskLevel::Low
+        } else {
+            RiskLevel::Safe
         };
         
         // Generate recommendations
@@ -451,7 +527,12 @@ impl SecurityScanner {
         
         // Cache result
         let report = SecurityReport {
-            address: address.to_string(),
+            address: format!("{address:#x}"),
+            code_hash: format!("0x{}", hex::encode(ethers::utils::keccak256(bytecode))),
+            selectors: selectors
+                .iter()
+                .map(|selector| format!("0x{selector}"))
+                .collect(),
             is_malicious,
             risk_level,
             honeypot_score,
@@ -464,7 +545,8 @@ impl SecurityScanner {
         };
         
         let mut state = self.state.write();
-        state.cache.insert(address.to_string(), report.clone());
+        state.cache.insert(format!("{address:#x}"), report.clone());
+        state.scans_today += 1;
         
         Ok(report)
     }
@@ -585,8 +667,105 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_contract_hash() {
-        let hash = compute_contract_hash("0x608060405234");
-        assert_eq!(hash.len(), 64);
+    fn contract_hash_is_sha256_hex() {
+        // NIST vector: SHA-256("abc").
+        assert_eq!(
+            compute_contract_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn selectors_are_extracted_from_push4_operands() {
+        let bytecode = [0x63, 0xa9, 0x05, 0x9c, 0xbb, 0x63, 0x70, 0xa0, 0x82, 0x31];
+
+        assert_eq!(extract_selectors(&bytecode), vec!["a9059cbb", "70a08231"]);
+    }
+
+    #[test]
+    fn a_repeated_selector_is_reported_once() {
+        let bytecode = [0x63, 0xa9, 0x05, 0x9c, 0xbb, 0x63, 0xa9, 0x05, 0x9c, 0xbb];
+
+        assert_eq!(extract_selectors(&bytecode).len(), 1);
+    }
+
+    #[test]
+    fn a_blacklist_selector_is_reported() {
+        let patterns = Arc::new(RwLock::new(HashMap::new()));
+        patterns.write().insert(
+            "blacklist".to_string(),
+            HoneypotPattern {
+                name: "blacklist".to_string(),
+                pattern: "0xf9f92be4".to_string(),
+                severity: FindingSeverity::High,
+                description: "Owner can block an address".to_string(),
+            },
+        );
+
+        let detector = HoneypotDetector {
+            config: Config::default(),
+            rpc: Provider::<Http>::try_from("http://127.0.0.1:8545").unwrap(),
+            known_patterns: patterns,
+        };
+
+        let bytecode = [0x63, 0xf9, 0xf9, 0x2b, 0xe4];
+
+        let findings = detector.analyze_bytecode(&bytecode);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, FindingSeverity::High);
+    }
+
+    #[test]
+    fn a_plain_erc20_raises_no_finding() {
+        let patterns = Arc::new(RwLock::new(HashMap::new()));
+        patterns.write().insert(
+            "blacklist".to_string(),
+            HoneypotPattern {
+                name: "blacklist".to_string(),
+                pattern: "0xf9f92be4".to_string(),
+                severity: FindingSeverity::High,
+                description: "Owner can block an address".to_string(),
+            },
+        );
+
+        let detector = HoneypotDetector {
+            config: Config::default(),
+            rpc: Provider::<Http>::try_from("http://127.0.0.1:8545").unwrap(),
+            known_patterns: patterns,
+        };
+
+        // transfer(address,uint256) and balanceOf(address).
+        let bytecode = [0x63, 0xa9, 0x05, 0x9c, 0xbb, 0x63, 0x70, 0xa0, 0x82, 0x31];
+
+        assert!(detector.analyze_bytecode(&bytecode).is_empty());
+    }
+
+    #[test]
+    fn a_blacklist_together_with_a_trading_switch_is_critical() {
+        let detector = HoneypotDetector {
+            config: Config::default(),
+            rpc: Provider::<Http>::try_from("http://127.0.0.1:8545").unwrap(),
+            known_patterns: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let finding = detector
+            .check_transfer_logic(&["f9f92be4".to_string(), "c2e5ec04".to_string()])
+            .expect("blacklist plus trading switch must be reported");
+
+        assert_eq!(finding.severity, FindingSeverity::Critical);
+    }
+
+    #[test]
+    fn a_trading_switch_alone_is_not_a_finding() {
+        let detector = HoneypotDetector {
+            config: Config::default(),
+            rpc: Provider::<Http>::try_from("http://127.0.0.1:8545").unwrap(),
+            known_patterns: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        assert!(detector
+            .check_transfer_logic(&["c2e5ec04".to_string()])
+            .is_none());
     }
 }

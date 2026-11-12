@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use statistical::{mean, median};

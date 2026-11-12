@@ -58,6 +58,41 @@ impl Error {
     pub fn validation(msg: impl Into<String>) -> Self {
         Self::Validation(msg.into())
     }
+
+    /// Create database error
+    pub fn database(msg: impl Into<String>) -> Self {
+        Self::Database(msg.into())
+    }
+
+    /// Create resolver error
+    pub fn resolver(msg: impl Into<String>) -> Self {
+        Self::Resolver(msg.into())
+    }
+
+    /// Create cache error
+    pub fn cache(msg: impl Into<String>) -> Self {
+        Self::Cache(msg.into())
+    }
+
+    /// Create rate limit error
+    pub fn rate_limit(msg: impl Into<String>) -> Self {
+        Self::RateLimit(msg.into())
+    }
+
+    /// Create internal error
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::Internal(msg.into())
+    }
+
+    /// Create invalid name error
+    pub fn invalid_name(name: impl AsRef<str>) -> Self {
+        Self::InvalidName(name.as_ref().to_string())
+    }
+
+    /// Create invalid address error
+    pub fn invalid_address(address: impl AsRef<str>) -> Self {
+        Self::InvalidAddress(address.as_ref().to_string())
+    }
     
     /// Create not found error
     pub fn not_found(msg: impl Into<String>) -> Self {

@@ -6,6 +6,7 @@ description = "Security service for TigerScan Explorer - honeypot detection, phi
 authors = ["TigerSmartChain Team"]
 
 [dependencies]
+tigerscan-service-http = { path = "../../tigerscan-service-http" }
 tokio = { version = "1.35", features = ["full"] }
 async-trait = "0.1"
 ethers = { version = "2.0", features = ["rustls"] }

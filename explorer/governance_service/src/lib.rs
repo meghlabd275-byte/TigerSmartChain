@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use ethers::core::types::{Address, H256, U256};
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

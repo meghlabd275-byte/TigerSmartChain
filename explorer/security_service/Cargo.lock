@@ -3719,6 +3719,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tigerscan-service-http"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tracing",
+]
+
+[[package]]
 name = "tigerscan_security"
 version = "1.0.0"
 dependencies = [
@@ -3733,6 +3743,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",
+ "tigerscan-service-http",
  "tiny_http",
  "tokio",
  "tracing",

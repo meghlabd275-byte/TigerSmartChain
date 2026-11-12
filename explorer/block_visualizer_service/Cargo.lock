@@ -194,6 +194,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tigerscan-service-http",
  "tiny_http",
  "tokio",
  "tracing",
@@ -1007,6 +1008,7 @@ dependencies = [
  "const-hex",
  "enr",
  "ethers-core",
+ "futures-channel",
  "futures-core",
  "futures-timer",
  "futures-util",
@@ -3175,6 +3177,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tigerscan-service-http"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tracing",
 ]
 
 [[package]]

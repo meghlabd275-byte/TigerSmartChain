@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tiny_http::{Header, Response, Server, StatusCode};
+use tiny_http::{Response, Server, StatusCode};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -163,38 +163,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handler = Arc::new(Handler::new(analytics));
 
     // Start HTTP server
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8547));
     let server = Server::http(addr)?;
 
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8562));
     info!("Server listening on {}", addr);
 
-    for request in server.incoming_requests() {
-        let handler = handler.clone();
-
-        tokio::spawn(async move {
-            let body = request.as_vec();
-
-            let response = handler.handle(&body);
-
-            let mut resp = request.respond(response)?;
-
-            // Add security headers
-            let headers = vec![
-                Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-                Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap(),
-                Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap(),
-                Header::from_bytes(&b"X-XSS-Protection"[..], &b"1; mode=block"[..]).unwrap(),
-                Header::from_bytes(&b"Strict-Transport-Security"[..], &b"max-age=31536000"[..]).unwrap(),
-                Header::from_bytes(&b"Content-Security-Policy"[..], &b"default-src 'none'"[..]).unwrap(),
-            ];
-
-            for header in headers {
-                resp.add_header(header);
-            }
-
-            Ok(())
-        });
-    }
+    tigerscan_service_http::serve(addr, move |body| handler.handle(body))?;
 
     Ok(())
 }

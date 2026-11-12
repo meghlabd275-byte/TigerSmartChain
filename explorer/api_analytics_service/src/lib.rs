@@ -311,24 +311,37 @@ impl AnalyticsService {
         key_stats.truncate(10);
         
         // Errors
-        let mut error_map: HashMap<(String, u16), u64> = HashMap::new();
+        let mut error_map: HashMap<(String, u16), (u64, i64)> = HashMap::new();
         for request in state.requests.iter().filter(|r| r.status_code >= 400) {
-            *error_map.entry((request.endpoint.clone(), request.status_code)).or_insert(0) += 1;
+            let entry = error_map
+                .entry((request.endpoint.clone(), request.status_code))
+                .or_insert((0, i64::MIN));
+            entry.0 += 1;
+            entry.1 = entry.1.max(request.timestamp);
         }
-        
-        let errors: Vec<_> = error_map.into_iter()
-            .map(|((endpoint, code), count)| ErrorStats {
+
+        let failed_requests: u64 = error_map.values().map(|(count, _)| *count).sum();
+
+        let mut errors: Vec<ErrorStats> = error_map
+            .into_iter()
+            .map(|((endpoint, code), (count, last_occurrence))| ErrorStats {
                 endpoint,
                 status_code: code,
                 count,
-                last_occurrence: Utc::now().timestamp(),
+                last_occurrence: if last_occurrence == i64::MIN {
+                    0
+                } else {
+                    last_occurrence
+                },
             })
             .collect();
-        
+
+        errors.sort_by(|a, b| b.count.cmp(&a.count).then(a.endpoint.cmp(&b.endpoint)));
+
         APIAnalytics {
             total_requests: total,
-            successful_requests: total - errors,
-            failed_requests: errors,
+            successful_requests: total.saturating_sub(failed_requests),
+            failed_requests,
             avg_response_time: avg_response,
             p95_response_time: p95,
             p99_response_time: p99,
@@ -354,9 +367,11 @@ impl AnalyticsService {
         
         // Reset at midnight UTC
         let now = Utc::now();
-        let reset = now.date_naive().succ_opt()
-            .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-            .unwrap_or(now);
+        let reset = now
+            .date_naive()
+            .succ_opt()
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .unwrap_or_else(|| now.naive_utc());
         
         RateLimitInfo {
             ip: ip.to_string(),

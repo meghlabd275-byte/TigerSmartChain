@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use std::net::SocketAddr;
 use serde::Deserialize;
-use tiny_http::{Header, Response, StatusCode};
+use tiny_http::Response;
 use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,10 +23,9 @@ impl Handler {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting Export Service");
-    let server = tiny_http::Server::http(SocketAddr::from(([0, 0, 0, 0], 9004))?;
-    for request in server.incoming_requests() {
-        let mut resp = request.respond(Handler::handle(&request.as_vec()))?;
-        for h in [Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()] { resp.add_header(h); }
-    }
+    let addr = SocketAddr::from(([0, 0, 0, 0], 9004));
+    info!("Server listening on {}", addr);
+
+    tigerscan_service_http::serve(addr, move |body| Handler::handle(body))?;
     Ok(())
 }

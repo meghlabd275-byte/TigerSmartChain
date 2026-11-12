@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use ethers::core::abi::{Abi, Token};
 use ethers::core::k256::sha2::Sha256;
 use ethers::core::types::{Address, H256, U256};
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use ethers::types::{Filter, Log, Transaction};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

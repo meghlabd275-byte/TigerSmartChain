@@ -449,6 +449,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tigerscan-service-http",
  "tiny_http",
  "tokio",
  "tracing",
@@ -1018,6 +1019,7 @@ dependencies = [
  "const-hex",
  "enr",
  "ethers-core",
+ "futures-channel",
  "futures-core",
  "futures-timer",
  "futures-util",
@@ -3222,6 +3224,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tigerscan-service-http"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tracing",
 ]
 
 [[package]]

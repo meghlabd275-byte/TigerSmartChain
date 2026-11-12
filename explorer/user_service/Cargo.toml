@@ -5,6 +5,8 @@ edition = "2021"
 description = "User Service: Watchlists, Notes, Alerts, Custom Dashboards"
 
 [dependencies]
+tiny_http = "0.12"
+tigerscan-service-http = { path = "../../tigerscan-service-http" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use ethers::types::{Address, Bytes, H256, U256, U64};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

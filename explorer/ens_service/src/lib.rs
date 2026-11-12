@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 mod cache;
+mod chain;
 mod crypto;
 mod database;
 mod errors;
@@ -15,6 +16,7 @@ mod types;
 mod validation;
 
 pub use cache::ENSCache;
+pub use chain::Chain;
 pub use crypto::*;
 pub use database::Database;
 pub use errors::{Error, Result};

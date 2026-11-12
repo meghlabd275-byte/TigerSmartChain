@@ -158,7 +158,7 @@ pub struct PriceFeedService {
     state: Arc<RwLock<PriceFeedState>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PriceFeedState {
     pub last_update: Option<DateTime<Utc>>,
     pub updates_count: u64,

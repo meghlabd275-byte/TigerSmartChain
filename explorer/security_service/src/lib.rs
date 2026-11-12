@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Provider, Middleware};
 use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub struct SecurityService {
     scam_patterns: Vec<Regex>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SecurityState {
     pub contracts_scanned: u64,
     pub threats_detected: u64,
@@ -105,6 +105,7 @@ impl SecurityService {
             address: address.to_string(),
             is_safe: true,
             threat_type: None,
+            confidence: 100,
             warnings: vec![],
             details: vec![],
         };
