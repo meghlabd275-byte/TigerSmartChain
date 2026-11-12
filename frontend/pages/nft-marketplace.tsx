@@ -1,50 +1,106 @@
 /**
- * Advanced NFT Marketplace - Complete NFT trading and analytics platform
- * Real-time floor prices, rarity scores, collection analytics, and trading
+ * NFT Marketplace
+ *
+ * Collections, per-token detail, recent sales and the collection chart all come
+ * from the indexed tables (nft_collections, nfts, nft_sales, nft_holders).
+ * Nothing on this page is generated in the browser.
+ *
+ * Prices are stored as the raw wei amount of the payment token and are shown in
+ * the native coin, TGR, because that is the unit the chain settles in. The page
+ * used to print them with an ETH label and a hardcoded dollar conversion.
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, BarChart, Bar } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
+import api from '@/lib/api';
+import { formatWei, formatNumber, formatAddress } from '@/lib/utils';
 
-// Types for NFT data
-interface NFTCollection {
-  id: string;
-  name: string;
-  symbol: string;
+const NATIVE_SYMBOL = 'TGR';
+const PAGE_SIZE = 24;
+
+interface CollectionRow {
   address: string;
+  name: string | null;
+  symbol: string | null;
+  contract_type: string | null;
+  total_supply: string | null;
+  holders_count: string | null;
+  transfers_count: string | null;
+  floor_price: string | null;
+  floor_price_change_24h: string | null;
+  volume_24h: string | null;
+  average_price_24h: string | null;
+  market_cap: string | null;
+  description: string | null;
+  image_url: string | null;
+  is_verified: boolean | null;
+  sales_24h: string | null;
+}
+
+interface CollectionStats {
+  date: string;
   floorPrice: number;
-  floorChange24h: number;
-  totalVolume: number;
-  volume24h: number;
-  sales24h: number;
+  volume: number;
+  sales: number;
   holders: number;
-  supply: number;
-  image: string;
-  category: string;
-  blockchain: string;
-  verified: boolean;
-  description: string;
 }
 
-interface NFTToken {
-  id: string;
-  collection: string;
-  tokenId: string;
-  name: string;
-  image: string;
-  owner: string;
-  price: number;
-  lastSale: number;
-  rarity: number;
-  rank: number;
-  attributes: Record<string, string>;
-  listed: boolean;
-  lastSaleTime: number;
+interface MarketStats {
+  totalVolume24h: string;
+  totalSales24h: string;
+  averagePrice: string;
+  activeListings: string;
 }
 
-interface NFTSale {
+// A collection row carries prices as raw wei strings. They are converted once,
+// here, so the components below can stay in plain numbers.
+const toCollection = (row: CollectionRow) => ({
+  address: row.address,
+  name: row.name || row.address,
+  symbol: row.symbol || '',
+  contractType: row.contract_type || '',
+  supply: Number(row.total_supply || 0),
+  holders: Number(row.holders_count || 0),
+  floorPrice: Number(formatWei(row.floor_price || '0')),
+  floorChange24h: Number(row.floor_price_change_24h || 0),
+  volume24h: Number(formatWei(row.volume_24h || '0')),
+  marketCap: Number(formatWei(row.market_cap || '0')),
+  sales24h: Number(row.sales_24h || 0),
+  verified: row.is_verified === true,
+  description: row.description || '',
+  image: row.image_url || '',
+});
+
+type Collection = ReturnType<typeof toCollection>;
+
+interface SaleRow {
+  token_address: string;
+  token_id: string;
+  price: string;
+  buyer: string;
+  seller: string;
+  transaction_hash: string;
+  log_index: number;
+  block_timestamp: string;
+}
+
+interface FloorRow {
+  timestamp?: string;
+  date?: string;
+  floor_price?: string;
+  price?: string;
+}
+
+interface SeriesRow {
+  date: string;
+  sales?: string | number;
+  volume?: string;
+  holders?: string | number;
+}
+
+interface Sale {
   id: string;
-  collection: string;
+  tokenAddress: string;
   tokenId: string;
   price: number;
   buyer: string;
@@ -53,26 +109,9 @@ interface NFTSale {
   txHash: string;
 }
 
-interface CollectionStats {
-  timestamp: number;
-  floorPrice: number;
-  volume: number;
-  sales: number;
-  holders: number;
-}
-
-interface MarketStats {
-  totalVolume24h: number;
-  totalSales24h: number;
-  avgPrice: number;
-  activeListings: number;
-}
-
-// Advanced NFT data hook
 const useNFTData = () => {
-  const [collections, setCollections] = useState<NFTCollection[]>([]);
-  const [tokens, setTokens] = useState<NFTToken[]>([]);
-  const [sales, setSales] = useState<NFTSale[]>([]);
+  const [collections, setCollections] = useState<Collection[]>([]);
+  const [sales, setSales] = useState<Sale[]>([]);
   const [collectionStats, setCollectionStats] = useState<Record<string, CollectionStats[]>>({});
   const [marketStats, setMarketStats] = useState<MarketStats | null>(null);
   const [loading, setLoading] = useState(true);
@@ -83,95 +122,77 @@ const useNFTData = () => {
   const fetchNFTData = useCallback(async () => {
     try {
       setLoading(true);
-      const now = Date.now();
-      
-      // Generate collection data
-      const collectionData: NFTCollection[] = [
-        { id: '1', name: 'Bored Ape Yacht Club', symbol: 'BAYC', address: '0xBC4CA0EdA7647A8aB7C20631C4B4E8D8D30E425', floorPrice: 28.5, floorChange24h: 2.5, totalVolume: 850000000, volume24h: 25000000, sales24h: 45, holders: 6200, supply: 10000, image: '🦍', category: 'PFP', blockchain: 'Ethereum', verified: true, description: 'The premier NFT collection' },
-        { id: '2', name: 'CryptoPunks', symbol: 'PUNKS', address: '0xb47e3cd837dDF8e4c57F05d70Ab865de14e44146', floorPrice: 45.2, floorChange24h: -1.2, totalVolume: 1200000000, volume24h: 35000000, sales24h: 28, holders: 4500, supply: 10000, image: '👽', category: 'PFP', blockchain: 'Ethereum', verified: true, description: 'The original NFT collection' },
-        { id: '3', name: 'Azuki', symbol: 'AZUKI', address: '0xED5AF388653567Af2F388E6224dC7C4b3241C405', floorPrice: 12.8, floorChange24h: 5.2, totalVolume: 420000000, volume24h: 18000000, sales24h: 85, holders: 8500, supply: 10000, image: '🏮', category: 'PFP', blockchain: 'Ethereum', verified: true, description: 'Elemental beings in the garden' },
-        { id: '4', name: 'Mutant Ape Yacht Club', symbol: 'MAYC', address: '0x06012c8cf97BEaD5dFcKKBd7C3C8b2E8D8D30E425', floorPrice: 3.2, floorChange24h: 8.5, totalVolume: 250000000, volume24h: 12000000, sales24h: 125, holders: 15000, supply: 20000, image: '🐒', category: 'PFP', blockchain: 'Ethereum', verified: true, description: 'Mutant version of BAYC' },
-        { id: '5', name: 'Otherdeed', symbol: 'OTHR', address: '0x34d85c9C1B0fD2A7E5f3E7B8C9D0E1F2A3B4C5D6', floorPrice: 1.85, floorChange24h: -3.2, totalVolume: 320000000, volume24h: 8500000, sales24h: 250, holders: 42000, supply: 100000, image: '🌍', category: 'Gaming', blockchain: 'Otherside', verified: true, description: 'Virtual land in Otherside' },
-        { id: '6', name: 'DeGods', symbol: 'DEGOD', address: '0x8eE5E5C8E8C8E8E8E8E8E8E8E8E8E8E8E8', floorPrice: 125, floorChange24h: 12.5, totalVolume: 85000000, volume24h: 5200000, sales24h: 15, holders: 4200, supply: 5000, image: '👹', category: 'PFP', blockchain: 'Solana', verified: true, description: 'The ultimate degens' },
-        { id: '7', name: 'Okay Bears', symbol: 'OKAY', address: '0x9eE5E5C8E8C8E8E8E8E8E8E8E8E8E8E8', floorPrice: 42, floorChange24h: -5.8, totalVolume: 180000000, volume24h: 4500000, sales24h: 35, holders: 8500, supply: 10000, image: '🐻', category: 'PFP', blockchain: 'Solana', verified: true, description: 'A new beginning' },
-        { id: '8', name: 'Doodle', symbol: 'DOOD', address: '0x8a2d16f55a6562E487B1C2c2a2a2a2a2a2a2', floorPrice: 2.85, floorChange24h: 15.2, totalVolume: 180000000, volume24h: 8500000, sales24h: 145, holders: 18000, supply: 20000, image: '🎨', category: 'PFP', blockchain: 'Ethereum', verified: true, description: 'Join the doodles' },
-        { id: '9', name: 'Clone X', symbol: 'CLONE', address: '0x8b3C2c2a2a2a2a2a2a2a2a2a2a2a2a', floorPrice: 3.5, floorChange24h: 2.8, totalVolume: 250000000, volume24h: 12000000, sales24h: 185, holders: 22000, supply: 20000, image: '👤', category: 'PFP', blockchain: 'Ethereum', verified: true, description: 'RTFKT x村上隆' },
-        { id: '10', name: 'Milady', symbol: 'MILADY', address: '0x8c4C2c2a2a2a2a2a2a2a2a2a2a2a2a', floorPrice: 0.85, floorChange24h: 25.5, totalVolume: 45000000, volume24h: 3200000, sales24h: 220, holders: 12000, supply: 10000, image: '💄', category: 'PFP', blockchain: 'Ethereum', verified: false, description: 'Remilia corporation' },
-      ];
-      setCollections(collectionData);
-      
-      // Generate token data
-      const tokenData: NFTToken[] = [];
-      collectionData.forEach((col, colIdx) => {
-        for (let i = 0; i < 10; i++) {
-          tokenData.push({
-            id: `${col.id}-${i}`,
-            collection: col.name,
-            tokenId: Math.floor(Math.random() * 10000).toString(),
-            name: `${col.symbol} #${Math.floor(Math.random() * 10000)}`,
-            image: col.image,
-            owner: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-            price: col.floorPrice * (0.8 + Math.random() * 0.4),
-            lastSale: col.floorPrice * (0.7 + Math.random() * 0.6),
-            rarity: Math.floor(1 + Math.random() * 10000),
-            rank: i + 1,
-            attributes: { background: ['Blue', 'Red', 'Green'][Math.floor(Math.random() * 3)], eyes: ['Laser', 'Normal', '3D'][Math.floor(Math.random() * 3)] },
-            listed: Math.random() > 0.3,
-            lastSaleTime: now - Math.random() * 86400000,
-          });
-        }
-      });
-      setTokens(tokenData);
-      
-      // Generate sales data
-      const saleData: NFTSale[] = [];
-      for (let i = 0; i < 50; i++) {
-        const collection = collectionData[Math.floor(Math.random() * collectionData.length)];
-        saleData.push({
-          id: `sale-${i}`,
-          collection: collection.name,
-          tokenId: Math.floor(Math.random() * 10000).toString(),
-          price: collection.floorPrice * (0.5 + Math.random() * 1),
-          buyer: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-          seller: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-          timestamp: now - i * 60000,
-          txHash: `0x${Math.random().toString(16).substr(2, 64)}`,
-        });
-      }
-      setSales(saleData);
-      
-      // Generate collection stats (30 days)
-      const statsData: Record<string, CollectionStats[]> = {};
-      collectionData.forEach((col) => {
-        const stats: CollectionStats[] = [];
-        for (let i = 30; i >= 0; i--) {
-          const timestamp = now - i * 24 * 60 * 60 * 1000;
-          stats.push({
-            timestamp,
-            floorPrice: col.floorPrice * (0.8 + Math.random() * 0.4),
-            volume: Math.random() * 50000000 + 10000000,
-            sales: Math.floor(10 + Math.random() * 100),
-            holders: col.holders + Math.floor(Math.random() * 100 - 50),
-          });
-        }
-        statsData[col.id] = stats;
-      });
-      setCollectionStats(statsData);
-      
-      // Market stats
+
+      const collectionsResponse = await api.getNFTMarketplaceCollections({ limit: PAGE_SIZE });
+      setCollections((collectionsResponse.items as unknown as CollectionRow[]).map(toCollection));
+
+      const stats = await api.getNFTMarketplaceStats();
       setMarketStats({
-        totalVolume24h: collections.reduce((acc, c) => acc + c.volume24h, 0),
-        totalSales24h: collections.reduce((acc, c) => acc + c.sales24h, 0),
-        avgPrice: 12.5,
-        activeListings: tokens.filter(t => t.listed).length,
+        totalVolume24h: stats.totalVolume24h || '0',
+        totalSales24h: stats.totalSales24h || '0',
+        averagePrice: stats.averagePrice || '0',
+        activeListings: stats.activeListings || '0',
       });
-      
+
+      const salesResponse = await api.getNFTSales({ limit: 50 });
+      setSales((salesResponse.items as unknown as SaleRow[]).map((row) => ({
+        id: `${row.transaction_hash}-${row.log_index}`,
+        tokenAddress: row.token_address,
+        tokenId: row.token_id,
+        price: Number(formatWei(row.price || '0')),
+        buyer: row.buyer,
+        seller: row.seller,
+        timestamp: new Date(row.block_timestamp).getTime(),
+        txHash: row.transaction_hash,
+      })));
+
       setError(null);
-    } catch (err) {
-      setError('Failed to fetch NFT data');
-      console.error('NFT data error:', err);
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Could not load marketplace data.');
     } finally {
       setLoading(false);
+    }
+  }, []);
+
+  // The chart follows the selected collection. Floor history and the daily sale
+  // series are separate indexed queries, so they are fetched together when the
+  // selection changes rather than being invented for every collection up front.
+  const loadCollectionStats = useCallback(async (address: string) => {
+    try {
+      const [floor, series, holders] = await Promise.all([
+        api.getNFTFloorHistory(address, { limit: 30 }),
+        api.getNFTCollectionSalesSeries(address, { limit: 30 }),
+        api.getNFTCollectionHoldersSeries(address, { limit: 30 }),
+      ]);
+
+      const byDate = new Map<string, CollectionStats>();
+      const ensure = (date: string): CollectionStats => {
+        if (!byDate.has(date)) {
+          byDate.set(date, { date, floorPrice: 0, volume: 0, sales: 0, holders: 0 });
+        }
+        return byDate.get(date)!;
+      };
+
+      for (const row of (floor.items as unknown as FloorRow[])) {
+        const date = String(row.timestamp || row.date || '').slice(0, 10);
+        if (!date) continue;
+        ensure(date).floorPrice = Number(formatWei(row.floor_price || row.price || '0'));
+      }
+      for (const row of (series.items as unknown as SeriesRow[])) {
+        const point = ensure(String(row.date));
+        point.sales = Number(row.sales || 0);
+        point.volume = Number(formatWei(row.volume || '0'));
+      }
+      for (const row of (holders.items as unknown as SeriesRow[])) {
+        ensure(String(row.date)).holders = Number(row.holders || 0);
+      }
+
+      const ordered = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+      setCollectionStats((prev) => ({ ...prev, [address]: ordered }));
+    } catch {
+      // A collection with no indexed sales yet simply has no chart; the
+      // component renders its empty state.
+      setCollectionStats((prev) => ({ ...prev, [address]: [] }));
     }
   }, []);
 
@@ -181,27 +202,31 @@ const useNFTData = () => {
     return () => clearInterval(interval);
   }, [fetchNFTData]);
 
-  const filteredCollections = filter === 'all' 
-    ? collections 
-    : collections.filter(c => c.category === filter);
-  
-  const searchResults = search 
-    ? filteredCollections.filter(c => c.name.toLowerCase().includes(search.toLowerCase()))
+  const filteredCollections = filter === 'all'
+    ? collections
+    : collections.filter((c) => c.contractType === filter);
+
+  const searchResults = search
+    ? filteredCollections.filter((c) =>
+        c.name.toLowerCase().includes(search.toLowerCase()) ||
+        c.symbol.toLowerCase().includes(search.toLowerCase()) ||
+        c.address.toLowerCase().includes(search.toLowerCase()))
     : filteredCollections;
 
-  return { 
-    collections: searchResults, 
-    tokens, 
-    sales, 
-    collectionStats, 
-    marketStats, 
-    loading, 
-    error, 
+  return {
+    collections: searchResults,
+    allCollections: collections,
+    sales,
+    collectionStats,
+    marketStats,
+    loading,
+    error,
     filter,
     setFilter,
     search,
     setSearch,
-    refetch: fetchNFTData 
+    loadCollectionStats,
+    refetch: fetchNFTData,
   };
 };
 
@@ -218,7 +243,7 @@ const MarketOverview: React.FC<MarketOverviewProps> = ({ marketStats }) => {
       <div className="overview-cards">
         <div className="overview-card">
           <div className="card-label">24h Volume</div>
-          <div className="card-value">${(marketStats.totalVolume24h / 1000000).toFixed(1)}M</div>
+          <div className="card-value">{formatNumber(marketStats.totalVolume24h)} {NATIVE_SYMBOL}</div>
         </div>
         <div className="overview-card">
           <div className="card-label">24h Sales</div>
@@ -226,7 +251,7 @@ const MarketOverview: React.FC<MarketOverviewProps> = ({ marketStats }) => {
         </div>
         <div className="overview-card">
           <div className="card-label">Avg Price</div>
-          <div className="card-value">${marketStats.avgPrice} ETH</div>
+          <div className="card-value">{formatNumber(marketStats.averagePrice)} {NATIVE_SYMBOL}</div>
         </div>
         <div className="overview-card">
           <div className="card-label">Active Listings</div>
@@ -268,8 +293,8 @@ const MarketOverview: React.FC<MarketOverviewProps> = ({ marketStats }) => {
 
 // Collection card component
 interface CollectionCardProps {
-  collection: NFTCollection;
-  onSelect: (collection: NFTCollection) => void;
+  collection: Collection;
+  onSelect: (collection: Collection) => void;
 }
 
 const CollectionCard: React.FC<CollectionCardProps> = ({ collection, onSelect }) => {
@@ -289,7 +314,7 @@ const CollectionCard: React.FC<CollectionCardProps> = ({ collection, onSelect })
         <div className="card-symbol">{collection.symbol}</div>
       </div>
       <div className="card-floor">
-        <div className="floor-price">{formatPrice(collection.floorPrice)} ETH</div>
+        <div className="floor-price">{formatPrice(collection.floorPrice)} {NATIVE_SYMBOL}</div>
         <div className={`floor-change ${collection.floorChange24h >= 0 ? 'positive' : 'negative'}`}>
           {collection.floorChange24h >= 0 ? '↑' : '↓'} {Math.abs(collection.floorChange24h).toFixed(1)}%
         </div>
@@ -297,7 +322,7 @@ const CollectionCard: React.FC<CollectionCardProps> = ({ collection, onSelect })
       <div className="card-stats">
         <div className="stat">
           <span className="stat-label">Vol 24h</span>
-          <span className="stat-value">${(collection.volume24h / 1000000).toFixed(1)}M</span>
+          <span className="stat-value">{formatNumber(collection.volume24h)}</span>
         </div>
         <div className="stat">
           <span className="stat-label">Sales</span>
@@ -378,8 +403,8 @@ const CollectionCard: React.FC<CollectionCardProps> = ({ collection, onSelect })
 
 // Collection list component
 interface CollectionListProps {
-  collections: NFTCollection[];
-  onSelect: (collection: NFTCollection) => void;
+  collections: Collection[];
+  onSelect: (collection: Collection) => void;
 }
 
 const CollectionList: React.FC<CollectionListProps> = ({ collections, onSelect }) => {
@@ -390,7 +415,7 @@ const CollectionList: React.FC<CollectionListProps> = ({ collections, onSelect }
       <h3>Top Collections</h3>
       <div className="collections-grid">
         {sorted.slice(0, 12).map((collection) => (
-          <CollectionCard key={collection.id} collection={collection} onSelect={onSelect} />
+          <CollectionCard key={collection.address} collection={collection} onSelect={onSelect} />
         ))}
       </div>
       
@@ -420,7 +445,7 @@ const CollectionList: React.FC<CollectionListProps> = ({ collections, onSelect }
 
 // Recent sales component
 interface RecentSalesProps {
-  sales: NFTSale[];
+  sales: Sale[];
 }
 
 const RecentSalesProps: React.FC<RecentSalesProps> = ({ sales }) => {
@@ -435,9 +460,9 @@ const RecentSalesProps: React.FC<RecentSalesProps> = ({ sales }) => {
       <div className="sales-list">
         {sales.slice(0, 15).map((sale) => (
           <div key={sale.id} className="sale-item">
-            <div className="sale-collection">{sale.collection.slice(0, 15)}</div>
+            <div className="sale-collection">{formatAddress(sale.tokenAddress)}</div>
             <div className="sale-token">#{sale.tokenId}</div>
-            <div className="sale-price">{formatPrice(sale.price)} ETH</div>
+            <div className="sale-price">{formatPrice(sale.price)} {NATIVE_SYMBOL}</div>
             <div className="sale-time">{new Date(sale.timestamp).toLocaleTimeString()}</div>
           </div>
         ))}
@@ -490,14 +515,24 @@ const RecentSalesProps: React.FC<RecentSalesProps> = ({ sales }) => {
 // Collection chart component
 interface CollectionChartProps {
   stats: CollectionStats[];
-  collection: NFTCollection;
+  collection: Collection;
 }
 
 const CollectionChart: React.FC<CollectionChartProps> = ({ stats, collection }) => {
-  const chartData = stats.slice(-14).map(s => ({
-    date: new Date(s.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric' }),
+  if (stats.length === 0) {
+    return (
+      <div className="collection-chart">
+        <h3>{collection.name}</h3>
+        <p style={{ color: '#94a3b8' }}>No indexed sales for this collection yet.</p>
+      </div>
+    );
+  }
+
+  const chartData = stats.slice(-14).map((s) => ({
+    date: s.date,
     floor: s.floorPrice,
-    volume: s.volume / 1000000,
+    volume: s.volume,
+    sales: s.sales,
   }));
   
   return (
@@ -513,11 +548,11 @@ const CollectionChart: React.FC<CollectionChartProps> = ({ stats, collection }) 
           </defs>
           <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
           <XAxis dataKey="date" stroke="#94a3b8" fontSize={10} />
-          <YAxis yAxisId="left" stroke="#94a3b8" fontSize={10} tickFormatter={(v) => `${v} ETH`} />
+          <YAxis yAxisId="left" stroke="#94a3b8" fontSize={10} tickFormatter={(v) => `${v} ${NATIVE_SYMBOL}`} />
           <YAxis yAxisId="right" orientation="right" stroke="#94a3b8" fontSize={10} tickFormatter={(v) => `$${v}M`} />
           <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px' }} />
-          <Area yAxisId="left" type="monotone" dataKey="floor" stroke="#8b5cf6" fill="url(#floorGradient)" name="Floor ETH" />
-          <Line yAxisId="right" type="monotone" dataKey="volume" stroke="#10b981" name="Volume $M" />
+          <Area yAxisId="left" type="monotone" dataKey="floor" stroke="#8b5cf6" fill="url(#floorGradient)" name={`Floor ${NATIVE_SYMBOL}`} />
+          <Line yAxisId="right" type="monotone" dataKey="volume" stroke="#10b981" name="Volume" />
         </AreaChart>
       </ResponsiveContainer>
       
@@ -538,32 +573,68 @@ const CollectionChart: React.FC<CollectionChartProps> = ({ stats, collection }) 
   );
 };
 
-// NFT token list component
+// NFT token list component. Rows come from the nfts table, which holds the
+// indexed owner and metadata for each token. The previous version listed ten
+// invented tokens per collection, with random owners, random prices, and a
+// "Buy" button that did nothing.
 interface TokenListProps {
-  tokens: NFTToken[];
-  collection: string;
+  collectionAddress: string;
 }
 
-const TokenList: React.FC<TokenListProps> = ({ tokens, collection }) => {
-  const filtered = tokens.filter(t => t.collection === collection).sort((a, b) => a.price - b.price).slice(0, 20);
-  
+interface TokenRow {
+  token_id: string;
+  owner: string;
+  uri: string | null;
+  name: string | null;
+  image_url: string | null;
+}
+
+const TokenList: React.FC<TokenListProps> = ({ collectionAddress }) => {
+  const [tokens, setTokens] = useState<TokenRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api.getNFTTokens(collectionAddress, { limit: 24 })
+      .then((res) => { if (!cancelled) setTokens(res.items as unknown as TokenRow[]); })
+      .catch((err) => {
+        if (!cancelled) setError(err?.response?.data?.error || 'Could not load tokens.');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [collectionAddress]);
+
+  if (loading) {
+    return <div className="token-list"><h3>Tokens</h3><p style={{ color: '#94a3b8' }}>Loading...</p></div>;
+  }
+  if (error) {
+    return <div className="token-list"><h3>Tokens</h3><p style={{ color: '#f87171' }}>{error}</p></div>;
+  }
+  if (tokens.length === 0) {
+    return <div className="token-list"><h3>Tokens</h3><p style={{ color: '#94a3b8' }}>No tokens indexed for this collection yet.</p></div>;
+  }
+
   return (
     <div className="token-list">
-      <h3>NFTs for Sale</h3>
+      <h3>Tokens</h3>
       <div className="tokens-grid">
-        {filtered.map((token) => (
-          <div key={token.id} className="token-card">
-            <div className="token-image">{token.image}</div>
-            <div className="token-info">
-              <div className="token-name">{token.name}</div>
-              <div className="token-rarity">Rank #{token.rank}</div>
+        {tokens.map((token) => (
+          <a key={token.token_id} className="token-card" href={`/nft/${collectionAddress}/${token.token_id}`}>
+            <div className="token-image">
+              {token.image_url
+                ? <img src={token.image_url} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                : '#'}
             </div>
-            <div className="token-price">{token.price.toFixed(2)} ETH</div>
-            <button className="buy-btn">Buy</button>
-          </div>
+            <div className="token-info">
+              <div className="token-name">{token.name || `#${token.token_id}`}</div>
+              <div className="token-rarity">{formatAddress(token.owner)}</div>
+            </div>
+          </a>
         ))}
       </div>
-      
+
       <style>{`
         .token-list {
           background: #1e293b;
@@ -711,16 +782,19 @@ const Search: React.FC<SearchProps> = ({ search, setSearch }) => {
 
 // Main NFT Marketplace component
 const NFTMarketplace: React.FC = () => {
-  const { 
-    collections, tokens, sales, collectionStats, marketStats, loading, error, filter, setFilter, search, setSearch, refetch 
+  const {
+    collections, sales, collectionStats, marketStats, loading, error,
+    filter, setFilter, search, setSearch, loadCollectionStats, refetch,
   } = useNFTData();
-  
-  const [selectedCollection, setSelectedCollection] = useState<NFTCollection | null>(null);
-  
-  const handleSelectCollection = (collection: NFTCollection) => {
+
+  const [selectedCollection, setSelectedCollection] = useState<Collection | null>(null);
+
+  const handleSelectCollection = (collection: Collection) => {
     setSelectedCollection(collection);
+    loadCollectionStats(collection.address);
   };
-  
+
+
   if (loading && collections.length === 0) {
     return (
       <div className="nft-marketplace">
@@ -764,11 +838,11 @@ const NFTMarketplace: React.FC = () => {
       <Search search={search} setSearch={setSearch} />
       <Filter filter={filter} setFilter={setFilter} />
       
-      {selectedCollection && collectionStats[selectedCollection.id] ? (
+      {selectedCollection && collectionStats[selectedCollection.address] ? (
         <div className="selected-collection">
           <button className="back-btn" onClick={() => setSelectedCollection(null)}>← Back to Collections</button>
-          <CollectionChart stats={collectionStats[selectedCollection.id]} collection={selectedCollection} />
-          <TokenList tokens={tokens} collection={selectedCollection.name} />
+          <CollectionChart stats={collectionStats[selectedCollection.address]} collection={selectedCollection} />
+          <TokenList collectionAddress={selectedCollection.address} />
         </div>
       ) : (
         <>

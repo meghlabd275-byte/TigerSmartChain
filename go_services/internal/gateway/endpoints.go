@@ -132,6 +132,15 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	api.GET("/nfts/search", h.SearchNFTs)
 	api.GET("/nfts/trending", h.GetTrendingNFTs)
 
+	// Marketplace. These read nft_sales and nft_holders; the marketplace page
+	// used to invent its sale rows and chart points in the browser.
+	api.GET("/nfts/sales", h.GetNFTSales)
+	api.GET("/nfts/marketplace/stats", h.GetNFTMarketplaceStats)
+	api.GET("/nfts/marketplace/collections", h.GetNFTMarketplaceCollections)
+	api.GET("/nfts/:address/sales", h.GetNFTSales)
+	api.GET("/nfts/:address/sales-series", h.GetNFTCollectionSalesSeries)
+	api.GET("/nfts/:address/holders-series", h.GetNFTCollectionHoldersSeries)
+
 	// ==================== CONTRACTS (15 endpoints) ====================
 	api.GET("/contracts/:address", h.GetContract)
 	api.GET("/contracts/:address/code", h.GetContractCode)

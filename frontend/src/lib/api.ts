@@ -218,6 +218,17 @@ class APIClient {
     return data
   }
 
+  async getNFTTokens(collectionAddress: string, params?: {
+    page?: number
+    limit?: number
+  }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      `/nfts/${collectionAddress}/tokens`,
+      { params }
+    )
+    return data
+  }
+
   // The gateway exposes owners per collection (/nfts/:address/owners), not per
   // token id, and returns rows rather than bare addresses.
   async getNFTOwners(collectionAddress: string, params?: {
@@ -229,6 +240,52 @@ class APIClient {
       { params }
     )
     return data.items
+  }
+
+  // Marketplace. These read indexed rows; nothing is generated client-side.
+  async getNFTMarketplaceCollections(params?: { page?: number; limit?: number }):
+    Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/nfts/marketplace/collections', { params }
+    )
+    return data
+  }
+
+  async getNFTMarketplaceStats(): Promise<Record<string, string>> {
+    const { data } = await this.client.get('/nfts/marketplace/stats')
+    return data
+  }
+
+  async getNFTSales(params?: { page?: number; limit?: number }):
+    Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/nfts/sales', { params }
+    )
+    return data
+  }
+
+  async getNFTCollectionSales(collectionAddress: string, params?: { page?: number; limit?: number }):
+    Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      `/nfts/${collectionAddress}/sales`, { params }
+    )
+    return data
+  }
+
+  async getNFTCollectionSalesSeries(collectionAddress: string, params?: { limit?: number }):
+    Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      `/nfts/${collectionAddress}/sales-series`, { params }
+    )
+    return data
+  }
+
+  async getNFTCollectionHoldersSeries(collectionAddress: string, params?: { limit?: number }):
+    Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      `/nfts/${collectionAddress}/holders-series`, { params }
+    )
+    return data
   }
 
   async getNFTTransfers(collectionAddress: string, params?: {
