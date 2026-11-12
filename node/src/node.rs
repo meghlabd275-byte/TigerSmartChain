@@ -68,6 +68,18 @@ pub struct TigerNode {
     /// moment a block is due.
     validator_key: Option<[u8; 32]>,
 
+    /// Post-execution world state for recently imported blocks, keyed by block
+    /// hash, newest last.
+    ///
+    /// A block on a side branch has to be executed against the state at *its*
+    /// parent, not the state at the current head, so the node has to be able to
+    /// produce that state. Rebuilding it by replaying from genesis works but
+    /// costs one execution per block in between; keeping the recent ones
+    /// answers the common case (a fork within the last few blocks) directly.
+    /// The window is bounded, and a miss falls back to replaying, so the cache
+    /// is an optimisation and never a correctness dependency.
+    recent_states: tokio::sync::Mutex<RecentStates>,
+
     /// Network sync status
     sync_status: RwLock<SyncStatus>,
 
@@ -215,6 +227,7 @@ impl TigerNode {
             mempool: tokio::sync::Mutex::new(mempool),
             consensus: tokio::sync::Mutex::new(consensus),
             validator_key,
+            recent_states: tokio::sync::Mutex::new(RecentStates::new()),
             sync_status,
             tasks,
             storage,
@@ -319,7 +332,10 @@ impl TigerNode {
             let mut blocks = snapshot.blocks;
             blocks.sort_by_key(|b| b.header.number);
             for block in blocks {
-                chain.insert_block(block);
+                let number = block.header.number;
+                if let Err(e) = chain.insert_block(block) {
+                    warn!("persisted block #{number} could not be re-inserted: {e}");
+                }
             }
             for (number, receipts) in snapshot.receipts {
                 chain.set_receipts(number, receipts);
@@ -329,6 +345,10 @@ impl TigerNode {
         if let Some(state) = restored_state {
             *self.world_state.lock().await = state;
         }
+
+        // The states cached before the reload describe a chain that has just
+        // been replaced, so they are dropped rather than risk being served.
+        self.recent_states.lock().await.clear();
 
         let height = {
             let cm = self.chain_manager.lock().await;
@@ -354,42 +374,35 @@ impl TigerNode {
         &self,
         block: tiger_blockchain::types::Block,
     ) -> Result<bool> {
-        // Cheap checks first, against the current head.
-        let (head_number, head_hash, known) = {
+        // Cheap check first: a block already in the tree costs nothing to
+        // recognise, and peers re-announce constantly.
+        let known = {
             let cm = self.chain_manager.lock().await;
-            let chain = cm.chain();
-            let head = chain.height();
-            let head_hash = chain
-                .get_block(head)
-                .and_then(|b| tiger_blockchain::block_hash(&b.header).ok())
-                .unwrap_or_default();
             // `block_hash` already returns a 0x-prefixed string, the same form
             // the chain indexes by.
-            let known = tiger_blockchain::block_hash(&block.header)
+            tiger_blockchain::block_hash(&block.header)
                 .ok()
-                .map(|hash| chain.get_block_by_hash(&hash).is_some())
-                .unwrap_or(false);
-            (head, head_hash, known)
+                .map(|hash| cm.chain().get_block_by_hash(&hash).is_some())
+                .unwrap_or(false)
         };
 
         if known {
             return Ok(false);
         }
 
-        if block.header.number != head_number + 1 {
+        // A block whose parent is unknown cannot be linked to the chain. It is
+        // not rejected as invalid, because the parent may simply not have
+        // arrived yet, but it cannot be executed either: the state it must run
+        // against does not exist here.
+        let parent_known = {
+            let cm = self.chain_manager.lock().await;
+            cm.chain().contains_block(&block.header.parent_hash)
+        };
+        if !parent_known && block.header.number != 0 {
             return Err(anyhow::anyhow!(
-                "block {} does not extend the head at {}",
+                "block {} names parent {}, which is not known",
                 block.header.number,
-                head_number
-            ));
-        }
-
-        if block.header.parent_hash != head_hash {
-            return Err(anyhow::anyhow!(
-                "block {} names parent {} but the head is {}",
-                block.header.number,
-                block.header.parent_hash,
-                head_hash
+                block.header.parent_hash
             ));
         }
 
@@ -428,22 +441,84 @@ impl TigerNode {
             }
         }
 
-        // Re-execute against the current state. This is the check that makes
-        // the block trustworthy: the sender's numbers are reproduced, not
-        // believed.
-        let parent_state = self.world_state.lock().await.clone();
+        // Re-execute against the state at the block's own parent. This is the
+        // check that makes the block trustworthy: the sender's numbers are
+        // reproduced, not believed. For a side branch the parent state is not
+        // the head state, so it is resolved rather than assumed.
+        let parent_state = self.state_for_parent_of(&block).await?;
         let (new_state, receipts) =
             execute_block_transactions(&parent_state, &block, self.config.chain_id)
                 .map_err(|e| anyhow::anyhow!("block {} is invalid: {e}", block.header.number))?;
 
         let declared_number = block.header.number;
         let mut cm = self.chain_manager.lock().await;
-        cm.process_block_with_receipts(block.clone(), receipts)
+        let outcome = cm
+            .process_block_with_receipts_outcome(block.clone(), receipts)
             .map_err(|e| anyhow::anyhow!("block {declared_number} rejected: {e}"))?;
-        drop(cm);
 
-        // Adopt the state the re-execution produced and verified.
-        *self.world_state.lock().await = new_state;
+        match outcome {
+            tiger_blockchain::InsertOutcome::Known => return Ok(false),
+            tiger_blockchain::InsertOutcome::SideBranch => {
+                // The block is stored so it can be built on later, but it is
+                // not the chain. Its state changes are discarded, and the
+                // transactions it carries stay in the pool in case the
+                // canonical branch includes them.
+                info!(
+                    "stored block #{declared_number} on a side branch (not canonical)"
+                );
+                drop(cm);
+                return Ok(true);
+            }
+            tiger_blockchain::InsertOutcome::Extended => {
+                drop(cm);
+                *self.world_state.lock().await = new_state.clone();
+                // Remember this state so a block forking from here can be
+                // executed against it without a replay.
+                if let Ok(hash) = tiger_blockchain::block_hash(&block.header) {
+                    self.recent_states.lock().await.insert(&hash, new_state);
+                }
+            }
+            tiger_blockchain::InsertOutcome::Reorged {
+                old_head,
+                new_head,
+                common_ancestor,
+            } => {
+                // The new branch outweighs the one we were following. Rewind
+                // the world state to the fork point and replay the winning
+                // branch, so the state we hold is derived from the canonical
+                // chain rather than from the branch we just abandoned.
+                let blocks_to_replay = cm
+                    .chain()
+                    .canonical_blocks()
+                    .into_iter()
+                    .filter(|(number, _)| *number > common_ancestor)
+                    .map(|(_, block)| block.clone())
+                    .collect::<Vec<_>>();
+                drop(cm);
+
+                info!(
+                    "reorg: {old_head} -> {new_head} at height {common_ancestor}, \
+                     replaying {} block(s)",
+                    blocks_to_replay.len()
+                );
+
+                let replayed = self
+                    .rewind_and_replay(common_ancestor, &blocks_to_replay)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "reorg to {new_head} failed while replaying from \
+                             height {common_ancestor}: {e}"
+                        )
+                    })?;
+                info!("reorg complete: head is now {new_head} after replaying {replayed} block(s)");
+
+                // Transactions that were in the abandoned blocks and are not
+                // in the new chain are pending again, so a client does not
+                // have to resubmit them.
+                self.requeue_reorged_transactions(&old_head).await;
+            }
+        }
 
         // Drop the transactions the block contained from the pool.
         {
@@ -456,6 +531,214 @@ impl TigerNode {
         self.persist().await;
         info!("Imported block #{} from the network", declared_number);
         Ok(true)
+    }
+
+    /// The world state as it was *after* the block named by `hash` executed.
+    ///
+    /// Tries the recent-state cache first, then rebuilds by replaying the
+    /// canonical branch from genesis up to that block. Rebuilding is the
+    /// fallback rather than the rule because it costs one execution per block
+    /// in between, but it always produces the same answer, so a cache miss
+    /// costs time and never correctness.
+    async fn state_after_block(&self, hash: &str) -> Result<WorldState> {
+        if let Some(state) = self.recent_states.lock().await.get(hash) {
+            return Ok(state);
+        }
+
+        // Walk the target's own ancestry back to the most recent block whose
+        // state is known, then replay forward from there. The chain from a
+        // block to genesis is unique, so this is exactly the sequence of
+        // transitions that produced it, even when the block sits on a side
+        // branch.
+        let (ancestry, base) = {
+            let cm = self.chain_manager.lock().await;
+            let chain = cm.chain();
+            let mut ancestry: Vec<tiger_blockchain::types::Block> = Vec::new();
+            let mut cursor = hash.to_ascii_lowercase();
+            let base;
+            loop {
+                if let Some(state) = self.recent_states.try_lock().ok().and_then(|c| c.get(&cursor)) {
+                    base = state;
+                    break;
+                }
+                let block = chain.get_block_by_hash(&cursor).ok_or_else(|| {
+                    anyhow::anyhow!("no block with hash {cursor} in the tree")
+                })?;
+                let number = block.header.number;
+                let parent = block.header.parent_hash.to_ascii_lowercase();
+                ancestry.push(block.clone());
+                if number == 0 {
+                    // Genesis with no cached state: fall back to the
+                    // allocation, which is the only thing that can seed it.
+                    base = self.genesis_world_state();
+                    break;
+                }
+                cursor = parent;
+            }
+            (ancestry, base)
+        };
+
+        let mut state = base;
+        for block in ancestry.iter().rev() {
+            let (next, _) = execute_block_transactions(&state, block, self.config.chain_id)
+                .map_err(|e| anyhow::anyhow!("replaying block {} failed: {e}", block.header.number))?;
+            state = next;
+            if let Ok(h) = tiger_blockchain::block_hash(&block.header) {
+                self.recent_states.lock().await.insert(&h, state.clone());
+            }
+        }
+
+        self.recent_states
+            .lock()
+            .await
+            .insert(hash, state.clone());
+        Ok(state)
+    }
+
+    /// The state a block at `number` must be executed against.
+    ///
+    /// For a block extending the head that is simply the current state; for a
+    /// side branch it is the state after its parent, which may have to be
+    /// rebuilt. The two are distinguished by whether the named parent is the
+    /// current head, not by height, because at a fork both branches have a
+    /// parent at the same height.
+    async fn state_for_parent_of(
+        &self,
+        block: &tiger_blockchain::types::Block,
+    ) -> Result<WorldState> {
+        let head = {
+            let cm = self.chain_manager.lock().await;
+            let chain = cm.chain();
+            chain
+                .get_block(chain.height())
+                .and_then(|b| tiger_blockchain::block_hash(&b.header).ok())
+        };
+
+        let parent = block.header.parent_hash.to_ascii_lowercase();
+        if head.as_deref().map(|h| h.to_ascii_lowercase()) == Some(parent) {
+            return Ok(self.world_state.lock().await.clone());
+        }
+
+        if block.header.number == 0 {
+            return Ok(self.genesis_world_state());
+        }
+
+        self.state_after_block(&block.header.parent_hash).await
+    }
+
+    /// Rewind the world state to `ancestor` and replay `blocks` in order.
+    ///
+    /// The state at `ancestor` is rebuilt by replaying the canonical branch from
+    /// genesis. Rebuilding is what makes a reorg safe: the alternative,
+    /// reversing each abandoned block's effects, requires an inverse for every
+    /// state transition, and one missing inverse silently corrupts the state.
+    /// Replaying from genesis uses only the forward transition the EVM already
+    /// implements, so a reorg cannot introduce a state the chain could not have
+    /// produced.
+    ///
+    /// Returns the number of blocks replayed after the ancestor.
+    async fn rewind_and_replay(
+        &self,
+        ancestor: u64,
+        blocks: &[tiger_blockchain::types::Block],
+    ) -> Result<usize> {
+        // Start from the state at the ancestor, which is either cached or
+        // rebuilt by replaying the canonical branch up to and including it.
+        let ancestor_hash = {
+            let cm = self.chain_manager.lock().await;
+            cm.chain()
+                .get_block(ancestor)
+                .and_then(|b| tiger_blockchain::block_hash(&b.header).ok())
+                .ok_or_else(|| anyhow::anyhow!("no canonical block at height {ancestor}"))?
+        };
+        let mut state = self.state_after_block(&ancestor_hash).await?;
+
+        // Then apply the winning branch on top of it.
+        let mut applied = 0usize;
+        for block in blocks {
+            let (next, _) = execute_block_transactions(&state, block, self.config.chain_id)
+                .map_err(|e| anyhow::anyhow!("replaying block {} failed: {e}", block.header.number))?;
+            state = next;
+            if let Ok(hash) = tiger_blockchain::block_hash(&block.header) {
+                self.recent_states.lock().await.insert(&hash, state.clone());
+            }
+            applied += 1;
+        }
+
+        *self.world_state.lock().await = state;
+        Ok(applied)
+    }
+
+    /// The world state implied by the genesis allocation alone.
+    fn genesis_world_state(&self) -> WorldState {
+        let mut state = WorldState::new();
+        for (address, account) in &self.genesis.alloc {
+            if let Ok(addr) = parse_address(address) {
+                if let Some(balance) = parse_genesis_balance(&account.balance) {
+                    state.set_balance(&addr, balance);
+                }
+            }
+        }
+        state
+    }
+
+    /// Return transactions that were confirmed on an abandoned branch to the
+    /// mempool.
+    ///
+    /// A reorg un-confirms them, so a client that submitted them should not
+    /// have to notice and resubmit. Anything already on the new canonical
+    /// branch, or already in the pool, is skipped.
+    async fn requeue_reorged_transactions(&self, old_head: &str) {
+        let orphaned = {
+            let cm = self.chain_manager.lock().await;
+            let chain = cm.chain();
+            // Walk the abandoned branch back to the fork point, collecting the
+            // transactions it held.
+            let mut out = Vec::new();
+            let mut cursor = old_head.to_string();
+            loop {
+                let Some(block) = chain.get_block_by_hash(&cursor) else {
+                    break;
+                };
+                if chain.is_canonical(&cursor) {
+                    break;
+                }
+                for tx in &block.transactions {
+                    out.push(tx.clone());
+                }
+                if block.header.number == 0 {
+                    break;
+                }
+                cursor = block.header.parent_hash.clone();
+            }
+            out
+        };
+
+        if orphaned.is_empty() {
+            return;
+        }
+
+        let mut requeued = 0usize;
+        let mut mempool = self.mempool.lock().await;
+        let cm = self.chain_manager.lock().await;
+        for tx in orphaned {
+            // Skip a transaction that the new canonical branch already
+            // contains, which would otherwise be mined twice.
+            if cm.chain().find_transaction(&tx.hash).is_some() {
+                continue;
+            }
+            if mempool.get(&tx.hash).is_some() {
+                continue;
+            }
+            if mempool.add(tx).is_ok() {
+                requeued += 1;
+            }
+        }
+        drop(cm);
+        drop(mempool);
+        if requeued > 0 {
+            info!("returned {requeued} transaction(s) from the abandoned branch to the pool");
+        }
     }
 
     /// Persist the current chain and world state.
@@ -553,6 +836,19 @@ impl TigerNode {
                     .map_err(|e| anyhow::anyhow!("failed to insert genesis block: {e}"))?;
                 info!("Genesis block installed at height 0 (hash: {})", hash);
                 drop(cm);
+
+                // Anchor the replay base to the state the node actually starts
+                // from. A reorg rebuilds state by replaying from genesis, so
+                // that starting point has to be recorded rather than
+                // recomputed: recomputing from the genesis allocation would
+                // silently differ if anything else ever contributes to the
+                // initial state.
+                let genesis_state = self.world_state.lock().await.clone();
+                self.recent_states
+                    .lock()
+                    .await
+                    .insert(&hash, genesis_state);
+
                 self.persist().await;
             }
         }
@@ -1186,6 +1482,19 @@ pub fn produce_block(
         None => format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
     };
 
+    // A PoSA block carries the same difficulty as its parent, so the two
+    // branches of a fork compare on height alone. Genesis has no parent, so it
+    // supplies the chain's initial difficulty from the genesis definition.
+    let parent_difficulty = parent_block
+        .map(|block| block.header.difficulty.clone())
+        .unwrap_or_else(|| format!("0x{:x}", chain_manager.chain().genesis().map(|g| {
+            g.difficulty
+                .strip_prefix("0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .or_else(|| g.difficulty.parse::<u64>().ok())
+                .unwrap_or(1)
+        }).unwrap_or(1)));
+
     // A block's timestamp must be strictly greater than its parent's, and
     // block validation enforces that. Two blocks produced within the same
     // second would otherwise share a timestamp and the second would be
@@ -1341,7 +1650,11 @@ pub fn produce_block(
         transactions_root: format!("0x{}", tiger_blockchain::hex_encode(&tx_root)),
         receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&receipts_root)),
         logs_bloom: format!("0x{}", tiger_blockchain::hex_encode(&logs_bloom)),
-        difficulty: "0".to_string(),
+        // Every PoSA block carries the chain's difficulty, taken from its
+        // parent. Writing zero here, as an earlier version did, made cumulative
+        // work identical on every branch and left fork choice unable to compare
+        // anything but height.
+        difficulty: parent_difficulty.clone(),
         number: block_number,
         gas_limit: BLOCK_GAS_LIMIT,
         gas_used,
@@ -1567,6 +1880,65 @@ fn parse_address(value: &str) -> Result<[u8; 20], String> {
     let mut out = [0u8; 20];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+
+/// Post-execution world states for the most recent blocks, keyed by block hash.
+///
+/// This is a bounded FIFO: inserting past the limit drops the oldest entry.
+/// Bounding it keeps memory proportional to the fork window rather than to the
+/// chain, and because a miss is handled by replaying from genesis, dropping an
+/// entry costs work but never correctness.
+pub struct RecentStates {
+    entries: Vec<(String, WorldState)>,
+    limit: usize,
+}
+
+impl RecentStates {
+    /// How many recent states to retain. A fork deeper than this still works,
+    /// it just costs a replay.
+    pub const DEFAULT_LIMIT: usize = 128;
+
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            limit: Self::DEFAULT_LIMIT,
+        }
+    }
+
+    /// Record the state after `hash` executed, evicting the oldest if full.
+    pub fn insert(&mut self, hash: &str, state: WorldState) {
+        let key = hash.to_ascii_lowercase();
+        if let Some(existing) = self.entries.iter_mut().find(|(h, _)| *h == key) {
+            existing.1 = state;
+            return;
+        }
+        self.entries.push((key, state));
+        while self.entries.len() > self.limit {
+            self.entries.remove(0);
+        }
+    }
+
+    /// The state after `hash` executed, if it is still cached.
+    pub fn get(&self, hash: &str) -> Option<WorldState> {
+        let key = hash.to_ascii_lowercase();
+        self.entries
+            .iter()
+            .find(|(h, _)| *h == key)
+            .map(|(_, state)| state.clone())
+    }
+
+    /// Forget everything, so a reload does not serve states from the chain the
+    /// node has just replaced.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+}
+
+impl Default for RecentStates {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The key used to seal blocks in tests.
@@ -1826,7 +2198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_block_that_does_not_extend_the_head_is_rejected() {
+    async fn a_block_whose_parent_is_unknown_is_rejected() {
         let (node, mut producer_cm, mut producer_world, miner) = node_and_producer().await;
         // Produce block 1 on the producer, but give the node only block 2, so
         // the node sees a block whose parent it does not have.
@@ -1835,8 +2207,156 @@ mod tests {
 
         let error = node.import_block(block).await.unwrap_err().to_string();
         assert!(
-            error.contains("does not extend the head"),
+            error.contains("which is not known"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// A block that does not extend the head but *does* build on a known block
+    /// is a side branch: it must be accepted into the tree without moving the
+    /// head, because a later block on it may win.
+    #[tokio::test]
+    async fn a_side_branch_block_is_accepted_without_moving_the_head() {
+        let (node, mut producer_cm, mut producer_world, miner) = node_and_producer().await;
+
+        // The node follows the producer's block 1.
+        let block1 = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[]);
+        assert!(node.import_block(block1.clone()).await.unwrap());
+        assert_eq!(node.get_chain_manager().await.chain().height(), 1);
+
+        // A competing block at height 1 built on genesis. Its timestamp is
+        // varied until its hash exceeds block1's, so fork choice is guaranteed
+        // to keep block1: the test is about side-branch handling, not about
+        // which hash happens to win.
+        let block1_hash = tiger_blockchain::block_hash(&block1.header).unwrap();
+        let mut fork = block1.clone();
+        let mut found = false;
+        for step in 0..10_000u64 {
+            fork = block1.clone();
+            fork.header.timestamp = block1.header.timestamp + 1 + step;
+            fork.header.extra_data =
+                tiger_blockchain::seal_header(&fork.header, &TESTS_SEAL_KEY).unwrap();
+            if tiger_blockchain::block_hash(&fork.header).unwrap() > block1_hash {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not build a fork that loses the hash tie-break");
+
+        assert!(
+            node.import_block(fork.clone()).await.unwrap(),
+            "a side branch block is stored, not rejected"
+        );
+
+        let cm = node.get_chain_manager().await;
+        assert_eq!(cm.chain().height(), 1, "the head must not move");
+        // The fork is in the tree so a block building on it can be validated.
+        let fork_hash = tiger_blockchain::block_hash(&fork.header).unwrap();
+        assert!(cm.chain().get_block_by_hash(&fork_hash).is_some());
+        assert!(!cm.chain().is_canonical(&fork_hash));
+    }
+
+    /// A heavier competing branch must reorganise the node: the head moves,
+    /// the world state is rebuilt from the winning branch, and a transaction
+    /// that was only on the abandoned branch is no longer confirmed.
+    #[tokio::test]
+    async fn a_heavier_branch_reorganises_the_node_and_rebuilds_state() {
+        // Fund the sender in genesis itself. A reorg rebuilds state by
+        // replaying from genesis, so any balance that exists only in memory
+        // would be lost by the replay and the test would be asserting against
+        // a state the chain could not actually reproduce.
+        let sender_key = [0x46u8; 32];
+        let sender = tiger_crypto::private_key_to_address(&sender_key).unwrap();
+        let recipient = [0x22u8; 20];
+
+        let mut genesis = create_genesis_block(6666);
+        genesis.alloc.insert(
+            format!("0x{}", tiger_blockchain::hex_encode(&sender)),
+            tiger_blockchain::types::Account {
+                balance: "0xf4240".to_string(), // 1_000_000
+                nonce: None,
+                code: None,
+                storage: std::collections::HashMap::new(),
+            },
+        );
+
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            data_dir: std::env::temp_dir()
+                .join(format!("tiger-reorg-test-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default_mainnet()
+        };
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .expect("node must initialize"),
+        );
+        node.start().await.expect("node must start");
+
+        // The producer and the fork builder both start from the same genesis,
+        // exactly as two real validators would.
+        let mut producer_cm = chain_manager();
+        producer_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let mut producer_world = state_from_genesis(&genesis);
+
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+
+        // Branch A: genesis -> a1, carrying a transfer.
+        let transfer = signed_transfer(sender_key, 0, recipient, 5_000);
+        let a1 = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[transfer]);
+        assert!(node.import_block(a1.clone()).await.unwrap());
+        assert_ne!(
+            node.world_state().lock().await.balance(&recipient),
+            u256_from_u64(0),
+            "branch A must have credited the recipient"
+        );
+
+        // Branch B: an independent producer forks from genesis and builds two
+        // blocks, neither carrying the transfer.
+        let mut fork_cm = chain_manager();
+        fork_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let mut fork_world = state_from_genesis(&genesis);
+
+        let b1 = build_block(&mut fork_cm, &mut fork_world, 1, &miner, &[]);
+        assert!(
+            node.import_block(b1.clone()).await.unwrap(),
+            "b1 is a side branch, accepted but not canonical"
+        );
+        let b2 = build_block(&mut fork_cm, &mut fork_world, 2, &miner, &[]);
+
+        assert!(
+            node.import_block(b2.clone()).await.unwrap(),
+            "b2 makes branch B heavier than branch A"
+        );
+
+        let cm = node.get_chain_manager().await;
+        assert_eq!(cm.chain().height(), 2, "the node must follow the heavier branch");
+        let b2_hash = tiger_blockchain::block_hash(&b2.header).unwrap();
+        assert!(cm.chain().is_canonical(&b2_hash), "b2 must be the head");
+        let a1_hash = tiger_blockchain::block_hash(&a1.header).unwrap();
+        assert!(!cm.chain().is_canonical(&a1_hash), "branch A is abandoned");
+        drop(cm);
+
+        // The state must be the one branch B implies: the recipient's credit
+        // from branch A is gone, and the sender's balance is back to its
+        // genesis value, since B carries no transfer.
+        let world = node.world_state().lock().await;
+        assert_eq!(
+            world.balance(&recipient),
+            u256_from_u64(0),
+            "the abandoned branch's state changes must be rolled back"
+        );
+        assert_eq!(
+            world.balance(&sender),
+            u256_from_u64(1_000_000),
+            "the transfer from the abandoned branch must not be applied"
         );
     }
 

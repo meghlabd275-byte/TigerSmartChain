@@ -674,6 +674,15 @@ pub fn validate_block(
                 found: header.parent_hash.clone(),
             });
         }
+        // The difficulty is not free for a block to choose. Fork choice weighs
+        // a branch by the work its blocks claim, so a validator that could
+        // write any difficulty could claim more work than it did and win a
+        // fork it should lose. Requiring every block to carry the chain's
+        // configured difficulty makes the two branches of a fork compare on
+        // height alone, which is the PoSA rule.
+        if !difficulty_matches(header, parent, config) {
+            return Err(ValidationError::MalformedField("difficulty"));
+        }
         if header.timestamp <= parent.header.timestamp {
             return Err(ValidationError::NonMonotonicTimestamp {
                 parent: parent.header.timestamp,
@@ -715,6 +724,25 @@ pub fn validate_block(
     }
 
     Ok(())
+}
+
+/// Whether a block's declared difficulty is the one the chain requires.
+///
+/// PoSA blocks all carry the same difficulty, taken from the genesis
+/// definition, so a valid block's difficulty is simply its parent's. Comparing
+/// against the parent rather than against a constant means a chain whose
+/// genesis names any value still validates, and it needs no extra config.
+fn difficulty_matches(
+    header: &BlockHeader,
+    parent: &Block,
+    _config: &crate::types::ChainConfig,
+) -> bool {
+    // Compare numerically rather than as strings: `0x1`, `0x01` and `1` are
+    // the same difficulty, and a peer is entitled to send any of them.
+    match (decode_hex_quantity(&header.difficulty), decode_hex_quantity(&parent.header.difficulty)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Lowercase hex encoding.
