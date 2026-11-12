@@ -1,11 +1,16 @@
 //! TigerScan API Module
 //! High-performance API server
 
-pub mod types;
-pub mod routes;
+pub mod chain;
 pub mod handlers;
 pub mod middleware;
+pub mod routes;
+pub mod rpc;
 pub mod server;
+pub mod types;
 
-pub use types::*;
+pub use chain::*;
+pub use handlers::*;
+pub use rpc::*;
 pub use server::*;
+pub use types::*;
