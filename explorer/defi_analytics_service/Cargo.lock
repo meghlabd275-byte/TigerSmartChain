@@ -67,6 +67,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3704,6 +3710,7 @@ dependencies = [
 name = "tigerscan_defi_analytics"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "ethers",

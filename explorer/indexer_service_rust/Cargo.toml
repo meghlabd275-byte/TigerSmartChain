@@ -16,6 +16,7 @@ parking_lot = "0.12"
 anyhow = "1.0"
 hex = "0.4"
 
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 opt-level = 3
 lto = true

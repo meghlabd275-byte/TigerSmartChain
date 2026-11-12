@@ -21,6 +21,8 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 base64 = "0.21"
 
+anyhow = "1.0"
+parking_lot = "0.12"
 [lib]
 name = "tigerscan_nft_metadata"
 path = "src/lib.rs"

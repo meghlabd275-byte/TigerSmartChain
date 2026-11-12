@@ -3631,6 +3631,7 @@ name = "tigerscan_multisig"
 version = "1.0.0"
 dependencies = [
  "ethers",
+ "parking_lot",
  "serde",
  "sqlx",
  "tokio",

@@ -1572,9 +1572,3 @@ func (h *Handler) queryResource(c *gin.Context, resource string, defLimit int) {
 	}
 	respondList(c, rows, int(total))
 }
-
-// getMockData is retained as a thin alias so existing route registrations keep
-// compiling; it now delegates to the real database-backed queryResource.
-func (h *Handler) getMockData(c *gin.Context, resource string, count int) {
-	h.queryResource(c, resource, count)
-}

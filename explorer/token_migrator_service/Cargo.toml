@@ -12,6 +12,7 @@ parking_lot = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 
+thiserror = "1.0"
 [lib]
 name = "token_migrator_service"
 path = "src/lib.rs"

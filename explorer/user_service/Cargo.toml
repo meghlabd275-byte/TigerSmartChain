@@ -19,6 +19,7 @@ sha2 = "0.10"
 base64 = "0.21"
 aes-gcm = "0.10"
 
+hex = "0.4"
 [lib]
 name = "user_service"
 path = "src/lib.rs"

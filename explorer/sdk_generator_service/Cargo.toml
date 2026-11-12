@@ -9,6 +9,7 @@ serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 
+chrono = { version = "0.4", features = ["serde"] }
 [lib]
 name = "sdk_generator_service"
 path = "src/lib.rs"

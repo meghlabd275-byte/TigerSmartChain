@@ -91,19 +91,37 @@ impl AnalyticsEngine {
         prices.values().map(|p| p.market_cap).sum()
     }
 
-    /// Detect whale activity
-    pub async fn detect_whale(&self, address: &str, amount_usd: f64) -> Option<WhaleAlert> {
-        if amount_usd >= self.config.whale_threshold_usd {
-            Some(WhaleAlert {
-                address: address.to_string(),
-                amount_usd,
-                timestamp: chrono::Utc::now().timestamp(),
-                alert_type: "large_transfer".to_string(),
-            })
-        } else {
-            None
+    /// Record a whale alert when a transfer exceeds the configured threshold.
+    ///
+    /// The alert is appended to the engine's alert log, so `whale_alerts`
+    /// reflects the transfers that were actually observed.
+    pub async fn detect_whale(
+        &self,
+        address: &str,
+        amount_usd: f64,
+        transaction_hash: Option<String>,
+        tokens: Option<Vec<String>>,
+    ) -> Option<WhaleAlert> {
+        if amount_usd < self.config.whale_threshold_usd {
+            return None;
         }
+
+        let alert = WhaleAlert {
+            address: address.to_string(),
+            amount_usd,
+            timestamp: chrono::Utc::now().timestamp(),
+            alert_type: "large_transfer".to_string(),
+            transaction_hash,
+            tokens,
+        };
+
+        self.whale_alerts.write().await.push(alert.clone());
+
+        Some(alert)
+    }
+
+    /// The whale alerts recorded so far.
+    pub async fn whale_alerts(&self) -> Vec<WhaleAlert> {
+        self.whale_alerts.read().await.clone()
     }
 }
-
-use chrono::Utc;

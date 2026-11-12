@@ -816,17 +816,28 @@ pub fn analyze_contract(contract: Contract) -> Result<ContractAnalysis, Analysis
     analyzer.add_contract(contract);
     
     analyzer.analyze()?;
-    
-    let contracts = analyzer.contracts;
-    let contract = contracts.values().next().unwrap();
-    
+
+    // Collect every derived value before moving `contracts` out of the
+    // analyzer; the later borrows would otherwise be illegal.
+    let call_graph = analyzer.get_call_graph().clone();
+    let inheritance_graph = analyzer.get_inheritance_graph().clone();
+    let reentrancy_warnings = analyzer.detect_reentrancy();
+    let unprotected_warnings = analyzer.detect_unprotected();
+
+    let contract = analyzer
+        .contracts
+        .values()
+        .next()
+        .ok_or_else(|| AnalysisError::ParseError("no contract was analysed".to_string()))?
+        .clone();
+
     Ok(ContractAnalysis {
         contract: contract.name.clone(),
-        call_graph: analyzer.get_call_graph().clone(),
-        inheritance_graph: analyzer.get_inheritance_graph().clone(),
+        call_graph,
+        inheritance_graph,
         storage_layouts: analyzer.get_storage_layout(&contract.address).cloned(),
-        reentrancy_warnings: analyzer.detect_reentrancy(),
-        unprotected_warnings: analyzer.detect_unprotected(),
+        reentrancy_warnings,
+        unprotected_warnings,
     })
 }
 

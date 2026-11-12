@@ -18,22 +18,33 @@ pub struct SlackMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackBlock {
-    pub type: String,
+    pub r#type: String,
     pub text: Option<SlackText>,
     pub elements: Option<Vec<SlackElement>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackText {
-    pub type: String,
+    pub r#type: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackElement {
-    pub type: String,
+    pub r#type: String,
     pub text: Option<String>,
     pub url: Option<String>,
+}
+
+/// The first `len` characters of `value`, or all of it when it is shorter.
+///
+/// Slicing a hash by index panics when the value is truncated, which happens
+/// whenever a caller passes a malformed identifier.
+fn safe_prefix(value: &str, len: usize) -> &str {
+    match value.char_indices().nth(len) {
+        Some((index, _)) => &value[..index],
+        None => value,
+    }
 }
 
 pub struct SlackService {
@@ -53,11 +64,21 @@ impl SlackService {
             channel: None,
             blocks: None,
         };
-        client.post(&self.config.webhook_url)
+        let response = client
+            .post(&self.config.webhook_url)
             .json(&payload)
             .send()
             .await
             .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "slack webhook returned {}: {}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            ));
+        }
+
         Ok(())
     }
 
@@ -69,11 +90,21 @@ impl SlackService {
             channel: Some(self.config.channel_id.clone()),
             blocks: Some(blocks),
         };
-        client.post(&self.config.webhook_url)
+        let response = client
+            .post(&self.config.webhook_url)
             .json(&payload)
             .send()
             .await
             .map_err(|e| e.to_string())?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "slack webhook returned {}: {}",
+                response.status(),
+                response.text().await.unwrap_or_default()
+            ));
+        }
+
         Ok(())
     }
 
@@ -81,17 +112,17 @@ impl SlackService {
     pub async fn send_price_alert(&self, token: &str, price: f64, condition: &str) {
         let blocks = vec![
             SlackBlock {
-                type: "section".to_string(),
+                r#type: "section".to_string(),
                 text: Some(SlackText {
-                    type: "mrkdwn".to_string(),
-                    text: format!("*🔔 Price Alert*"),
+                    r#type: "mrkdwn".to_string(),
+                    text: "*🔔 Price Alert*".to_string(),
                 }),
                 elements: None,
             },
             SlackBlock {
-                type: "section".to_string(),
+                r#type: "section".to_string(),
                 text: Some(SlackText {
-                    type: "mrkdwn".to_string(),
+                    r#type: "mrkdwn".to_string(),
                     text: format!("Token: `{}`\nCondition: {}\nPrice: ${:.2}", token, condition, price),
                 }),
                 elements: None,
@@ -104,19 +135,19 @@ impl SlackService {
     pub async fn send_tx_notification(&self, tx_hash: &str, from: &str, to: &str, value: &str) {
         let blocks = vec![
             SlackBlock {
-                type: "section".to_string(),
+                r#type: "section".to_string(),
                 text: Some(SlackText {
-                    type: "mrkdwn".to_string(),
-                    text: format!("*📝 Transaction Confirmed*"),
+                    r#type: "mrkdwn".to_string(),
+                    text: "*📝 Transaction Confirmed*".to_string(),
                 }),
                 elements: None,
             },
             SlackBlock {
-                type: "section".to_string(),
+                r#type: "section".to_string(),
                 text: Some(SlackText {
-                    type: "mrkdwn".to_string(),
+                    r#type: "mrkdwn".to_string(),
                     text: format!("Hash: `{}`\nFrom: `{}`\nTo: `{}`\nValue: {}", 
-                        &tx_hash[..10], &from[..8], &to[..8], value),
+                        safe_prefix(tx_hash, 10), safe_prefix(from, 8), safe_prefix(to, 8), value),
                 }),
                 elements: None,
             },
@@ -128,17 +159,17 @@ impl SlackService {
     pub async fn send_whale_alert(&self, address: &str, value: f64) {
         let blocks = vec![
             SlackBlock {
-                type: "section".to_string(),
+                r#type: "section".to_string(),
                 text: Some(SlackText {
-                    type: "mrkdwn".to_string(),
+                    r#type: "mrkdwn".to_string(),
                     text: "*🐋 Whale Alert!*".to_string(),
                 }),
                 elements: None,
             },
             SlackBlock {
-                type: "section".to_string(),
+                r#type: "section".to_string(),
                 text: Some(SlackText {
-                    type: "mrkdwn".to_string(),
+                    r#type: "mrkdwn".to_string(),
                     text: format!("Address: `{}`\nValue: ${:.2}", address, value),
                 }),
                 elements: None,
@@ -164,9 +195,9 @@ impl SlackService {
         
         match parts.first() {
             Some(&"price") => format!("Token price for {}: $XXX", parts.get(1).unwrap_or(&"ETH")),
-            Some(&"tx") => format!("Transaction info for {}: ...", parts.get(1).unwrap_or(&"0x..."))),
-            Some(&"balance") => format!("Balance for {}: XXX TGR", parts.get(1).unwrap_or(&"0x..."))),
-            Some(&"help") => format!("Available commands: price, tx, balance, help"),
+            Some(&"tx") => format!("Transaction info for {}: ...", parts.get(1).unwrap_or(&"0x...")),
+            Some(&"balance") => format!("Balance for {}: XXX TGR", parts.get(1).unwrap_or(&"0x...")),
+            Some(&"help") => "Available commands: price, tx, balance, help".to_string(),
             _ => "Unknown command. Try: price, tx, balance, help".to_string(),
         }
     }

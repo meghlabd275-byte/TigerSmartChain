@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_detector() {
-        let detector = MEVDetector::new(MEVConfig::default());
+        let mut detector = MEVDetector::new(MEVConfig::default());
         
         // Test detection
         let result = detector.detect(

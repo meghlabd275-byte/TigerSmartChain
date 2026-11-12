@@ -3631,8 +3631,10 @@ name = "tigerscan_account_abstraction"
 version = "1.0.0"
 dependencies = [
  "ethers",
+ "rand 0.8.8",
  "serde",
  "sqlx",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]

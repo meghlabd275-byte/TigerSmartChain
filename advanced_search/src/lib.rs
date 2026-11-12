@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use regex::Regex;
 use std::sync::Mutex;
 
 // ============================================
@@ -51,7 +50,7 @@ pub struct BytecodeMatch {
     pub match_type: BytecodeMatchType,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BytecodeMatchType {
     Exact,
     Substring,
@@ -59,6 +58,33 @@ pub enum BytecodeMatchType {
     DeployedBytecode,
     ConstructorBytecode,
     RuntimeBytecode,
+}
+
+impl BytecodeMatchType {
+    /// How strong this kind of match is. Higher is a closer match, so callers
+    /// can rank results without depending on variant declaration order.
+    pub fn rank(&self) -> u8 {
+        match self {
+            BytecodeMatchType::Exact => 6,
+            BytecodeMatchType::DeployedBytecode => 5,
+            BytecodeMatchType::RuntimeBytecode => 4,
+            BytecodeMatchType::ConstructorBytecode => 3,
+            BytecodeMatchType::Substring => 2,
+            BytecodeMatchType::Pattern => 1,
+        }
+    }
+}
+
+impl Ord for BytecodeMatchType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for BytecodeMatchType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +143,8 @@ pub struct SearchFilters {
     pub min_value: Option<u64>,
     pub max_value: Option<u64>,
     pub has_error: Option<bool>,
+    /// Maximum number of results to return.
+    pub limit: Option<usize>,
 }
 
 // ============================================

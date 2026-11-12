@@ -143,7 +143,7 @@ impl MetadataFetcher {
             background_color: None,
             animation_url: None,
             youtube_url: None,
-            external_metadata: Some(text),
+            external_metadata: Some(serde_json::Value::String(text)),
         })
     }
 
