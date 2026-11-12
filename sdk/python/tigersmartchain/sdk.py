@@ -20,7 +20,23 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .crypto import (
+    derive_address,
+    is_valid_address,
+    keccak256,
+    sign_message,
+    sign_transaction,
+    verify_message,
+)
+
 __version__ = "1.0.0"
+
+
+def _to_hex(value) -> str:
+    """A 0x-prefixed hex string for bytes, or the value unchanged if already one."""
+    if isinstance(value, (bytes, bytearray)):
+        return "0x" + bytes(value).hex()
+    return value
 
 
 class ChainID(enum.Enum):
@@ -739,86 +755,232 @@ class TigerScanSDK:
 
 
 class Wallet:
-    """Wallet for signing and sending transactions"""
-    
+    """A private key that can sign messages and send transactions.
+
+    Transactions are signed locally with real secp256k1 ECDSA and broadcast as
+    raw bytes over `eth_sendRawTransaction`. The private key never leaves this
+    process.
+    """
+
     def __init__(
         self,
         private_key: str,
-        sdk: Optional[TigerScanSDK] = None,
-        rpc_url: Optional[str] = None
+        sdk: Optional["TigerScanSDK"] = None,
+        rpc_url: Optional[str] = None,
+        chain_id: Optional[int] = None,
     ):
         self.private_key = private_key
         self.sdk = sdk
         self.rpc_url = rpc_url or os.environ.get("TIGERSCAN_RPC_URL", "http://localhost:8545")
-        
-        # Derive address from private key
-        self.address = self._derive_address()
-    
-    def _derive_address(self) -> str:
-        """Derive address from private key"""
-        # In production, use eth_keys library
-        return "0x" + hashlib.new("keccak256", 
-            self.private_key.encode()
-        ).hexdigest()[-40:]
-    
-    def get_nonce(self) -> int:
-        """Get account nonce"""
-        # Use RPC in production
-        return 0
-    
+        self.chain_id = chain_id
+
+        # The address comes from the key, so it is correct even with no node.
+        self.address = derive_address(private_key)
+
+    # -- RPC ---------------------------------------------------------------
+
+    def _rpc(self, method: str, params: Optional[list] = None):
+        """Call the node directly. Raises on a transport or node error."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params or [],
+        }
+        response = requests.post(self.rpc_url, json=payload, timeout=30)
+        response.raise_for_status()
+        body = response.json()
+        if "error" in body:
+            raise RuntimeError(f"{method} failed: {body['error']}")
+        return body.get("result")
+
+    def get_nonce(self, block: str = "pending") -> int:
+        """The account's next nonce, read from the node.
+
+        Reading it from the node matters: reusing a nonce replaces a pending
+        transaction, and a stale nonce makes the new one unminable.
+        """
+        result = self._rpc("eth_getTransactionCount", [self.address, block])
+        if result is None:
+            raise RuntimeError("the node returned no nonce")
+        return int(result, 16)
+
+    def get_chain_id(self) -> int:
+        """The chain id, cached once read."""
+        if self.chain_id is None:
+            result = self._rpc("eth_chainId")
+            if result is None:
+                raise RuntimeError("the node returned no chain id")
+            self.chain_id = int(result, 16)
+        return self.chain_id
+
+    def get_gas_price(self) -> int:
+        """The current gas price."""
+        result = self._rpc("eth_gasPrice")
+        if result is None:
+            raise RuntimeError("the node returned no gas price")
+        return int(result, 16)
+
+    def get_balance(self) -> int:
+        """The account's balance in wei."""
+        result = self._rpc("eth_getBalance", [self.address, "latest"])
+        return int(result, 16) if result else 0
+
+    def estimate_gas(self, tx: Dict) -> int:
+        """Gas the node estimates for a transaction."""
+        result = self._rpc("eth_estimateGas", [tx])
+        return int(result, 16) if result else 21000
+
+    # -- Signing -----------------------------------------------------------
+
+    def sign_message(self, message) -> str:
+        """Sign a message with EIP-191 personal_sign semantics."""
+        return sign_message(message, self.private_key)
+
+    def verify_message(self, message, signature: str) -> bool:
+        """True when the signature was produced by this wallet's key."""
+        return verify_message(message, signature, self.address)
+
+    def build_transaction(
+        self,
+        to: str,
+        value: int = 0,
+        data: bytes = b"",
+        gas_limit: Optional[int] = None,
+        max_fee_per_gas: Optional[int] = None,
+        max_priority_fee_per_gas: Optional[int] = None,
+        nonce: Optional[int] = None,
+    ) -> Dict:
+        """Assemble a transaction, filling in the fields that come from the
+        node. Fees are read from the chain rather than hardcoded, because a
+        fixed fee is either an overpayment or a rejection."""
+        if not is_valid_address(to):
+            raise ValueError(f"not a valid recipient address: {to}")
+
+        tx: Dict = {
+            "type": 2,
+            "chainId": self.get_chain_id(),
+            "nonce": self.get_nonce() if nonce is None else nonce,
+            "to": to,
+            "value": int(value),
+            "data": _to_hex(data) if data else "0x",
+        }
+
+        if max_fee_per_gas is None or max_priority_fee_per_gas is None:
+            priority = self.get_gas_price()
+            tx["maxPriorityFeePerGas"] = max_priority_fee_per_gas if max_priority_fee_per_gas is not None else priority
+            tx["maxFeePerGas"] = max_fee_per_gas if max_fee_per_gas is not None else priority * 2
+        else:
+            tx["maxFeePerGas"] = max_fee_per_gas
+            tx["maxPriorityFeePerGas"] = max_priority_fee_per_gas
+
+        tx["gas"] = self.estimate_gas(tx) if gas_limit is None else gas_limit
+        return tx
+
+    def sign_transaction(self, tx: Dict) -> str:
+        """Sign a transaction, returning the raw bytes as hex."""
+        return sign_transaction(tx, self.private_key, self.get_chain_id())
+
+    def send_raw_transaction(self, raw: str) -> str:
+        """Broadcast signed transaction bytes, returning the transaction hash."""
+        result = self._rpc("eth_sendRawTransaction", [raw])
+        if not result:
+            raise RuntimeError("the node did not return a transaction hash")
+        return result
+
     def send_transaction(
         self,
         to: str,
-        value: str = "0",
-        gas_limit: int = 21000,
-        gas_price: Optional[int] = None
+        value: int = 0,
+        data: bytes = b"",
+        gas_limit: Optional[int] = None,
+        gas_price: Optional[int] = None,
     ) -> str:
-        """Send a transaction"""
-        if not self.sdk:
-            raise ValueError("SDK required for transaction sending")
-        
-        # Get gas price if not provided
-        if gas_price is None:
-            gas_data = self.sdk.get_gas_price()
-            gas_price = int(gas_data.get("standard", "20000000000"))
-        
-        # Build transaction
-        tx = {
-            "to": to,
-            "value": value,
-            "gasLimit": gas_limit,
-            "gasPrice": str(gas_price)
-        }
-        
-        # In production, sign and broadcast via RPC
-        return "0x" + hashlib.new("keccak256", 
-            json.dumps(tx).encode()
-        ).hexdigest()[:64]
-    
-    def transfer_token(
-        self,
-        token_address: str,
-        to: str,
-        amount: str
-    ) -> str:
-        """Transfer tokens"""
-        # ERC-20 transfer
+        """Build, sign and broadcast a transaction, returning its hash."""
+        tx = self.build_transaction(
+            to=to,
+            value=value,
+            data=data,
+            gas_limit=gas_limit,
+            max_fee_per_gas=gas_price,
+            max_priority_fee_per_gas=gas_price,
+        )
+        return self.send_raw_transaction(self.sign_transaction(tx))
+
+    def get_transaction_receipt(self, tx_hash: str) -> Optional[Dict]:
+        """The receipt for a transaction, or None while it is pending."""
+        return self._rpc("eth_getTransactionReceipt", [tx_hash])
+
+    def wait_for_receipt(self, tx_hash: str, timeout: float = 120.0, poll: float = 1.0) -> Optional[Dict]:
+        """Poll until the transaction is mined, or the timeout elapses."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            receipt = self.get_transaction_receipt(tx_hash)
+            if receipt is not None:
+                return receipt
+            time.sleep(poll)
+        return None
+
+    # -- ERC-20 ------------------------------------------------------------
+
+    def transfer_token(self, token_address: str, to: str, amount: int) -> str:
+        """Transfer ERC-20 tokens."""
+        if not is_valid_address(token_address):
+            raise ValueError(f"not a valid token address: {token_address}")
         return self.send_transaction(
             to=token_address,
-            value="0",
-            data=self._encode_transfer(to, amount)
+            value=0,
+            data=encode_erc20_transfer(to, amount),
         )
-    
-    def _encode_transfer(self, to: str, amount: str) -> str:
-        """Encode transfer function call"""
-        # Keccak256("transfer(address,uint256)")
-        method_id = "0xa9059cbb"
-        
-        # Pad addresses and amounts
-        to_padded = to[2:].zfill(64)
-        amount_padded = str(int(amount)).zfill(64)
-        
-        return method_id + to_padded + amount_padded
+
+    def approve_token(self, token_address: str, spender: str, amount: int) -> str:
+        """Approve an ERC-20 allowance."""
+        if not is_valid_address(token_address):
+            raise ValueError(f"not a valid token address: {token_address}")
+        return self.send_transaction(
+            to=token_address,
+            value=0,
+            data=encode_erc20_approve(spender, amount),
+        )
+
+    def get_token_balance(self, token_address: str) -> int:
+        """An ERC-20 balance, read with eth_call."""
+        data = "0x70a08231" + self.address[2:].lower().rjust(64, "0")
+        result = self._rpc("eth_call", [{"to": token_address, "data": data}, "latest"])
+        return int(result, 16) if result and result != "0x" else 0
+
+
+def encode_erc20_transfer(to: str, amount: int) -> bytes:
+    """ABI encoding of transfer(address,uint256).
+
+    The selector is the first four bytes of Keccak-256 of the signature; the
+    arguments follow as 32-byte words.
+    """
+    if not is_valid_address(to):
+        raise ValueError(f"not a valid recipient address: {to}")
+    if amount < 0 or amount >= 2**256:
+        raise ValueError("amount is outside the uint256 range")
+    selector = keccak256(b"transfer(address,uint256)")[:4]
+    return selector + bytes.fromhex(to[2:].lower().rjust(64, "0")) + amount.to_bytes(32, "big")
+
+
+def encode_erc20_approve(spender: str, amount: int) -> bytes:
+    """ABI encoding of approve(address,uint256)."""
+    if not is_valid_address(spender):
+        raise ValueError(f"not a valid spender address: {spender}")
+    if amount < 0 or amount >= 2**256:
+        raise ValueError("amount is outside the uint256 range")
+    selector = keccak256(b"approve(address,uint256)")[:4]
+    return selector + bytes.fromhex(spender[2:].lower().rjust(64, "0")) + amount.to_bytes(32, "big")
+
+
+def encode_erc20_balance_of(owner: str) -> bytes:
+    """ABI encoding of balanceOf(address)."""
+    if not is_valid_address(owner):
+        raise ValueError(f"not a valid owner address: {owner}")
+    selector = keccak256(b"balanceOf(address)")[:4]
+    return selector + bytes.fromhex(owner[2:].lower().rjust(64, "0"))
+
 
 
 # Convenience functions

@@ -10,6 +10,13 @@ from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass
 from enum import Enum
 
+from .crypto import (
+    derive_address,
+    generate_private_key,
+    is_valid_address as _is_valid_address,
+    private_key_to_address,
+)
+
 
 class ChainID(Enum):
     """TigerSmartChain Chain IDs"""
@@ -73,30 +80,20 @@ class TigerSmartChain:
             self._setup_account(private_key)
     
     def _setup_account(self, private_key: str) -> None:
-        """Setup account from private key"""
-        if self.w3 and self._connected:
-            try:
-                account = self.w3.eth.account.from_key(private_key)
-                self.account = Account(
-                    address=account.address,
-                    private_key=private_key,
-                )
-            except:
-                # Fallback for basic key
-                self.account = Account(
-                    address=self._derive_address(private_key),
-                    private_key=private_key,
-                )
-        else:
-            self.account = Account(
-                address=self._derive_address(private_key),
-                private_key=private_key,
-            )
-    
+        """Derive the account's address from its private key.
+
+        The address comes from the key, not from the node: a caller that holds
+        a key can sign and be paid before any RPC connection exists, and the
+        address is the same either way.
+        """
+        self.account = Account(
+            address=derive_address(private_key),
+            private_key=private_key,
+        )
+
     def _derive_address(self, private_key: str) -> str:
-        """Derive address from private key"""
-        # Simplified - use actual implementation in production
-        return "0x" + ("0" * 40)
+        """Derive the checksummed address for a private key."""
+        return derive_address(private_key)
     
     @property
     def is_connected(self) -> bool:
@@ -292,21 +289,22 @@ class TigerSmartChain:
 # =============================================================================
 
 def generate_wallet() -> tuple:
-    """Generate a new wallet"""
-    import secrets
-    private_key = f"0x{secrets.token_hex(32)}"
-    return private_key, f"0x{secrets.token_hex(20)}"
+    """Generate a new wallet, returning (private_key, address).
+
+    The address is derived from the key. An earlier version returned a random
+    20 bytes, which belonged to nobody, so any funds sent to it were lost.
+    """
+    private_key = generate_private_key()
+    return (
+        "0x" + private_key.hex(),
+        private_key_to_address(private_key),
+    )
 
 
 def is_valid_address(address: str) -> bool:
-    """Check if address is valid"""
-    if not address or not address.startswith('0x') or len(address) != 42:
-        return False
-    try:
-        int(address[2:], 16)
-        return True
-    except ValueError:
-        return False
+    """Check that an address is well formed, including its EIP-55 checksum
+    when it is mixed-case."""
+    return _is_valid_address(address)
 
 
 def to_wei(eth_amount: float) -> int:
