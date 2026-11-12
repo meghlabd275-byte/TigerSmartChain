@@ -413,13 +413,13 @@ class APIClient {
   }
 
   // Whale activity
-  async getWhales(params?: { page?: number; limit?: number }): Promise<any[]> {
-    const { data } = await this.client.get<any[]>('/whales', { params })
+  async getWhales(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/whales', { params })
     return data
   }
 
-  async getWhalesByAddress(address: string, params?: { page?: number; limit?: number }): Promise<any[]> {
-    const { data } = await this.client.get<any[]>(`/whales/${address}`, { params })
+  async getWhalesByAddress(address: string, params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>(`/whales/${address}`, { params })
     return data
   }
 
@@ -470,8 +470,8 @@ class APIClient {
   }
 
   // Flash loans
-  async getFlashLoans(params?: { page?: number; limit?: number }): Promise<any[]> {
-    const { data } = await this.client.get<any[]>('/flash-loans', { params })
+  async getFlashLoans(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/flash-loans', { params })
     return data
   }
 
@@ -521,6 +521,17 @@ class APIClient {
 
   async getApprovalsBySpender(address: string, params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
     const { data } = await this.client.get<PaginatedResponse<any>>(`/approvals/spender/${address}`, { params })
+    return data
+  }
+
+  // 24-hour whale, MEV and flash-loan totals, summed in SQL.
+  async getWhaleStats(): Promise<Record<string, string | number>> {
+    const { data } = await this.client.get('/whales/stats')
+    return data
+  }
+
+  async getMEVBundles(params?: { page?: number; limit?: number }): Promise<PaginatedResponse<any>> {
+    const { data } = await this.client.get<PaginatedResponse<any>>('/mev/bundles', { params })
     return data
   }
 }

@@ -305,6 +305,7 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	api.PUT("/watchlist/:address", h.UpdateWatchlistItem)
 
 	// ==================== WHALES (2 endpoints) ====================
+	api.GET("/whales/stats", h.GetWhaleStats)
 	api.GET("/whales", h.GetWhales)
 	api.GET("/whales/:address", h.GetWhalesByAddress)
 

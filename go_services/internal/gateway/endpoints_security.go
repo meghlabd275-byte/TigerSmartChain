@@ -30,6 +30,32 @@ func (h *Handler) GetWhales(c *gin.Context) {
 	respondList(c, rows, int(total))
 }
 
+// GetWhaleStats aggregates whale, MEV and flash-loan activity over the last
+// 24 hours. Each figure is a SQL sum over the indexed tables; there is no
+// estimate, so an unindexed chain reports zero rather than a plausible number.
+func (h *Handler) GetWhaleStats(c *gin.Context) {
+	ctx := c.Request.Context()
+	row, err := h.queryOne(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM whale_transactions) AS whale_transfer_count,
+			(SELECT COALESCE(SUM(value_usd), 0) FROM whale_transactions
+			 WHERE created_at >= NOW() - INTERVAL '24 hours') AS whale_volume_24h,
+			(SELECT COALESCE(SUM(profit_usd), 0) FROM mev_bundles
+			 WHERE inserted_at >= NOW() - INTERVAL '24 hours') AS mev_profit_24h,
+			(SELECT COUNT(*) FROM mev_bundles
+			 WHERE inserted_at >= NOW() - INTERVAL '24 hours') AS mev_bundle_count_24h,
+			(SELECT COALESCE(SUM(profit_usd), 0) FROM flash_loans
+			 WHERE created_at >= NOW() - INTERVAL '24 hours') AS flash_profit_24h,
+			(SELECT COUNT(*) FROM flash_loans
+			 WHERE created_at >= NOW() - INTERVAL '24 hours') AS flash_loan_count_24h
+	`)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
 // GetWhalesByAddress lists whale transfers where the address is either side.
 func (h *Handler) GetWhalesByAddress(c *gin.Context) {
 	addr := c.Param("address")
