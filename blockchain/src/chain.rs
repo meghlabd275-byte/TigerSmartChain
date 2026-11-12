@@ -171,7 +171,11 @@ impl ChainManager {
         } else {
             self.chain.get_block(block.header.number - 1)
         };
-        validate_block(block, parent, &self.chain.config)
+        validate_block(block, parent, &self.chain.config)?;
+        // A block is only acceptable if the validator it names actually sealed
+        // it. Checking the `miner` field alone would let anyone produce a block
+        // in any validator's name.
+        crate::seal::verify_seal(&block.header)
     }
 
     /// Validate then insert a block.
@@ -285,6 +289,18 @@ mod tests {
         }
     }
 
+    /// The key every hand-built test block is sealed with. Real blocks are
+    /// sealed by the proposing validator's key; a test needs one it controls.
+    const TEST_KEY: [u8; 32] = [0x5c; 32];
+
+    /// Seal `block` with [`TEST_KEY`] and set its `miner` to the matching
+    /// address, which is what a real producer does.
+    fn seal(block: &mut Block) {
+        let address = tiger_crypto::private_key_to_address(&TEST_KEY).unwrap();
+        block.header.miner = format!("0x{}", hex_encode(&address));
+        block.header.extra_data = crate::seal::seal_header(&block.header, &TEST_KEY).unwrap();
+    }
+
     fn child_of(parent: &Block, timestamp: u64) -> Block {
         let mut block = genesis();
         block.header.number = parent.header.number + 1;
@@ -297,6 +313,7 @@ mod tests {
             parent.header.gas_used,
             parent.header.gas_limit,
         ));
+        seal(&mut block);
         block
     }
 

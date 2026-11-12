@@ -39,6 +39,17 @@ pub enum ValidationError {
     ReceiptsRootMismatch { expected: String, found: String },
     /// The declared logs bloom does not match the block's receipts.
     LogsBloomMismatch,
+    /// A sealed block carries no seal. Without one there is nothing tying the
+    /// block to the validator its `miner` field names.
+    MissingSeal { number: u64 },
+    /// The seal is present but cannot be recovered to any address.
+    InvalidSeal { number: u64 },
+    /// The seal recovers to a key other than the one the header claims.
+    SealSignerMismatch {
+        number: u64,
+        signer: String,
+        claimed: String,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -78,6 +89,20 @@ impl std::fmt::Display for ValidationError {
             ValidationError::LogsBloomMismatch => {
                 write!(f, "logs bloom does not match the block's receipts")
             }
+            ValidationError::MissingSeal { number } => {
+                write!(f, "block {number} carries no proposer seal")
+            }
+            ValidationError::InvalidSeal { number } => {
+                write!(f, "block {number} carries a seal that cannot be recovered")
+            }
+            ValidationError::SealSignerMismatch {
+                number,
+                signer,
+                claimed,
+            } => write!(
+                f,
+                "block {number} is sealed by {signer} but claims to be from {claimed}"
+            ),
         }
     }
 }

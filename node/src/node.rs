@@ -63,6 +63,11 @@ pub struct TigerNode {
     /// Consensus engine
     consensus: tokio::sync::Mutex<PoSA>,
 
+    /// The key this node seals blocks with, when it is a validator. Parsed
+    /// once at startup so a malformed key is reported then rather than at the
+    /// moment a block is due.
+    validator_key: Option<[u8; 32]>,
+
     /// Network sync status
     sync_status: RwLock<SyncStatus>,
 
@@ -144,6 +149,46 @@ impl TigerNode {
         }
         consensus.update_epoch(0);
 
+        // Parse the sealing key, if one was configured. A validator without a
+        // usable key cannot seal a block, and a block without a seal is
+        // rejected by every peer, so this is reported at startup.
+        let validator_key = match &config.validator_key {
+            Some(raw) => match parse_private_key(raw) {
+                Ok(key) => {
+                    if let Some(claimed) = &config.validator_addr {
+                        match tiger_crypto::private_key_to_address(&key) {
+                            Ok(derived) => {
+                                let derived = format!(
+                                    "0x{}",
+                                    tiger_blockchain::hex_encode(&derived)
+                                );
+                                if !derived.eq_ignore_ascii_case(claimed) {
+                                    warn!(
+                                        "validator key derives address {derived} but \
+                                         --validator-addr says {claimed}; blocks will be \
+                                         sealed as {derived}"
+                                    );
+                                }
+                            }
+                            Err(e) => warn!("cannot derive an address from the validator key: {e}"),
+                        }
+                    }
+                    Some(key)
+                }
+                Err(e) => {
+                    warn!("ignoring unusable validator key: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        if !config.validators.is_empty() && validator_key.is_none() {
+            warn!(
+                "this node is configured as a validator but has no sealing key; it \
+                 cannot produce blocks (set --validator-key)"
+            );
+        }
+
         // Initialize network sync status
         let sync_status = RwLock::new(SyncStatus::default());
 
@@ -169,6 +214,7 @@ impl TigerNode {
             world_state,
             mempool: tokio::sync::Mutex::new(mempool),
             consensus: tokio::sync::Mutex::new(consensus),
+            validator_key,
             sync_status,
             tasks,
             storage,
@@ -615,6 +661,7 @@ impl TigerNode {
                                     next_block,
                                     &proposer,
                                     node.config.chain_id,
+                                    node.validator_key.as_ref(),
                                 )
                             };
 
@@ -1123,6 +1170,7 @@ pub fn produce_block(
     block_number: u64,
     miner: &str,
     chain_id: u64,
+    signing_key: Option<&[u8; 32]>,
 ) -> Result<String, String> {
     use tiger_blockchain::types::{Block, BlockHeader};
     use tiger_blockchain::{block_hash, transactions_root};
@@ -1151,8 +1199,20 @@ pub fn produce_block(
         now.max(parent_timestamp.saturating_add(1))
     };
 
+    // The seal must recover to exactly the address in `miner`, so when this
+    // node holds the signing key that key decides the address. Trusting a
+    // caller-supplied string would let the two disagree and produce a block
+    // that fails its own seal check.
+    let miner = match signing_key {
+        Some(key) => match tiger_crypto::private_key_to_address(key) {
+            Ok(derived) => format!("0x{}", tiger_blockchain::hex_encode(&derived)),
+            Err(e) => return Err(format!("cannot derive the sealing address: {e}")),
+        },
+        None => miner.to_string(),
+    };
+
     let mut coinbase = [0u8; 20];
-    if let Ok(addr) = parse_address(miner) {
+    if let Ok(addr) = parse_address(&miner) {
         coinbase = addr;
     }
 
@@ -1270,13 +1330,13 @@ pub fn produce_block(
     let receipts_root = tiger_blockchain::receipts_root(&receipts);
     let logs_bloom = tiger_blockchain::logs_bloom(&receipts);
 
-    let header = BlockHeader {
+    let mut header = BlockHeader {
         parent_hash,
         sha3_uncles: format!(
             "0x{}",
             tiger_blockchain::hex_encode(&tiger_crypto::keccak256(&[]))
         ),
-        miner: miner.to_string(),
+        miner: miner.clone(),
         state_root: format!("0x{}", tiger_blockchain::hex_encode(&state_root)),
         transactions_root: format!("0x{}", tiger_blockchain::hex_encode(&tx_root)),
         receipts_root: format!("0x{}", tiger_blockchain::hex_encode(&receipts_root)),
@@ -1297,6 +1357,20 @@ pub fn produce_block(
         base_fee_per_gas: Some(base_fee),
         withdrawals_root: None,
     };
+
+    // Seal the header with the proposer's key. Without this a block carries
+    // only a claimed `miner` address and anyone could produce one in a
+    // validator's name, so a node that cannot seal must not produce a block
+    // at all rather than emit one every peer will reject.
+    if block_number >= tiger_blockchain::FIRST_SEALED_BLOCK {
+        let key = signing_key.ok_or_else(|| {
+            format!(
+                "cannot produce block #{block_number}: no validator key to seal it with"
+            )
+        })?;
+        header.extra_data = tiger_blockchain::seal_header(&header, key)
+            .map_err(|e| format!("failed to seal block header: {e}"))?;
+    }
 
     // The block hash is keccak256(RLP(header)), identical to every other
     // Ethereum-compatible client.
@@ -1495,6 +1569,35 @@ fn parse_address(value: &str) -> Result<[u8; 20], String> {
     Ok(out)
 }
 
+/// The key used to seal blocks in tests.
+///
+/// A sealed block is the only kind a node will accept, so tests that build
+/// blocks by hand have to seal them too. Exposed to the rest of the crate
+/// because `debug_rpc`'s tests build blocks the same way.
+#[cfg(test)]
+pub const TESTS_SEAL_KEY: [u8; 32] = [0x5c; 32];
+
+/// Parse a `0x`-prefixed 32-byte private key.
+///
+/// Rejects anything that is not exactly 32 bytes, and the all-zero key, which
+/// is not a valid secp256k1 scalar: accepting it would produce a node that
+/// believes it can seal but whose signatures no peer can verify.
+fn parse_private_key(value: &str) -> Result<[u8; 32], String> {
+    let bytes = hex_decode(value);
+    if bytes.len() != 32 {
+        return Err(format!(
+            "expected a 32-byte private key, got {} bytes",
+            bytes.len()
+        ));
+    }
+    if bytes.iter().all(|&b| b == 0) {
+        return Err("private key is all zero, which is not a valid scalar".to_string());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 /// Parse a `0x`-prefixed hex quantity into a 32-byte big-endian value.
 fn parse_u256(value: &str) -> [u8; 32] {
     let bytes = hex_decode(value);
@@ -1689,7 +1792,7 @@ mod tests {
         miner: &str,
         txs: &[Transaction],
     ) -> tiger_blockchain::types::Block {
-        produce_block(cm, world, txs, number, miner, 6666).unwrap();
+        produce_block(cm, world, txs, number, miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
         cm.chain().get_block(number).cloned().unwrap()
     }
 
@@ -1791,7 +1894,7 @@ mod tests {
         let genesis_hash = block_hash(&genesis.header).unwrap();
         cm.process_block(genesis).unwrap();
 
-        let hash = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666).unwrap();
+        let hash = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
         let block = cm.chain().get_block(1).expect("block 1 must exist");
 
         assert_eq!(block.header.parent_hash, genesis_hash);
@@ -1822,7 +1925,7 @@ mod tests {
             .unwrap();
 
         let txs = vec![signed_transfer(key, 0, recipient, 1234)];
-        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666).unwrap();
+        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
 
         assert_eq!(world.balance(&recipient), u256_from_u64(1234));
         assert_eq!(
@@ -1870,7 +1973,7 @@ mod tests {
             chain_id: None,
         };
 
-        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666).unwrap();
+        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
 
         let block = cm.chain().get_block(1).unwrap();
         // The invalid transaction is excluded from the block, not merely
@@ -1900,6 +2003,7 @@ mod tests {
             1,
             &miner,
             6666,
+            Some(&TESTS_SEAL_KEY),
         )
         .unwrap();
 
@@ -1944,6 +2048,7 @@ mod tests {
             1,
             &miner,
             6666,
+            Some(&TESTS_SEAL_KEY),
         )
         .unwrap();
 
@@ -1951,6 +2056,23 @@ mod tests {
         let mut block = cm.chain().get_block(1).unwrap().clone();
         block.header.receipts_root = hex32(&[0x11u8; 32]);
 
+        // Editing a sealed header breaks the seal, so the tampering is caught
+        // before the receipts are even examined.
+        let mut fresh = chain_manager();
+        fresh
+            .process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+        let err = fresh.process_block_with_receipts(block.clone(), receipts.clone()).unwrap_err();
+        assert!(
+            matches!(err, tiger_blockchain::ValidationError::SealSignerMismatch { .. }),
+            "editing a sealed header must break the seal, got {err}"
+        );
+        assert_eq!(fresh.chain().height(), 0);
+
+        // Re-sealing the tampered header isolates the receipts check, which
+        // must still reject a root that does not match the receipts.
+        block.header.extra_data =
+            tiger_blockchain::seal_header(&block.header, &TESTS_SEAL_KEY).unwrap();
         let mut fresh = chain_manager();
         fresh
             .process_block(genesis_block_from(&create_genesis_block(6666)))
@@ -2060,7 +2182,7 @@ mod tests {
         tx.max_priority_fee_per_gas = Some(1);
         sign_transaction(&mut tx, 6666, &key).unwrap();
 
-        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666).unwrap();
+        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
 
         let block = cm.chain().get_block(1).unwrap();
         assert!(block.transactions.is_empty(), "an under-priced tx must not be mined");
@@ -2091,13 +2213,95 @@ mod tests {
         let txs: Vec<_> = (0..5)
             .map(|nonce| signed_transfer(key, nonce, [0x22u8; 20], 1))
             .collect();
-        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666).unwrap();
+        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
 
         let block = cm.chain().get_block(1).unwrap();
         assert!(block.header.gas_used <= block.header.gas_limit);
         assert_eq!(block.transactions.len(), 5);
         assert_eq!(block.header.gas_used, 5 * 21_000);
         assert_eq!(world.nonce(&sender), 5);
+    }
+
+
+    /// The attack the seal exists to stop, at the node boundary: a block that
+    /// names a validator in its `miner` field but was not signed by that
+    /// validator's key must be refused, and its state changes must not be
+    /// adopted.
+    #[test]
+    fn a_block_forged_in_a_validators_name_is_rejected() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let victim = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        // Produce an honest block, then strip its seal and re-seal it with an
+        // attacker's key while still claiming the victim's address.
+        produce_block(&mut cm, &mut world, &[], 1, &victim, 6666, Some(&TESTS_SEAL_KEY))
+            .unwrap();
+        let honest = cm.chain().get_block(1).unwrap().clone();
+
+        let attacker_key = [0x99u8; 32];
+        let mut forged = honest.clone();
+        forged.header.miner = victim.clone();
+        forged.header.extra_data =
+            tiger_blockchain::seal_header(&forged.header, &attacker_key).unwrap();
+
+        // A fresh chain must refuse it.
+        let mut fresh = chain_manager();
+        fresh
+            .process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+        let err = fresh.process_block(forged).unwrap_err();
+        assert!(
+            matches!(err, tiger_blockchain::ValidationError::SealSignerMismatch { .. }),
+            "a block forged in another validator's name must be rejected, got {err}"
+        );
+        assert_eq!(fresh.chain().height(), 0, "the forged block must not be adopted");
+    }
+
+    /// A block with no seal at all is refused, so a peer cannot sidestep the
+    /// check by simply omitting the seal.
+    #[test]
+    fn an_unsealed_block_is_rejected() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+        produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, Some(&TESTS_SEAL_KEY))
+            .unwrap();
+
+        let mut stripped = cm.chain().get_block(1).unwrap().clone();
+        stripped.header.extra_data = "0x".to_string();
+
+        let mut fresh = chain_manager();
+        fresh
+            .process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+        let err = fresh.process_block(stripped).unwrap_err();
+        assert!(
+            matches!(err, tiger_blockchain::ValidationError::MissingSeal { .. }),
+            "an unsealed block must be rejected, got {err}"
+        );
+    }
+
+    /// A node configured as a validator without a sealing key must not emit a
+    /// block, because every peer would reject it.
+    #[test]
+    fn producing_without_a_key_is_refused() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        let err = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, None).unwrap_err();
+        assert!(
+            err.contains("no validator key"),
+            "expected a refusal to produce, got: {err}"
+        );
+        assert_eq!(cm.chain().height(), 0, "nothing may be produced");
     }
 
 }

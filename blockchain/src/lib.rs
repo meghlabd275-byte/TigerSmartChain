@@ -4,6 +4,7 @@ pub mod block;
 pub mod chain;
 pub mod mempool;
 pub mod receipt;
+pub mod seal;
 pub mod types;
 
 pub use block::{
@@ -14,6 +15,10 @@ pub use block::{
     ValidationError, EMPTY_TRIE_ROOT,
 };
 pub use chain::*;
+pub use seal::{
+    has_seal, recover_sealer, seal_header, verify_seal, FIRST_SEALED_BLOCK, SEAL_LENGTH,
+    SEAL_MAGIC,
+};
 pub use mempool::*;
 pub use receipt::{
     bloom_hex, logs_bloom, receipts_root, validate_bloom, Receipt as BlockReceipt, ReceiptLog,

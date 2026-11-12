@@ -469,7 +469,16 @@ mod tests {
             let number = (index + 1) as u64;
             let mut cm = node.get_chain_manager().await;
             let mut world = node.world_state().lock().await;
-            crate::node::produce_block(&mut cm, &mut world, &txs, number, &miner, 6666).unwrap();
+            crate::node::produce_block(
+                &mut cm,
+                &mut world,
+                &txs,
+                number,
+                &miner,
+                6666,
+                Some(&crate::node::TESTS_SEAL_KEY),
+            )
+            .unwrap();
         }
 
         node
