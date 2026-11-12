@@ -24,7 +24,14 @@ import { WalletConnect } from '@/components/providers'
 import { formatAddress, isValidAddress, isValidHash } from '@/lib/utils'
 import { SearchAutocomplete } from './SearchAutocomplete'
 
-const navItems = [
+interface NavItem {
+  name: string
+  href: string
+  /** Only the entries that are shown with an icon carry one. */
+  icon?: typeof Database
+}
+
+const navItems: NavItem[] = [
   { name: 'Home', href: '/' },
   { name: 'Blockchain', href: '/blocks', icon: Database },
   { name: 'Transactions', href: '/txs', icon: FileText },
@@ -98,7 +105,8 @@ export function Navbar() {
           <div className="hidden md:flex items-center space-x-1">
             {navItems.map((item) => {
               const Icon = item.icon
-              const isActive = pathname === item.href || pathname.startsWith(item.href + '/')
+              const isActive = pathname !== null &&
+                (pathname === item.href || pathname.startsWith(item.href + '/'))
               return (
                 <Link
                   key={item.name}
@@ -109,7 +117,7 @@ export function Navbar() {
                       : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-dark-800'
                   }`}
                 >
-                  <Icon className="w-4 h-4 mr-2" />
+                  {Icon && <Icon className="w-4 h-4 mr-2" />}
                   {item.name}
                 </Link>
               )
@@ -210,7 +218,7 @@ export function Navbar() {
                       : 'text-gray-600 dark:text-gray-300'
                   }`}
                 >
-                  <Icon className="w-5 h-5 mr-3" />
+                  {Icon && <Icon className="w-5 h-5 mr-3" />}
                   {item.name}
                 </Link>
               )

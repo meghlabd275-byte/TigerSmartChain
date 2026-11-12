@@ -8,8 +8,8 @@ import api from '@/lib/api'
 import { formatNumber, formatTimestamp, formatAddress, copyToClipboard } from '@/lib/utils'
 
 export default function BlockPage() {
-  const params = useParams()
-  const number = parseInt(params.number as string)
+  const params = useParams<{ number: string }>()
+  const number = Number.parseInt(params?.number ?? '', 10)
   
   const [data, setData] = useState<any>(null)
   const [transactions, setTransactions] = useState<any[]>([])

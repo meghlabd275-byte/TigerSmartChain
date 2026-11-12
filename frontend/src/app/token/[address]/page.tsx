@@ -9,8 +9,8 @@ import api from '@/lib/api'
 import { formatNumber, formatCurrency, formatPercentage, copyToClipboard } from '@/lib/utils'
 
 export default function TokenPage() {
-  const params = useParams()
-  const address = params.address as string
+  const params = useParams<{ address: string }>()
+  const address = params?.address ?? ''
   
   const [data, setData] = useState<any>(null)
   const [holders, setHolders] = useState<any[]>([])

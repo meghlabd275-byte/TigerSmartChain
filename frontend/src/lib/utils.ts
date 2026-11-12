@@ -15,7 +15,11 @@ export function formatHash(hash: string, startChars = 10, endChars = 8): string 
   return formatAddress(hash, startChars, endChars)
 }
 
-export function formatNumber(num: number | string, decimals = 2): string {
+export function formatNumber(
+  num: number | string | null | undefined,
+  decimals = 2
+): string {
+  if (num === null || num === undefined) return '0'
   const n = typeof num === 'string' ? parseFloat(num) : num
   if (isNaN(n)) return '0'
   

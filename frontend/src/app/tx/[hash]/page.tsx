@@ -8,8 +8,8 @@ import api from '@/lib/api'
 import { formatNumber, formatCurrency, formatAddress, formatTimestamp, formatWei, copyToClipboard } from '@/lib/utils'
 
 export default function TransactionPage() {
-  const params = useParams()
-  const hash = params.hash as string
+  const params = useParams<{ hash: string }>()
+  const hash = params?.hash ?? ''
   
   const [data, setData] = useState<any>(null)
   const [loading, setLoading] = useState(true)

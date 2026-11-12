@@ -67,7 +67,7 @@ export default function DaoPage() {
       case 'active': return <HowToVote />;
       case 'passed': return <CheckCircle />;
       case 'failed': return <Cancel />;
-      default: return null;
+      default: return undefined;
     }
   };
   

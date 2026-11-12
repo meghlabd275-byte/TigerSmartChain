@@ -18,8 +18,8 @@ import { formatNumber, formatCurrency, copyToClipboard, formatTimestamp } from '
 import type { Address as AddressType, Transaction, Token, NFTToken } from '@/types'
 
 export default function AddressPage() {
-  const params = useParams()
-  const address = params.address as string
+  const params = useParams<{ address: string }>()
+  const address = params?.address ?? ''
   
   const [data, setData] = useState<AddressType | null>(null)
   const [transactions, setTransactions] = useState<Transaction[]>([])

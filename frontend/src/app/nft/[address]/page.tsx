@@ -9,8 +9,8 @@ import api from '@/lib/api'
 import { formatNumber, formatCurrency, copyToClipboard, formatTimestamp } from '@/lib/utils'
 
 export default function NFTCollectionPage() {
-  const params = useParams()
-  const address = params.address as string
+  const params = useParams<{ address: string }>()
+  const address = params?.address ?? ''
   
   const [collection, setCollection] = useState<any>(null)
   const [floorHistory, setFloorHistory] = useState<any[]>([])
