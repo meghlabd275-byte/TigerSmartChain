@@ -79,6 +79,13 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
+/// The widest block range one `eth_getLogs` call may scan.
+///
+/// The scan is linear and its result is held in memory, so this bounds the
+/// work a single unauthenticated request can ask for. Clients that need more
+/// page through with successive ranges.
+const MAX_LOG_BLOCK_RANGE: u64 = 5_000;
+
 /// Which browser origins are allowed to call the RPC.
 ///
 /// Empty means none. Answering every request with `Access-Control-Allow-Origin:
@@ -1610,7 +1617,7 @@ async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, S
 
     let manager = node.get_chain_manager().await;
     let chain = manager.chain();
-    let numbers = log_block_numbers(chain, &filter, height);
+    let numbers = log_block_numbers(chain, &filter, height)?;
     Ok(collect_logs(chain, &filter, &numbers))
 }
 
@@ -1650,26 +1657,40 @@ fn parse_log_filter(filter: &Value, height: u64) -> Result<LogFilter, String> {
 }
 
 /// The block numbers a log filter covers, clamped to the chain.
+///
+/// A range wider than [`MAX_LOG_BLOCK_RANGE`] is refused rather than served.
+/// The scan is linear in the number of blocks and holds every matching log in
+/// memory, so an unbounded `fromBlock: 0, toBlock: latest` would let any
+/// unauthenticated caller make the node walk the whole chain and allocate the
+/// result — the cheapest way to take a node down. Real providers impose the
+/// same limit and clients page with a narrower range.
 fn log_block_numbers(
     chain: &tiger_blockchain::Blockchain,
     filter: &LogFilter,
     height: u64,
-) -> Vec<u64> {
+) -> Result<Vec<u64>, String> {
     if let Some(hash) = &filter.block_hash {
-        return match chain.get_block_by_hash(hash) {
+        return Ok(match chain.get_block_by_hash(hash) {
             Some(block) => vec![block.header.number],
             None => Vec::new(),
-        };
+        });
     }
 
     let from = filter.from_block.unwrap_or(0);
     let to = filter.to_block.unwrap_or(height);
     if from > to {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // A block tag of `pending` can exceed the current height; clamp so the
     // scan stays within the chain.
-    (from..=to.min(height)).collect()
+    let to = to.min(height);
+    if to.saturating_sub(from) + 1 > MAX_LOG_BLOCK_RANGE {
+        return Err(format!(
+            "block range too large: {} blocks requested, at most {MAX_LOG_BLOCK_RANGE} may be scanned in one query",
+            to.saturating_sub(from) + 1
+        ));
+    }
+    Ok((from..=to).collect())
 }
 
 /// Collect the logs of `numbers` that match `filter`.
@@ -1840,7 +1861,7 @@ async fn filter_logs(node: &Arc<TigerNode>, id: u64) -> Result<Value, String> {
 
     let manager = node.get_chain_manager().await;
     let chain = manager.chain();
-    let numbers = log_block_numbers(chain, &log_filter, height);
+    let numbers = log_block_numbers(chain, &log_filter, height)?;
     Ok(Value::Array(collect_logs(chain, &log_filter, &numbers)))
 }
 
@@ -2210,6 +2231,63 @@ mod tests {
             parse_header("POST / HTTP/1.1\r\nORIGIN:   https://b.example  \r\n", "Origin"),
             Some("https://b.example".to_string())
         );
+    }
+
+    #[test]
+    fn a_log_range_wider_than_the_cap_is_refused() {
+        let chain = tiger_blockchain::Blockchain::new(tiger_blockchain::ChainConfig::default());
+        let filter = LogFilter {
+            from_block: Some(0),
+            to_block: None,
+            address: None,
+            topics: None,
+            block_hash: None,
+        };
+        // `toBlock` defaults to the head, so at a height above the cap the
+        // default range alone must be refused.
+        let err = log_block_numbers(&chain, &filter, MAX_LOG_BLOCK_RANGE + 10).unwrap_err();
+        assert!(err.contains("block range too large"), "got: {err}");
+
+        // A range exactly at the cap is served.
+        let numbers = log_block_numbers(&chain, &filter, MAX_LOG_BLOCK_RANGE - 1).unwrap();
+        assert_eq!(numbers.len() as u64, MAX_LOG_BLOCK_RANGE);
+
+        // A narrower explicit range is served even at a great height.
+        let narrow = LogFilter {
+            from_block: Some(1_000_000),
+            to_block: Some(1_000_100),
+            address: None,
+            topics: None,
+            block_hash: None,
+        };
+        let numbers = log_block_numbers(&chain, &narrow, 2_000_000).unwrap();
+        assert_eq!(numbers.len(), 101);
+
+        // An inverted range yields nothing rather than an error.
+        let inverted = LogFilter {
+            from_block: Some(50),
+            to_block: Some(10),
+            address: None,
+            topics: None,
+            block_hash: None,
+        };
+        assert!(log_block_numbers(&chain, &inverted, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_log_range_is_clamped_to_the_chain_height() {
+        let chain = tiger_blockchain::Blockchain::new(tiger_blockchain::ChainConfig::default());
+        // `toBlock: pending` can name a block that does not exist yet; the scan
+        // must stop at the head rather than erroring or inventing blocks.
+        let filter = LogFilter {
+            from_block: Some(0),
+            to_block: Some(1_000),
+            address: None,
+            topics: None,
+            block_hash: None,
+        };
+        let numbers = log_block_numbers(&chain, &filter, 3).unwrap();
+        assert_eq!(numbers, vec![0, 1, 2, 3]);
     }
 
     #[test]
