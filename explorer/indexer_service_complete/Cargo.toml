@@ -13,7 +13,6 @@ async-trait = "0.1"
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate", "json"] }
-postgres = "0.21"
 bb8 = "0.8"
 
 # RPC Client
@@ -39,7 +38,6 @@ regex = "1.10"
 
 # Metrics
 prometheus = "0.13"
-metrics = "0.6"
 
 # Config
 config = "0.13"
