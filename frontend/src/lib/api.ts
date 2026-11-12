@@ -558,6 +558,41 @@ class APIClient {
     return data
   }
 
+  // DeFi analytics, read from defi_tvl, defi_tvl_history, lending_rates and
+  // dex_pairs.
+  async getDeFiSummary(): Promise<Record<string, any>> {
+    const { data } = await this.client.get('/defi/summary')
+    return data
+  }
+
+  async getDeFiProtocols(params?: { limit?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/defi/protocols', { params }
+    )
+    return data
+  }
+
+  async getDeFiTVLHistory(params?: { days?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/defi/tvl-history', { params }
+    )
+    return data
+  }
+
+  async getDeFiLending(params?: { limit?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/defi/lending', { params }
+    )
+    return data
+  }
+
+  async getDeFiPools(params?: { limit?: number }): Promise<PaginatedResponse<Record<string, unknown>>> {
+    const { data } = await this.client.get<PaginatedResponse<Record<string, unknown>>>(
+      '/defi/pools', { params }
+    )
+    return data
+  }
+
   // Governance APIs
   async getGovernanceProposals(params?: {
     page?: number

@@ -277,6 +277,11 @@ func (h *Handler) RegisterAllRoutes(router *gin.Engine) {
 	api.GET("/stats/tokens", h.GetTokenStats)
 	api.GET("/stats/nfts", h.GetNFTStats)
 	api.GET("/stats/dex", h.GetDexStats)
+	api.GET("/defi/summary", h.GetDeFiSummary)
+	api.GET("/defi/protocols", h.GetDeFiProtocols)
+	api.GET("/defi/tvl-history", h.GetDeFiTVLHistory)
+	api.GET("/defi/lending", h.GetDeFiLendingRates)
+	api.GET("/defi/pools", h.GetDeFiPools)
 	api.GET("/stats/overview", h.GetStatsOverview)
 	api.GET("/stats/historical", h.GetHistoricalStats)
 
