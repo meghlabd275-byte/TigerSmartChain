@@ -13,6 +13,7 @@ import './tests/staking.test.mjs';
 import './tests/governance.test.mjs';
 import './tests/multisig.test.mjs';
 import './tests/bridge.test.mjs';
+import './tests/stablecoin.test.mjs';
 
 const ok = await run();
 process.exit(ok ? 0 : 1);
