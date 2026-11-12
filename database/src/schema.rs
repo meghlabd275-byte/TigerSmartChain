@@ -704,8 +704,6 @@ pub const ALL_TABLES: &[&str] = &[
     CREATE_PENDING_TX_TABLE,
 ];
 
-use serde::Serialize;
-
 /// Numeric type for currency values
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct USD(f64);
