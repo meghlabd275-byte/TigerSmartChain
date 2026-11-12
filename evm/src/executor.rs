@@ -110,7 +110,37 @@ impl Executor {
         // Only the outermost frame reports `finish`; a nested call must not
         // overwrite the top-level summary with its own.
         let is_outermost = !tracer.in_frame();
-        tracer.enter_frame(ctx.address, code);
+        {
+            // The context carries the caller, value and calldata of whatever
+            // frame is being executed, so the same description is correct for a
+            // transaction's own frame and for a nested call.
+            // A nested frame records where it came from, because `caller` and
+            // `value` report the callee's view rather than the call the caller
+            // issued. A transaction's own frame has no such record: its context
+            // already describes it.
+            let (frame_from, frame_value) = match &ctx.trace_origin {
+                Some(origin) => (origin.from.clone(), origin.value.clone()),
+                None => (ctx.caller.clone(), EvmWord::from_u64(ctx.value)),
+            };
+            let enter = crate::trace::FrameEnter {
+                kind: if is_outermost {
+                    crate::types::FrameKind::Call
+                } else {
+                    ctx.frame_kind
+                },
+                code_address: ctx
+                    .code_address
+                    .clone()
+                    .unwrap_or_else(|| ctx.address.clone()),
+                storage_address: ctx.address.clone(),
+                caller: frame_from,
+                value: frame_value,
+                input: &ctx.data,
+                gas: ctx.gas,
+                is_top_level: is_outermost,
+            };
+            tracer.enter_frame(&enter);
+        }
 
         while pc < code.len() {
             // Flush the opcode executed by the previous iteration now that its
@@ -525,6 +555,16 @@ impl Executor {
                     } else {
                         let mut child = ExecutionContext::new();
                         child.address = new_address.clone();
+                        child.code_address = Some(new_address.clone());
+                        child.frame_kind = crate::types::FrameKind::Create;
+                        child.trace_origin = Some(crate::types::TraceOrigin {
+                            from: ctx.address.clone(),
+                            value: value_word.clone(),
+                        });
+                        // A creation's calldata is empty; the init code is the
+                        // code being executed, and a tracer reports it as the
+                        // frame's input.
+                        child.data = init_code.clone();
                         child.caller = ctx.address.clone();
                         child.origin = ctx.origin.clone();
                         child.gas = ctx.gas.saturating_sub(gas_used);
@@ -585,6 +625,13 @@ impl Executor {
                     } else {
                         let mut child = ExecutionContext::new();
                         child.address = new_address.clone();
+                        child.code_address = Some(new_address.clone());
+                        child.frame_kind = crate::types::FrameKind::Create2;
+                        child.trace_origin = Some(crate::types::TraceOrigin {
+                            from: ctx.address.clone(),
+                            value: value_word.clone(),
+                        });
+                        child.data = init_code.clone();
                         child.caller = ctx.address.clone();
                         child.origin = ctx.origin.clone();
                         child.gas = ctx.gas.saturating_sub(gas_used);
@@ -658,8 +705,6 @@ impl Executor {
                         }
                         _ => unreachable!(),
                     };
-                    let _ = exec_address;
-
                     let callee_code = host.code(&to);
 
                     // Move value before execution for CALL. A failure here
@@ -719,7 +764,30 @@ impl Executor {
                     }
 
                     let mut child = ExecutionContext::new();
-                    child.address = storage_address;
+                    // `address` is the storage context: the caller's own
+                    // account under DELEGATECALL and CALLCODE, the callee's
+                    // otherwise. The code always comes from the target.
+                    child.address = storage_address.clone();
+                    child.code_address = Some(exec_address.clone());
+                    child.frame_kind = match opcode {
+                        Opcode::CALL => crate::types::FrameKind::CallOpcode,
+                        Opcode::CALLCODE => crate::types::FrameKind::CallCode,
+                        Opcode::DELEGATECALL => crate::types::FrameKind::DelegateCall,
+                        Opcode::STATICCALL => crate::types::FrameKind::StaticCall,
+                        _ => crate::types::FrameKind::CallOpcode,
+                    };
+                    // A trace reports the call the caller issued: the account
+                    // that issued it, and the value actually attached. Under
+                    // DELEGATECALL that value is zero even though CALLVALUE
+                    // inside the frame reports the parent's value.
+                    child.trace_origin = Some(crate::types::TraceOrigin {
+                        from: ctx.address.clone(),
+                        value: if opcode == Opcode::DELEGATECALL {
+                            EvmWord::zero()
+                        } else {
+                            value_word.clone()
+                        },
+                    });
                     child.caller = if opcode == Opcode::DELEGATECALL {
                         // The caller of the current frame becomes the caller.
                         ctx.caller.clone()

@@ -34,6 +34,11 @@ impl EvmWord {
         u64::from_be_bytes(bytes)
     }
 
+    /// Render as a decimal string, the form a trace reports `value` in.
+    pub fn to_decimal_string(&self) -> String {
+        self.u256().to_string()
+    }
+
     fn u256(&self) -> ethnum::U256 {
         ethnum::U256::from_be_bytes(self.0)
     }
@@ -292,6 +297,11 @@ impl Address {
         Self([0u8; 20])
     }
 
+    /// Render as `0x`-prefixed lower-case hex, the JSON-RPC form.
+    pub fn to_hex(&self) -> String {
+        format!("0x{}", hex::encode(self.0))
+    }
+
     pub fn from_hex(s: &str) -> Option<Self> {
         let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok()?;
         let mut addr = [0u8; 20];
@@ -435,10 +445,55 @@ impl Storage {
 // EXECUTION
 // =============================================================================
 
+/// Which call family opened a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// The transaction's own frame.
+    Call,
+    /// `CALL`.
+    CallOpcode,
+    /// `CALLCODE`.
+    CallCode,
+    /// `DELEGATECALL`.
+    DelegateCall,
+    /// `STATICCALL`.
+    StaticCall,
+    /// `CREATE`.
+    Create,
+    /// `CREATE2`.
+    Create2,
+}
+
+/// Where a frame came from, for tracing.
+///
+/// This is not the same as [`ExecutionContext::caller`]. `caller` is what the
+/// `CALLER` opcode reports inside the frame, which under `DELEGATECALL` is the
+/// caller's own caller. A trace instead reports the account that issued the
+/// call, and the value actually attached to it, which under `DELEGATECALL` is
+/// zero even though `CALLVALUE` reports the parent's value.
+#[derive(Debug, Clone)]
+pub struct TraceOrigin {
+    /// Account that issued the call.
+    pub from: Address,
+    /// Value attached to the call.
+    pub value: EvmWord,
+}
+
 /// Execution Context
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
+    /// Account whose storage this frame reads and writes. Under
+    /// `DELEGATECALL` and `CALLCODE` this is the caller's account, because the
+    /// callee's code runs in the caller's context.
     pub address: Address,
+    /// Account the executing code was fetched from, when that differs from
+    /// [`Self::address`]. `None` means the code came from `address`.
+    pub code_address: Option<Address>,
+    /// Which call family opened this frame.
+    pub frame_kind: FrameKind,
+    /// Where this frame came from, for tracing. `None` on a transaction's own
+    /// frame, where `caller` and `value` are already the trace values.
+    pub trace_origin: Option<TraceOrigin>,
     pub caller: Address,
     pub origin: Address,
     pub gas: u64,
@@ -464,6 +519,9 @@ impl ExecutionContext {
     pub fn new() -> Self {
         Self {
             address: Address::zero(),
+            code_address: None,
+            frame_kind: FrameKind::Call,
+            trace_origin: None,
             caller: Address::zero(),
             origin: Address::zero(),
             gas: 0,

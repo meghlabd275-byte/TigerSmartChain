@@ -10,12 +10,108 @@
 use crate::node::{state_from_genesis, transaction_to_request, TigerNode};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tiger_evm::trace::{Step, StepTracerBuffer, TraceSummary};
+use tiger_evm::trace::{CallTracer, Step, StepTracerBuffer, StepTracer, TraceSummary};
 
 /// Maximum steps retained per trace. A pathological contract can execute
 /// millions of opcodes; bounding the buffer keeps a trace request from
 /// exhausting node memory.
 const MAX_TRACE_STEPS: usize = 200_000;
+
+/// Maximum call frames retained per trace, for the same reason.
+const MAX_CALL_FRAMES: usize = 4_096;
+
+/// The tracer a request asked for.
+///
+/// The two are dispatched through one enum so `debug_traceTransaction` and
+/// `debug_traceCall` pass a single `&mut dyn StepTracer` to the interpreter
+/// whatever was requested.
+enum Tracer {
+    Opcodes(StepTracerBuffer),
+    Calls(CallTracer),
+}
+
+impl StepTracer for Tracer {
+    fn step(&mut self, step: &Step) {
+        match self {
+            Tracer::Opcodes(t) => t.step(step),
+            Tracer::Calls(t) => t.step(step),
+        }
+    }
+
+    fn finish(&mut self, summary: &TraceSummary) {
+        match self {
+            Tracer::Opcodes(t) => t.finish(summary),
+            Tracer::Calls(t) => t.finish(summary),
+        }
+    }
+
+    fn enter_frame(&mut self, frame: &tiger_evm::trace::FrameEnter) {
+        match self {
+            Tracer::Opcodes(t) => t.enter_frame(frame),
+            Tracer::Calls(t) => t.enter_frame(frame),
+        }
+    }
+
+    fn exit_frame(&mut self, summary: &TraceSummary) {
+        match self {
+            Tracer::Opcodes(t) => t.exit_frame(summary),
+            Tracer::Calls(t) => t.exit_frame(summary),
+        }
+    }
+
+    fn depth(&self) -> u32 {
+        match self {
+            Tracer::Opcodes(t) => t.depth(),
+            Tracer::Calls(t) => t.depth(),
+        }
+    }
+
+    fn in_frame(&self) -> bool {
+        match self {
+            Tracer::Opcodes(t) => t.in_frame(),
+            Tracer::Calls(t) => t.in_frame(),
+        }
+    }
+
+    fn wants_memory(&self) -> bool {
+        match self {
+            Tracer::Opcodes(t) => t.wants_memory(),
+            Tracer::Calls(t) => t.wants_memory(),
+        }
+    }
+}
+
+/// Build the tracer a request asked for.
+///
+/// An unknown tracer name is an error rather than a silent fallback: a client
+/// that asks for a tracer this node does not implement would otherwise receive
+/// a struct log while believing it held a call tree.
+fn build_tracer(trace_config: Option<&Value>) -> Result<Tracer, String> {
+    match tracer_name(trace_config) {
+        "opcodeLogger" | "structLogger" => Ok(Tracer::Opcodes(if wants_memory(trace_config) {
+            StepTracerBuffer::with_memory(MAX_TRACE_STEPS)
+        } else {
+            StepTracerBuffer::new(MAX_TRACE_STEPS)
+        })),
+        "callTracer" => Ok(Tracer::Calls(CallTracer::new(MAX_CALL_FRAMES))),
+        other => Err(format!(
+            "unsupported tracer {other:?}; this node implements \"callTracer\" and \"opcodeLogger\""
+        )),
+    }
+}
+
+/// Render a finished trace in the shape its tracer produces.
+fn render_trace(tracer: &Tracer) -> Result<Value, String> {
+    match tracer {
+        Tracer::Opcodes(t) => trace_response(t),
+        Tracer::Calls(t) => Ok(t.to_json()),
+    }
+}
+
+/// Whether the trace is a call tree rather than a struct log.
+fn is_call_tracer(tracer: &Tracer) -> bool {
+    matches!(tracer, Tracer::Calls(_))
+}
 
 /// Decode a `0x`-prefixed hex quantity.
 fn hex_to_u64(value: &str) -> Result<u64, String> {
@@ -197,11 +293,7 @@ pub async fn debug_trace_transaction(
     }
 
     // Execute the target through the traced transition path.
-    let mut tracer = if wants_memory(trace_config) {
-        StepTracerBuffer::with_memory(MAX_TRACE_STEPS)
-    } else {
-        StepTracerBuffer::new(MAX_TRACE_STEPS)
-    };
+    let mut tracer = build_tracer(trace_config)?;
 
     let outcome = tiger_evm::transition::apply_transaction_traced(
         &mut state,
@@ -211,15 +303,15 @@ pub async fn debug_trace_transaction(
     )
     .map_err(|e| format!("trace replay failed: {e}"))?;
 
-    let _ = tracer_name(trace_config);
-
     let (outcome, diffs) = outcome;
-
-    let mut response = trace_response(&tracer)?;
+    let mut response = render_trace(&tracer)?;
 
     // `gas` is the transaction's total consumption, which includes the
-    // intrinsic charge the interpreter never sees.
-    response["gas"] = json!(format!("0x{:x}", outcome.gas_used));
+    // intrinsic charge the interpreter never sees. A call tree reports it per
+    // frame, so the total is not written over it.
+    if !is_call_tracer(&tracer) {
+        response["gas"] = json!(format!("0x{:x}", outcome.gas_used));
+    }
 
     // The state writes the transaction performed, which `debug_traceTransaction`
     // reports separately from the opcode log.
@@ -306,15 +398,11 @@ pub async fn debug_trace_call(
     ctx.chain_id = node.config().chain_id;
     ctx.block_number = node.get_chain_manager().await.chain().height();
 
-    let mut tracer = if wants_memory(params.get(1)) {
-        StepTracerBuffer::with_memory(MAX_TRACE_STEPS)
-    } else {
-        StepTracerBuffer::new(MAX_TRACE_STEPS)
-    };
+    let mut tracer = build_tracer(params.get(1))?;
 
     Executor::new().execute_traced_with_host(&code, &mut ctx, &mut host, &mut tracer);
 
-    trace_response(&tracer)
+    render_trace(&tracer)
 }
 
 /// `debug_traceBlockByHash`: trace every transaction in the block with this
@@ -562,6 +650,71 @@ mod tests {
         assert_eq!(
             tracer_name(Some(&json!({ "tracer": "callTracer" }))),
             "callTracer"
+        );
+    }
+
+    #[test]
+    fn a_request_for_the_call_tracer_produces_a_call_tracer() {
+        // The tracer name used to be read and discarded, so every request got a
+        // struct log whatever it asked for.
+        let tracer = build_tracer(Some(&json!({ "tracer": "callTracer" })))
+            .expect("callTracer is implemented");
+        assert!(is_call_tracer(&tracer));
+    }
+
+    #[test]
+    fn a_request_for_the_opcode_logger_produces_a_struct_log() {
+        for config in [None, Some(&json!({})), Some(&json!({ "tracer": "opcodeLogger" }))] {
+            let tracer = build_tracer(config).expect("the default is implemented");
+            assert!(!is_call_tracer(&tracer));
+        }
+    }
+
+    #[test]
+    fn an_unknown_tracer_is_refused_rather_than_silently_replaced() {
+        // Answering a request for `4byteTracer` with a struct log would hand the
+        // client a different shape than it asked for and it would not know.
+        let err = match build_tracer(Some(&json!({ "tracer": "4byteTracer" }))) {
+            Ok(_) => panic!("an unimplemented tracer must be an error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("4byteTracer"),
+            "the error names the tracer: {err}"
+        );
+    }
+
+    #[test]
+    fn the_call_tracer_renders_a_call_tree_not_a_struct_log() {
+        let mut tracer = build_tracer(Some(&json!({ "tracer": "callTracer" }))).unwrap();
+        let from = tiger_evm::Address::from_hex("0x00000000000000000000000000000000000000aa")
+            .unwrap();
+        let to = tiger_evm::Address::from_hex("0x00000000000000000000000000000000000000bb")
+            .unwrap();
+        tracer.enter_frame(&tiger_evm::trace::FrameEnter {
+            kind: tiger_evm::trace::FrameKind::Call,
+            code_address: to.clone(),
+            storage_address: to.clone(),
+            caller: from.clone(),
+            value: tiger_evm::EvmWord::zero(),
+            input: &[],
+            gas: 21_000,
+            is_top_level: true,
+        });
+        tracer.exit_frame(&TraceSummary {
+            success: true,
+            gas_used: 21_000,
+            output: Vec::new(),
+            address: to.clone(),
+            steps: 0,
+        });
+
+        let rendered = render_trace(&tracer).unwrap();
+        assert_eq!(rendered["type"], "CALL");
+        assert_eq!(rendered["to"], "0x00000000000000000000000000000000000000bb");
+        assert!(
+            rendered.get("structLogs").is_none(),
+            "a call tree has no structLogs"
         );
     }
 

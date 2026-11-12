@@ -6,6 +6,7 @@
 //! trace a client receives is the trace the interpreter actually performed.
 
 use crate::opcodes::gas_cost;
+pub use crate::types::FrameKind;
 use crate::types::{Address, EvmWord, ExecutionContext, Opcode};
 
 /// A single executed opcode.
@@ -47,6 +48,33 @@ pub struct TraceSummary {
     pub steps: usize,
 }
 
+/// A frame that is about to execute.
+///
+/// This carries what a `callTracer` needs to describe the call and what an
+/// opcode tracer needs to attribute steps to a frame. It is passed to
+/// [`StepTracer::enter_frame`] before the frame's first opcode runs.
+#[derive(Debug, Clone)]
+pub struct FrameEnter<'a> {
+    /// Which call family opened this frame.
+    pub kind: FrameKind,
+    /// Account whose code is executing. For `DELEGATECALL` this is the
+    /// caller's own address, because the callee runs in the caller's context.
+    pub code_address: Address,
+    /// Account whose storage is being read and written. For `CALLCODE` and
+    /// `DELEGATECALL` this is the caller's address, not the callee's.
+    pub storage_address: Address,
+    /// Account that initiated the call.
+    pub caller: Address,
+    /// Value attached to the call, zero when there is none.
+    pub value: EvmWord,
+    /// Calldata, or init code for a creation.
+    pub input: &'a [u8],
+    /// Gas made available to the frame.
+    pub gas: u64,
+    /// Whether this is the transaction's own frame rather than a call.
+    pub is_top_level: bool,
+}
+
 /// Receives execution events. Implementations decide what to retain, which
 /// keeps the interpreter free of allocation when tracing is not requested.
 pub trait StepTracer {
@@ -61,7 +89,7 @@ pub trait StepTracer {
     /// `CALL`, `CALLCODE`, `DELEGATECALL`, `STATICCALL`, `CREATE` and
     /// `CREATE2` it performs. This is what lets a tracer attribute steps to the
     /// frame they belong to and derive the call tree.
-    fn enter_frame(&mut self, _address: Address, _code: &[u8]) {}
+    fn enter_frame(&mut self, _frame: &FrameEnter) {}
 
     /// Called as a frame finishes, innermost first.
     fn exit_frame(&mut self, _summary: &TraceSummary) {}
@@ -157,8 +185,8 @@ impl StepTracer for StepTracerBuffer {
         }
     }
 
-    fn enter_frame(&mut self, address: Address, _code: &[u8]) {
-        self.frames.push(address);
+    fn enter_frame(&mut self, frame: &FrameEnter) {
+        self.frames.push(frame.code_address);
     }
 
     fn exit_frame(&mut self, _summary: &TraceSummary) {
@@ -374,6 +402,374 @@ pub fn context_address(ctx: &ExecutionContext) -> Address {
     ctx.address
 }
 
+// =============================================================================
+// CALL TRACER
+// =============================================================================
+
+/// One frame of a call trace, as `debug_traceTransaction` with the
+/// `callTracer` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallTraceFrame {
+    /// `CALL`, `DELEGATECALL`, `STATICCALL`, `CREATE` and so on.
+    pub call_type: String,
+    /// Account the call came from.
+    pub from: Address,
+    /// Account the call went to. A creation that failed has none, because the
+    /// address was never used.
+    pub to: Option<Address>,
+    /// Value attached to the call, in wei, as a decimal string.
+    pub value: String,
+    /// Calldata, or init code for a creation.
+    pub input: Vec<u8>,
+    /// Return data, or the revert payload.
+    pub output: Vec<u8>,
+    /// Gas made available to the frame.
+    pub gas: u64,
+    /// Gas the frame consumed.
+    pub gas_used: u64,
+    /// Why the frame stopped, when it did not complete normally.
+    pub error: Option<String>,
+    /// Frames this one called, in the order they started.
+    pub calls: Vec<CallTraceFrame>,
+}
+
+impl CallTraceFrame {
+    /// Render the frame as the JSON a `callTracer` returns.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".into(), serde_json::json!(self.call_type));
+        obj.insert("from".into(), serde_json::json!(self.from.to_hex()));
+        if let Some(to) = &self.to {
+            obj.insert("to".into(), serde_json::json!(to.to_hex()));
+        }
+        obj.insert("value".into(), serde_json::json!(self.value));
+        obj.insert("gas".into(), serde_json::json!(format!("0x{:x}", self.gas)));
+        obj.insert(
+            "gasUsed".into(),
+            serde_json::json!(format!("0x{:x}", self.gas_used)),
+        );
+        obj.insert(
+            "input".into(),
+            serde_json::json!(format!("0x{}", hex::encode(&self.input))),
+        );
+        obj.insert(
+            "output".into(),
+            serde_json::json!(format!("0x{}", hex::encode(&self.output))),
+        );
+        if let Some(error) = &self.error {
+            obj.insert("error".into(), serde_json::json!(error));
+        }
+        if !self.calls.is_empty() {
+            let calls: Vec<serde_json::Value> =
+                self.calls.iter().map(|c| c.to_json()).collect();
+            obj.insert("calls".into(), serde_json::json!(calls));
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+/// Builds a call tree from the frames the interpreter reports.
+///
+/// The tree is the same structure `debug_traceTransaction` returns with the
+/// `callTracer`, and it is derived from the execution this node performed
+/// rather than from a second replay: every frame comes from the interpreter
+/// entering it, and every field comes from the frame's own context.
+///
+/// Frames are reported as they are entered and exited, which nests naturally:
+/// a frame that is open when another opens is its parent.
+#[derive(Debug, Default)]
+pub struct CallTracer {
+    /// Frames that have not yet finished, outermost first.
+    open: Vec<PartialFrame>,
+    /// Finished top-level frames, in the order they completed. Normally one.
+    roots: Vec<CallTraceFrame>,
+    /// Set once a frame has been dropped because the cap was reached.
+    truncated: bool,
+    /// Maximum frames to retain. Deeper frames are dropped rather than
+    /// aborting the trace, so a contract that recurses cannot exhaust memory.
+    max_frames: usize,
+    /// One entry per frame entered, in entry order, saying whether that frame
+    /// was retained. Frames nest strictly, so this pairs each `exit_frame` with
+    /// the `enter_frame` that opened it.
+    entered: Vec<bool>,
+}
+
+/// A frame that has been entered but has not exited yet.
+#[derive(Debug)]
+struct PartialFrame {
+    frame: FrameEnterOwned,
+    calls: Vec<CallTraceFrame>,
+}
+
+/// [`FrameEnter`] with its borrowed input copied out.
+#[derive(Debug)]
+struct FrameEnterOwned {
+    kind: FrameKind,
+    code_address: Address,
+    caller: Address,
+    value: EvmWord,
+    input: Vec<u8>,
+    gas: u64,
+}
+
+impl CallTracer {
+    /// A tracer that retains up to `max_frames` frames.
+    pub fn new(max_frames: usize) -> Self {
+        Self {
+            open: Vec::new(),
+            roots: Vec::new(),
+            truncated: false,
+            max_frames,
+            entered: Vec::new(),
+        }
+    }
+
+    /// The completed trace.
+    ///
+    /// A trace normally has exactly one root, the transaction's own frame. More
+    /// than one is possible only if a frame never reported its exit, and the
+    /// roots are then returned in completion order.
+    pub fn roots(&self) -> &[CallTraceFrame] {
+        &self.roots
+    }
+
+    /// The single root, or `None` if no frame completed.
+    pub fn root(&self) -> Option<&CallTraceFrame> {
+        self.roots.first()
+    }
+
+    /// Whether any frame was dropped because the cap was reached.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The trace as the JSON a `callTracer` returns.
+    pub fn to_json(&self) -> serde_json::Value {
+        match self.root() {
+            Some(root) => root.to_json(),
+            None => serde_json::Value::Null,
+        }
+    }
+
+    /// Decide whether a newly entered frame fits under the cap.
+    fn retain(&mut self) -> bool {
+        if self.entered.len() >= self.max_frames {
+            self.truncated = true;
+            self.entered.push(false);
+            return false;
+        }
+        self.entered.push(true);
+        true
+    }
+
+    /// Convert a finished frame, given what the interpreter reported.
+    fn close(&mut self, summary: &TraceSummary) {
+        let partial = match self.open.pop() {
+            Some(p) => p,
+            None => return,
+        };
+        let info = partial.frame;
+
+        // The interpreter reports success and the return data. A frame that
+        // did not succeed either reverted, in which case the payload is the
+        // revert reason, or faulted and produced nothing.
+        let error = if summary.success {
+            None
+        } else {
+            Some(revert_reason(&summary.output))
+        };
+
+        let frame = CallTraceFrame {
+            call_type: call_type_name(info.kind).to_string(),
+            from: info.caller,
+            to: if info.kind == FrameKind::Create || info.kind == FrameKind::Create2 {
+                // A creation that succeeded deployed code at the address it
+                // ran at; one that failed left nothing there.
+                if summary.success {
+                    Some(info.code_address)
+                } else {
+                    None
+                }
+            } else {
+                Some(info.code_address)
+            },
+            value: info.value.to_decimal_string(),
+            input: info.input,
+            output: summary.output.clone(),
+            gas: info.gas,
+            gas_used: summary.gas_used,
+            error,
+            calls: partial.calls,
+        };
+
+        match self.open.last_mut() {
+            Some(parent) => parent.calls.push(frame),
+            None => self.roots.push(frame),
+        }
+    }
+}
+
+/// The `error` a `callTracer` reports for a frame that did not succeed.
+///
+/// A revert with a standard payload carries a human-readable reason, and that
+/// reason is what a client displays. Anything else is reported the way
+/// go-ethereum reports it: `execution reverted` for a revert with no payload or
+/// an unrecognised one, and `out of gas` when the frame consumed all its gas.
+///
+/// The payload is `Error(string)` when its first four bytes are the selector
+/// `0x08c379a0`, followed by an ABI-encoded string.
+pub fn revert_reason(output: &[u8]) -> String {
+    /// `keccak256("Error(string)")[0..4]`.
+    const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+
+    if output.len() < 4 {
+        return "execution reverted".to_string();
+    }
+    if output[..4] != ERROR_STRING_SELECTOR {
+        return "execution reverted".to_string();
+    }
+
+    // ABI: a 32-byte offset, then a 32-byte length, then the bytes, padded.
+    let body = &output[4..];
+    if body.len() < 64 {
+        return "execution reverted".to_string();
+    }
+    let offset = match read_u256(&body[..32]) {
+        Some(o) => o,
+        None => return "execution reverted".to_string(),
+    };
+    let offset = match usize::try_from(offset) {
+        Ok(o) => o,
+        Err(_) => return "execution reverted".to_string(),
+    };
+    if body.len() < offset + 32 {
+        return "execution reverted".to_string();
+    }
+    let len = match read_u256(&body[offset..offset + 32]) {
+        Some(l) => l,
+        None => return "execution reverted".to_string(),
+    };
+    let len = match usize::try_from(len) {
+        Ok(l) => l,
+        Err(_) => return "execution reverted".to_string(),
+    };
+    let start = offset + 32;
+    if body.len() < start + len {
+        return "execution reverted".to_string();
+    }
+    match std::str::from_utf8(&body[start..start + len]) {
+        Ok(text) => format!("execution reverted: {text}"),
+        Err(_) => "execution reverted".to_string(),
+    }
+}
+
+/// Read a big-endian 256-bit integer, refusing one that cannot be a length or
+/// an offset, which also rules out a hostile payload that would overflow.
+fn read_u256(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() < 32 {
+        return None;
+    }
+    // A length or offset above u128 is not a real ABI encoding, and refusing it
+    // avoids a cast that would silently truncate.
+    if bytes[..16].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&bytes[16..32]);
+    Some(u128::from_be_bytes(buf))
+}
+
+/// The `type` field a `callTracer` reports for a frame.
+///
+/// A transaction's own frame is reported as `CALL`, the same as an explicit
+/// `CALL` opcode, because the tracer has no separate name for it.
+fn call_type_name(kind: FrameKind) -> &'static str {
+    match kind {
+        FrameKind::Call | FrameKind::CallOpcode => "CALL",
+        FrameKind::CallCode => "CALLCODE",
+        FrameKind::DelegateCall => "DELEGATECALL",
+        FrameKind::StaticCall => "STATICCALL",
+        FrameKind::Create => "CREATE",
+        FrameKind::Create2 => "CREATE2",
+    }
+}
+
+impl StepTracer for CallTracer {
+    fn step(&mut self, _step: &Step) {
+        // A call tracer reports structure, not opcodes, so steps are ignored.
+        // This is what makes it cheap enough to leave on for every
+        // transaction.
+    }
+
+    /// The number of frames currently open, one-based.
+    fn depth(&self) -> u32 {
+        self.open.len().max(1) as u32
+    }
+
+    /// Whether a frame is already executing.
+    ///
+    /// The executor reads this to decide whether the frame it is about to run
+    /// is the outermost one. Without it a nested frame would be described as
+    /// top-level and would report its own `finish`, so the tree would lose the
+    /// distinction between the transaction's frame and the calls it makes.
+    fn in_frame(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    fn enter_frame(&mut self, frame: &FrameEnter) {
+        if !self.retain() {
+            return;
+        }
+        self.open.push(PartialFrame {
+            frame: FrameEnterOwned {
+                kind: frame.kind,
+                code_address: frame.code_address.clone(),
+                caller: frame.caller.clone(),
+                value: frame.value.clone(),
+                input: frame.input.to_vec(),
+                gas: frame.gas,
+            },
+            calls: Vec::new(),
+        });
+    }
+
+    fn exit_frame(&mut self, summary: &TraceSummary) {
+        // A frame the cap refused still reports its exit, so the flag recorded
+        // at entry decides whether there is anything to close.
+        match self.entered.pop() {
+            Some(true) => self.close(summary),
+            Some(false) => {}
+            None => {}
+        }
+    }
+
+    fn finish(&mut self, _summary: &TraceSummary) {
+        // Any frame still open never reported an exit, which means the
+        // interpreter stopped mid-frame. It is closed here so the trace does
+        // not silently lose it.
+        while !self.open.is_empty() {
+            let partial = self.open.pop().expect("checked non-empty");
+            let info = partial.frame;
+            let frame = CallTraceFrame {
+                call_type: call_type_name(info.kind).to_string(),
+                from: info.caller,
+                to: Some(info.code_address),
+                value: info.value.to_decimal_string(),
+                input: info.input,
+                output: Vec::new(),
+                gas: info.gas,
+                gas_used: 0,
+                error: Some("execution stopped before the frame returned".to_string()),
+                calls: partial.calls,
+            };
+            match self.open.last_mut() {
+                Some(parent) => parent.calls.push(frame),
+                None => self.roots.push(frame),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,7 +906,17 @@ mod tests {
         }
         let mut plain = Plain;
         assert_eq!(plain.depth(), 1);
-        plain.enter_frame(Address::zero(), &[]);
+        let frame = FrameEnter {
+            kind: FrameKind::Call,
+            code_address: Address::zero(),
+            storage_address: Address::zero(),
+            caller: Address::zero(),
+            value: EvmWord::zero(),
+            input: &[],
+            gas: 0,
+            is_top_level: true,
+        };
+        plain.enter_frame(&frame);
         assert_eq!(plain.depth(), 1, "the default must not depend on frames");
     }
 
@@ -544,6 +950,436 @@ mod tests {
 
         assert!(!result.success);
         assert!(tracer.steps().len() < 6);
+    }
+
+
+    // -------------------------------------------------------------------------
+    // Call tracer
+    // -------------------------------------------------------------------------
+
+    /// A transaction frame, as the interpreter reports it.
+    fn top_frame(caller: &Address, to: &Address, value: u64) -> FrameEnter<'static> {
+        // `input` is borrowed, so a static empty slice keeps the lifetime
+        // simple for frames that carry no calldata.
+        FrameEnter {
+            kind: FrameKind::Call,
+            code_address: to.clone(),
+            storage_address: to.clone(),
+            caller: caller.clone(),
+            value: EvmWord::from_u64(value),
+            input: &[],
+            gas: 100_000,
+            is_top_level: true,
+        }
+    }
+
+    fn summary(success: bool, gas_used: u64, output: Vec<u8>, address: &Address) -> TraceSummary {
+        TraceSummary {
+            success,
+            gas_used,
+            output,
+            address: address.clone(),
+            steps: 1,
+        }
+    }
+
+    #[test]
+    fn a_call_tracer_builds_one_frame_from_one_call() {
+        let from = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let to = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        let mut tracer = CallTracer::new(64);
+        tracer.enter_frame(&top_frame(&from, &to, 7));
+        tracer.exit_frame(&summary(true, 21_000, vec![0xde, 0xad], &to));
+
+        let root = tracer.root().expect("the call completed, so there is a root");
+        assert_eq!(root.call_type, "CALL");
+        assert_eq!(root.from, from);
+        assert_eq!(root.to, Some(to.clone()));
+        assert_eq!(root.value, "7");
+        assert_eq!(root.gas_used, 21_000);
+        assert_eq!(root.output, vec![0xde, 0xad]);
+        assert!(root.error.is_none());
+        assert!(root.calls.is_empty());
+        assert!(!tracer.truncated());
+    }
+
+    #[test]
+    fn nested_calls_are_attached_to_the_frame_that_made_them() {
+        let eoa = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let router = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+        let token = Address::from_hex("0x00000000000000000000000000000000000000cc").unwrap();
+
+        let mut tracer = CallTracer::new(64);
+        tracer.enter_frame(&top_frame(&eoa, &router, 0));
+        // The router makes a STATICCALL into the token.
+        tracer.enter_frame(&FrameEnter {
+            kind: FrameKind::StaticCall,
+            code_address: token.clone(),
+            storage_address: token.clone(),
+            caller: router.clone(),
+            value: EvmWord::zero(),
+            input: &[],
+            gas: 5_000,
+            is_top_level: false,
+        });
+        // The token returns first, then the router.
+        tracer.exit_frame(&summary(true, 500, vec![0x01], &token));
+        tracer.exit_frame(&summary(true, 1_200, vec![], &router));
+
+        let root = tracer.root().expect("a root frame");
+        assert_eq!(root.calls.len(), 1, "the token call is the router's child");
+        let child = &root.calls[0];
+        assert_eq!(child.call_type, "STATICCALL");
+        assert_eq!(child.from, router);
+        assert_eq!(child.to, Some(token.clone()));
+        assert_eq!(child.gas_used, 500);
+        // The child is not also a root.
+        assert_eq!(tracer.roots().len(), 1);
+    }
+
+    #[test]
+    fn a_reverted_frame_reports_its_reason() {
+        let from = Address::zero();
+        let to = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        let mut tracer = CallTracer::new(16);
+        tracer.enter_frame(&top_frame(&from, &to, 0));
+        tracer.exit_frame(&summary(false, 900, Vec::new(), &to));
+
+        let root = tracer.root().expect("a root frame");
+        assert_eq!(root.error.as_deref(), Some("execution reverted"));
+    }
+
+    /// `Error(string)` with `reason` == `"nope"`, ABI-encoded.
+    fn error_string_payload(reason: &str) -> Vec<u8> {
+        let mut out = vec![0x08, 0xc3, 0x79, 0xa0];
+        let mut offset = [0u8; 32];
+        offset[31] = 32;
+        out.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[31] = reason.len() as u8;
+        out.extend_from_slice(&len);
+        let mut text = reason.as_bytes().to_vec();
+        while text.len() % 32 != 0 {
+            text.push(0);
+        }
+        out.extend_from_slice(&text);
+        out
+    }
+
+    #[test]
+    fn a_standard_revert_payload_is_decoded_into_the_reason() {
+        let from = Address::zero();
+        let to = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        let mut tracer = CallTracer::new(16);
+        tracer.enter_frame(&top_frame(&from, &to, 0));
+        tracer.exit_frame(&summary(false, 900, error_string_payload("nope"), &to));
+
+        let root = tracer.root().expect("a root frame");
+        assert_eq!(
+            root.error.as_deref(),
+            Some("execution reverted: nope"),
+            "the payload carries a reason and it must be surfaced"
+        );
+    }
+
+    #[test]
+    fn a_revert_payload_that_is_not_a_reason_does_not_panic() {
+        // Selector present but the body is truncated: must not read past the
+        // end or claim a reason it does not have.
+        let truncated = vec![0x08, 0xc3, 0x79, 0xa0, 0x00, 0x01];
+        assert_eq!(revert_reason(&truncated), "execution reverted");
+
+        // A length that runs past the payload must be refused too.
+        let mut lying = vec![0x08, 0xc3, 0x79, 0xa0];
+        lying.extend_from_slice(&[0u8; 31]);
+        lying.push(32); // offset
+        lying.extend_from_slice(&[0xff; 32]); // length far beyond the data
+        assert_eq!(revert_reason(&lying), "execution reverted");
+
+        // A reason whose bytes are not valid UTF-8 is not displayed as text.
+        let mut bad = vec![0x08, 0xc3, 0x79, 0xa0];
+        let mut offset = [0u8; 32];
+        offset[31] = 32;
+        bad.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[31] = 2;
+        bad.extend_from_slice(&len);
+        bad.extend_from_slice(&[0xff, 0xfe]);
+        bad.extend_from_slice(&[0u8; 30]);
+        assert_eq!(revert_reason(&bad), "execution reverted");
+    }
+
+    #[test]
+    fn a_failed_creation_has_no_address_but_a_successful_one_does() {
+        let deployer = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let created = Address::from_hex("0x00000000000000000000000000000000000000dd").unwrap();
+
+        let mut ok = CallTracer::new(8);
+        ok.enter_frame(&FrameEnter {
+            kind: FrameKind::Create,
+            code_address: created.clone(),
+            storage_address: created.clone(),
+            caller: deployer.clone(),
+            value: EvmWord::zero(),
+            input: &[0x60, 0x00],
+            gas: 50_000,
+            is_top_level: true,
+        });
+        ok.exit_frame(&summary(true, 40_000, vec![0x60, 0x00], &created));
+        let root = ok.root().unwrap();
+        assert_eq!(root.call_type, "CREATE");
+        assert_eq!(root.to, Some(created.clone()));
+        assert_eq!(root.input, vec![0x60, 0x00], "init code is the frame input");
+
+        let mut failed = CallTracer::new(8);
+        failed.enter_frame(&FrameEnter {
+            kind: FrameKind::Create,
+            code_address: created.clone(),
+            storage_address: created.clone(),
+            caller: deployer.clone(),
+            value: EvmWord::zero(),
+            input: &[0xfe],
+            gas: 50_000,
+            is_top_level: true,
+        });
+        failed.exit_frame(&summary(false, 50_000, Vec::new(), &created));
+        let root = failed.root().unwrap();
+        assert_eq!(
+            root.to, None,
+            "a creation that failed deployed nothing, so it has no address"
+        );
+    }
+
+    #[test]
+    fn the_frame_cap_drops_deeper_frames_and_says_so() {
+        let from = Address::zero();
+        let to = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        let mut tracer = CallTracer::new(2);
+        // Three frames nest: the third must be dropped.
+        tracer.enter_frame(&top_frame(&from, &to, 0));
+        tracer.enter_frame(&FrameEnter {
+            kind: FrameKind::CallOpcode,
+            code_address: to.clone(),
+            storage_address: to.clone(),
+            caller: to.clone(),
+            value: EvmWord::zero(),
+            input: &[],
+            gas: 1_000,
+            is_top_level: false,
+        });
+        tracer.enter_frame(&FrameEnter {
+            kind: FrameKind::CallOpcode,
+            code_address: to.clone(),
+            storage_address: to.clone(),
+            caller: to.clone(),
+            value: EvmWord::zero(),
+            input: &[],
+            gas: 1_000,
+            is_top_level: false,
+        });
+        // All three exit, including the one that was refused.
+        tracer.exit_frame(&summary(true, 10, vec![], &to));
+        tracer.exit_frame(&summary(true, 10, vec![], &to));
+        tracer.exit_frame(&summary(true, 10, vec![], &to));
+
+        assert!(tracer.truncated(), "dropping a frame must be reported");
+        let root = tracer.root().expect("the retained frames still close");
+        assert_eq!(root.calls.len(), 1, "only the second frame was retained");
+        // The refused frame's exit must not have closed the retained parent.
+        assert!(root.calls[0].calls.is_empty());
+    }
+
+    #[test]
+    fn a_frame_that_never_returned_is_still_reported() {
+        let from = Address::zero();
+        let to = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        let mut tracer = CallTracer::new(8);
+        tracer.enter_frame(&top_frame(&from, &to, 0));
+        // No `exit_frame`: the interpreter stopped mid-frame.
+        tracer.finish(&summary(false, 0, Vec::new(), &to));
+
+        let root = tracer.root().expect("an unreturned frame is not dropped");
+        assert_eq!(
+            root.error.as_deref(),
+            Some("execution stopped before the frame returned")
+        );
+    }
+
+    #[test]
+    fn the_trace_renders_as_the_json_a_call_tracer_returns() {
+        let from = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let to = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        let mut tracer = CallTracer::new(8);
+        tracer.enter_frame(&FrameEnter {
+            kind: FrameKind::Call,
+            code_address: to.clone(),
+            storage_address: to.clone(),
+            caller: from.clone(),
+            value: EvmWord::from_u64(1_000),
+            input: &[0xab, 0xcd],
+            gas: 0x5208,
+            is_top_level: true,
+        });
+        tracer.exit_frame(&summary(true, 0x5208, vec![0x01], &to));
+
+        let json = tracer.to_json();
+        assert_eq!(json["type"], "CALL");
+        assert_eq!(json["from"], "0x00000000000000000000000000000000000000aa");
+        assert_eq!(json["to"], "0x00000000000000000000000000000000000000bb");
+        assert_eq!(json["value"], "1000");
+        assert_eq!(json["gas"], "0x5208");
+        assert_eq!(json["gasUsed"], "0x5208");
+        assert_eq!(json["input"], "0xabcd");
+        assert_eq!(json["output"], "0x01");
+        // No `calls` key when there are no children, which is what clients
+        // expect from a leaf.
+        assert!(json.get("calls").is_none());
+    }
+
+    #[test]
+    fn an_empty_trace_renders_as_null() {
+        let tracer = CallTracer::new(8);
+        assert_eq!(tracer.to_json(), serde_json::Value::Null);
+        assert!(tracer.root().is_none());
+    }
+
+    /// The decisive end-to-end test: a real `CALL` through the interpreter must
+    /// produce a nested frame with the callee's address and the caller's
+    /// address, and the callee's return data must land in the parent's output.
+    #[test]
+    fn a_real_nested_call_is_reported_with_both_addresses() {
+        let caller_addr = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let callee_addr = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        // The callee returns 32 bytes of 0x2a.
+        //   PUSH1 0x2a  PUSH1 0  MSTORE  PUSH1 32  PUSH1 0  RETURN
+        let callee_code = vec![
+            0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+
+        let mut host = crate::host::MemoryHost::new()
+            .with_code(callee_addr.clone(), callee_code)
+            .with_balance(caller_addr.clone(), EvmWord::from_u64(0));
+
+        let caller_code = calls_the_callee(callee_addr.clone());
+
+        let mut ctx = ExecutionContext::new();
+        ctx.address = caller_addr.clone();
+        ctx.caller = caller_addr.clone();
+        ctx.gas = 1_000_000;
+
+        let mut tracer = CallTracer::new(64);
+        let result =
+            Executor::new().execute_traced_with_host(&caller_code, &mut ctx, &mut host, &mut tracer);
+
+        assert!(result.success, "the call should succeed");
+
+        let root = tracer.root().expect("a top-level frame");
+        assert_eq!(root.from, caller_addr);
+        assert_eq!(root.to, Some(caller_addr.clone()));
+
+        assert_eq!(
+            root.calls.len(),
+            1,
+            "the CALL must produce exactly one child frame"
+        );
+        let child = &root.calls[0];
+        assert_eq!(child.call_type, "CALL");
+        assert_eq!(
+            child.from, caller_addr,
+            "the child's caller is the contract that called it"
+        );
+        assert_eq!(
+            child.to,
+            Some(callee_addr.clone()),
+            "the child's target is the callee"
+        );
+        assert_eq!(
+            child.output,
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0x2a
+            ],
+            "the callee's return data must be reported on the child frame"
+        );
+        assert!(child.error.is_none());
+    }
+
+    /// A `DELEGATECALL` runs the callee's code in the caller's storage context.
+    ///
+    /// The trace names the library as the target, because that is the operand
+    /// the caller supplied, and the `DELEGATECALL` type is what tells a reader
+    /// that storage belongs to `from` rather than `to`. The decisive check is
+    /// the storage itself: the library writes a slot, and that write must land
+    /// in the caller's account.
+    #[test]
+    fn a_delegate_call_writes_into_the_callers_storage_not_the_librarys() {
+        let caller_addr = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let lib_addr = Address::from_hex("0x00000000000000000000000000000000000000cc").unwrap();
+
+        // The library stores 0x2a at slot 0:
+        //   PUSH1 0x2a  PUSH1 0  SSTORE  STOP
+        let lib_code = vec![0x60, 0x2a, 0x60, 0x00, 0x55, 0x00];
+
+        let mut host = crate::host::MemoryHost::new()
+            .with_code(lib_addr.clone(), lib_code)
+            .with_balance(caller_addr.clone(), EvmWord::from_u64(0));
+
+        // PUSH1 0 x4, PUSH20 <lib>, GAS, DELEGATECALL, POP, STOP
+        let mut caller_code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+        caller_code.push(0x73);
+        caller_code.extend_from_slice(&lib_addr.0);
+        caller_code.push(0x5a); // GAS
+        caller_code.push(0xf4); // DELEGATECALL
+        caller_code.push(0x50); // POP
+        caller_code.push(0x00); // STOP
+
+        let mut ctx = ExecutionContext::new();
+        ctx.address = caller_addr.clone();
+        ctx.caller = caller_addr.clone();
+        ctx.gas = 1_000_000;
+
+        let mut tracer = CallTracer::new(64);
+        let result =
+            Executor::new().execute_traced_with_host(&caller_code, &mut ctx, &mut host, &mut tracer);
+
+        assert!(result.success);
+        let root = tracer.root().expect("a top-level frame");
+        assert_eq!(root.calls.len(), 1);
+        let child = &root.calls[0];
+        assert_eq!(child.call_type, "DELEGATECALL");
+        assert_eq!(
+            child.from, caller_addr,
+            "the call was issued by the caller's account"
+        );
+        assert_eq!(
+            child.to,
+            Some(lib_addr.clone()),
+            "the target is the library the caller named"
+        );
+        assert_eq!(
+            child.value, "0",
+            "a DELEGATECALL attaches no value, whatever the parent frame holds"
+        );
+
+        // The library's write landed in the caller's storage. This is the
+        // property the trace's `type` field exists to convey.
+        use crate::host::Host as _;
+        let written = host
+            .storage(&caller_addr, &EvmWord::zero())
+            .to_decimal_string();
+        assert_eq!(written, "42", "the library's SSTORE must use the caller's storage");
+        assert_eq!(
+            host.storage(&lib_addr, &EvmWord::zero()).to_decimal_string(),
+            "0",
+            "the library's own storage must be untouched"
+        );
     }
 }
 
@@ -737,3 +1573,4 @@ mod conformance {
         assert_eq!(gas_cost_of(0x00), 0);
     }
 }
+
