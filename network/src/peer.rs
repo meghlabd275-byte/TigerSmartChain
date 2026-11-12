@@ -233,6 +233,39 @@ impl PeerManager {
             .collect()
     }
 
+    /// The height a peer last reported, if it is still connected.
+    ///
+    /// Used by the sync driver to decide whether asking this peer for the next
+    /// batch is worthwhile.
+    pub fn peer_height(&self, id: &PeerID) -> Option<u64> {
+        self.peers
+            .get(id)
+            .and_then(|peer| peer.try_lock().ok())
+            .map(|peer| peer.height)
+    }
+
+    /// The peers that claim a height above `height`, tallest first.
+    ///
+    /// The catch-up driver asks these for blocks. A peer that is not ahead of
+    /// us has nothing to send, so including it would only waste a request.
+    pub fn peers_ahead(&self, height: u64, limit: usize) -> Vec<Arc<Mutex<PeerConnection>>> {
+        let mut peers: Vec<Arc<Mutex<PeerConnection>>> = self
+            .peers
+            .values()
+            .filter(|peer| {
+                peer.try_lock()
+                    .map(|peer| peer.height > height)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        peers.sort_by_key(|peer| {
+            std::cmp::Reverse(peer.try_lock().map(|p| p.height).unwrap_or(0))
+        });
+        peers.truncate(limit);
+        peers
+    }
+
     /// The peers that claim the greatest height, best first.
     pub fn best_peers(&self, limit: usize) -> Vec<Arc<Mutex<PeerConnection>>> {
         let mut peers: Vec<Arc<Mutex<PeerConnection>>> = self.peers.values().cloned().collect();

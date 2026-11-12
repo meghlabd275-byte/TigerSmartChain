@@ -1435,6 +1435,22 @@ impl TigerNode {
     }
 
     /// Get network sync status.
+    /// Record sync progress for the `eth_syncing` RPC and the metrics endpoint.
+    ///
+    /// `starting_block` is only set when sync begins, so it keeps naming where
+    /// this sync run started rather than following the head forward.
+    pub async fn set_syncing(&self, syncing: bool, current: u64, highest: u64) {
+        let mut status = self.sync_status.write().await;
+        if syncing && !status.syncing {
+            status.starting_block = current;
+        }
+        status.syncing = syncing;
+        status.current_block = current;
+        if highest > status.highest_block {
+            status.highest_block = highest;
+        }
+    }
+
     pub fn get_sync_status(&self) -> &RwLock<SyncStatus> {
         &self.sync_status
     }

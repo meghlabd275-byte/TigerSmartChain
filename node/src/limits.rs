@@ -24,9 +24,39 @@ use std::time::Instant;
 const MAX_TRACKED_ADDRESSES: usize = 100_000;
 
 /// One address's token bucket.
+///
+/// `last` is in seconds on the limiter's own clock rather than an `Instant`, so
+/// the refill arithmetic is a plain subtraction and the whole thing can be
+/// driven by a test clock.
 struct Bucket {
     tokens: f64,
-    last: Instant,
+    last: f64,
+}
+
+/// Where the limiter reads the time from.
+///
+/// Refill is inherently time-dependent, and a test that sleeps is a test that
+/// fails on a loaded machine: at a thousand tokens a second, a one-millisecond
+/// pause during the drain loop refills a token and the "bucket is empty"
+/// assertion stops holding. Injecting the clock makes refill exactly checkable.
+enum Clock {
+    /// Seconds since the limiter was created.
+    Monotonic(Instant),
+    /// Milliseconds since the test began, advanced explicitly by the test.
+    #[cfg(test)]
+    Manual(std::sync::Arc<std::sync::atomic::AtomicU64>),
+}
+
+impl Clock {
+    fn now_secs(&self) -> f64 {
+        match self {
+            Clock::Monotonic(origin) => origin.elapsed().as_secs_f64(),
+            #[cfg(test)]
+            Clock::Manual(millis) => {
+                millis.load(std::sync::atomic::Ordering::SeqCst) as f64 / 1000.0
+            }
+        }
+    }
 }
 
 /// A token bucket and a concurrent-work cap, both keyed by client address.
@@ -41,6 +71,8 @@ pub struct PerIpLimiter {
     held: Mutex<HashMap<IpAddr, usize>>,
     /// Accept-rate token buckets, per address.
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    /// The source of time for refill.
+    clock: Clock,
 }
 
 impl PerIpLimiter {
@@ -58,7 +90,31 @@ impl PerIpLimiter {
             max_held,
             held: Mutex::new(HashMap::new()),
             buckets: Mutex::new(HashMap::new()),
+            clock: Clock::Monotonic(Instant::now()),
         }
+    }
+
+    /// A limiter whose clock the test controls, plus a handle to advance it.
+    ///
+    /// Test-only: production always reads the monotonic clock.
+    #[cfg(test)]
+    pub fn with_manual_clock(
+        refill_per_second: f64,
+        burst: f64,
+        max_held: usize,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        let millis = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        (
+            Self {
+                refill_per_second,
+                burst,
+                max_held,
+                held: Mutex::new(HashMap::new()),
+                buckets: Mutex::new(HashMap::new()),
+                clock: Clock::Manual(std::sync::Arc::clone(&millis)),
+            },
+            millis,
+        )
     }
 
     /// Whether a request from `ip` may proceed, recording it if so.
@@ -69,17 +125,17 @@ impl PerIpLimiter {
         if self.refill_per_second <= 0.0 {
             return true;
         }
-        let now = Instant::now();
+        let now = self.clock.now_secs();
 
         let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         if buckets.len() > MAX_TRACKED_ADDRESSES {
-            buckets.retain(|_, b| now.duration_since(b.last).as_secs() < 60);
+            buckets.retain(|_, b| now - b.last < 60.0);
         }
         let bucket = buckets.entry(ip).or_insert(Bucket {
             tokens: self.burst,
             last: now,
         });
-        let elapsed = now.duration_since(bucket.last).as_secs_f64();
+        let elapsed = now - bucket.last;
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_second).min(self.burst);
         bucket.last = now;
         if bucket.tokens < 1.0 {
@@ -122,6 +178,7 @@ impl PerIpLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -129,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_burst_is_allowed_and_the_next_request_is_refused() {
-        let limiter = PerIpLimiter::new(5.0, 5.0, 100);
+        let (limiter, _clock) = PerIpLimiter::with_manual_clock(5.0, 5.0, 100);
         let addr = ip("203.0.113.7");
         for i in 0..5 {
             assert!(limiter.admit(addr), "request {i} within the burst must pass");
@@ -139,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_zero_rate_disables_the_limit() {
-        let limiter = PerIpLimiter::new(0.0, 0.0, 1);
+        let (limiter, _clock) = PerIpLimiter::with_manual_clock(0.0, 0.0, 1);
         let addr = ip("203.0.113.8");
         for _ in 0..1000 {
             assert!(limiter.admit(addr));
@@ -148,21 +205,33 @@ mod tests {
 
     #[test]
     fn buckets_refill_over_time() {
-        // A small bucket so draining it is exact, and a rate that refills one
-        // token well within the wait below.
-        let limiter = PerIpLimiter::new(50.0, 10.0, 100_000);
+        let (limiter, clock) = PerIpLimiter::with_manual_clock(50.0, 10.0, 100_000);
         let addr = ip("203.0.113.9");
         for i in 0..10 {
             assert!(limiter.admit(addr), "request {i} within the bucket must pass");
         }
         assert!(!limiter.admit(addr), "the bucket must be empty");
-        std::thread::sleep(std::time::Duration::from_millis(60));
+
+        // Twenty milliseconds at fifty tokens a second is exactly one token.
+        clock.fetch_add(20, Ordering::SeqCst);
         assert!(limiter.admit(addr), "the bucket must refill with time");
+        assert!(
+            !limiter.admit(addr),
+            "one token buys exactly one request, so the bucket is empty again"
+        );
+
+        // The refill is bounded by the burst: a long idle period must not bank
+        // more than the burst allows.
+        clock.fetch_add(1_000_000, Ordering::SeqCst);
+        for i in 0..10 {
+            assert!(limiter.admit(addr), "burst request {i} must pass");
+        }
+        assert!(!limiter.admit(addr), "the burst must not exceed ten tokens");
     }
 
     #[test]
     fn addresses_do_not_share_a_budget() {
-        let limiter = PerIpLimiter::new(1.0, 1.0, 100);
+        let (limiter, _clock) = PerIpLimiter::with_manual_clock(1.0, 1.0, 100);
         let attacker = ip("192.0.2.10");
         let honest = ip("192.0.2.11");
         assert!(limiter.admit(attacker));
@@ -176,7 +245,7 @@ mod tests {
     #[test]
     fn the_held_count_caps_concurrent_work_and_release_frees_it() {
         // A generous rate, so only the held count can refuse.
-        let limiter = PerIpLimiter::new(1_000_000.0, 1_000_000.0, 3);
+        let (limiter, _clock) = PerIpLimiter::with_manual_clock(1_000_000.0, 1_000_000.0, 3);
         let addr = ip("198.51.100.5");
         for i in 0..3 {
             assert!(limiter.admit(addr), "slot {i} must be available");
@@ -190,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_refused_request_does_not_leave_a_held_count_behind() {
-        let limiter = PerIpLimiter::new(1.0, 1.0, 10);
+        let (limiter, _clock) = PerIpLimiter::with_manual_clock(1.0, 1.0, 10);
         let addr = ip("198.51.100.6");
         assert!(limiter.admit(addr));
         assert!(!limiter.admit(addr));

@@ -34,6 +34,8 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 const DIAL_RETRY: Duration = Duration::from_secs(30);
 /// How many blocks to ask for in one bulk request.
 const SYNC_BATCH: u64 = 64;
+/// How often the catch-up driver re-checks whether this node is behind.
+const SYNC_INTERVAL: Duration = Duration::from_secs(3);
 /// How long to wait for a frame before sending a ping, so a silent peer is
 /// detected rather than held open forever.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -292,6 +294,60 @@ impl P2pService {
                     for id in stale {
                         debug!("dropping silent peer {id}");
                     }
+                }
+            });
+        }
+
+        // Catch-up driver. The status handler asks for blocks once, when a
+        // peer reports its height; if that reply is lost, or the node is
+        // restarted behind the head, nothing would ask again. This loop keeps
+        // the node moving toward the tallest peer until it reaches it.
+        {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(SYNC_INTERVAL);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if !service.node.is_running().await {
+                        break;
+                    }
+                    let our_height = {
+                        let cm = service.node.get_chain_manager().await;
+                        cm.chain().height()
+                    };
+                    let peers = {
+                        let manager = service.manager.lock().await;
+                        manager.peers_ahead(our_height, 3)
+                    };
+                    if peers.is_empty() {
+                        // Nothing is ahead, so this node is at the head.
+                        service
+                            .node
+                            .set_syncing(false, our_height, our_height)
+                            .await;
+                        continue;
+                    }
+                    let mut highest = our_height;
+                    for peer in peers {
+                        let peer_height = {
+                            let peer = peer.lock().await;
+                            peer.height
+                        };
+                        if peer_height <= our_height {
+                            continue;
+                        }
+                        highest = highest.max(peer_height);
+                        service
+                            .request_blocks(&peer, our_height + 1, peer_height - our_height)
+                            .await;
+                    }
+                    // Report the gap so eth_syncing and the metrics endpoint
+                    // describe what is actually happening.
+                    service
+                        .node
+                        .set_syncing(true, our_height, highest)
+                        .await;
                 }
             });
         }
@@ -622,6 +678,10 @@ impl P2pService {
             }
 
             PeerMessage::Blocks(blocks) => {
+                let before = {
+                    let cm = self.node.get_chain_manager().await;
+                    cm.chain().height()
+                };
                 // A batch is applied in order, and the first block that does
                 // not fit stops the batch: a gap means the rest cannot be
                 // applied either, and asking for them again is cheaper than
@@ -634,6 +694,27 @@ impl P2pService {
                         Err(e) => {
                             debug!("stopping a block batch at #{number}: {e}");
                             break;
+                        }
+                    }
+                }
+                // A full batch means the peer has more. Asking again straight
+                // away is what turns one batch per status into a catch-up that
+                // runs to the head. The request is only repeated when the
+                // batch actually advanced this node: if nothing imported, the
+                // next request would be for the same range and would spin.
+                let after = {
+                    let cm = self.node.get_chain_manager().await;
+                    cm.chain().height()
+                };
+                if after > before {
+                    let peer_height = {
+                        let manager = self.manager.lock().await;
+                        manager.peer_height(&peer_id)
+                    };
+                    if let Some(peer_height) = peer_height {
+                        if peer_height > after {
+                            self.request_blocks(connection, after + 1, peer_height - after)
+                                .await;
                         }
                     }
                 }
@@ -657,6 +738,28 @@ impl P2pService {
         }
     }
 
+    /// Ask a peer for a batch of blocks starting at `from`.
+    ///
+    /// The count is capped at one batch: a peer that is asked for its whole
+    /// chain would have to build a reply too large to send, and a batch that
+    /// is applied triggers the next request, so catch-up still runs to
+    /// completion.
+    async fn request_blocks(
+        &self,
+        connection: &Arc<Mutex<tiger_network::peer::PeerConnection>>,
+        from: u64,
+        count: u64,
+    ) {
+        let request = PeerMessage::GetBlocks {
+            from,
+            count: count.min(SYNC_BATCH).max(1),
+        };
+        if let Ok(frame) = encode_message(&request) {
+            let peer = connection.lock().await;
+            peer.try_send_frame(frame);
+        }
+    }
+
     /// Ask a peer for the blocks this node is missing.
     async fn request_missing_blocks(
         &self,
@@ -670,14 +773,8 @@ impl P2pService {
         if peer_height <= our_height {
             return;
         }
-        let request = PeerMessage::GetBlocks {
-            from: our_height + 1,
-            count: (peer_height - our_height).min(SYNC_BATCH),
-        };
-        if let Ok(frame) = encode_message(&request) {
-            let peer = connection.lock().await;
-            peer.try_send_frame(frame);
-        }
+        self.request_blocks(connection, our_height + 1, peer_height - our_height)
+            .await;
     }
 }
 
