@@ -29,6 +29,27 @@ import type {
 const API_ROOT = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080').replace(/\/+$/, '')
 const API_URL = /\/api\/v1$/.test(API_ROOT) ? API_ROOT : `${API_ROOT}/api/v1`
 
+// The gateway returns database columns as-is, so every response key is
+// snake_case. The types in @/types are camelCase, so the wire format is
+// converted here in one place instead of at each of the ~250 call sites.
+// Only keys are rewritten; string values are left untouched.
+const snakeToCamel = (key: string): string =>
+  key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase())
+
+const convertKeys = (value: unknown): any => {
+  if (Array.isArray(value)) {
+    return value.map(convertKeys)
+  }
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[snakeToCamel(k)] = convertKeys(v)
+    }
+    return out
+  }
+  return value
+}
+
 class APIClient {
   private client: AxiosInstance
 
@@ -42,7 +63,10 @@ class APIClient {
     })
 
     this.client.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        response.data = convertKeys(response.data)
+        return response
+      },
       (error) => {
         console.error('API Error:', error.message)
         return Promise.reject(error)
@@ -151,6 +175,27 @@ class APIClient {
     timeframe?: '1h' | '24h' | '7d' | '30d' | '1y'
   }): Promise<ChartData[]> {
     const { data } = await this.client.get<ChartData[]>(`/tokens/${tokenAddress}/price-history`, { params })
+    return data
+  }
+
+  // Holder concentration and balance-bucket counts, computed by the indexer.
+  async getTokenAnalytics(tokenAddress: string): Promise<{
+    holderCount: number
+    totalBalance: string
+    totalValueUsd: string
+    top10Percent: number
+    top50Percent: number
+    top100Percent: number
+    above10m: number
+    from1mTo10m: number
+    from100kTo1m: number
+    from10kTo100k: number
+    from1kTo10k: number
+    below1k: number
+    transferVolume: string
+    transferCount: number
+  }> {
+    const { data } = await this.client.get(`/tokens/${tokenAddress}/analytics`)
     return data
   }
 
@@ -308,6 +353,16 @@ class APIClient {
 
   async getDexPair(pairAddress: string): Promise<DexPair> {
     const { data } = await this.client.get<DexPair>(`/dex/pairs/${pairAddress}`)
+    return data
+  }
+
+  // Protocol-wide DEX totals, summed in SQL over every indexed pair.
+  async getDexStats(): Promise<{
+    totalPairs: number
+    totalLiquidity: string
+    totalVolume: string
+  }> {
+    const { data } = await this.client.get('/stats/dex')
     return data
   }
 

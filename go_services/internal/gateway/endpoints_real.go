@@ -287,21 +287,63 @@ func (h *Handler) GetTokenAnalytics(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.queryOne(ctx, `
+
+	// Concentration is computed over balance_usd so it reflects value rather
+	// than token count, which is what a holder page reports.
+	concentration, err := h.queryOne(ctx, `
+		WITH ranked AS (
+			SELECT balance, balance_usd,
+			       ROW_NUMBER() OVER (ORDER BY balance DESC) AS rn
+			FROM token_holders WHERE token_address = $1
+		)
 		SELECT
-			COUNT(DISTINCT th.address) AS holder_count,
-			COALESCE(SUM(tt.value), 0) AS transfer_volume,
-			COUNT(tt.id) AS transfer_count
-		FROM tokens t
-		LEFT JOIN token_holders th ON th.token_address = t.address
-		LEFT JOIN token_transfers tt ON tt.token_address = t.address
-		WHERE t.address = $1
+			COUNT(*) AS holder_count,
+			COALESCE(SUM(balance), 0) AS total_balance,
+			COALESCE(SUM(balance_usd), 0) AS total_value_usd,
+			COALESCE(100.0 * SUM(balance_usd) FILTER (WHERE rn <= 10)
+			         / NULLIF(SUM(balance_usd), 0), 0) AS top10_percent,
+			COALESCE(100.0 * SUM(balance_usd) FILTER (WHERE rn <= 50)
+			         / NULLIF(SUM(balance_usd), 0), 0) AS top50_percent,
+			COALESCE(100.0 * SUM(balance_usd) FILTER (WHERE rn <= 100)
+			         / NULLIF(SUM(balance_usd), 0), 0) AS top100_percent
+		FROM ranked
 	`, token)
 	if err != nil {
 		dbError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, row)
+
+	distribution, err := h.queryOne(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE balance_usd >= 10000000) AS above_10m,
+			COUNT(*) FILTER (WHERE balance_usd >= 1000000 AND balance_usd < 10000000) AS from_1m_to_10m,
+			COUNT(*) FILTER (WHERE balance_usd >= 100000 AND balance_usd < 1000000) AS from_100k_to_1m,
+			COUNT(*) FILTER (WHERE balance_usd >= 10000 AND balance_usd < 100000) AS from_10k_to_100k,
+			COUNT(*) FILTER (WHERE balance_usd >= 1000 AND balance_usd < 10000) AS from_1k_to_10k,
+			COUNT(*) FILTER (WHERE balance_usd < 1000) AS below_1k
+		FROM token_holders WHERE token_address = $1
+	`, token)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+
+	volume, err := h.queryOne(ctx, `
+		SELECT COALESCE(SUM(value), 0) AS transfer_volume, COUNT(*) AS transfer_count
+		FROM token_transfers WHERE token_address = $1
+	`, token)
+	if err != nil {
+		dbError(c, err)
+		return
+	}
+
+	response := gin.H{}
+	for _, m := range []map[string]interface{}{concentration, distribution, volume} {
+		for k, v := range m {
+			response[k] = v
+		}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handler) GetTokenFlippening(c *gin.Context) {

@@ -1,33 +1,29 @@
 /**
- * Advanced Top Holders - Token holder distribution and analytics
- * Complete implementation with holder tracking, VIP detection, and portfolio analysis
+ * Top Holders - holder distribution for one token, read from the indexer.
+ *
+ * Sources: GET /api/v1/tokens/:address (token metadata),
+ *          GET /api/v1/tokens/:address/holders (ranked holders),
+ *          GET /api/v1/tokens/:address/analytics (concentration and buckets).
  */
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'next/router';
 import { PieChart, Pie, Cell, ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
+import { api } from '@/lib/api';
 
-// Types
 interface Holder {
-  address: string;
-  balance: number;
-  balanceUSD: number;
-  percentage: number;
   rank: number;
-  firstSeen: number;
-  lastActive: number;
-  txCount: number;
+  address: string;
+  balance: string;
+  balanceUsd: number;
+  percentage: number;
   isContract: boolean;
-  isWhale: boolean;
-  tags: string[];
 }
 
-interface Token {
-  address: string;
+interface TokenStats {
   name: string;
   symbol: string;
-  totalSupply: number;
-  holders: number;
-  price: number;
+  holdersCount: number;
   marketCap: number;
   top10: number;
   top50: number;
@@ -37,139 +33,75 @@ interface Token {
 interface HolderDistribution {
   range: string;
   count: number;
-  percentage: number;
 }
 
-// Data hook
+// Balances are stored as integers in the token's smallest unit.
+const TOKEN_DECIMALS = 1e18;
+
+const toNumber = (value: unknown): number => {
+  if (value === null || value === undefined) return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+};
+
 const useHolders = (tokenAddress?: string) => {
   const [holders, setHolders] = useState<Holder[]>([]);
-  const [token, setToken] = useState<Token | null>(null);
+  const [token, setToken] = useState<TokenStats | null>(null);
   const [distribution, setDistribution] = useState<HolderDistribution[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const fetchData = useCallback(async () => {
+    if (!tokenAddress) {
+      setLoading(false);
+      return;
+    }
     try {
       setLoading(true);
-      
-      // Generate token data
-      const tokenData: Token = {
-        address: tokenAddress || '0x55d398326f99059fF775485246999027B3197955',
-        name: 'Tether USD',
-        symbol: 'USDT',
-        totalSupply: 83000000000000000000000000000,
-        holders: 4523156,
-        price: 1.0,
-        marketCap: 83000000000,
-        top10: 45.2,
-        top50: 62.8,
-        top100: 72.5,
-      };
-      setToken(tokenData);
-      
-      // Generate holders data
-      const holdersData: Holder[] = [];
-      let cumulativeBalance = 0;
-      
-      // Top 10 whales
-      for (let i = 0; i < 10; i++) {
-        const balance = (50000000 + Math.random() * 100000000) * tokenData.price;
-        cumulativeBalance += balance;
-        holdersData.push({
-          address: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-          balance: balance / tokenData.price,
-          balanceUSD: balance,
-          percentage: 0,
-          rank: i + 1,
-          firstSeen: Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000 * 2,
-          lastActive: Date.now() - Math.random() * 30 * 24 * 60 * 60 * 1000,
-          txCount: Math.floor(1000 + Math.random() * 10000),
-          isContract: Math.random() > 0.8,
-          isWhale: true,
-          tags: ['whale', Math.random() > 0.5 ? 'vc' : 'exchange'],
-        });
-      }
-      
-      // Holders 11-50
-      for (let i = 10; i < 50; i++) {
-        const balance = (10000000 + Math.random() * 50000000) * tokenData.price;
-        cumulativeBalance += balance;
-        holdersData.push({
-          address: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-          balance: balance / tokenData.price,
-          balanceUSD: balance,
-          percentage: 0,
-          rank: i + 1,
-          firstSeen: Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000 * 2,
-          lastActive: Date.now() - Math.random() * 60 * 24 * 60 * 60 * 1000,
-          txCount: Math.floor(500 + Math.random() * 5000),
-          isContract: Math.random() > 0.9,
-          isWhale: true,
-          tags: Math.random() > 0.5 ? ['whale'] : [],
-        });
-      }
-      
-      // Holders 51-100
-      for (let i = 50; i < 100; i++) {
-        const balance = (1000000 + Math.random() * 10000000) * tokenData.price;
-        cumulativeBalance += balance;
-        holdersData.push({
-          address: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-          balance: balance / tokenData.price,
-          balanceUSD: balance,
-          percentage: 0,
-          rank: i + 1,
-          firstSeen: Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000 * 2,
-          lastActive: Date.now() - Math.random() * 90 * 24 * 60 * 60 * 1000,
-          txCount: Math.floor(100 + Math.random() * 1000),
-          isContract: Math.random() > 0.95,
-          isWhale: false,
-          tags: [],
-        });
-      }
-      
-      // Regular holders
-      for (let i = 100; i < 200; i++) {
-        const balance = (1000 + Math.random() * 1000000) * tokenData.price;
-        cumulativeBalance += balance;
-        holdersData.push({
-          address: `0x${Math.random().toString(16).substr(2, 40).padStart(40, '0')}`,
-          balance: balance / tokenData.price,
-          balanceUSD: balance,
-          percentage: 0,
-          rank: i + 1,
-          firstSeen: Date.now() - Math.random() * 365 * 24 * 60 * 60 * 1000 * 2,
-          lastActive: Date.now() - Math.random() * 180 * 24 * 60 * 60 * 1000,
-          txCount: Math.floor(10 + Math.random() * 500),
-          isContract: false,
-          isWhale: false,
-          tags: [],
-        });
-      }
-      
-      // Calculate percentages
-      const totalUSD = cumulativeBalance;
-      holdersData.forEach(h => {
-        h.percentage = (h.balanceUSD / totalUSD) * 100;
-      });
-      
-      // Sort by balance
-      holdersData.sort((a, b) => b.balanceUSD - a.balanceUSD);
-      setHolders(holdersData);
-      
-      // Distribution data
-      setDistribution([
-        { range: '> $10M', count: 45, percentage: 52.5 },
-        { range: '$1M - $10M', count: 280, percentage: 18.2 },
-        { range: '$100K - $1M', count: 2500, percentage: 15.8 },
-        { range: '$10K - $100K', count: 25000, percentage: 10.5 },
-        { range: '$1K - $10K', count: 180000, percentage: 2.8 },
-        { range: '< $1K', count: 4300000, percentage: 0.2 },
+
+      const [tokenData, holderRows, analytics] = await Promise.all([
+        api.getToken(tokenAddress),
+        api.getTokenHolders(tokenAddress, { limit: 100 }),
+        api.getTokenAnalytics(tokenAddress),
       ]);
-      
+
+      const rows = holderRows.items ?? [];
+      const balances = rows.map(r => toNumber(r.balance) / TOKEN_DECIMALS);
+      const totalBalance = balances.reduce((a, b) => a + b, 0);
+
+      setHolders(
+        rows.map((r, i) => ({
+          rank: i + 1,
+          address: r.address,
+          balance: balances[i].toLocaleString(undefined, { maximumFractionDigits: 4 }),
+          balanceUsd: toNumber(r.balanceUsd),
+          percentage: totalBalance > 0 ? (balances[i] / totalBalance) * 100 : 0,
+          isContract: Boolean(r.isContract),
+        }))
+      );
+
+      setToken({
+        name: tokenData?.name ?? '',
+        symbol: tokenData?.symbol ?? '',
+        holdersCount: toNumber((tokenData as any)?.holdersCount),
+        marketCap: toNumber((tokenData as any)?.marketCap),
+        top10: toNumber(analytics?.top10Percent),
+        top50: toNumber(analytics?.top50Percent),
+        top100: toNumber(analytics?.top100Percent),
+      });
+
+      setDistribution([
+        { range: '> $10M', count: toNumber(analytics?.above10m) },
+        { range: '$1M - $10M', count: toNumber(analytics?.from1mTo10m) },
+        { range: '$100K - $1M', count: toNumber(analytics?.from100kTo1m) },
+        { range: '$10K - $100K', count: toNumber(analytics?.from10kTo100k) },
+        { range: '$1K - $10K', count: toNumber(analytics?.from1kTo10k) },
+        { range: '< $1K', count: toNumber(analytics?.below1k) },
+      ]);
+
       setError(null);
     } catch (err) {
-      setError('Failed to fetch holder data');
+      setError('Failed to load holder data for this token');
     } finally {
       setLoading(false);
     }
@@ -184,26 +116,25 @@ const useHolders = (tokenAddress?: string) => {
   return { holders, token, distribution, loading, error, refetch: fetchData };
 };
 
-// Stats cards
-const StatsCards: React.FC<{ token: Token }> = ({ token }) => (
+const StatsCards: React.FC<{ token: TokenStats }> = ({ token }) => (
   <div className="stats-grid">
     <div className="stat-card">
       <div className="stat-label">Total Holders</div>
-      <div className="stat-value">{token.holders.toLocaleString()}</div>
+      <div className="stat-value">{token.holdersCount.toLocaleString()}</div>
     </div>
     <div className="stat-card">
       <div className="stat-label">Market Cap</div>
-      <div className="stat-value">${(token.marketCap / 1000000000).toFixed(1)}B</div>
+      <div className="stat-value">${(token.marketCap / 1e9).toFixed(2)}B</div>
     </div>
     <div className="stat-card">
       <div className="stat-label">Top 10 Concentration</div>
-      <div className="stat-value">{token.top10}%</div>
+      <div className="stat-value">{token.top10.toFixed(2)}%</div>
     </div>
     <div className="stat-card">
       <div className="stat-label">Top 100 Concentration</div>
-      <div className="stat-value">{token.top100}%</div>
+      <div className="stat-value">{token.top100.toFixed(2)}%</div>
     </div>
-    
+
     <style>{`
       .stats-grid {
         display: grid;
@@ -224,15 +155,14 @@ const StatsCards: React.FC<{ token: Token }> = ({ token }) => (
   </div>
 );
 
-// Concentration chart
-const ConcentrationChart: React.FC<{ token: Token }> = ({ token }) => {
+const ConcentrationChart: React.FC<{ token: TokenStats }> = ({ token }) => {
   const data = [
     { name: 'Top 10', value: token.top10, color: '#ef4444' },
-    { name: 'Top 11-50', value: token.top50 - token.top10, color: '#f59e0b' },
-    { name: 'Top 51-100', value: token.top100 - token.top50, color: '#3b82f6' },
-    { name: 'Others', value: 100 - token.top100, color: '#10b981' },
+    { name: 'Top 11-50', value: Math.max(token.top50 - token.top10, 0), color: '#f59e0b' },
+    { name: 'Top 51-100', value: Math.max(token.top100 - token.top50, 0), color: '#3b82f6' },
+    { name: 'Others', value: Math.max(100 - token.top100, 0), color: '#10b981' },
   ];
-  
+
   return (
     <div className="concentration-chart">
       <h3>Holder Concentration</h3>
@@ -250,12 +180,12 @@ const ConcentrationChart: React.FC<{ token: Token }> = ({ token }) => {
             <div key={item.name} className="legend-item">
               <span className="color" style={{ backgroundColor: item.color }}></span>
               <span className="label">{item.name}</span>
-              <span className="value">{item.value}%</span>
+              <span className="value">{item.value.toFixed(2)}%</span>
             </div>
           ))}
         </div>
       </div>
-      
+
       <style>{`
         .concentration-chart {
           background: #1e293b;
@@ -275,7 +205,6 @@ const ConcentrationChart: React.FC<{ token: Token }> = ({ token }) => {
   );
 };
 
-// Distribution chart
 const DistributionChart: React.FC<{ distribution: HolderDistribution[] }> = ({ distribution }) => (
   <div className="distribution-chart">
     <h3>Holder Distribution by Balance</h3>
@@ -288,7 +217,7 @@ const DistributionChart: React.FC<{ distribution: HolderDistribution[] }> = ({ d
         <Bar dataKey="count" fill="#3b82f6" name="Holders" />
       </BarChart>
     </ResponsiveContainer>
-    
+
     <style>{`
       .distribution-chart {
         background: #1e293b;
@@ -301,15 +230,9 @@ const DistributionChart: React.FC<{ distribution: HolderDistribution[] }> = ({ d
   </div>
 );
 
-// Holders table
 const HoldersTable: React.FC<{ holders: Holder[] }> = ({ holders }) => {
   const formatAddress = (addr: string) => addr.slice(0, 10) + '...' + addr.slice(-8);
-  const formatBalance = (balance: number) => {
-    if (balance >= 1000000) return `${(balance / 1000000).toFixed(2)}M`;
-    if (balance >= 1000) return `${(balance / 1000).toFixed(2)}K`;
-    return balance.toFixed(2);
-  };
-  
+
   return (
     <div className="holders-table">
       <h3>Top Holders</h3>
@@ -318,38 +241,30 @@ const HoldersTable: React.FC<{ holders: Holder[] }> = ({ holders }) => {
           <span>Rank</span>
           <span>Address</span>
           <span>Balance</span>
+          <span>Value</span>
           <span>Percentage</span>
-          <span>Transactions</span>
-          <span>Last Active</span>
-          <span>Tags</span>
         </div>
-        {holders.slice(0, 50).map(holder => (
+        {holders.map(holder => (
           <div key={holder.address} className="table-row">
             <span className="rank">#{holder.rank}</span>
             <span className="address">
               {formatAddress(holder.address)}
               {holder.isContract && <span className="contract-badge">Contract</span>}
             </span>
-            <span className="balance">${formatBalance(holder.balanceUSD)}</span>
+            <span className="balance">{holder.balance}</span>
+            <span className="balance-usd">${holder.balanceUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
             <span className="percentage">{holder.percentage.toFixed(4)}%</span>
-            <span className="tx-count">{holder.txCount.toLocaleString()}</span>
-            <span className="last-active">{new Date(holder.lastActive).toLocaleDateString()}</span>
-            <span className="tags">
-              {holder.tags.map(tag => (
-                <span key={tag} className={`tag ${tag}`}>{tag}</span>
-              ))}
-            </span>
           </div>
         ))}
       </div>
-      
+
       <style>{`
         .holders-table { background: #1e293b; border-radius: 12px; padding: 20px; }
         .holders-table h3 { color: #e2e8f0; margin-bottom: 16px; }
         .table { overflow-x: auto; }
         .table-header, .table-row {
           display: grid;
-          grid-template-columns: 60px 180px 120px 100px 80px 100px 120px;
+          grid-template-columns: 60px 200px 160px 140px 110px;
           padding: 14px 16px;
           align-items: center;
         }
@@ -358,45 +273,57 @@ const HoldersTable: React.FC<{ holders: Holder[] }> = ({ holders }) => {
         .rank { color: #64748b; font-weight: 600; }
         .address { font-family: monospace; color: #3b82f6; cursor: pointer; }
         .contract-badge { margin-left: 8px; padding: 2px 6px; background: #f59e0b; border-radius: 4px; font-size: 10px; color: white; }
-        .balance { color: #10b981; font-weight: 600; }
+        .balance { color: #e2e8f0; font-family: monospace; }
+        .balance-usd { color: #10b981; font-weight: 600; }
         .percentage { color: #94a3b8; }
-        .tx-count { color: #94a3b8; }
-        .last-active { color: #64748b; font-size: 12px; }
-        .tags { display: flex; gap: 4px; flex-wrap: wrap; }
-        .tag { padding: 2px 8px; border-radius: 4px; font-size: 10px; text-transform: uppercase; }
-        .tag.whale { background: #8b5cf6; color: white; }
-        .tag.exchange { background: #3b82f6; color: white; }
-        .tag.vc { background: #ec4899; color: white; }
       `}</style>
     </div>
   );
 };
 
-// Main
 const TopHolders: React.FC = () => {
-  const { holders, token, distribution, loading, error, refetch } = useHolders();
-  
+  const router = useRouter();
+  const tokenAddress = typeof router.query.address === 'string' ? router.query.address : undefined;
+  const { holders, token, distribution, loading, error, refetch } = useHolders(tokenAddress);
+
   if (loading) {
     return <div className="loading">Loading...</div>;
   }
-  
+
+  if (!tokenAddress) {
+    return (
+      <div className="top-holders-page">
+        <div className="page-header">
+          <h1>🏆 Top Holders</h1>
+          <p>Open this page with a token address to see its holder distribution.</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="top-holders-page">
       <div className="page-header">
-        <h1>🏆 Top Holders</h1>
-        <p>Token holder distribution and analytics</p>
+        <h1>🏆 Top Holders{token?.symbol ? ` - ${token.symbol}` : ''}</h1>
+        <p>{token?.name || tokenAddress}</p>
         <button onClick={refetch}>↻ Refresh</button>
       </div>
-      
+
+      {error && <div className="error">{error}</div>}
+
       {token && <StatsCards token={token} />}
-      
+
       <div className="grid">
         {token && <ConcentrationChart token={token} />}
         <DistributionChart distribution={distribution} />
       </div>
-      
-      <HoldersTable holders={holders} />
-      
+
+      {holders.length === 0 && !error ? (
+        <div className="empty">No holders are indexed for this token yet.</div>
+      ) : (
+        <HoldersTable holders={holders} />
+      )}
+
       <style>{`
         .top-holders-page { padding: 24px; max-width: 1400px; margin: 0 auto; }
         .page-header { margin-bottom: 24px; }
@@ -405,7 +332,8 @@ const TopHolders: React.FC = () => {
         .page-header button { margin-top: 12px; padding: 8px 16px; background: #3b82f6; border: none; border-radius: 8px; color: white; cursor: pointer; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
         @media (max-width: 1024px) { .grid { grid-template-columns: 1fr; } }
-        .loading { padding: 40px; text-align: center; color: #94a3b8; }
+        .loading, .empty { padding: 40px; text-align: center; color: #94a3b8; }
+        .error { padding: 16px; background: #7f1d1d; color: #fecaca; border-radius: 8px; margin-bottom: 16px; }
       `}</style>
     </div>
   );

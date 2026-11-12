@@ -8,11 +8,11 @@ import { formatNumber, formatCurrency } from '@/lib/utils'
 
 interface DexPair {
   address: string
-  token0_symbol: string
-  token1_symbol: string
+  token0Symbol: string
+  token1Symbol: string
   liquidity: number
-  volume_24h: number
-  volume_7d: number
+  volume24h: number
+  volume7d: number
 }
 
 export default function DexPage() {
@@ -22,6 +22,11 @@ export default function DexPage() {
   const [page, setPage] = useState(1)
   const [totalPages, setTotalPages] = useState(1)
   const [total, setTotal] = useState(0)
+  const [stats, setStats] = useState<{
+    totalPairs: number
+    totalLiquidity: string
+    totalVolume: string
+  } | null>(null)
   const limit = 25
 
   useEffect(() => {
@@ -32,26 +37,29 @@ export default function DexPage() {
     setLoading(true)
     setError(null)
     try {
-      const response = await api.getDexPairs({ page, limit })
+      const [response, dexStats] = await Promise.all([
+        api.getDexPairs({ page, limit }),
+        api.getDexStats(),
+      ])
       setPairs((response.items || []) as unknown as DexPair[])
       setTotal(response.total || 0)
       setTotalPages(Math.max(1, Math.ceil(response.total / limit)))
+      setStats(dexStats)
     } catch (err) {
       // Show the failure rather than substituting invented pairs, which would
       // present fabricated liquidity and volume as if they were on chain.
       setPairs([])
       setTotal(0)
       setTotalPages(1)
+      setStats(null)
       setError(err instanceof Error ? err.message : 'Failed to load DEX pairs')
     } finally {
       setLoading(false)
     }
   }
 
-  const pageLiquidity = pairs.reduce((sum, p) => sum + (p.liquidity || 0), 0)
-  const pageVolume24h = pairs.reduce((sum, p) => sum + (p.volume_24h || 0), 0)
   const topPair = pairs.reduce<DexPair | null>(
-    (best, p) => (!best || p.volume_24h > best.volume_24h ? p : best),
+    (best, p) => (!best || p.volume24h > best.volume24h ? p : best),
     null,
   )
 
@@ -71,28 +79,32 @@ export default function DexPage() {
           </button>
         </div>
 
-        {/* Stats — derived from the loaded pairs, not invented figures. */}
+        {/* Stats — protocol totals summed in SQL, not page-level sums. */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <TrendingUp className="w-4 h-4" />
               <span className="text-sm">Total Pairs</span>
             </div>
-            <p className="text-2xl font-bold">{formatNumber(total)}</p>
+            <p className="text-2xl font-bold">{formatNumber(stats?.totalPairs ?? total)}</p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <Coins className="w-4 h-4" />
-              <span className="text-sm">Liquidity (page)</span>
+              <span className="text-sm">Total Liquidity</span>
             </div>
-            <p className="text-2xl font-bold">{formatCurrency(pageLiquidity)}</p>
+            <p className="text-2xl font-bold">
+              {stats ? formatCurrency(Number(stats.totalLiquidity)) : '—'}
+            </p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
               <Flame className="w-4 h-4" />
-              <span className="text-sm">Volume 24h (page)</span>
+              <span className="text-sm">Volume 24h</span>
             </div>
-            <p className="text-2xl font-bold">{formatCurrency(pageVolume24h)}</p>
+            <p className="text-2xl font-bold">
+              {stats ? formatCurrency(Number(stats.totalVolume)) : '—'}
+            </p>
           </div>
           <div className="bg-white dark:bg-dark-800 rounded-xl border p-6">
             <div className="flex items-center space-x-2 text-gray-500 mb-2">
@@ -100,7 +112,7 @@ export default function DexPage() {
               <span className="text-sm">Top Pair</span>
             </div>
             <p className="text-2xl font-bold truncate">
-              {topPair ? `${topPair.token0_symbol}/${topPair.token1_symbol}` : '—'}
+              {topPair ? `${topPair.token0Symbol}/${topPair.token1Symbol}` : '—'}
             </p>
           </div>
         </div>
@@ -144,7 +156,7 @@ export default function DexPage() {
                         <Link href={`/dex/${pair.address}`} className="flex items-center space-x-2">
                           <Coins className="w-5 h-5 text-primary-500" />
                           <span className="font-medium text-gray-900 dark:text-white">
-                            {pair.token0_symbol}/{pair.token1_symbol}
+                            {pair.token0Symbol}/{pair.token1Symbol}
                           </span>
                         </Link>
                       </td>
@@ -152,10 +164,10 @@ export default function DexPage() {
                         {formatCurrency(pair.liquidity)}
                       </td>
                       <td className="px-6 py-4 text-right text-gray-900 dark:text-white">
-                        {formatCurrency(pair.volume_24h)}
+                        {formatCurrency(pair.volume24h)}
                       </td>
                       <td className="px-6 py-4 text-right text-gray-900 dark:text-white">
-                        {formatCurrency(pair.volume_7d)}
+                        {formatCurrency(pair.volume7d)}
                       </td>
                       <td className="px-6 py-4 text-right">
                         <Link href={`/dex/${pair.address}`} className="text-primary-500 hover:underline">

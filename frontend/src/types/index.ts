@@ -97,6 +97,9 @@ export interface TokenHolder {
   address: string
   balance: string
   percentage: number
+  // Present in the indexed token_holders rows; absent on rows a caller builds.
+  balanceUsd?: number
+  isContract?: boolean
 }
 
 export interface TokenTransfer {
