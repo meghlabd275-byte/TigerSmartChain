@@ -55,6 +55,35 @@ pub trait StepTracer {
     /// Called once when execution finishes, whether or not it succeeded.
     fn finish(&mut self, summary: &TraceSummary);
 
+    /// Called as a frame begins executing, outermost first.
+    ///
+    /// A frame is one contract's execution: the top-level call plus each
+    /// `CALL`, `CALLCODE`, `DELEGATECALL`, `STATICCALL`, `CREATE` and
+    /// `CREATE2` it performs. This is what lets a tracer attribute steps to the
+    /// frame they belong to and derive the call tree.
+    fn enter_frame(&mut self, _address: Address, _code: &[u8]) {}
+
+    /// Called as a frame finishes, innermost first.
+    fn exit_frame(&mut self, _summary: &TraceSummary) {}
+
+    /// Number of frames currently open, one-based.
+    ///
+    /// The default of one suits a tracer that does not track frames. A tracer
+    /// that does should report how many `enter_frame` calls are unmatched.
+    fn depth(&self) -> u32 {
+        1
+    }
+
+    /// Whether a frame is already executing.
+    ///
+    /// The executor asks this before entering a frame to decide whether the
+    /// frame it is about to run is the outermost one. Only the outermost frame
+    /// reports `finish`, so a nested call cannot overwrite the top-level
+    /// summary with its own.
+    fn in_frame(&self) -> bool {
+        false
+    }
+
     /// Whether the tracer wants the memory image attached to every step.
     ///
     /// Copying memory on every step is quadratic in the number of steps, so it
@@ -73,6 +102,8 @@ pub struct StepTracerBuffer {
     truncated: bool,
     capture_memory: bool,
     summary: Option<TraceSummary>,
+    /// Address of each frame currently executing, outermost first.
+    frames: Vec<Address>,
 }
 
 impl StepTracerBuffer {
@@ -84,6 +115,7 @@ impl StepTracerBuffer {
             truncated: false,
             capture_memory: false,
             summary: None,
+            frames: Vec::new(),
         }
     }
 
@@ -105,6 +137,11 @@ impl StepTracerBuffer {
         self.truncated
     }
 
+    /// Address of each frame currently executing, outermost first.
+    pub fn frames(&self) -> &[Address] {
+        &self.frames
+    }
+
     /// The final summary, once execution has finished.
     pub fn summary(&self) -> Option<&TraceSummary> {
         self.summary.as_ref()
@@ -118,6 +155,23 @@ impl StepTracer for StepTracerBuffer {
         } else {
             self.truncated = true;
         }
+    }
+
+    fn enter_frame(&mut self, address: Address, _code: &[u8]) {
+        self.frames.push(address);
+    }
+
+    fn exit_frame(&mut self, _summary: &TraceSummary) {
+        self.frames.pop();
+    }
+
+    fn depth(&self) -> u32 {
+        // One-based, so the outermost frame is depth 1.
+        self.frames.len().max(1) as u32
+    }
+
+    fn in_frame(&self) -> bool {
+        !self.frames.is_empty()
     }
 
     fn finish(&mut self, summary: &TraceSummary) {
@@ -382,6 +436,82 @@ mod tests {
         assert!(!result.success);
         let summary = tracer.summary().expect("summary is recorded even on failure");
         assert!(!summary.success);
+    }
+
+    /// A contract that calls another contract and ignores the result.
+    ///
+    ///   PUSH1 0  PUSH1 0  PUSH1 0  PUSH1 0  PUSH1 0
+    ///   PUSH20 <callee>  GAS  CALL  POP  STOP
+    fn calls_the_callee(callee: Address) -> Vec<u8> {
+        let mut code = vec![0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00];
+        code.push(0x73); // PUSH20
+        code.extend_from_slice(&callee.0);
+        code.push(0x5a); // GAS
+        code.push(0xf1); // CALL
+        code.push(0x50); // POP
+        code.push(0x00); // STOP
+        code
+    }
+
+    #[test]
+    fn a_callee_frame_is_traced_and_its_steps_carry_depth_two() {
+        let caller_addr = Address::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let callee_addr = Address::from_hex("0x00000000000000000000000000000000000000bb").unwrap();
+
+        // The callee pushes a value then stops.
+        let callee_code = vec![0x60, 0x2a, 0x00];
+
+        let mut host = crate::host::MemoryHost::new()
+            .with_code(callee_addr.clone(), callee_code)
+            .with_balance(caller_addr.clone(), EvmWord::from_u64(0));
+
+        let caller_code = calls_the_callee(callee_addr.clone());
+
+        let mut ctx = ExecutionContext::new();
+        ctx.address = caller_addr.clone();
+        ctx.gas = 1_000_000;
+
+        let mut tracer = StepTracerBuffer::new(1_000);
+        let result =
+            Executor::new().execute_traced_with_host(&caller_code, &mut ctx, &mut host, &mut tracer);
+
+        assert!(result.success, "the call should succeed");
+
+        let depths: Vec<u32> = tracer.steps().iter().map(|s| s.depth).collect();
+        assert!(
+            depths.iter().any(|d| *d == 1),
+            "the caller's own opcodes are depth one, got {depths:?}"
+        );
+        assert!(
+            depths.iter().any(|d| *d == 2),
+            "the callee's opcodes must be depth two, got {depths:?}"
+        );
+
+        // The callee's PUSH1 0x2a ran inside the callee's frame. Without the
+        // tracer reaching the child frame these steps do not exist at all.
+        let callee_steps = tracer.steps().iter().filter(|s| s.depth == 2).count();
+        assert_eq!(
+            callee_steps, 2,
+            "the callee pushes one value and stops, so it executes two opcodes"
+        );
+
+        // Frames close again, so nothing is left on the stack.
+        assert!(tracer.frames().is_empty(), "every frame must be closed");
+    }
+
+    #[test]
+    fn a_tracer_that_ignores_frames_reports_depth_one() {
+        // The default trait implementation must stay usable: a tracer that does
+        // not track frames still gets a coherent depth.
+        struct Plain;
+        impl StepTracer for Plain {
+            fn step(&mut self, _step: &Step) {}
+            fn finish(&mut self, _summary: &TraceSummary) {}
+        }
+        let mut plain = Plain;
+        assert_eq!(plain.depth(), 1);
+        plain.enter_frame(Address::zero(), &[]);
+        assert_eq!(plain.depth(), 1, "the default must not depend on frames");
     }
 
     #[test]

@@ -107,6 +107,11 @@ impl Executor {
         let mut step_count = 0usize;
         let capture_memory = tracer.wants_memory();
 
+        // Only the outermost frame reports `finish`; a nested call must not
+        // overwrite the top-level summary with its own.
+        let is_outermost = !tracer.in_frame();
+        tracer.enter_frame(ctx.address, code);
+
         while pc < code.len() {
             // Flush the opcode executed by the previous iteration now that its
             // effects on the stack are visible.
@@ -141,7 +146,7 @@ impl Executor {
                 op: mnemonic(op_byte),
                 gas: ctx.gas.saturating_sub(gas_used),
                 gas_cost: cost,
-                depth: 1,
+                depth: tracer.depth(),
                 stack: Vec::new(),
                 memory: None,
                 error: None,
@@ -532,7 +537,8 @@ impl Executor {
                         child.block_basefee = ctx.block_basefee;
                         child.chain_id = ctx.chain_id;
 
-                        let child_res = self.execute_with_host(&init_code, &mut child, host);
+                        let child_res =
+                            self.execute_traced_with_host(&init_code, &mut child, host, tracer);
                         gas_used += child_res.gas_used;
 
                         if child_res.success {
@@ -591,7 +597,8 @@ impl Executor {
                         child.block_basefee = ctx.block_basefee;
                         child.chain_id = ctx.chain_id;
 
-                        let child_res = self.execute_with_host(&init_code, &mut child, host);
+                        let child_res =
+                            self.execute_traced_with_host(&init_code, &mut child, host, tracer);
                         gas_used += child_res.gas_used;
 
                         if child_res.success {
@@ -735,7 +742,8 @@ impl Executor {
                     child.block_basefee = ctx.block_basefee;
                     child.chain_id = ctx.chain_id;
 
-                    let child_res = self.execute_with_host(&callee_code, &mut child, host);
+                    let child_res =
+                        self.execute_traced_with_host(&callee_code, &mut child, host, tracer);
                     gas_used += child_res.gas_used;
 
                     // Copy the return data into the caller's memory, truncated
@@ -812,7 +820,10 @@ impl Executor {
         };
 
         let logs = host.take_logs();
-        tracer.finish(&summary);
+        tracer.exit_frame(&summary);
+        if is_outermost {
+            tracer.finish(&summary);
+        }
 
         // On failure the state changes are still applied by the caller, which
         // decides whether to commit or roll back the journal; logs are
