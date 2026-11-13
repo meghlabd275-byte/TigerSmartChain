@@ -194,16 +194,15 @@ func (s *Server) updatePrices() error {
 
 // Token price mapping for common tokens (BNB Chain)
 var tokenPriceMapping = map[string]string{
-	"0xbb4cdb9cbd36b7bd638a9ea19568d5e7c9e1f5e":  "binancecoin",       // BNB
+	"0xbb4cdb9cbd36b01b1dcbaebf2de08d9173bc095c":  "binancecoin",       // BNB
 	"0xe9e7cea3dedca598478052b3cbea3c1010209f80": "binance-usd",       // BUSD
 	"0x55d398326f99059f79a484a3c2dafe5d6f3a93f0": "tether",            // USDT
 	"0x8ac76a51cc950d9822d68b9fe5e0de9a2ee4d55d": "usd-coin",          // USDC
 	"0x1f3faf79714af8b3e5a373cb7cfd7a9f8e6f5a2c": "wrapped-bnb",       // WBNB
 	"0x2170ed0880ac9a755fd29b2688956bd9296e6bbd": "ethereum",          // ETH
-	"0x7130d2a12b9ccb6fbf05d016f06f2b0d2ae3a75":  "bitcoin",           // BTCB
+	"0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c":  "bitcoin",           // BTCB
 	"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82": "pancakeswap-token", // CAKE
-	"0x58f876857a02d6762e0101bb5e1448edb15b9c":   "dai",               // DAI
-	"0x3ee22068e2ea3abf1a4d7e1c33e6f9b7ff13bfd":  "axe",               // AXE
+	"0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3":   "dai",               // DAI
 }
 
 // =============================================================================
@@ -448,12 +447,12 @@ type BinanceTicker struct {
 
 // Symbol mapping for Binance
 var symbolMap = map[string]string{
-	"0xbb4cdb9cbd36b7bd638a9ea19568d5e7c9e1f5e":  "BNBUSDT",
+	"0xbb4cdb9cbd36b01b1dcbaebf2de08d9173bc095c":  "BNBUSDT",
 	"0xe9e7cea3dedca598478052b3cbea3c1010209f80": "BUSDUSDT",
 	"0x55d398326f99059f79a484a3c2dafe5d6f3a93f0": "USDTUSDT",
 	"0x8ac76a51cc950d9822d68b9fe5e0de9a2ee4d55d": "USDCUSDT",
 	"0x2170ed0880ac9a755fd29b2688956bd9296e6bbd": "ETHUSDT",
-	"0x7130d2a12b9ccb6fbf05d016f06f2b0d2ae3a75":  "BTCBUSD",
+	"0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c":  "BTCBUSD",
 	"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82": "CAKEUSDT",
 }
 

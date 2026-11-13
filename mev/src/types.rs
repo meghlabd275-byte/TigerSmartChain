@@ -95,7 +95,7 @@ pub struct MEVConfig {
 impl Default for MEVConfig {
     fn default() -> Self {
         Self {
-            chain_id: 9001,
+            chain_id: 6666,
             min_profit: 1000000000, // 1 Gwei
             detection_enabled: true,
         }

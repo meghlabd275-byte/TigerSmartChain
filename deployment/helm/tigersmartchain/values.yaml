@@ -3,7 +3,7 @@
 
 # Global settings
 global:
-  chainId: 9001
+  chainId: 6666
   networkName: TigerSmartChain
   
 # Image configuration
@@ -46,8 +46,8 @@ rpc:
   
 # EVM configuration
 evm:
-  chainId: 9001
-  networkId: 9001
+  chainId: 6666
+  networkId: 6666
   gasLimit: 300000000
   gasPrice: 1000000000
   blockTime: 450  # 0.45 seconds

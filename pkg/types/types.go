@@ -33,7 +33,7 @@ type Bloom [256]byte
 
 // Chain configuration constants
 const (
-	ChainID    = 9001
+	ChainID    = 6666
 	ChainName  = "TigerSmartChain"
 	Ticker    = "Tiger"
 	Symbol    = "TGR"

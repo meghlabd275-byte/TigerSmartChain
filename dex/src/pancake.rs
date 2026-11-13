@@ -60,7 +60,7 @@ impl PancakeClient {
 
     /// Get token price (USDT)
     pub async fn get_price(&self, token: &str) -> DEXResult<f64> {
-        let pair = format!("{}:{}", token.to_lowercase(), "0x55d398326f16d2596de6801afa493c3fcd2828a5ae"); // USDT on BSC
+        let pair = format!("{}:{}", token.to_lowercase(), "0x55d398326f99059ff775485246999027b3197955"); // USDT on BSC
         if let Ok(dex_pair) = self.get_pair(&pair).await {
             return Ok(dex_pair.token0_price);
         }

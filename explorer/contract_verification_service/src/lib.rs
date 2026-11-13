@@ -1086,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_validate_address() {
-        assert!(validate_address("0x742d35Cc6634C0532925a3b8D3812e09e48F2F0504"));
+        assert!(validate_address("0x742d35Cc6634C0532925a3b8D3812e09e48F2F05"));
         assert!(!validate_address("0x742d35Cc6634C0532925a3b8D3812e09e48F2F0"));
         assert!(!validate_address("invalid"));
     }

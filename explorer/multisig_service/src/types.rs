@@ -36,8 +36,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rpc_url: "http://localhost:8545".to_string(),
-            safe_master_copy: "0xd9dbafc0b7dd8e3f08b1a6a4c5f5d3a8e4f2b1c".to_string(),
-            safe_proxy_factory: "0xa6b71e26c5e0845f74c1021c2661f19ec6e3ce6e".to_string(),
+            safe_master_copy: "0xd9db270c1b5e3bd161e8c8503c55ceabee209425".to_string(),
+            safe_proxy_factory: "0xa6b71e26c5e0845f74c812102ca7114b6a896ab2".to_string(),
         }
     }
 }

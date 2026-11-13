@@ -131,7 +131,7 @@ pub struct GasConfig {
 impl Default for GasConfig {
     fn default() -> Self {
         Self {
-            chain_id: 9001,
+            chain_id: 6666,
             update_interval: 15,
             history_size: 1000,
             prediction_enabled: true,

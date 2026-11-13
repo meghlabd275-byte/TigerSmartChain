@@ -55,9 +55,9 @@ impl UniswapClient {
     /// Get token price (USDC)
     pub async fn get_price(&self, token: &str) -> DEXResult<f64> {
         let usdc = match self.chain {
-            ChainId::Ethereum => "0xa0b86991c6218b36c1d19d4a2e9eb0e3602d24c30", // USDC
-            ChainId::Base => "0x833589fcd6e527b83008d7c5e2c5e2c2e2e2e2e2e", // USDC on Base
-            _ => "0x55d398326f16d2596de6801afa493c3fcd2828a5ae", // USDT on BSC
+            ChainId::Ethereum => "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
+            ChainId::Base => "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC on Base
+            _ => "0x55d398326f99059ff775485246999027b3197955", // USDT on BSC
         };
         
         let pair = format!("{}:{}", token.to_lowercase(), usdc);

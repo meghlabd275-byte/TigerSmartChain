@@ -44,11 +44,19 @@ type Indexer struct {
 	mu           sync.RWMutex
 }
 
-// LoadConfig loads configuration from environment
+// DefaultChainID is TigerSmartChain's mainnet chain id. The indexer derives
+// the transaction signer from the chain id the node reports, so this is only
+// the fallback used when the node cannot be queried.
+const DefaultChainID = 6666
+
+// LoadConfig loads configuration from environment. The defaults point at a
+// TigerSmartChain node on the local host, never at a third-party chain: an
+// indexer that silently read another network's blocks would publish foreign
+// data under this chain's name.
 func LoadConfig() Config {
 	return Config{
-		RPCURL:        getEnv("RPC_URL", "https://bsc-dataseed1.binance.org"),
-		WSURL:         getEnv("WS_URL", "wss://bsc-ws.noderadio.cn"),
+		RPCURL:        getEnv("RPC_URL", "http://127.0.0.1:8545"),
+		WSURL:         getEnv("WS_URL", "ws://127.0.0.1:8546"),
 		DatabaseURL:   getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tigerscan"),
 		RedisURL:      getEnv("REDIS_URL", "localhost:6379"),
 		StartBlock:    0,
@@ -187,7 +195,7 @@ func (i *Indexer) indexTransaction(tx *types.Transaction, block *types.Block) er
 
 	// Derive sender address from the transaction signature
 	fromAddr := ""
-	chainID := big.NewInt(56) // BSC chain ID
+	chainID := big.NewInt(DefaultChainID)
 	if i.ethClient != nil {
 		if cid, err := i.ethClient.ChainID(context.Background()); err == nil {
 			chainID = cid
@@ -559,13 +567,16 @@ func (i *Indexer) setLastIndexedBlock(key string, block uint64) {
 }
 
 func (i *Indexer) getKnownTokenAddresses() []string {
-	// Common BSC tokens
+	// Well-known BEP-20 tokens, used only to seed metadata the first time a
+	// transfer from the token is seen. Every entry is a canonical 40-hex-digit
+	// address; a malformed one would never match a real contract and would
+	// silently leave the token unnamed.
 	return []string{
-		"0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b095c",  // WBNB
-		"0x55d398326f99059fF775485246999027B3197955", // USDT
-		"0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56", // BUSD
-		"0x8Ba1f109551bD432803012645Ac136ddd64DBA72", // BNB
-		"0x10ed43c718714eb63d5aa57b78b54704e256024e", // CAKE
+		"0xbb4cdb9cbd36b01b1dcbaebf2de08d9173bc095c", // WBNB
+		"0x55d398326f99059ff775485246999027b3197955", // USDT
+		"0xe9e7cea3dedca5984780bafc599bd69add087d56", // BUSD
+		"0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
+		"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", // CAKE
 	}
 }
 

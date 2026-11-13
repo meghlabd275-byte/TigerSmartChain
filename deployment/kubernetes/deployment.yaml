@@ -16,8 +16,8 @@ metadata:
   name: tigersmartchain-config
   namespace: tigersmartchain
 data:
-  chain-id: "9001"
-  network-id: "9001"
+  chain-id: "6666"
+  network-id: "6666"
   block-time: "450"
   max-gas: "300000000"
   min-gas-price: "1000000000"

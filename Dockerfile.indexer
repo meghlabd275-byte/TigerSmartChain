@@ -1,0 +1,45 @@
+# TigerScan indexer image.
+#
+# The indexer is a standalone Rust crate (`indexer/`) that reads the node over
+# JSON-RPC/WebSocket and writes to PostgreSQL, so the image needs no other crate
+# in the repository. A multi-stage build keeps the toolchain out of the runtime
+# layer and the runtime image carries only the binary, its CA bundle and curl
+# for the health check.
+
+FROM rust:1.82-bookworm AS builder
+
+WORKDIR /src
+
+COPY indexer/Cargo.toml indexer/Cargo.toml
+# A placeholder main so the dependency graph can be compiled and cached before
+# the real sources are copied in.
+RUN mkdir -p indexer/src \
+    && echo 'fn main() {}' > indexer/src/main.rs \
+    && cargo build --release --manifest-path indexer/Cargo.toml \
+    && rm -rf indexer/src
+
+COPY indexer/ indexer/
+
+# Touch the manifest so cargo rebuilds the crate now the real source is present.
+RUN touch indexer/Cargo.toml \
+    && cargo build --release --manifest-path indexer/Cargo.toml \
+    && strip indexer/target/release/tiger-indexer
+
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 tigerscan
+
+COPY --from=builder /src/indexer/target/release/tiger-indexer /usr/local/bin/tiger-indexer
+
+USER tigerscan
+WORKDIR /home/tigerscan
+
+# The indexer has no listening port; liveness is proven by the process running.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD pgrep -x tiger-indexer > /dev/null || exit 1
+
+ENTRYPOINT ["tiger-indexer"]

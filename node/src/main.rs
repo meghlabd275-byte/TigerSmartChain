@@ -59,10 +59,13 @@ fn resolve_validator_key(
     }
 }
 
-/// Default network ID
-pub const DEFAULT_NETWORK_ID: u64 = 1;
+/// Default network ID. TigerSmartChain's mainnet is chain 6666 on network 6666;
+/// the CLI default must match `genesis-mainnet.json` and every other component
+/// (indexer, explorer, SDK), or a node started with no `--chain-id` would sign
+/// and verify against a different chain than the rest of the deployment.
+pub const DEFAULT_NETWORK_ID: u64 = 6666;
 /// Default chain ID
-pub const DEFAULT_CHAIN_ID: u64 = 1;
+pub const DEFAULT_CHAIN_ID: u64 = 6666;
 /// Default P2P listen address
 pub const DEFAULT_LISTEN_ADDR: &str = ":30303";
 /// Default RPC address

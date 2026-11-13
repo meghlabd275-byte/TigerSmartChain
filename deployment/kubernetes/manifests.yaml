@@ -218,7 +218,7 @@ spec:
             - name: INDEXER_RPC_URL
               value: http://tigerscan-node:8545
             - name: INDEXER_CHAIN_ID
-              value: "9001"
+              value: "6666"
             - name: INDEXER_BATCH_SIZE
               value: "100"
             - name: INDEXER_WORKERS
@@ -339,7 +339,7 @@ spec:
             - name: API_URL
               value: http://tigerscan-api
             - name: NEXT_PUBLIC_CHAIN_ID
-              value: "9001"
+              value: "6666"
             - name: NEXT_PUBLIC_CHAIN_NAME
               value: TigerSmartChain
             - name: NEXT_PUBLIC_TOKEN_SYMBOL
@@ -569,7 +569,7 @@ metadata:
   name: tigerscan-config
   namespace: tigerscan
 data:
-  CHAIN_ID: "9001"
+  CHAIN_ID: "6666"
   CHAIN_NAME: "TigerSmartChain"
   TOKEN_SYMBOL: "TGR"
   TOKEN_NAME: "Tiger Coin"

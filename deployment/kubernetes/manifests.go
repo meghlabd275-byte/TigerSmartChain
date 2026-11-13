@@ -42,7 +42,7 @@ spec:
           name: eth
         env:
         - name: CHAIN_ID
-          value: "9001"
+          value: "6666"
         - name: P2P_LISTEN_ADDRESS
           value: "0.0.0.0:26656"
         - name: RPC_LISTEN_ADDRESS
@@ -135,7 +135,7 @@ spec:
           name: ws
         env:
         - name: CHAIN_ID
-          value: "9001"
+          value: "6666"
         - name: JSON_RPC_ADDRESS
           value: "0.0.0.0:8545"
         - name: WS_ADDRESS

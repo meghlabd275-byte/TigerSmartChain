@@ -1,0 +1,41 @@
+# TigerScan API image.
+#
+# The API server is the standalone Rust crate `api/`. It serves the explorer
+# REST API by reading the node over JSON-RPC, so it links no other crate in the
+# repository.
+
+FROM rust:1.82-bookworm AS builder
+
+WORKDIR /src
+
+COPY api/Cargo.toml api/Cargo.toml
+RUN mkdir -p api/src \
+    && echo 'fn main() {}' > api/src/main.rs \
+    && cargo build --release --manifest-path api/Cargo.toml \
+    && rm -rf api/src
+
+COPY api/ api/
+
+RUN touch api/Cargo.toml \
+    && cargo build --release --manifest-path api/Cargo.toml \
+    && strip api/target/release/tiger-api
+
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 tigerscan
+
+COPY --from=builder /src/api/target/release/tiger-api /usr/local/bin/tiger-api
+
+USER tigerscan
+WORKDIR /home/tigerscan
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["tiger-api"]

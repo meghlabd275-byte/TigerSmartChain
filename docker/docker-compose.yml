@@ -118,7 +118,7 @@ services:
   # ============================================
   frontend:
     build:
-      context: ./explorer/frontend
+      context: ./frontend
       dockerfile: Dockerfile
     container_name: tigersmartchain-frontend
     ports:

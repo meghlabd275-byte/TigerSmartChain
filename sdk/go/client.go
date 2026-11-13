@@ -37,7 +37,7 @@ func NewClient(rpcURL string) (*Client, error) {
 			Timeout: 30 * time.Second,
 		},
 		nonce:   make(map[string]uint64),
-		chainID: 9001,
+		chainID: 6666,
 	}
 
 	// Verify connection

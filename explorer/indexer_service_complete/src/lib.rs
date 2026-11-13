@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_parse_address() {
-        let addr = "0x742d35Cc6634C0532925a3b8D3812e09e48F2F0504";
+        let addr = "0x742d35Cc6634C0532925a3b8D3812e09e48F2F05";
         let parsed = parse_address(addr);
         assert!(parsed.is_some());
     }

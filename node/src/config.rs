@@ -143,8 +143,8 @@ impl Config {
     /// Create default configuration for mainnet.
     pub fn default_mainnet() -> Self {
         Self {
-            network_id: 1,
-            chain_id: 1,
+            network_id: 6666,
+            chain_id: 6666,
             network: "mainnet".to_string(),
             listen_addr: ":30303".to_string(),
             boot_nodes: Vec::new(),
@@ -222,8 +222,8 @@ mod tests {
     #[test]
     fn test_default_mainnet() {
         let config = Config::default_mainnet();
-        assert_eq!(config.network_id, 1);
-        assert_eq!(config.chain_id, 1);
+        assert_eq!(config.network_id, 6666);
+        assert_eq!(config.chain_id, 6666);
         assert_eq!(config.network, "mainnet");
     }
 

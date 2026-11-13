@@ -202,8 +202,8 @@ services:
           cpus: '4'
           memory: 8G
     environment:
-      - CHAIN_ID=9001
-      - NETWORK_ID=9001
+      - CHAIN_ID=6666
+      - NETWORK_ID=6666
       - DATA_DIR=/data
       - HTTP_HOST=0.0.0.0
       - HTTP_PORT=8545

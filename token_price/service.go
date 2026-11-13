@@ -177,9 +177,9 @@ func main() {
 
 	// Example: Fetch prices for some popular tokens
 	addresses := []string{
-		"0x2260fac5e5542a760e1e3b8c8b95e7deda2a8bb9a5", // WBTC
-		"0xc00e94cb662c3520282ead6c89d6d5e2e2be9d0e3",  // COMP
-		"0x514910771af9ca656af8408ffea2b475a5b5a6823",  // LINK
+		"0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", // WBTC
+		"0xc00e94cb662c3520282e6f5717214004a7f26888",  // COMP
+		"0x514910771af9ca656af840dff83e8264ecf986ca",  // LINK
 	}
 
 	prices, err := service.FetchMultiplePrices(addresses)

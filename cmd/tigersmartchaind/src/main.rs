@@ -12,7 +12,7 @@ mod commands;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Chain ID
-    #[arg(long, default_value_t = 9001)]
+    #[arg(long, default_value_t = 6666)]
     chain_id: u64,
 
     /// Data directory
