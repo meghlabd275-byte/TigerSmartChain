@@ -228,6 +228,17 @@ impl TigerNode {
         // or their state roots diverge.
         let block_reward = genesis_block_reward(&genesis);
 
+        // The slot duration is part of the chain definition too. The proposer
+        // rotation is measured in slots, so a follower started without the
+        // same value would compute a different window for the same block and
+        // reject every proposal. Reading it from genesis makes the producer
+        // and the importer agree without an operator having to match flags.
+        if let Some(slot) = genesis.config.slot_duration_secs {
+            if slot > 0 {
+                config.slot_duration_secs = slot;
+            }
+        }
+
         let mut consensus = PoSA::new(
             config.chain_id,
             config.epoch_length,
@@ -632,8 +643,14 @@ impl TigerNode {
         }
 
         // The consensus engine decides whether the block's proposer was
-        // entitled to propose it. A block from an unauthorised proposer is
-        // rejected before any work is done on it.
+        // entitled to propose it, and whether the block's timestamp sits in
+        // that proposer's slot. Both the producer and every importer apply the
+        // same `is_authorised_block_proposer` rule, so a block the producer is
+        // willing to seal is a block every follower is willing to import. An
+        // earlier version checked only the strictly in-turn proposer here
+        // while the producer allowed any active validator to take over a later
+        // slot; the two rules disagreed and every block from a backup proposer
+        // was rejected, freezing every follower one block behind the head.
         //
         // A node with an empty authority set cannot verify anything: it would
         // have to accept whoever proposes first, which lets one attacker own
@@ -642,36 +659,61 @@ impl TigerNode {
         // without a validator set refuses every block instead.
         {
             let mut consensus = self.consensus.lock().await;
-            if !consensus.is_authorised_proposer(block.header.number, &block.header.miner) {
-                if self.config.validators.is_empty() {
-                    if !self.config.allow_unlisted_validators {
-                        return Err(anyhow::anyhow!(
-                            "block {} was proposed by {}, but this node has no validator \
-                             set; refusing to adopt a proposer from the network (start \
-                             with --validators, or --allow-unlisted-validators on a \
-                             private chain)",
-                            block.header.number,
-                            block.header.miner
-                        ));
-                    }
-                    warn!(
-                        "adopting {} as a validator, learned from block {}; this node is \
-                         running in unlisted-validator mode and has no fixed authority set",
-                        block.header.miner, block.header.number
-                    );
-                    consensus.register_validator(
-                        block.header.miner.clone(),
-                        tiger_consensus::posa::MIN_STAKE,
-                    );
-                    // Registration only adds the authority; the epoch rotation
-                    // decides who proposes, so it is refreshed here too.
-                    consensus.update_epoch(block.header.number);
-                }
-                if !consensus.is_authorised_proposer(block.header.number, &block.header.miner) {
+            if self.config.validators.is_empty() {
+                if block.header.number == 0 {
+                    // Genesis is the chain's own definition and is exempt.
+                } else if !self.config.allow_unlisted_validators {
                     return Err(anyhow::anyhow!(
-                        "block {} was proposed by {}, who is not the expected proposer",
+                        "block {} was proposed by {}, but this node has no validator \
+                         set; refusing to adopt a proposer from the network (start \
+                         with --validators, or --allow-unlisted-validators on a \
+                         private chain)",
                         block.header.number,
                         block.header.miner
+                    ));
+                } else {
+                    if !consensus.is_validator(&block.header.miner) {
+                        warn!(
+                            "adopting {} as a validator, learned from block {}; this node is \
+                             running in unlisted-validator mode and has no fixed authority set",
+                            block.header.miner, block.header.number
+                        );
+                        consensus.register_validator(
+                            block.header.miner.clone(),
+                            tiger_consensus::posa::MIN_STAKE,
+                        );
+                        consensus.update_epoch(block.header.number);
+                    }
+                }
+            } else if block.header.number > 0 {
+                // The parent's timestamp bounds the proposer's slot window.
+                // It is read from the parent identified by the header, not the
+                // head, so a side branch is checked against its own parent.
+                let parent_timestamp = {
+                    let cm = self.chain_manager.lock().await;
+                    cm.chain()
+                        .get_block_by_hash(&block.header.parent_hash)
+                        .map(|b| b.header.timestamp)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "block {} names parent {}, which is not known",
+                                block.header.number,
+                                block.header.parent_hash
+                            )
+                        })?
+                };
+                if !consensus.is_authorised_block_proposer(
+                    block.header.number,
+                    &block.header.miner,
+                    block.header.timestamp,
+                    parent_timestamp,
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "block {} was proposed by {} with timestamp {}, which is not an \
+                         authorised proposer for that slot",
+                        block.header.number,
+                        block.header.miner,
+                        block.header.timestamp
                     ));
                 }
             }
@@ -1314,6 +1356,11 @@ impl TigerNode {
                     _ => None,
                 };
                 let now_secs = chrono::Utc::now().timestamp().max(0) as u64;
+                // The producer waits for its own slot, exactly as an importer
+                // requires: a block sealed before the proposer's turn would be
+                // rejected by every peer, and a node that kept sealing outside
+                // its slot would fork the network. The rule lives in
+                // `is_authorised_block_proposer` so the two sides agree.
                 let may_propose = proposal_slot
                     .map(|earliest| now_secs >= earliest)
                     .unwrap_or(false);
@@ -2278,6 +2325,21 @@ pub fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
         )
     };
 
+    // The genesis timestamp is part of the chain definition. It is taken from
+    // the genesis document (hex or decimal) rather than hardcoded, because
+    // every proposer's first slot is measured from it: a fixed zero would put
+    // the first block's slot far in the past and let the very first proposal
+    // look backdated to any importer that checked.
+    let timestamp = {
+        let raw = genesis.timestamp.trim();
+        let parsed = raw
+            .strip_prefix("0x")
+            .or_else(|| raw.strip_prefix("0X"))
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .or_else(|| raw.parse::<u64>().ok());
+        parsed.unwrap_or(0)
+    };
+
     Block {
         header: BlockHeader {
             parent_hash: format!("0x{}", tiger_blockchain::hex_encode(&[0u8; 32])),
@@ -2294,7 +2356,7 @@ pub fn genesis_block_from(genesis: &Genesis) -> tiger_blockchain::types::Block {
             number: 0,
             gas_limit,
             gas_used: 0,
-            timestamp: 0,
+            timestamp,
             extra_data: format!("0x{}", tiger_blockchain::hex_encode(genesis.extra_data.as_bytes())),
             mix_hash: genesis.mix_hash.clone(),
             nonce: "0x0000000000000000".to_string(),

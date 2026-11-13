@@ -73,7 +73,7 @@ pub const DEFAULT_RPC_ADDR: &str = ":8545";
 /// Default metrics address
 pub const DEFAULT_METRICS_ADDR: &str = ":9090";
 /// Default WebSocket address
-pub const DEFAULT_WS_ADDR: &str = ":8546";
+pub const DEFAULT_WS_ADDR: &str = "127.0.0.1:8546";
 /// Default max peers
 pub const DEFAULT_MAX_PEERS: usize = 50;
 /// Default epoch length

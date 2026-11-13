@@ -169,6 +169,13 @@ pub struct ChainConfig {
     /// the network.
     #[serde(default)]
     pub validators: Vec<String>,
+    /// Seconds per proposal slot, fixed in genesis. The proposer rotation is
+    /// measured in slots, so every node must use the same value or two nodes
+    /// with the same validator set would compute different slot windows for
+    /// the same block and reject each other's blocks. A node that reads it
+    /// from the chain definition cannot disagree with the validators.
+    #[serde(alias = "slotDurationSecs", alias = "slotDuration", default)]
+    pub slot_duration_secs: Option<u64>,
 }
 
 fn default_chain_id() -> u64 {
@@ -198,6 +205,7 @@ impl Default for ChainConfig {
             epoch_length: None,
             block_reward: None,
             validators: Vec::new(),
+            slot_duration_secs: None,
         }
     }
 }

@@ -419,3 +419,76 @@ whole-chain rewrite.
 `mkdir -p /tmp/ossllibs && ln -sf /usr/lib/x86_64-linux-gnu/libssl.so.3 /tmp/ossllibs/libssl.so
  && ln -sf /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /tmp/ossllibs/libcrypto.so`
 then `LIBRARY_PATH=/tmp/ossllibs cargo test`.
+
+## Session 2026-11-13 — multi-validator consensus liveness + fork convergence (VERIFIED live)
+
+The earlier note "all nodes stuck at height 0" had several independent causes,
+all now fixed. A 3-node live test (2 validators + 1 follower) now stays
+consistent: every node reports the same head hash at the same height, and
+transient one-block gaps heal within a slot.
+
+### Root causes found (all real)
+1. **Genesis timestamp was hardcoded `timestamp: 0`** in
+   `node/src/node.rs::genesis_block_from`, ignoring `genesis.timestamp`. Every
+   proposer's first slot is measured from the genesis timestamp, so a zero
+   genesis put the first block's slot far in the past. Now parsed from the
+   genesis document (hex or decimal).
+2. **`slot_duration_secs` was not part of the chain definition.** It lived only
+   in `Config` (CLI default 3s). A follower started without `--slot-duration-secs`
+   used 3s while the validators used 1s, so it computed a different slot window
+   for the same block and rejected every proposal. Now a genesis field
+   (`config.slotDurationSecs`, alias `slotDuration`) on `ChainConfig`, read in
+   `TigerNode::from_genesis`; the CLI flag remains a fallback only.
+3. **Peers exchanged `Status` once at handshake and never again.** A peer that
+   connected while a node was near the head kept a stale view of that node's
+   height and never asked for later blocks, so it stayed permanently behind.
+   The ping heartbeat in `node/src/p2p.rs::serve` now re-sends `Status` (height +
+   head hash) alongside each `Ping`.
+4. **A peer announced ahead of a follower is rejected as "parent not known".**
+   Harmless when catch-up works, but it looked like a stall before (1) and (2)
+   were fixed. Catch-up via `GetBlocks` is what closes the gap; announcements
+   simply arrive before the parent.
+
+### Slot-window rule (the one both producer and importer use)
+`PoSA::earliest_proposal_time` (in `consensus/src/posa.rs`) is
+`parent_timestamp + 1 + slot_duration * proposer_turn_distance`. The in-turn
+validator (distance 0) may propose as soon as the parent exists; each backup
+waits one further slot, so an offline in-turn validator is skipped rather than
+waited for, and no validator can backdate into an earlier proposer's slot.
+`is_authorised_block_proposer` = `is_validator && is_timely_proposal`. The
+producer's `may_propose` gate in `node/src/node.rs` uses the same rule.
+NOTE: for `slot_duration == 1` this is identical to the old formula; the change
+only matters for multi-second slots, where the in-turn window is
+`[parent+1, parent+slot_duration)`.
+
+### Fork convergence
+Two validators can both seal the same height when the backup's slot arrives
+before it has imported the in-turn block (common with 1s slots). Fork choice
+(`blockchain/src/chain.rs`) scores branches by cumulative difficulty and breaks
+ties by lower hash, and `import_block` reorgs + replays on
+`InsertOutcome::Reorged`. The chain therefore converges once each validator
+imports the other's block. Do not "fix" a fork by refusing backup proposals —
+that reintroduces the liveness bug where an offline in-turn validator stalls
+the chain.
+
+### WebSocket bind
+`DEFAULT_WS_ADDR` / `Config::ws_addr` default was `":8546"`, which fails DNS
+lookup ("Name or service not known") on this host. Now `127.0.0.1:8546`.
+
+### Test counts (all passing)
+consensus 31, blockchain 65, network 22, node 138.
+
+### Live test recipe (2 validators + 1 follower)
+```
+pkill -f 'node/target/debug/tigersmartchaind'
+K1=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d   # account #1
+K2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a   # account #2
+./node/target/debug/tigersmartchaind --chain-id 6666 --rpc-addr 127.0.0.1:8545 \
+  --listen-addr 127.0.0.1:30303 --data-dir /tmp/tsc-a \
+  --genesis-file genesis-mainnet.json --validator-key $K1 &
+# node B: :8546 / :30304, same genesis, --validator-key $K2 --boot-nodes 127.0.0.1:30303
+# node C (follower): :8547 / :30305, same genesis, --boot-nodes 127.0.0.1:30303 (no key)
+# check: eth_getBlockByNumber("latest") hash must match on all three
+```
+Genesis must carry `config.slotDurationSecs` (1) and `config.validators`
+(2 addresses); `timestamp` is set (not 0).

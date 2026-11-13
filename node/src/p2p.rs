@@ -328,6 +328,7 @@ impl P2pService {
                             .await;
                         continue;
                     }
+                    debug!("catch-up: our_height={our_height}, {} peer(s) ahead", peers.len());
                     let mut highest = our_height;
                     for peer in peers {
                         let peer_height = {
@@ -548,6 +549,22 @@ impl P2pService {
                 }
 
                 _ = ping_interval.tick() => {
+                    // Re-advertise our height, not just liveness. The status is
+                    // sent once at handshake; without this refresh a peer that
+                    // connected while this node was near the head would keep
+                    // its stale view and never ask for the blocks produced
+                    // afterwards, leaving it permanently behind. Sending the
+                    // status lets the peer re-drive its catch-up.
+                    let (height, head_hash) = head_status(&self.node).await;
+                    let status = PeerMessage::Status {
+                        chain_id: self.node.config().chain_id,
+                        height,
+                        head_hash,
+                    };
+                    if let Ok(frame) = encode_message(&status) {
+                        let peer = connection.lock().await;
+                        peer.try_send_frame(frame);
+                    }
                     let ping = encode_message(&PeerMessage::Ping(now_seconds()))?;
                     let peer = connection.lock().await;
                     peer.try_send_frame(ping);
@@ -695,6 +712,7 @@ impl P2pService {
                         .filter_map(|n| chain.get_block(n).cloned())
                         .collect::<Vec<_>>()
                 };
+                debug!("GetBlocks({from}, {count}) -> {} block(s)", blocks.len());
                 if !blocks.is_empty() {
                     if let Ok(frame) = encode_message(&PeerMessage::Blocks(blocks)) {
                         let peer = connection.lock().await;
@@ -814,7 +832,8 @@ impl P2pService {
         };
         if let Ok(frame) = encode_message(&request) {
             let peer = connection.lock().await;
-            peer.try_send_frame(frame);
+            let sent = peer.try_send_frame(frame);
+            debug!("requested blocks {from}..{} from a peer (queued={sent})", from + count);
         }
     }
 

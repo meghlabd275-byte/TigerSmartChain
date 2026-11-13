@@ -229,11 +229,13 @@ impl PoSA {
 
     /// The earliest timestamp at which `proposer` may propose `block_number`.
     ///
-    /// The in-turn validator may propose one slot after the parent. Each
-    /// subsequent validator in the rotation waits one further slot, so a
-    /// proposer who is offline is skipped rather than waited for. The parent
-    /// timestamp is passed in rather than read from the header so this stays a
-    /// pure function of the inputs.
+    /// The in-turn validator may propose as soon as the parent exists, so its
+    /// earliest time is one second past the parent. Each subsequent validator
+    /// in the rotation waits one further slot, so a proposer who is offline is
+    /// skipped rather than waited for, while a validator later in the rotation
+    /// still cannot backdate its block into an earlier validator's slot. The
+    /// parent timestamp is passed in rather than read from the header so this
+    /// stays a pure function of the inputs.
     pub fn earliest_proposal_time(
         &self,
         block_number: u64,
@@ -241,11 +243,11 @@ impl PoSA {
         parent_timestamp: u64,
     ) -> Option<u64> {
         let distance = self.proposer_turn_distance(block_number, proposer)?;
-        let slots = distance as u64 + 1;
-        Some(
-            parent_timestamp
-                .saturating_add(self.slot_duration.max(1).saturating_mul(slots)),
-        )
+        let wait = self
+            .slot_duration
+            .max(1)
+            .saturating_mul(distance as u64);
+        Some(parent_timestamp.saturating_add(1).saturating_add(wait))
     }
 
     /// Whether a block from `proposer` at `block_number` with `timestamp` is
@@ -265,6 +267,29 @@ impl PoSA {
             Some(earliest) => timestamp >= earliest,
             None => false,
         }
+    }
+
+    /// Whether `proposer` is allowed to have produced `block_number` with the
+    /// given timestamp.
+    ///
+    /// This is the single rule that both the producer and every importer must
+    /// apply, and it is deliberately one function so the two can never
+    /// disagree. A block is authorised when its proposer is an active
+    /// validator and its timestamp is not backdated before that proposer's
+    /// turn in the rotation. The in-turn validator may propose one slot after
+    /// the parent; a backup waits one further slot per position, so an offline
+    /// in-turn validator is skipped rather than waited for. Without the lower
+    /// bound a validator could ignore the rotation and seal every block by
+    /// stamping it with a time that belongs to an earlier proposer's slot.
+    pub fn is_authorised_block_proposer(
+        &self,
+        block_number: u64,
+        proposer: &str,
+        timestamp: u64,
+        parent_timestamp: u64,
+    ) -> bool {
+        self.is_validator(proposer)
+            && self.is_timely_proposal(block_number, proposer, timestamp, parent_timestamp)
     }
 
     /// Slash a validator for double signing or downtime
@@ -459,15 +484,17 @@ mod tests {
         assert_eq!(posa.proposer_turn_distance(0, "0xb"), Some(1));
         assert_eq!(posa.proposer_turn_distance(0, "0xc"), Some(2));
 
-        // The in-turn validator may go one slot after the parent.
-        assert_eq!(posa.earliest_proposal_time(0, "0xa", 1_000), Some(1_003));
-        // A backup waits longer, so the in-turn validator gets first refusal.
-        assert_eq!(posa.earliest_proposal_time(0, "0xb", 1_000), Some(1_006));
-        assert_eq!(posa.earliest_proposal_time(0, "0xc", 1_000), Some(1_009));
+        // The in-turn validator may propose as soon as the parent exists, so
+        // its window opens one second after the parent.
+        assert_eq!(posa.earliest_proposal_time(0, "0xa", 1_000), Some(1_001));
+        // A backup waits one whole slot longer, so the in-turn validator's
+        // slot (which lasts `slot_duration` seconds) is not stolen.
+        assert_eq!(posa.earliest_proposal_time(0, "0xb", 1_000), Some(1_004));
+        assert_eq!(posa.earliest_proposal_time(0, "0xc", 1_000), Some(1_007));
 
-        // If 0xa never proposes, 0xb's block at 1_006 is accepted.
-        assert!(!posa.is_timely_proposal(0, "0xb", 1_005, 1_000));
-        assert!(posa.is_timely_proposal(0, "0xb", 1_006, 1_000));
+        // If 0xa never proposes, 0xb's block at 1_004 is accepted.
+        assert!(!posa.is_timely_proposal(0, "0xb", 1_003, 1_000));
+        assert!(posa.is_timely_proposal(0, "0xb", 1_004, 1_000));
     }
 
     /// Backdating must not let a validator bypass the rotation entirely.
