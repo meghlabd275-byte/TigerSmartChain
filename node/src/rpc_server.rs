@@ -552,7 +552,7 @@ pub(crate) async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcR
             let full = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
             let manager = node.get_chain_manager().await;
             let chain = manager.chain();
-            let number = match parse_block_tag(&tag, chain.height()) {
+            let number = match resolve_block_tag(node.finalized_height().await, &tag, chain.height()) {
                 Some(number) => number,
                 None => return RpcResponse::success(Value::Null, id),
             };
@@ -600,7 +600,7 @@ pub(crate) async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcR
             };
             let manager = node.get_chain_manager().await;
             let chain = manager.chain();
-            let number = match parse_block_tag(&tag, chain.height()) {
+            let number = match resolve_block_tag(node.finalized_height().await, &tag, chain.height()) {
                 Some(number) => number,
                 None => return RpcResponse::success(Value::Null, id),
             };
@@ -659,7 +659,7 @@ pub(crate) async fn dispatch(node: &Arc<TigerNode>, request: RpcRequest) -> RpcR
             };
             let manager = node.get_chain_manager().await;
             let chain = manager.chain();
-            let number = match parse_block_tag(&tag, chain.height()) {
+            let number = match resolve_block_tag(node.finalized_height().await, &tag, chain.height()) {
                 Some(number) => number,
                 None => return RpcResponse::success(Value::Null, id),
             };
@@ -1531,7 +1531,7 @@ async fn fee_history(node: &Arc<TigerNode>, params: &Value) -> Result<Value, Str
     let manager = node.get_chain_manager().await;
     let chain = manager.chain();
     let height = chain.height();
-    let newest = parse_block_tag(newest_tag, height)
+    let newest = resolve_block_tag(node.finalized_height().await, newest_tag, height)
         .ok_or_else(|| "invalid newest block".to_string())?;
 
     // The window never reaches below genesis.
@@ -1636,7 +1636,7 @@ async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, S
         let manager = node.get_chain_manager().await;
         manager.chain().height()
     };
-    let filter = parse_log_filter(filter_json, height)?;
+    let filter = parse_log_filter(filter_json, height, node.finalized_height().await)?;
 
     let manager = node.get_chain_manager().await;
     let chain = manager.chain();
@@ -1645,7 +1645,11 @@ async fn get_logs(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<Value>, S
 }
 
 /// Turn a log filter's JSON body into a [`LogFilter`].
-pub(crate) fn parse_log_filter(filter: &Value, height: u64) -> Result<LogFilter, String> {
+pub(crate) fn parse_log_filter(
+    filter: &Value,
+    height: u64,
+    finalized: Option<u64>,
+) -> Result<LogFilter, String> {
     let block_hash = filter
         .get("blockHash")
         .and_then(|v| v.as_str())
@@ -1657,14 +1661,13 @@ pub(crate) fn parse_log_filter(filter: &Value, height: u64) -> Result<LogFilter,
         (None, None)
     } else {
         let from = match filter.get("fromBlock").and_then(|v| v.as_str()) {
-            Some(tag) => parse_block_tag(tag, height)
+            Some(tag) => resolve_block_tag(finalized, tag, height)
                 .ok_or_else(|| "invalid fromBlock".to_string())?,
             None => 0,
         };
         let to = match filter.get("toBlock").and_then(|v| v.as_str()) {
-            Some(tag) => {
-                parse_block_tag(tag, height).ok_or_else(|| "invalid toBlock".to_string())?
-            }
+            Some(tag) => resolve_block_tag(finalized, tag, height)
+                .ok_or_else(|| "invalid toBlock".to_string())?,
             None => height,
         };
         (Some(from), Some(to))
@@ -1785,7 +1788,7 @@ async fn new_log_filter(node: &Arc<TigerNode>, params: &Value) -> Result<u64, St
         let manager = node.get_chain_manager().await;
         manager.chain().height()
     };
-    let filter = parse_log_filter(filter_json, height)?;
+    let filter = parse_log_filter(filter_json, height, node.finalized_height().await)?;
     let mut filters = node.get_filters().await;
     filters.install(FilterKind::Logs(filter), height)
 }
@@ -1917,7 +1920,9 @@ async fn block_receipts(node: &Arc<TigerNode>, params: &Value) -> Result<Value, 
     let height = chain.height();
 
     // The argument may be a number, a tag, or a block hash.
-    let block = if let Some(number) = parse_block_tag(&tag, height) {
+    let block = if let Some(number) =
+        resolve_block_tag(node.finalized_height().await, &tag, height)
+    {
         chain.get_block(number)
     } else {
         chain.get_block_by_hash(&tag)
@@ -2051,12 +2056,31 @@ pub(crate) fn topics_match(filter: &TopicFilter, topics: &[[u8; 32]]) -> bool {
 }
 
 /// Resolve a block tag to a number, or `None` when it cannot match a block.
+///
+/// `safe` and `finalized` need the node's finality state and are resolved by
+/// [`resolve_block_tag`]; this function handles the tags that are a pure
+/// function of the head height.
 fn parse_block_tag(tag: &str, height: u64) -> Option<u64> {
     match tag {
-        "latest" | "safe" | "finalized" => Some(height),
+        "latest" => Some(height),
         "earliest" => Some(0),
         "pending" => Some(height + 1),
         other => parse_u64_hex(other),
+    }
+}
+
+/// Resolve a block tag, including the finality-aware ones.
+///
+/// `finalized` reports the highest height a quorum has certified, and `safe`
+/// reports the same height: this chain finalises the head directly, so there
+/// is no separate "safe but not final" region. When nothing has been finalised
+/// yet, both fall back to the head — the same as `latest` — rather than
+/// inventing a height, because a client asking for a finalised block must
+/// either get one that really is final or be told there is none.
+fn resolve_block_tag(finalized: Option<u64>, tag: &str, height: u64) -> Option<u64> {
+    match tag {
+        "finalized" | "safe" => finalized.or(Some(height)),
+        other => parse_block_tag(other, height),
     }
 }
 
@@ -2366,6 +2390,22 @@ mod tests {
         assert_eq!(parse_block_tag("pending", 100), Some(101));
         assert_eq!(parse_block_tag("0x10", 100), Some(16));
         assert_eq!(parse_block_tag("nonsense", 100), None);
+    }
+
+    #[test]
+    fn safe_and_finalized_report_the_finalised_height() {
+        // With finality recorded, `safe` and `finalized` name that height and
+        // not the head, so a client that trusts them is not handed a block
+        // that could still be reverted.
+        assert_eq!(resolve_block_tag(Some(40), "finalized", 100), Some(40));
+        assert_eq!(resolve_block_tag(Some(40), "safe", 100), Some(40));
+        // Without any finality the tags fall back to the head, which is what
+        // every client already treats as "the latest I can see".
+        assert_eq!(resolve_block_tag(None, "finalized", 100), Some(100));
+        assert_eq!(resolve_block_tag(None, "safe", 100), Some(100));
+        // The other tags are unaffected by finality.
+        assert_eq!(resolve_block_tag(Some(40), "latest", 100), Some(100));
+        assert_eq!(resolve_block_tag(Some(40), "0x10", 100), Some(16));
     }
 
     #[test]

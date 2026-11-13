@@ -406,6 +406,32 @@ impl P2pService {
         }
     }
 
+    /// Gossip this node's signed vote for a block to every peer.
+    pub async fn gossip_attestation(&self, attestation: tiger_consensus::Attestation) {
+        let message = PeerMessage::Attestation(Box::new(attestation));
+        match encode_message(&message) {
+            Ok(frame) => {
+                let manager = self.manager.lock().await;
+                let sent = manager.broadcast(frame);
+                debug!("gossiped an attestation to {sent} peer(s)");
+            }
+            Err(e) => warn!("cannot encode an attestation: {e}"),
+        }
+    }
+
+    /// Gossip a completed quorum certificate to every peer.
+    pub async fn gossip_certificate(&self, certificate: tiger_consensus::QuorumCertificate) {
+        let message = PeerMessage::QuorumCertificate(Box::new(certificate));
+        match encode_message(&message) {
+            Ok(frame) => {
+                let manager = self.manager.lock().await;
+                let sent = manager.broadcast(frame);
+                debug!("gossiped a quorum certificate to {sent} peer(s)");
+            }
+            Err(e) => warn!("cannot encode a quorum certificate: {e}"),
+        }
+    }
+
     /// Dial a bootnode and serve the connection.
     async fn dial(&self, address: &str, identity: &Identity) -> Result<()> {
         let stream = TcpStream::connect(address).await?;
@@ -729,6 +755,38 @@ impl P2pService {
 
             PeerMessage::Pong(_) => {
                 // Any frame refreshes liveness, which `mark_seen` already did.
+            }
+
+            PeerMessage::Attestation(attestation) => {
+                // A peer's vote. Recording it may expose equivocation (which is
+                // slashed) and may complete a quorum, advancing finality. A
+                // vote for an unknown height is simply ignored by the tracker.
+                if let Some(proof) = self.node.record_attestation(*attestation).await {
+                    // Forward the proof so every peer slashes the same
+                    // validator, and the misbehaviour cannot be hidden.
+                    let message = PeerMessage::Equivocation(Box::new(proof));
+                    if let Ok(frame) = encode_message(&message) {
+                        let manager = self.manager.lock().await;
+                        manager.broadcast(frame);
+                    }
+                }
+            }
+
+            PeerMessage::QuorumCertificate(certificate) => {
+                // A certificate is a claim of finality. It is verified against
+                // the weights before it is believed, so a forged certificate is
+                // rejected rather than trusted.
+                if !self.node.record_certificate(*certificate).await {
+                    debug!("ignored a quorum certificate from {peer_id}: it did not verify");
+                }
+            }
+
+            PeerMessage::Equivocation(proof) => {
+                // A proof of misbehaviour is only acted on if it verifies, so a
+                // peer cannot slash an honest validator by claiming it did.
+                if proof.verify() {
+                    self.node.slash_for_equivocation(&proof).await;
+                }
             }
 
             PeerMessage::Disconnect(reason) => {

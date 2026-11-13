@@ -6,6 +6,7 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use log::{error, info, warn};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
@@ -15,7 +16,7 @@ use tiger_blockchain::{ChainConfig, ChainManager, Genesis, Mempool, Transaction}
 
 /// Gas limit for produced blocks.
 const BLOCK_GAS_LIMIT: u64 = 30_000_000;
-use tiger_consensus::PoSA;
+use tiger_consensus::{Attestation, EquivocationProof, PoSA, QuorumCertificate, SlashingManager};
 use tiger_network::SyncStatus;
 use tiger_state::account::WorldState;
 
@@ -119,6 +120,31 @@ pub struct TigerNode {
 
     /// Installed RPC filters (`eth_newFilter` and friends).
     filters: tokio::sync::Mutex<crate::filters::FilterRegistry>,
+
+    /// BFT finality: collects validator attestations into quorum certificates,
+    /// records equivocation evidence, and tracks the finalised height.
+    ///
+    /// This is what turns block *production* into block *finality*: without a
+    /// quorum a reorg could always be attempted, and `eth_getBlockByNumber`
+    /// could not honour the `finalized` tag.
+    attestations: tokio::sync::Mutex<tiger_consensus::AttestationTracker>,
+
+    /// The weights (stake per validator) a certificate is measured against.
+    /// Kept in step with the consensus engine's active set.
+    finality_weights: tokio::sync::Mutex<std::collections::HashMap<String, u128>>,
+
+    /// The highest finalised height and its hash, mirrored from the tracker so
+    /// RPC reads do not have to take the tracker lock on the hot path.
+    finalized: RwLock<Option<(u64, String)>>,
+
+    /// Validators already slashed for equivocation, keyed by
+    /// `validator:height`.
+    ///
+    /// A proof is gossiped to every peer and may arrive from several of them;
+    /// the penalty must be applied once, not once per copy. Keying on the
+    /// height means a validator that equivocates at a new height is still
+    /// slashed again.
+    slashed: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl TigerNode {
@@ -219,6 +245,11 @@ impl TigerNode {
         }
         consensus.update_epoch(0);
 
+        // Seed the finality weights from the active validator set. The
+        // certificate threshold is measured in stake weight, so a quorum is
+        // two thirds of the *active* stake, not of a validator headcount.
+        let finality_weights = finality_weight_map(&consensus);
+
         // Parse the sealing key, if one was configured. A validator without a
         // usable key cannot seal a block, and a block without a seal is
         // rejected by every peer, so this is reported at startup.
@@ -306,6 +337,10 @@ impl TigerNode {
             storage,
             persisted: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             canonical_mark: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            attestations: tokio::sync::Mutex::new(tiger_consensus::AttestationTracker::new()),
+            finality_weights: tokio::sync::Mutex::new(finality_weights),
+            finalized: RwLock::new(None),
+            slashed: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             started_at: std::time::Instant::now(),
             p2p: std::sync::OnceLock::new(),
             filters: tokio::sync::Mutex::new(crate::filters::FilterRegistry::new()),
@@ -1137,6 +1172,11 @@ impl TigerNode {
             }
         }
 
+        // Restore the last finalised height so a restarted node keeps the
+        // promise it already made: a client that treated a block as final must
+        // never see it reverted.
+        self.restore_finality().await;
+
         Ok(())
     }
 
@@ -1154,6 +1194,11 @@ impl TigerNode {
 
         // Spawn sync status monitor
         self.spawn_sync_monitor();
+
+        // Spawn the finality task: cast this node's vote on the head and
+        // collect peers' votes into a quorum certificate. This is what turns
+        // produced blocks into final ones.
+        self.spawn_finality();
 
         // Start the JSON-RPC server so wallets and the explorer can reach the
         // chain. Without it the node has no client interface at all.
@@ -1400,6 +1445,55 @@ impl TigerNode {
         });
     }
 
+    /// Spawn the finality loop.
+    ///
+    /// Every slot this task casts the node's own vote for the head (when it is
+    /// a validator) and gossips it, then assembles the votes it has collected
+    /// into a quorum certificate. A certificate that reaches two thirds of the
+    /// active stake advances the finalised height, which is what `finalized`
+    /// and `safe` RPC tags report.
+    fn spawn_finality(self: &Arc<Self>) {
+        let node = Arc::clone(self);
+        let period = std::time::Duration::from_secs(node.config.slot_duration_secs.max(1));
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.tick().await;
+            loop {
+                {
+                    let state = node.state.read().await;
+                    if *state != NodeState::Running {
+                        break;
+                    }
+                }
+                interval.tick().await;
+
+                // Cast and gossip our own vote.
+                if let Some(attestation) = node.attest_head().await {
+                    if let Some(p2p) = node.p2p() {
+                        p2p.gossip_attestation(attestation.clone()).await;
+                    }
+                    node.record_attestation(attestation).await;
+                }
+
+                // If a quorum is already in hand, forward the certificate so a
+                // peer that missed votes still learns the height is final.
+                if let Some(p2p) = node.p2p() {
+                    if let Some((height, hash)) = node.finalized().await {
+                        let certificate = {
+                            let tracker = node.attestations.lock().await;
+                            let weights = node.finality_weights.lock().await.clone();
+                            tracker.certificate_for(height, &hash, height, &weights)
+                        };
+                        if let Some(certificate) = certificate {
+                            p2p.gossip_certificate(certificate).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Stop the node and all its components gracefully.
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping node components...");
@@ -1450,6 +1544,222 @@ impl TigerNode {
     /// Get the consensus engine instance (locked).
     pub async fn get_consensus(&self) -> tokio::sync::MutexGuard<'_, PoSA> {
         self.consensus.lock().await
+    }
+
+    /// The last finalised height and hash, if any block has been finalised.
+    pub async fn finalized(&self) -> Option<(u64, String)> {
+        self.finalized.read().await.clone()
+    }
+
+    /// The last finalised height, if any. Used to resolve the `finalized` and
+    /// `safe` block tags.
+    pub async fn finalized_height(&self) -> Option<u64> {
+        self.finalized.read().await.as_ref().map(|(height, _)| *height)
+    }
+
+    /// The block height a validator is attesting to: the current head.
+    ///
+    /// Votes are cast for the head this node has executed, so a node that is
+    /// behind votes for a lower height and its vote simply does not help reach
+    /// the quorum for a height it has not reached.
+    pub async fn head_height(&self) -> u64 {
+        let manager = self.chain_manager.lock().await;
+        manager.chain().height()
+    }
+
+    /// Sign an attestation for the current head with this node's sealing key.
+    ///
+    /// Returns `None` when this node is not a validator (no key, or not in the
+    /// active set), so a follower never manufactures votes.
+    pub async fn attest_head(&self) -> Option<Attestation> {
+        let key = self.validator_key?;
+        let (height, hash, round) = {
+            let manager = self.chain_manager.lock().await;
+            let chain = manager.chain();
+            let height = chain.height();
+            let block = chain.get_block(height)?;
+            let hash = tiger_blockchain::block_hash(&block.header).ok()?;
+            // The round advances with the height so a validator's vote is
+            // unique per height; a second vote at the same height and round for
+            // a different hash is equivocation and is caught by the tracker.
+            (height, hash, height)
+        };
+        let validator = {
+            let consensus = self.consensus.lock().await;
+            let derived = tiger_crypto::private_key_to_address(&key).ok()?;
+            let derived = format!("0x{}", tiger_blockchain::hex_encode(&derived));
+            if !consensus.is_validator(&derived) {
+                return None;
+            }
+            derived
+        };
+        let digest = Attestation::digest(self.config.chain_id, height, round, &hash);
+        let signature = tiger_crypto::sign(&digest, &key).ok()?;
+        Some(Attestation {
+            chain_id: self.config.chain_id,
+            block_number: height,
+            round,
+            block_hash: hash,
+            validator,
+            signature: signature.bytes.to_vec(),
+            recovery_id: signature.recovery_id,
+        })
+    }
+
+    /// Record a peer's attestation, slashing on proven equivocation, and try to
+    /// advance finality.
+    ///
+    /// Returns the equivocation proof when the attestation exposed one, so the
+    /// caller can gossip it and the penalty is applied exactly once per proof.
+    pub async fn record_attestation(&self, attestation: Attestation) -> Option<EquivocationProof> {
+        if attestation.chain_id != self.config.chain_id {
+            return None;
+        }
+        let (proof, weights) = {
+            let mut tracker = self.attestations.lock().await;
+            let weights = self.finality_weights.lock().await.clone();
+            let proof = tracker.record(&attestation);
+            (proof, weights)
+        };
+        if let Some(ref proof) = proof {
+            self.slash_for_equivocation(proof).await;
+        }
+        self.try_advance_finality(&weights).await;
+        proof
+    }
+
+    /// Apply a peer's quorum certificate and advance finality if it verifies.
+    pub async fn record_certificate(&self, certificate: QuorumCertificate) -> bool {
+        if certificate.chain_id != self.config.chain_id {
+            return false;
+        }
+        let weights = self.finality_weights.lock().await.clone();
+        let advanced = {
+            let mut tracker = self.attestations.lock().await;
+            tracker.apply_certificate(&certificate, &weights)
+        };
+        if advanced {
+            self.persist_finality(certificate.block_number, &certificate.block_hash)
+                .await;
+        }
+        advanced
+    }
+
+    /// Assemble a certificate from the collected attestations, if a quorum has
+    /// been reached, and advance finality.
+    ///
+    /// The target is the current head: validators vote for the head they have
+    /// executed, so once two thirds of the stake has voted for a height, that
+    /// height's certificate verifies and finality moves. A certificate is only
+    /// applied through [`AttestationTracker::apply_certificate`], which refuses
+    /// to move finality backwards.
+    async fn try_advance_finality(&self, weights: &HashMap<String, u128>) {
+        let (height, hash) = {
+            let manager = self.chain_manager.lock().await;
+            let chain = manager.chain();
+            let height = chain.height();
+            match chain.get_block(height) {
+                Some(block) => match tiger_blockchain::block_hash(&block.header) {
+                    Ok(hash) => (height, hash),
+                    Err(_) => return,
+                },
+                None => return,
+            }
+        };
+        let certificate = {
+            let tracker = self.attestations.lock().await;
+            tracker.certificate_for(height, &hash, height, weights)
+        };
+        let Some(certificate) = certificate else {
+            return;
+        };
+        let advanced = {
+            let mut tracker = self.attestations.lock().await;
+            tracker.apply_certificate(&certificate, weights)
+        };
+        if advanced {
+            self.persist_finality(certificate.block_number, &certificate.block_hash)
+                .await;
+        }
+    }
+
+    /// Record finality and write it to disk, only ever moving forward.
+    async fn persist_finality(&self, height: u64, hash: &str) {
+        {
+            let mut finalized = self.finalized.write().await;
+            match &*finalized {
+                Some((existing, _)) if *existing >= height => return,
+                _ => *finalized = Some((height, hash.to_string())),
+            }
+        }
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.write_finality(height, hash) {
+                warn!("could not persist finality at height {height}: {e}");
+            }
+        }
+    }
+
+    /// Slash a validator whose equivocation has been proven, and record the
+    /// evidence durably so a restart does not forgive it.
+    pub(crate) async fn slash_for_equivocation(&self, proof: &EquivocationProof) {
+        if !proof.verify() {
+            return;
+        }
+        // Apply the penalty once per (validator, height). The same proof can
+        // arrive from several peers, and a validator must not be slashed
+        // repeatedly for a single equivocation.
+        {
+            let key = format!("{}:{}", proof.validator.to_lowercase(), proof.block_number);
+            let mut slashed = self.slashed.lock().await;
+            if !slashed.insert(key) {
+                return;
+            }
+        }
+        {
+            let mut consensus = self.consensus.lock().await;
+            let total_stake = consensus
+                .validator_stake(&proof.validator)
+                .unwrap_or(tiger_consensus::posa::MIN_STAKE);
+            SlashingManager::slash(
+                &mut consensus,
+                &proof.validator,
+                tiger_consensus::slashing::SlashingReason::DoubleSigning,
+                total_stake,
+            );
+        }
+        // The active set may have changed (a slashed validator below the
+        // minimum is removed), so the weights must be rebuilt.
+        {
+            let consensus = self.consensus.lock().await;
+            *self.finality_weights.lock().await = finality_weight_map(&consensus);
+        }
+        if let Some(storage) = &self.storage {
+            if let Err(e) = storage.write_evidence(proof) {
+                warn!("could not persist equivocation evidence: {e}");
+            }
+        }
+        warn!(
+            "slashed {} for signing two different blocks at height {}",
+            proof.validator, proof.block_number
+        );
+    }
+
+    /// Restore finality and evidence recorded before the last restart.
+    pub(crate) async fn restore_finality(&self) {
+        let Some(storage) = &self.storage else {
+            return;
+        };
+        match storage.load_finality() {
+            Ok(Some((height, hash))) => {
+                let head = self.head_height().await;
+                if height <= head {
+                    *self.finalized.write().await = Some((height, hash));
+                    info!("restored finality at block {height}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!("could not read finality from disk: {e}"),
+        }
     }
 
     /// Get network sync status.
@@ -2288,6 +2598,25 @@ pub fn genesis_validators(genesis: &Genesis) -> Vec<String> {
         .iter()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// The stake weight of every active validator, for measuring a quorum.
+///
+/// Weight is the validator's registered stake, floored at the minimum, so a
+/// quorum certificate is two thirds of the *stake* that can propose, not of
+/// the number of validators. Every node derives the same map from the same
+/// consensus state, so every node agrees on when a block is final.
+fn finality_weight_map(consensus: &PoSA) -> std::collections::HashMap<String, u128> {
+    consensus
+        .active_validators()
+        .iter()
+        .map(|address| {
+            let stake = consensus
+                .validator_stake(address)
+                .unwrap_or(tiger_consensus::posa::MIN_STAKE) as u128;
+            (address.to_lowercase(), stake)
+        })
         .collect()
 }
 
@@ -4160,5 +4489,340 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two validators, one of them producing: the producer's own vote plus the
+    /// follower's must reach two thirds of the stake and finalise the head.
+    ///
+    /// This exercises the whole path — vote signing, the weight map, quorum
+    /// assembly and the `finalized` tag — rather than the tracker alone.
+    #[tokio::test]
+    async fn a_quorum_of_validators_finalises_the_head() {
+        let seal_address = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&TESTS_SEAL_KEY).unwrap()
+            )
+        );
+        let other_key = [0x2bu8; 32];
+        let other_address = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&other_key).unwrap()
+            )
+        );
+
+        let mut genesis = create_genesis_block(6666);
+        genesis.config.validators = vec![seal_address.clone(), other_address.clone()];
+
+        let data_dir = unique_data_dir("finality");
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            allow_unlisted_validators: true,
+            validator_key: Some(format!("0x{}", "5c".repeat(32))),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .unwrap(),
+        );
+        node.open().await.unwrap();
+
+        // Produce one block with the sealing key so the node is a validator
+        // and has a head to vote on. Only the first slot of the rotation is
+        // produced, because with an equal-stake two-validator set the second
+        // height belongs to the other validator.
+        let mut producer_cm = chain_manager();
+        producer_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let mut producer_world = state_from_genesis(&genesis);
+        let reward = genesis_block_reward(&genesis);
+        let block = {
+            produce_block(
+                &mut producer_cm,
+                &mut producer_world,
+                &[],
+                1,
+                &seal_address,
+                6666,
+                Some(&TESTS_SEAL_KEY),
+                reward,
+            )
+            .unwrap();
+            producer_cm.chain().get_block(1).cloned().unwrap()
+        };
+        assert!(node.import_block(block).await.unwrap());
+
+        let head = node.head_height().await;
+        let head_hash = {
+            let cm = node.get_chain_manager().await;
+            tiger_blockchain::block_hash(&cm.chain().get_block(head).unwrap().header).unwrap()
+        };
+
+        // The node's own vote (it holds the sealing key and is a validator).
+        let own = node.attest_head().await.expect("a validator must vote");
+        assert_eq!(own.block_number, head);
+        assert_eq!(own.block_hash, head_hash);
+        assert!(own.verify(), "the vote must carry a valid signature");
+        node.record_attestation(own).await;
+
+        // One validator of two is not a quorum.
+        assert_eq!(node.finalized_height().await, None, "one of two is not a quorum");
+
+        // The second validator's vote pushes the pair past two thirds.
+        let digest = Attestation::digest(6666, head, head, &head_hash);
+        let signature = tiger_crypto::sign(&digest, &other_key).unwrap();
+        let peer_vote = Attestation {
+            chain_id: 6666,
+            block_number: head,
+            round: head,
+            block_hash: head_hash.clone(),
+            validator: other_address.clone(),
+            signature: signature.bytes.to_vec(),
+            recovery_id: signature.recovery_id,
+        };
+        node.record_attestation(peer_vote).await;
+
+        assert_eq!(
+            node.finalized_height().await,
+            Some(head),
+            "two thirds of the stake must finalise the head"
+        );
+        let (height, hash) = node.finalized().await.unwrap();
+        assert_eq!(height, head);
+        assert_eq!(hash, head_hash);
+
+        // Finality is durable: it is written before it is reported. The store
+        // holds an exclusive lock, so the node must be dropped first.
+        drop(node);
+        let store = crate::storage::Storage::open(&data_dir).unwrap();
+        let stored = store.load_finality().unwrap();
+        assert_eq!(
+            stored.map(|(h, _)| h),
+            Some(head),
+            "the finalised height must be on disk"
+        );
+        drop(store);
+
+        // A second open restores it, so a restart does not rewind the promise.
+        let node2 = Arc::new(
+            TigerNode::from_genesis(
+                Config {
+                    chain_id: 6666,
+                    validators: vec![],
+                    allow_unlisted_validators: true,
+                    validator_key: Some(format!("0x{}", "5c".repeat(32))),
+                    data_dir: data_dir.to_string_lossy().into_owned(),
+                    ..Config::default_mainnet()
+                },
+                genesis.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        node2.open().await.unwrap();
+        assert_eq!(node2.finalized_height().await, Some(head));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A validator that signs two different blocks at one height is slashed,
+    /// and the penalty is applied once no matter how many peers forward the
+    /// proof.
+    #[tokio::test]
+    async fn equivocation_is_slashed_once_and_the_proof_is_gossipable() {
+        let seal_address = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&TESTS_SEAL_KEY).unwrap()
+            )
+        );
+        let mut genesis = create_genesis_block(6666);
+        genesis.config.validators = vec![seal_address.clone()];
+
+        let data_dir = unique_data_dir("slash");
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            allow_unlisted_validators: true,
+            validator_key: Some(format!("0x{}", "5c".repeat(32))),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .unwrap(),
+        );
+        node.open().await.unwrap();
+
+        let mut producer_cm = chain_manager();
+        producer_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let mut producer_world = state_from_genesis(&genesis);
+        let reward = genesis_block_reward(&genesis);
+        let block = {
+            produce_block(
+                &mut producer_cm,
+                &mut producer_world,
+                &[],
+                1,
+                &seal_address,
+                6666,
+                Some(&TESTS_SEAL_KEY),
+                reward,
+            )
+            .unwrap();
+            producer_cm.chain().get_block(1).cloned().unwrap()
+        };
+        assert!(node.import_block(block).await.unwrap());
+        let head = node.head_height().await;
+
+        let stake_before = {
+            let consensus = node.get_consensus().await;
+            consensus.validator_stake(&seal_address).unwrap()
+        };
+
+        // Two conflicting votes by the same key at the same height.
+        let vote_a = {
+            let digest = Attestation::digest(6666, head, head, "0xaaaa");
+            let signature = tiger_crypto::sign(&digest, &TESTS_SEAL_KEY).unwrap();
+            Attestation {
+                chain_id: 6666,
+                block_number: head,
+                round: head,
+                block_hash: "0xaaaa".to_string(),
+                validator: seal_address.clone(),
+                signature: signature.bytes.to_vec(),
+                recovery_id: signature.recovery_id,
+            }
+        };
+        let vote_b = {
+            let digest = Attestation::digest(6666, head, head, "0xbbbb");
+            let signature = tiger_crypto::sign(&digest, &TESTS_SEAL_KEY).unwrap();
+            Attestation {
+                chain_id: 6666,
+                block_number: head,
+                round: head,
+                block_hash: "0xbbbb".to_string(),
+                validator: seal_address.clone(),
+                signature: signature.bytes.to_vec(),
+                recovery_id: signature.recovery_id,
+            }
+        };
+
+        assert!(node.record_attestation(vote_a).await.is_none());
+        let proof = node
+            .record_attestation(vote_b)
+            .await
+            .expect("the second conflicting vote is equivocation");
+        assert!(proof.verify(), "the proof must stand up to anyone's check");
+
+        let stake_after_first = {
+            let consensus = node.get_consensus().await;
+            consensus.validator_stake(&seal_address).unwrap()
+        };
+        assert!(
+            stake_after_first < stake_before,
+            "the equivocating validator must lose stake"
+        );
+
+        // A peer forwards the same proof: the penalty must not be applied twice.
+        node.slash_for_equivocation(&proof).await;
+        let stake_after_second = {
+            let consensus = node.get_consensus().await;
+            consensus.validator_stake(&seal_address).unwrap()
+        };
+        assert_eq!(
+            stake_after_second, stake_after_first,
+            "a replayed proof must not slash twice"
+        );
+
+        // The evidence is on disk so a restart cannot forgive it. The store
+        // holds an exclusive lock, so the node must be dropped first.
+        drop(node);
+        let store = crate::storage::Storage::open(&data_dir).unwrap();
+        assert!(
+            !store.load_evidence().unwrap().is_empty(),
+            "the equivocation proof must be persisted"
+        );
+        drop(store);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A forged quorum certificate is refused, so finality cannot be claimed
+    /// without real signatures.
+    #[tokio::test]
+    async fn a_forged_certificate_is_refused() {
+        let seal_address = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&TESTS_SEAL_KEY).unwrap()
+            )
+        );
+        let other_key = [0x33u8; 32];
+        let other_address = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&other_key).unwrap()
+            )
+        );
+        let mut genesis = create_genesis_block(6666);
+        genesis.config.validators = vec![seal_address.clone(), other_address.clone()];
+
+        let data_dir = unique_data_dir("forged-cert");
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            allow_unlisted_validators: true,
+            validator_key: Some(format!("0x{}", "5c".repeat(32))),
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .unwrap(),
+        );
+        node.open().await.unwrap();
+
+        // A certificate signed by a key that is not in the active set.
+        let outsider_key = [0x44u8; 32];
+        let digest = Attestation::digest(6666, 1, 1, "0xdead");
+        let signature = tiger_crypto::sign(&digest, &outsider_key).unwrap();
+        let outsider = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&outsider_key).unwrap()
+            )
+        );
+        let forged = QuorumCertificate {
+            chain_id: 6666,
+            block_number: 1,
+            block_hash: "0xdead".to_string(),
+            round: 1,
+            attestations: vec![Attestation {
+                chain_id: 6666,
+                block_number: 1,
+                round: 1,
+                block_hash: "0xdead".to_string(),
+                validator: outsider,
+                signature: signature.bytes.to_vec(),
+                recovery_id: signature.recovery_id,
+            }],
+        };
+        assert!(
+            !node.record_certificate(forged).await,
+            "a certificate from outside the active set must not be accepted"
+        );
+        assert_eq!(node.finalized_height().await, None);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

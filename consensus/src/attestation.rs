@@ -349,6 +349,37 @@ impl AttestationTracker {
         self.finalized.clone()
     }
 
+    /// Build a quorum certificate for `(block_number, block_hash, round)` from
+    /// the attestations recorded so far, or `None` while they fall short of a
+    /// quorum.
+    ///
+    /// The certificate is re-verified before it is returned, so a caller can
+    /// never receive a certificate that does not itself reach two thirds of
+    /// the weight.
+    pub fn certificate_for(
+        &self,
+        block_number: u64,
+        block_hash: &str,
+        round: u64,
+        weights: &HashMap<String, u128>,
+    ) -> Option<QuorumCertificate> {
+        let per_height = self.seen.get(&block_number)?;
+        let matching: Vec<&Attestation> = per_height
+            .values()
+            .filter(|a| a.round == round && a.block_hash == block_hash)
+            .collect();
+        let first = matching.first()?;
+        let certificate = QuorumCertificate {
+            chain_id: first.chain_id,
+            block_number,
+            block_hash: block_hash.to_string(),
+            round,
+            attestations: matching.into_iter().cloned().collect(),
+        };
+        certificate.verify(weights).ok()?;
+        Some(certificate)
+    }
+
     /// Whether `block_number` is at or below the finalised height, and so
     /// cannot be reverted.
     pub fn is_finalized(&self, block_number: u64) -> bool {

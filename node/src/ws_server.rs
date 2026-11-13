@@ -352,7 +352,11 @@ async fn create_subscription(
                 let cm = node.get_chain_manager().await;
                 cm.chain().height()
             };
-            Some(crate::rpc_server::parse_log_filter(&filter_json, height)?)
+            Some(crate::rpc_server::parse_log_filter(
+                &filter_json,
+                height,
+                node.finalized_height().await,
+            )?)
         }
         other => {
             return Err(format!(

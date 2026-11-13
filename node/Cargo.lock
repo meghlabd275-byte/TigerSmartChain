@@ -1569,6 +1569,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tiger-blockchain",
+ "tiger-consensus",
  "tiger-crypto",
  "tokio",
  "x25519-dalek",

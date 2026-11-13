@@ -262,6 +262,16 @@ pub enum PeerMessage {
     Ping(u64),
     /// The reply to [`PeerMessage::Ping`].
     Pong(u64),
+    /// A validator's signed vote for a block. Gossiped so every node can
+    /// assemble a quorum certificate and derive the same finalised height.
+    Attestation(Box<tiger_consensus::Attestation>),
+    /// A completed quorum certificate for a block, forwarded so a node that
+    /// missed individual votes still learns the height is final.
+    QuorumCertificate(Box<tiger_consensus::QuorumCertificate>),
+    /// Proof that a validator signed two different blocks at one height.
+    /// Forwarded so every peer slashes the same validator; each peer verifies
+    /// the proof before acting on it.
+    Equivocation(Box<tiger_consensus::EquivocationProof>),
     /// Ask the peer to stop sending. A peer that is misbehaving is told to go
     /// away rather than being disconnected silently.
     Disconnect(String),

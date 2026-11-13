@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
+use log::warn;
 use redb::{
     Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
@@ -387,6 +388,89 @@ impl Storage {
             Some(value) => Ok(Some(String::from_utf8_lossy(value.value()).to_string())),
             None => Ok(None),
         }
+    }
+
+    /// Persist the finalised height and hash.
+    ///
+    /// Finality is a promise that a block cannot be reverted, so it must
+    /// survive a restart: a node that forgot it had finalised height H could
+    /// serve a reorg below H to a client that already treated H as settled.
+    pub fn write_finality(&self, height: u64, hash: &str) -> Result<(), StorageError> {
+        let write = self.db.begin_write()?;
+        {
+            let mut meta = write.open_table(META)?;
+            meta.insert("finalized_height", height.to_be_bytes().as_slice())?;
+            meta.insert("finalized_hash", hash.as_bytes())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// The finalised height and hash recorded by the last write, if any.
+    pub fn load_finality(&self) -> Result<Option<(u64, String)>, StorageError> {
+        let read = self.db.begin_read()?;
+        let meta = match read.open_table(META) {
+            Ok(meta) => meta,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let height = match meta.get("finalized_height")? {
+            Some(value) => {
+                let bytes = value.value();
+                if bytes.len() != 8 {
+                    return Ok(None);
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                u64::from_be_bytes(buf)
+            }
+            None => return Ok(None),
+        };
+        let hash = match meta.get("finalized_hash")? {
+            Some(value) => String::from_utf8_lossy(value.value()).to_string(),
+            None => return Ok(None),
+        };
+        Ok(Some((height, hash)))
+    }
+
+    /// Persist a collected equivocation proof so a slashed validator cannot
+    /// escape the record by restarting the node.
+    pub fn write_evidence(&self, proof: &tiger_consensus::EquivocationProof) -> Result<(), StorageError> {
+        let key = format!(
+            "evidence/{}",
+            proof.validator.to_lowercase()
+        );
+        let encoded = serde_json::to_vec(proof)
+            .map_err(|e| StorageError::Encode(e.to_string()))?;
+        let write = self.db.begin_write()?;
+        {
+            let mut meta = write.open_table(META)?;
+            meta.insert(key.as_str(), encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Every equivocation proof recorded in the store.
+    pub fn load_evidence(&self) -> Result<Vec<tiger_consensus::EquivocationProof>, StorageError> {
+        let read = self.db.begin_read()?;
+        let meta = match read.open_table(META) {
+            Ok(meta) => meta,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in meta.iter()? {
+            let (key, value) = entry?;
+            if !key.value().starts_with("evidence/") {
+                continue;
+            }
+            match serde_json::from_slice::<tiger_consensus::EquivocationProof>(value.value()) {
+                Ok(proof) => out.push(proof),
+                Err(e) => warn!("skipping unreadable evidence record: {e}"),
+            }
+        }
+        Ok(out)
     }
 
     /// Every block in the store, keyed by hash.

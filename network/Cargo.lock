@@ -618,6 +618,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiger-consensus"
+version = "1.0.0"
+dependencies = [
+ "hex",
+ "log",
+ "serde",
+ "serde_json",
+ "tiger-crypto",
+]
+
+[[package]]
 name = "tiger-crypto"
 version = "1.0.0"
 dependencies = [
@@ -643,6 +654,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tiger-blockchain",
+ "tiger-consensus",
  "tiger-crypto",
  "tokio",
  "x25519-dalek",

@@ -160,6 +160,18 @@ impl PoSA {
         &self.validators
     }
 
+    /// The registered stake of a validator, if it is known.
+    ///
+    /// Used to weight a quorum certificate: the threshold is two thirds of the
+    /// active stake, so the engine has to be able to report each validator's
+    /// stake. Returns `None` for an address that was never registered.
+    pub fn validator_stake(&self, address: &str) -> Option<u64> {
+        self.validator_registry
+            .iter()
+            .find(|(addr, _)| addr.eq_ignore_ascii_case(address))
+            .map(|(_, v)| v.stake + v.delegated)
+    }
+
     /// Whether `proposer` is the validator entitled to propose
     /// `block_number`.
     ///
