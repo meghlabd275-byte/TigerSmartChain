@@ -200,7 +200,10 @@ impl ApprovalService {
             .from_block(from_block)
             .to_block(to_block)
             .address("0x".parse::<Address>().ok())
-            .topic0(H256::from_slice(&hex::decode("0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925e").unwrap()));
+            .topic0(H256::from_slice(
+                &hex::decode("8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925")
+                    .expect("the Approval topic is a constant 32-byte literal"),
+            ));
         
         // Get logs
         let logs = self.rpc.get_logs(&filter).await?;

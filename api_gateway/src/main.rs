@@ -117,6 +117,7 @@ pub struct UsageLog {
 // API KEY MANAGER
 // ============================================================================
 
+#[derive(Clone)]
 pub struct ApiKeyManager {
     keys: Arc<RwLock<HashMap<String, ApiKey>>>,
     usage: Arc<RwLock<HashMap<String, Vec<UsageLog>>>>,
@@ -269,6 +270,20 @@ pub enum RateLimitError {
     DailyLimitExceeded,
 }
 
+impl std::fmt::Display for RateLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidKey => "invalid API key",
+            Self::KeyInactive => "API key is inactive",
+            Self::RateLimitExceeded => "rate limit exceeded",
+            Self::DailyLimitExceeded => "daily limit exceeded",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for RateLimitError {}
+
 impl actix_web::error::ResponseError for RateLimitError {
     fn error_response(&self) -> HttpResponse {
         match self {
@@ -295,24 +310,23 @@ impl actix_web::error::ResponseError for RateLimitError {
 // ============================================================================
 
 fn generate_secure_key() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-    format!("tsk_{}", base64::encode(&bytes))
+    use base64::Engine;
+    use rand::RngCore;
+    // OsRng draws from the operating system CSPRNG, so a key cannot be
+    // predicted from a previously issued one.
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("tsk_{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// Hash a password with bcrypt. A keyed hash is the only correct way to store
+/// a credential: a plain digest is reversible with a rainbow table.
 fn hash_password(password: &str) -> String {
-    // In production, use proper bcrypt
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    password.hash(&mut hasher);
-    format!("${}${}", "bcrypt", hasher.finish())
+    bcrypt::hash(password, bcrypt::DEFAULT_COST).unwrap_or_else(|_| String::new())
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
-    let computed = hash_password(password);
-    computed == hash
+    bcrypt::verify(password, hash).unwrap_or(false)
 }
 
 // ============================================================================
@@ -416,39 +430,75 @@ impl RateLimitMiddleware {
     }
 }
 
-impl actix_web::dev::Transform<actix_web::App, actix_web::dev::ServiceRequest> 
-    for RateLimitMiddleware 
+impl<S, B> actix_web::dev::Transform<S, actix_web::dev::ServiceRequest>
+    for RateLimitMiddleware
+where
+    S: actix_web::dev::Service<
+        actix_web::dev::ServiceRequest,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    > + 'static,
+    S::Future: 'static,
+    B: 'static,
 {
-    type Response = actix_web::dev::ServiceResponse;
+    type Response = actix_web::dev::ServiceResponse<B>;
     type Error = actix_web::Error;
     type InitError = ();
-    type Transform = RateLimitMiddleware;
-    type Future = futures::future::Ready<Result<Self::Transform, Self::InitError>>;
+    type Transform = RateLimitService<S>;
+    type Future = std::future::Ready<Result<Self::Transform, Self::InitError>>;
 
-    fn new_transform(&self, _app: actix_web::App) -> Self::Future {
-        futures::future::ok(Self::new(self.manager.clone()))
+    fn new_transform(&self, service: S) -> Self::Future {
+        std::future::ready(Ok(RateLimitService {
+            service: std::rc::Rc::new(service),
+            manager: self.manager.clone(),
+        }))
     }
 }
 
-impl actix_web::dev::Transform<actix_web::App, actix_web::dev::ServiceRequest> 
-    for RateLimitMiddleware 
+/// The service produced by [`RateLimitMiddleware`]. It rejects a request whose
+/// `X-API-Key` is unknown, inactive or over its daily quota before the handler
+/// runs, then delegates to the wrapped service.
+pub struct RateLimitService<S> {
+    service: std::rc::Rc<S>,
+    manager: ApiKeyManager,
+}
+
+impl<S, B> actix_web::dev::Service<actix_web::dev::ServiceRequest> for RateLimitService<S>
+where
+    S: actix_web::dev::Service<
+        actix_web::dev::ServiceRequest,
+        Response = actix_web::dev::ServiceResponse<B>,
+        Error = actix_web::Error,
+    > + 'static,
+    S::Future: 'static,
+    B: 'static,
 {
-    async fn transform(
-        &self,
-        req: actix_web::dev::ServiceRequest,
-        _svc: &mut actix_web::dev::Service<actix_web::dev::ServiceResponse>,
-    ) -> Result<Self::Response, Self::Error> {
-        // Extract API key from header
-        if let Some(key) = req.headers().get("X-API-Key") {
-            if let Ok(key_str) = key.to_str() {
-                // Check rate limit
-                if let Err(e) = self.manager.check_rate_limit(key_str).await {
-                    return Err(e.into());
+    type Response = actix_web::dev::ServiceResponse<B>;
+    type Error = actix_web::Error;
+    type Future = futures::future::LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    actix_web::dev::forward_ready!(service);
+
+    fn call(&self, req: actix_web::dev::ServiceRequest) -> Self::Future {
+        let service = self.service.clone();
+        let manager = self.manager.clone();
+
+        Box::pin(async move {
+            // A key is required on every data route; /health is exempt so an
+            // orchestrator probe does not need credentials.
+            if req.path() != "/health" {
+                match req.headers().get("X-API-Key") {
+                    Some(key) => match key.to_str() {
+                        Ok(key_str) => manager.check_rate_limit(key_str).await?,
+                        Err(_) => {
+                            return Err(RateLimitError::InvalidKey.into());
+                        }
+                    },
+                    None => return Err(RateLimitError::InvalidKey.into()),
                 }
             }
-        }
-        
-        Ok(req.into_response(HttpResponse::Ok().finish()))
+            service.call(req).await
+        })
     }
 }
 
@@ -475,6 +525,7 @@ async fn main() -> std::io::Result<()> {
                     .allowed_headers(vec!["Content-Type", "Authorization", "X-API-Key"])
             )
             .wrap(middleware::Logger::default())
+            .wrap(RateLimitMiddleware::new(manager.clone()))
             .route("/health", web::get().to(health))
             .route("/api/keys", web::post().to(create_key))
             .route("/api/keys/validate", web::get().to(validate_key))
@@ -487,29 +538,3 @@ async fn main() -> std::io::Result<()> {
 }
 
 use log::info;
-use base64::Engine;
-
-// Import base64 for key generation
-mod base64 {
-    pub const CHARACTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    
-    pub fn encode(data: &[u8]) -> String {
-        let mut result = String::new();
-        for chunk in data.chunks(3) {
-            let mut n: u32 = 0;
-            for (i, &b) in chunk.iter().enumerate() {
-                n |= (b as u32) << (16 - i * 8);
-            }
-            for i in 0..chunk.len() + 1 {
-                if i * 6 < chunk.len() * 8 + (3 - chunk.len()) * 2 {
-                    let idx = ((n >> (18 - i * 6)) & 0x3F) as usize;
-                    result.push(CHARACTERS[idx] as char);
-                }
-            }
-            while result.len() % 4 != 0 {
-                result.push('=');
-            }
-        }
-        result
-    }
-}

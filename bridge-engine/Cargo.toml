@@ -20,7 +20,7 @@ ethers-providers = "2.0"
 ethers-contract = "2.0"
 ethers-signers = "2.0"
 ethers-core = "2.0"
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "migrate"] }
 sha3 = "0.10"
 hex = "0.4"
 rand = "0.8"

@@ -10,7 +10,7 @@ description = "High-performance NFT metadata and rarity analysis service"
 tokio = { version = "1.35", features = ["full"] }
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "migrate", "chrono", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid", "json", "migrate"] }
 
 # HTTP client
 reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }

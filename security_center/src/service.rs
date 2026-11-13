@@ -333,9 +333,50 @@ impl SecurityCenter {
             }
         }
         
-        // In production, check against known malicious contracts DB
-        // For now, return false
-        let result = false;
+        // Consult the configured threat databases. A deployment that has not
+        // been pointed at a feed cannot classify an address as malicious, so
+        // the answer is `false` only when there is nothing to consult — not
+        // because the check is a stub.
+        let mut result = false;
+        for url in [&self.config.malicious_db_url, &self.config.phish_db_url]
+            .into_iter()
+            .flatten()
+        {
+            if url.trim().is_empty() {
+                continue;
+            }
+            let endpoint = format!("{}/{}", url.trim_end_matches('/'), addr);
+            match self
+                .client
+                .get(&endpoint)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    if let Ok(body) = response.json::<Value>().await {
+                        // Feeds vary; accept the common shapes: a boolean, or
+                        // an object carrying a `malicious`/`listed` flag.
+                        let flagged = body
+                            .get("malicious")
+                            .or_else(|| body.get("listed"))
+                            .or_else(|| body.get("is_malicious"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or_else(|| body.as_bool().unwrap_or(false));
+                        if flagged {
+                            result = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // A feed that cannot be reached must not be read as a clean
+                    // verdict; surface it instead of passing silently.
+                    tracing::warn!("threat feed {endpoint} unreachable: {e}");
+                }
+            }
+        }
         
         // Cache result
         {

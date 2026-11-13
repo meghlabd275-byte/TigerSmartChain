@@ -831,17 +831,15 @@ pub fn recover_transaction_sender(
 
     let recovery_id = if tx.tx_type == 0 {
         // EIP-155 encodes the chain id in v as v = recovery_id + 35 + 2 *
-        // chain_id. Values of 27/28 are the pre-EIP-155 form.
-        match v_value {
-            27 | 28 => (v_value - 27) as u8,
-            other => {
-                let expected_parity_base = 35 + 2 * chain_id;
-                if other < expected_parity_base {
-                    return Err(ValidationError::MalformedField("v"));
-                }
-                ((other - expected_parity_base) % 2) as u8
-            }
+        // chain_id. The chain enforces EIP-155 from genesis, so the pre-155
+        // forms 27/28 are refused outright: the signing hash always commits to
+        // a chain id, so a legacy `v` would recover an unrelated key and let a
+        // transaction from another chain be replayed here.
+        let expected_parity_base = 35 + 2 * chain_id;
+        if v_value < expected_parity_base {
+            return Err(ValidationError::MalformedField("v"));
         }
+        ((v_value - expected_parity_base) % 2) as u8
     } else {
         // A typed transaction carries the raw y-parity, and the chain id is
         // an explicit field, so there is no recovery information to unpack.
@@ -1190,6 +1188,30 @@ mod tests {
             hex_encode(&recovered),
             "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f",
             "recovered sender must be the address of the signing key"
+        );
+    }
+
+    /// A pre-EIP-155 legacy signature (`v` of 27 or 28) must be refused. The
+    /// chain's signing hash always commits to a chain id, so accepting the
+    /// legacy form would recover an unrelated key and open the door to a
+    /// replay of a transaction signed for another chain.
+    #[test]
+    fn a_pre_eip155_legacy_transaction_is_refused() {
+        let mut key = [0u8; 32];
+        key.fill(0x46);
+        let mut tx = reference_tx();
+        sign_transaction(&mut tx, 6666, &key).unwrap();
+
+        // Rewrite v to the legacy form while keeping r and s.
+        tx.v = "0x1b".to_string();
+        assert!(
+            recover_transaction_sender(&tx, 6666).is_err(),
+            "v=27 (legacy) must be refused"
+        );
+        tx.v = "0x1c".to_string();
+        assert!(
+            recover_transaction_sender(&tx, 6666).is_err(),
+            "v=28 (legacy) must be refused"
         );
     }
 
