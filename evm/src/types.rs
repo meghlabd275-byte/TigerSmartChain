@@ -360,21 +360,55 @@ pub struct Memory {
     data: Vec<u8>,
 }
 
+/// The memory cost for `words` 32-byte words: `G_memory * words + words^2 /
+/// 512`, with `G_memory = 3`. Saturating so an absurd size cannot wrap.
+pub fn memory_cost(words: u64) -> u64 {
+    words
+        .saturating_mul(3)
+        .saturating_add(words.saturating_mul(words) / 512)
+}
+
+/// The gas to expand memory so it covers the byte range `[offset, offset+len)`.
+///
+/// Returns `(cost, new_size_in_bytes)`, or `None` when the range overflows a
+/// machine word (which is an out-of-gas condition, not a panic). A zero-length
+/// access never expands memory, matching every other client: no byte is
+/// touched, so there is nothing to pay for.
+pub fn memory_expansion_gas(
+    current_bytes: usize,
+    offset: usize,
+    length: usize,
+) -> Option<(u64, usize)> {
+    if length == 0 {
+        return Some((0, current_bytes));
+    }
+    let end = offset.checked_add(length)?;
+    let new_words = (end as u64).checked_add(31)? / 32;
+    let current_words = (current_bytes as u64).div_ceil(32);
+    if new_words <= current_words {
+        return Some((0, current_bytes));
+    }
+    let cost = memory_cost(new_words).saturating_sub(memory_cost(current_words));
+    Some((cost, (new_words as usize).checked_mul(32)?))
+}
+
 impl Memory {
     pub fn new() -> Self {
         Self { data: vec![] }
     }
 
     pub fn store(&mut self, offset: usize, value: &[u8]) {
-        if offset + value.len() > self.data.len() {
-            self.data.resize(offset + value.len(), 0);
+        let end = offset + value.len();
+        if end > self.data.len() {
+            let rounded = end.div_ceil(32) * 32;
+            self.data.resize(rounded, 0);
         }
-        self.data[offset..offset + value.len()].copy_from_slice(value);
+        self.data[offset..end].copy_from_slice(value);
     }
 
     pub fn load(&self, offset: usize, length: usize) -> Vec<u8> {
         // EVM semantics: reads beyond allocated memory return zero bytes.
-        let end = offset + length;
+        let end = offset.saturating_add(length);
         if end <= self.data.len() {
             self.data[offset..end].to_vec()
         } else {
@@ -396,11 +430,18 @@ impl Memory {
         &self.data
     }
 
+    /// Grow the backing buffer to exactly `size` bytes (a multiple of 32).
+    pub fn grow_to(&mut self, size: usize) {
+        if size > self.data.len() {
+            self.data.resize(size, 0);
+        }
+    }
+
     pub fn ensure_capacity(&mut self, offset: usize, length: usize) {
         let end = offset + length;
         if end > self.data.len() {
             // EVM memory grows in 32-byte words.
-            let rounded = (end + 31) & !31usize;
+            let rounded = end.div_ceil(32) * 32;
             self.data.resize(rounded, 0);
         }
     }

@@ -543,6 +543,10 @@ pub(crate) mod tests {
             config: ChainConfig {
                 chain_id: 6666,
                 london_block: Some(0),
+                // The reward is minted during block execution, so the test
+                // genesis declares it too; otherwise a produced block and an
+                // imported block would compute different state roots.
+                block_reward: Some(format!("0x{:x}", crate::config::DEFAULT_BLOCK_REWARD)),
                 ..Default::default()
             },
             nonce: 0,
@@ -656,6 +660,7 @@ pub(crate) mod tests {
                 &miner,
                 6666,
                 Some(&crate::node::TESTS_SEAL_KEY),
+                None,
             )
             .unwrap();
         }

@@ -135,6 +135,20 @@ pub struct ChainConfig {
     pub merge_fork_block: Option<u64>,
     pub shanghai_block: Option<u64>,
     pub cancel_deneb: Option<u64>,
+    /// Blocks per reward epoch. When this is set together with `validators`,
+    /// the chain mints `block_reward` to each block's proposer as part of
+    /// block execution, so every node derives the same state root.
+    #[serde(default)]
+    pub epoch_length: Option<u64>,
+    /// Reward minted to the proposer of each block, in wei, written as a
+    /// decimal or `0x`-prefixed hex string.
+    #[serde(default)]
+    pub block_reward: Option<String>,
+    /// The authorities entitled to propose blocks, fixed in genesis. A node
+    /// whose genesis pins the set enforces exactly it and learns nothing from
+    /// the network.
+    #[serde(default)]
+    pub validators: Vec<String>,
 }
 
 impl Default for ChainConfig {
@@ -157,6 +171,9 @@ impl Default for ChainConfig {
             merge_fork_block: None,
             shanghai_block: None,
             cancel_deneb: None,
+            epoch_length: None,
+            block_reward: None,
+            validators: Vec::new(),
         }
     }
 }

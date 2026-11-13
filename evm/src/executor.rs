@@ -10,6 +10,13 @@ use crate::types::*;
 /// EVM Executor
 pub struct Executor;
 
+/// EIP-170: the largest runtime bytecode a contract may be deployed with.
+pub const MAX_CODE_SIZE: usize = 24_576;
+/// EIP-3860: the largest initcode a creation may supply.
+pub const MAX_INITCODE_SIZE: usize = 2 * MAX_CODE_SIZE;
+/// EIP-3860: per-word charge for initcode, on top of the creation base cost.
+pub const INITCODE_WORD_COST: u64 = 2;
+
 impl Default for Executor {
     fn default() -> Self {
         Self::new()
@@ -99,6 +106,35 @@ impl Executor {
                 match (a, b, c) {
                     (Some(a), Some(b), Some(c)) => (a, b, c),
                     _ => { success = false; (EvmWord::zero(), EvmWord::zero(), EvmWord::zero()) }
+                }
+            }};
+        }
+
+        // Charge the memory-expansion gas for touching `[offset, offset+len)`.
+        //
+        // Every opcode that reads or writes memory must pay for the words it
+        // newly allocates. Without this charge memory is effectively free,
+        // which makes `eth_estimateGas` unfaithful and turns a large `MSTORE`
+        // into a denial-of-service: a few instructions can allocate gigabytes
+        // for the price of a handful of gas. Sets `success = false` (an
+        // out-of-gas halt) when the charge cannot be paid or the range
+        // overflows, so the caller must stop.
+        macro_rules! charge_memory {
+            ($offset:expr, $len:expr) => {{
+                match memory_expansion_gas(ctx.memory.size(), $offset, $len) {
+                    Some((cost, new_size)) => {
+                        if gas_used
+                            .checked_add(cost)
+                            .map(|g| g > ctx.gas)
+                            .unwrap_or(true)
+                        {
+                            success = false;
+                        } else {
+                            gas_used += cost;
+                            ctx.memory.grow_to(new_size);
+                        }
+                    }
+                    None => success = false,
                 }
             }};
         }
@@ -233,8 +269,9 @@ impl Executor {
                     let (off, len) = pop2!();
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(o, l);
+                    if !success { break; }
                     let data = ctx.memory.load(o, l);
-                    ctx.memory.ensure_capacity(o, l);
                     let hash = keccak256(&data);
                     ctx.stack.push(EvmWord::from_be_bytes(&hash));
                 }
@@ -275,13 +312,14 @@ impl Executor {
                     let d = dest_off.as_u64() as usize;
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(d, l);
+                    if !success { break; }
                     let mut chunk = vec![0u8; l];
                     if o < ctx.data.len() {
                         let avail = ctx.data.len() - o;
                         let take = avail.min(l);
                         chunk[..take].copy_from_slice(&ctx.data[o..o+take]);
                     }
-                    ctx.memory.ensure_capacity(d, l);
                     ctx.memory.store(d, &chunk);
                 }
                 Opcode::CODESIZE => { ctx.stack.push(EvmWord::from_u64(code.len() as u64)); }
@@ -291,13 +329,14 @@ impl Executor {
                     let d = dest_off.as_u64() as usize;
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(d, l);
+                    if !success { break; }
                     let mut chunk = vec![0u8; l];
                     if o < code.len() {
                         let avail = code.len() - o;
                         let take = avail.min(l);
                         chunk[..take].copy_from_slice(&code[o..o+take]);
                     }
-                    ctx.memory.ensure_capacity(d, l);
                     ctx.memory.store(d, &chunk);
                 }
                 Opcode::GASPRICE => { ctx.stack.push(EvmWord::from_u64(ctx.gas_price)); }
@@ -323,12 +362,13 @@ impl Executor {
                     let d = dest_off.as_u64() as usize;
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(d, l);
+                    if !success { break; }
                     let mut chunk = vec![0u8; l];
                     if o < ext_code.len() {
                         let take = (ext_code.len() - o).min(l);
                         chunk[..take].copy_from_slice(&ext_code[o..o + take]);
                     }
-                    ctx.memory.ensure_capacity(d, l);
                     ctx.memory.store(d, &chunk);
                 }
                 Opcode::RETURNDATASIZE => { ctx.stack.push(EvmWord::from_u64(ctx.return_data.len() as u64)); }
@@ -338,13 +378,14 @@ impl Executor {
                     let d = dest_off.as_u64() as usize;
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(d, l);
+                    if !success { break; }
                     let mut chunk = vec![0u8; l];
                     if o < ctx.return_data.len() {
                         let avail = ctx.return_data.len() - o;
                         let take = avail.min(l);
                         chunk[..take].copy_from_slice(&ctx.return_data[o..o+take]);
                     }
-                    ctx.memory.ensure_capacity(d, l);
                     ctx.memory.store(d, &chunk);
                 }
                 Opcode::EXTCODEHASH => {
@@ -394,7 +435,8 @@ impl Executor {
                 Opcode::MLOAD => {
                     if let Some(offset) = ctx.stack.pop() {
                         let o = offset.as_u64() as usize;
-                        ctx.memory.ensure_capacity(o, 32);
+                        charge_memory!(o, 32);
+                        if !success { break; }
                         let data = ctx.memory.load(o, 32);
                         ctx.stack.push(EvmWord::from_be_bytes(&data));
                     } else { success = false; break; }
@@ -402,14 +444,16 @@ impl Executor {
                 Opcode::MSTORE => {
                     if let (Some(offset), Some(value)) = (ctx.stack.pop(), ctx.stack.pop()) {
                         let o = offset.as_u64() as usize;
-                        ctx.memory.ensure_capacity(o, 32);
+                        charge_memory!(o, 32);
+                        if !success { break; }
                         ctx.memory.store(o, &value.0);
                     } else { success = false; break; }
                 }
                 Opcode::MSTORE8 => {
                     if let (Some(offset), Some(value)) = (ctx.stack.pop(), ctx.stack.pop()) {
                         let o = offset.as_u64() as usize;
-                        ctx.memory.ensure_capacity(o, 1);
+                        charge_memory!(o, 1);
+                        if !success { break; }
                         ctx.memory.store(o, &[value.0[31]]);
                     } else { success = false; break; }
                 }
@@ -440,8 +484,14 @@ impl Executor {
                     let d = dest.as_u64() as usize;
                     let s_off = src.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    // Memory expansion covers both the source and the
+                    // destination region.
+                    charge_memory!(s_off, l);
+                    if !success { break; }
+                    charge_memory!(d, l);
+                    if !success { break; }
                     // Charge the EIP-5656 per-word copy fee on top of the base
-                    // cost; the memory expansion cost is handled separately.
+                    // cost.
                     let words = (l as u64).div_ceil(32);
                     let copy_fee = words.saturating_mul(3);
                     if gas_used.checked_add(copy_fee).map(|g| g > ctx.gas).unwrap_or(true) {
@@ -456,7 +506,6 @@ impl Executor {
                         let data = ctx.memory.load(s_off, l);
                         buf[..l].copy_from_slice(&data[..l.min(data.len())]);
                     }
-                    ctx.memory.ensure_capacity(d, l);
                     ctx.memory.store(d, &buf);
                 }
                 Opcode::PUSH0 => { ctx.stack.push(EvmWord::zero()); }
@@ -506,11 +555,15 @@ impl Executor {
                 Opcode::LOG0 => {
                     let (off, len) = pop2!();
                     if !success { break; }
+                    charge_memory!(off.as_u64() as usize, len.as_u64() as usize);
+                    if !success { break; }
                     emit_log(host, ctx, off.as_u64() as usize, len.as_u64() as usize, 0, &mut success);
                     if !success { break; }
                 }
                 Opcode::LOG1 => {
                     let (off, len) = pop2!();
+                    if !success { break; }
+                    charge_memory!(off.as_u64() as usize, len.as_u64() as usize);
                     if !success { break; }
                     emit_log(host, ctx, off.as_u64() as usize, len.as_u64() as usize, 1, &mut success);
                     if !success { break; }
@@ -518,17 +571,23 @@ impl Executor {
                 Opcode::LOG2 => {
                     let (off, len) = pop2!();
                     if !success { break; }
+                    charge_memory!(off.as_u64() as usize, len.as_u64() as usize);
+                    if !success { break; }
                     emit_log(host, ctx, off.as_u64() as usize, len.as_u64() as usize, 2, &mut success);
                     if !success { break; }
                 }
                 Opcode::LOG3 => {
                     let (off, len) = pop2!();
                     if !success { break; }
+                    charge_memory!(off.as_u64() as usize, len.as_u64() as usize);
+                    if !success { break; }
                     emit_log(host, ctx, off.as_u64() as usize, len.as_u64() as usize, 3, &mut success);
                     if !success { break; }
                 }
                 Opcode::LOG4 => {
                     let (off, len) = pop2!();
+                    if !success { break; }
+                    charge_memory!(off.as_u64() as usize, len.as_u64() as usize);
                     if !success { break; }
                     emit_log(host, ctx, off.as_u64() as usize, len.as_u64() as usize, 4, &mut success);
                     if !success { break; }
@@ -543,7 +602,16 @@ impl Executor {
                     if !success { break; }
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
-                    ctx.memory.ensure_capacity(o, l);
+                    charge_memory!(o, l);
+                    if !success { break; }
+                    // EIP-3860: cap the initcode size and charge for it per
+                    // word. An unbounded initcode would let a creation run
+                    // arbitrary work for the flat creation fee.
+                    if l > MAX_INITCODE_SIZE {
+                        success = false;
+                        break;
+                    }
+                    gas_used += INITCODE_WORD_COST * (l as u64).div_ceil(32);
                     let init_code = ctx.memory.load(o, l);
 
                     // Address is keccak256(rlp([sender, nonce]))[12..].
@@ -581,7 +649,14 @@ impl Executor {
                             self.execute_traced_with_host(&init_code, &mut child, host, tracer);
                         gas_used += child_res.gas_used;
 
-                        if child_res.success {
+                        if child_res.success && child_res.output.len() > MAX_CODE_SIZE {
+                            // EIP-170: a contract whose runtime code exceeds the
+                            // limit is not deployed. The creation fails and the
+                            // value transfer is rolled back.
+                            let _ = host.transfer(&new_address, &ctx.address, value_word);
+                            ctx.return_data = Vec::new();
+                            ctx.stack.push(EvmWord::zero());
+                        } else if child_res.success {
                             // Init code returns the runtime bytecode.
                             host.set_code(&new_address, child_res.output.clone());
                             ctx.return_data = child_res.output;
@@ -607,7 +682,14 @@ impl Executor {
                     if !success { break; }
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
-                    ctx.memory.ensure_capacity(o, l);
+                    charge_memory!(o, l);
+                    if !success { break; }
+                    // EIP-3860: same initcode cap and per-word charge as CREATE.
+                    if l > MAX_INITCODE_SIZE {
+                        success = false;
+                        break;
+                    }
+                    gas_used += INITCODE_WORD_COST * (l as u64).div_ceil(32);
                     let init_code = ctx.memory.load(o, l);
 
                     // Address is keccak256(0xff ++ sender ++ salt ++ keccak256(init))[12..].
@@ -648,7 +730,12 @@ impl Executor {
                             self.execute_traced_with_host(&init_code, &mut child, host, tracer);
                         gas_used += child_res.gas_used;
 
-                        if child_res.success {
+                        if child_res.success && child_res.output.len() > MAX_CODE_SIZE {
+                            // EIP-170, as for CREATE.
+                            let _ = host.transfer(&new_address, &ctx.address, value_word);
+                            ctx.return_data = Vec::new();
+                            ctx.stack.push(EvmWord::zero());
+                        } else if child_res.success {
                             host.set_code(&new_address, child_res.output.clone());
                             ctx.return_data = child_res.output;
                             ctx.stack.push(EvmWord::from_be_bytes(&new_address.0));
@@ -689,7 +776,12 @@ impl Executor {
                     let il = in_len.as_u64() as usize;
                     let oo = out_off.as_u64() as usize;
                     let ol = out_len.as_u64() as usize;
-                    ctx.memory.ensure_capacity(io, il);
+                    // Both the input region and the output region count toward
+                    // memory expansion, whether or not the call succeeds.
+                    charge_memory!(io, il);
+                    if !success { break; }
+                    charge_memory!(oo, ol);
+                    if !success { break; }
                     let calldata = ctx.memory.load(io, il);
 
                     let available_gas = ctx.gas.saturating_sub(gas_used);
@@ -839,6 +931,8 @@ impl Executor {
                     let (off, len) = pop2!();
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(o, l);
+                    if !success { break; }
                     output = ctx.memory.load(o, l);
                     break;
                 }
@@ -846,6 +940,8 @@ impl Executor {
                     let (off, len) = pop2!();
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
+                    charge_memory!(o, l);
+                    if !success { break; }
                     output = ctx.memory.load(o, l);
                     success = false;
                     break;
@@ -1584,5 +1680,60 @@ mod tests {
         let code = vec![0xfe];
         let result = Executor::new().execute(&code, &mut ctx);
         assert!(!result.success);
+    }
+
+    /// A store far into memory must pay the quadratic memory-expansion charge.
+    ///
+    /// Before this charge memory was free: a 10 MiB `MSTORE` cost about
+    /// 21,000 gas instead of the ~190,000,000 Ethereum charges, so a handful
+    /// of instructions could allocate gigabytes and `eth_estimateGas` reported
+    /// a figure no real chain would honour.
+    #[test]
+    fn a_large_memory_access_pays_the_expansion_cost() {
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 1_000_000_000;
+        // PUSH1 0 (value), PUSH3 0x100000 (offset = 1 MiB), MSTORE
+        let code = vec![
+            0x60, 0x00, // PUSH1 0
+            0x62, 0x10, 0x00, 0x00, // PUSH3 1_048_576
+            0x52, // MSTORE
+        ];
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success, "the store itself is valid");
+
+        // 1 MiB rounds up to 32,769 words: 3*words + words^2/512.
+        let words = (1_048_576u64 + 32) / 32;
+        let expected = 3 * words + words * words / 512;
+        assert!(
+            result.gas_used >= expected,
+            "memory expansion must be charged: got {}, expected at least {}",
+            result.gas_used,
+            expected
+        );
+        assert!(
+            result.gas_used < 200_000_000,
+            "the charge must be the quadratic cost, not an inflated one: {}",
+            result.gas_used
+        );
+    }
+
+    /// A zero-length access never expands memory, so it pays no expansion fee.
+    #[test]
+    fn a_zero_length_memory_access_pays_no_expansion() {
+        // PUSH1 0 (len), PUSH1 0 (offset), PUSH1 0 (value), ... CALLDATACOPY
+        // with length 0 touches no byte.
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        let code = vec![
+            0x60, 0x00, // PUSH1 0 length
+            0x60, 0x00, // PUSH1 0 calldata offset
+            0x60, 0x00, // PUSH1 0 memory offset
+            0x37, // CALLDATACOPY
+            0x00, // STOP
+        ];
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success);
+        // Three PUSH1 (3 each) + CALLDATACOPY base (3) = 12; no memory charge.
+        assert_eq!(result.gas_used, 12);
     }
 }

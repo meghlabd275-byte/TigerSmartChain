@@ -68,6 +68,13 @@ pub struct TigerNode {
     /// moment a block is due.
     validator_key: Option<[u8; 32]>,
 
+    /// Reward minted to each block's proposer, in wei, derived from the
+    /// genesis definition. `None` means the chain issues no block reward.
+    ///
+    /// It is applied as part of block execution, so the value a follower uses
+    /// is the same one the producer used and the two state roots agree.
+    block_reward: Option<[u8; 32]>,
+
     /// Post-execution world state for recently imported blocks, keyed by block
     /// hash, newest last.
     ///
@@ -177,9 +184,24 @@ impl TigerNode {
         let mempool = Mempool::new();
         info!("Mempool initialized");
 
-        // Initialize PoSA consensus and register the validator set. Without
-        // at least one registered validator the engine has no proposer, so no
-        // block would ever be produced.
+        // Initialize PoSA consensus and register the validator set.
+        //
+        // The authority set is fixed in the chain's genesis definition, so a
+        // node started from a chain spec enforces exactly the validators that
+        // chain declares and never learns a validator from the network. The
+        // command line is only a fallback for a chain whose genesis does not
+        // name its validators; when it does, genesis wins so two nodes with
+        // the same genesis cannot disagree about who may propose.
+        let genesis_authorities = genesis_validators(&genesis);
+        if !genesis_authorities.is_empty() {
+            config.validators = genesis_authorities;
+        }
+
+        // The per-block reward is likewise part of the chain definition: it is
+        // minted during block execution, so every node must use the same value
+        // or their state roots diverge.
+        let block_reward = genesis_block_reward(&genesis);
+
         let mut consensus = PoSA::new(
             config.chain_id,
             config.epoch_length,
@@ -276,6 +298,7 @@ impl TigerNode {
             mempool: tokio::sync::Mutex::new(mempool),
             consensus: tokio::sync::Mutex::new(consensus),
             validator_key,
+            block_reward,
             recent_states: tokio::sync::Mutex::new(RecentStates::new()),
             events: crate::ws_server::EventBus::new(),
             sync_status,
@@ -614,7 +637,7 @@ impl TigerNode {
         // the head state, so it is resolved rather than assumed.
         let parent_state = self.state_for_parent_of(&block).await?;
         let (new_state, receipts) =
-            execute_block_transactions(&parent_state, &block, self.config.chain_id)
+            execute_block_transactions(&parent_state, &block, self.config.chain_id, self.block_reward)
                 .map_err(|e| anyhow::anyhow!("block {} is invalid: {e}", block.header.number))?;
 
         let declared_number = block.header.number;
@@ -750,7 +773,7 @@ impl TigerNode {
 
         let mut state = base;
         for block in ancestry.iter().rev() {
-            let (next, _) = execute_block_transactions(&state, block, self.config.chain_id)
+            let (next, _) = execute_block_transactions(&state, block, self.config.chain_id, self.block_reward)
                 .map_err(|e| anyhow::anyhow!("replaying block {} failed: {e}", block.header.number))?;
             state = next;
             if let Ok(h) = tiger_blockchain::block_hash(&block.header) {
@@ -826,7 +849,7 @@ impl TigerNode {
         // Then apply the winning branch on top of it.
         let mut applied = 0usize;
         for block in blocks {
-            let (next, _) = execute_block_transactions(&state, block, self.config.chain_id)
+            let (next, _) = execute_block_transactions(&state, block, self.config.chain_id, self.block_reward)
                 .map_err(|e| anyhow::anyhow!("replaying block {} failed: {e}", block.header.number))?;
             state = next;
             if let Ok(hash) = tiger_blockchain::block_hash(&block.header) {
@@ -1195,36 +1218,19 @@ impl TigerNode {
                     cm.chain().height() + 1
                 };
 
-                // Update the consensus epoch and get the proposer. When the
-                // call crosses an epoch boundary it returns the rewards earned
-                // during the epoch that just ended; those are credited to the
-                // real world state, since the consensus engine holds no
-                // balances of its own.
-                let (proposer, settled_rewards) = {
+                // Update the consensus epoch and get the proposer. The epoch
+                // rotation decides who proposes, but it no longer pays
+                // rewards: minting is part of block execution now, so every
+                // node derives the same state root from the same block.
+                let proposer = {
                     let mut consensus = node.consensus.lock().await;
-                    let settled = consensus.update_epoch(next_block);
-                    (consensus.get_proposer(next_block), settled)
+                    consensus.update_epoch(next_block);
+                    consensus.get_proposer(next_block)
                 };
 
                 if let Some(expected) = &proposer {
                     log::trace!(
                         "block {next_block}: in-turn proposer is {expected}"
-                    );
-                }
-
-                if !settled_rewards.is_empty() {
-                    let mut world = node.world_state.lock().await;
-                    for (validator, reward) in &settled_rewards {
-                        if let Ok(address) = parse_address(validator) {
-                            world.credit(&address, &parse_u256(&format!("0x{reward:x}")));
-                        } else {
-                            warn!("cannot pay reward to unparseable validator {validator}");
-                        }
-                    }
-                    info!(
-                        "settled {} validator reward entries at block {}",
-                        settled_rewards.len(),
-                        next_block
                     );
                 }
 
@@ -1281,6 +1287,7 @@ impl TigerNode {
                                     &proposer,
                                     node.config.chain_id,
                                     node.validator_key.as_ref(),
+                                    node.block_reward,
                                 )
                             };
 
@@ -1725,8 +1732,14 @@ fn hex_word(value: &str) -> Result<[u8; 32], String> {
 pub(crate) fn create_genesis_block(chain_id: u64) -> Genesis {
     use std::collections::HashMap;
 
+    // The chain definition carries its consensus parameters, because they are
+    // part of the state transition: the per-block reward is minted during block
+    // execution, so every node must read the same value from the same genesis
+    // or their state roots diverge at the first reward.
     let config = ChainConfig {
         chain_id,
+        epoch_length: Some(crate::DEFAULT_EPOCH_LENGTH),
+        block_reward: Some(format!("0x{:x}", crate::config::DEFAULT_BLOCK_REWARD)),
         ..Default::default()
     };
 
@@ -1992,6 +2005,7 @@ pub fn produce_block(
     miner: &str,
     chain_id: u64,
     signing_key: Option<&[u8; 32]>,
+    block_reward: Option<[u8; 32]>,
 ) -> Result<String, String> {
     use tiger_blockchain::types::{Block, BlockHeader};
     use tiger_blockchain::{block_hash, transactions_root};
@@ -2156,6 +2170,14 @@ pub fn produce_block(
     let tx_root = transactions_root(&included)
         .map_err(|e| format!("failed to compute transactions root: {e}"))?;
 
+    // Mint the block reward to the proposer as part of this block's state
+    // transition. `execute_block_transactions` performs the identical mint, so
+    // a follower re-executing the block derives the same state root; minting
+    // it anywhere else would fork the chain at the first reward.
+    if let Some(reward) = block_reward {
+        world_state.credit(&coinbase, &reward);
+    }
+
     // The state root reflects the world state after applying the block.
     let state_root = world_state.state_root();
 
@@ -2231,6 +2253,33 @@ pub fn produce_block(
     Ok(block_hash)
 }
 
+/// The proposer reward this chain mints for each block, from the genesis
+/// definition.
+///
+/// Returning `None` means the chain issues no block reward. The value is read
+/// from the genesis `config` so every node derives the same figure and a
+/// follower replays the mint that the producer performed, which is what keeps
+/// the two state roots identical.
+pub fn genesis_block_reward(genesis: &Genesis) -> Option<[u8; 32]> {
+    let raw = genesis.config.block_reward.as_deref()?;
+    let amount = parse_genesis_balance(raw)?;
+    if amount == [0u8; 32] {
+        return None;
+    }
+    Some(amount)
+}
+
+/// The authority set fixed in the genesis definition, if any.
+pub fn genesis_validators(genesis: &Genesis) -> Vec<String> {
+    genesis
+        .config
+        .validators
+        .iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// Execute a block's transactions against a copy of the world state and return
 /// the receipts they produce.
 ///
@@ -2239,10 +2288,16 @@ pub fn produce_block(
 /// returns `Err` when the block cannot be a valid extension of `parent_state`:
 /// a transaction whose signature does not recover, or whose declared hash does
 /// not match its contents, means the block is not executable.
+///
+/// `block_reward`, when set, is minted to the block's coinbase after the
+/// transactions run. It is part of the state transition — not a side effect
+/// the producer applies privately — so a follower that re-executes the block
+/// derives exactly the producer's state root.
 pub fn execute_block_transactions(
     parent_state: &WorldState,
     block: &tiger_blockchain::types::Block,
     chain_id: u64,
+    block_reward: Option<[u8; 32]>,
 ) -> Result<(WorldState, Vec<tiger_blockchain::BlockReceipt>), String> {
     use tiger_evm::transition::{apply_transaction, BlockContext};
 
@@ -2308,6 +2363,16 @@ pub fn execute_block_transactions(
                 })
                 .collect(),
         });
+    }
+
+    // Mint the block reward to the proposer as part of the state transition,
+    // after the transactions have run. Doing it here rather than in the
+    // producer's private path is what makes the state root reproducible: a
+    // follower re-executing the block mints the identical amount to the
+    // identical address, so the two roots agree and the chain cannot fork at
+    // an epoch boundary.
+    if let Some(reward) = block_reward {
+        state.credit(&coinbase, &reward);
     }
 
     // The header's state root is a commitment to the result of executing the
@@ -2682,6 +2747,10 @@ mod tests {
     }
 
     /// Build the block a validator would propose at `number`.
+    ///
+    /// The block reward is derived from the same genesis the node under test
+    /// uses, so a produced block and an imported one mint the identical reward
+    /// and commit to the identical state root.
     fn build_block(
         cm: &mut ChainManager,
         world: &mut WorldState,
@@ -2689,7 +2758,8 @@ mod tests {
         miner: &str,
         txs: &[Transaction],
     ) -> tiger_blockchain::types::Block {
-        produce_block(cm, world, txs, number, miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
+        let reward = genesis_block_reward(&create_genesis_block(6666));
+        produce_block(cm, world, txs, number, miner, 6666, Some(&TESTS_SEAL_KEY), reward).unwrap();
         cm.chain().get_block(number).cloned().unwrap()
     }
 
@@ -2720,6 +2790,120 @@ mod tests {
             expected_root,
             "the node must adopt the state the block produced"
         );
+    }
+
+    /// The proposer reward is part of the block's state transition, so an
+    /// empty block still changes state and the producer's own world state
+    /// reflects the mint.
+    #[test]
+    fn an_empty_block_still_mints_the_proposer_reward() {
+        let mut cm = chain_manager();
+        let mut world = WorldState::new();
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        cm.process_block(genesis_block_from(&create_genesis_block(6666)))
+            .unwrap();
+
+        let reward = genesis_block_reward(&create_genesis_block(6666))
+            .expect("the chain must issue a block reward");
+
+        produce_block(
+            &mut cm,
+            &mut world,
+            &[],
+            1,
+            &miner,
+            6666,
+            Some(&TESTS_SEAL_KEY),
+            Some(reward),
+        )
+        .unwrap();
+
+        // The seal key decides the coinbase: `produce_block` derives the
+        // miner from the signing key, so the reward lands there.
+        let coinbase = tiger_crypto::private_key_to_address(&TESTS_SEAL_KEY).unwrap();
+        assert_eq!(
+            world.balance(&coinbase),
+            reward,
+            "the proposer must be credited the block reward"
+        );
+    }
+
+    /// The epoch boundary must not fork the chain. Rewards are minted as part
+    /// of block execution, so a follower re-executing a block derives the same
+    /// state root the producer committed to — including across an epoch
+    /// boundary, where the reward is the only state change in an empty block.
+    #[tokio::test]
+    async fn the_chain_does_not_fork_at_an_epoch_boundary() {
+        // One authority and a short epoch, so the run crosses two boundaries.
+        let seal_address = format!(
+            "0x{}",
+            tiger_blockchain::hex_encode(
+                &tiger_crypto::private_key_to_address(&TESTS_SEAL_KEY).unwrap()
+            )
+        );
+        let mut genesis = create_genesis_block(6666);
+        genesis.config.validators = vec![seal_address.clone()];
+        genesis.config.epoch_length = Some(3);
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "tiger-node-epoch-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .unwrap(),
+        );
+        node.open().await.unwrap();
+
+        let mut producer_cm = chain_manager();
+        producer_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let mut producer_world = state_from_genesis(&genesis);
+        let reward = genesis_block_reward(&genesis);
+        assert!(reward.is_some(), "the chain must issue a block reward");
+
+        for number in 1..=7u64 {
+            let block = {
+                produce_block(
+                    &mut producer_cm,
+                    &mut producer_world,
+                    &[],
+                    number,
+                    &seal_address,
+                    6666,
+                    Some(&TESTS_SEAL_KEY),
+                    reward,
+                )
+                .unwrap();
+                producer_cm.chain().get_block(number).cloned().unwrap()
+            };
+            assert!(
+                node.import_block(block).await.unwrap(),
+                "block {number} must import cleanly across the epoch boundary"
+            );
+            let cm = node.get_chain_manager().await;
+            assert_eq!(cm.chain().height(), number, "the follower must keep up");
+            drop(cm);
+            let world = node.world_state().lock().await;
+            assert_eq!(
+                hex32(&world.state_root()),
+                hex32(&producer_world.state_root()),
+                "at height {number} the follower's state root must match the producer's"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
@@ -2939,7 +3123,7 @@ mod tests {
         let genesis_hash = block_hash(&genesis.header).unwrap();
         cm.process_block(genesis).unwrap();
 
-        let hash = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
+        let hash = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, Some(&TESTS_SEAL_KEY), None).unwrap();
         let block = cm.chain().get_block(1).expect("block 1 must exist");
 
         assert_eq!(block.header.parent_hash, genesis_hash);
@@ -2970,7 +3154,7 @@ mod tests {
             .unwrap();
 
         let txs = vec![signed_transfer(key, 0, recipient, 1234)];
-        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
+        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666, Some(&TESTS_SEAL_KEY), None).unwrap();
 
         assert_eq!(world.balance(&recipient), u256_from_u64(1234));
         assert_eq!(
@@ -3018,7 +3202,7 @@ mod tests {
             chain_id: None,
         };
 
-        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
+        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666, Some(&TESTS_SEAL_KEY), None).unwrap();
 
         let block = cm.chain().get_block(1).unwrap();
         // The invalid transaction is excluded from the block, not merely
@@ -3049,6 +3233,7 @@ mod tests {
             &miner,
             6666,
             Some(&TESTS_SEAL_KEY),
+            None,
         )
         .unwrap();
 
@@ -3094,6 +3279,7 @@ mod tests {
             &miner,
             6666,
             Some(&TESTS_SEAL_KEY),
+            None,
         )
         .unwrap();
 
@@ -3227,7 +3413,7 @@ mod tests {
         tx.max_priority_fee_per_gas = Some(1);
         sign_transaction(&mut tx, 6666, &key).unwrap();
 
-        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
+        produce_block(&mut cm, &mut world, &[tx], 1, &miner, 6666, Some(&TESTS_SEAL_KEY), None).unwrap();
 
         let block = cm.chain().get_block(1).unwrap();
         assert!(block.transactions.is_empty(), "an under-priced tx must not be mined");
@@ -3258,7 +3444,7 @@ mod tests {
         let txs: Vec<_> = (0..5)
             .map(|nonce| signed_transfer(key, nonce, [0x22u8; 20], 1))
             .collect();
-        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666, Some(&TESTS_SEAL_KEY)).unwrap();
+        produce_block(&mut cm, &mut world, &txs, 1, &miner, 6666, Some(&TESTS_SEAL_KEY), None).unwrap();
 
         let block = cm.chain().get_block(1).unwrap();
         assert!(block.header.gas_used <= block.header.gas_limit);
@@ -3282,7 +3468,7 @@ mod tests {
 
         // Produce an honest block, then strip its seal and re-seal it with an
         // attacker's key while still claiming the victim's address.
-        produce_block(&mut cm, &mut world, &[], 1, &victim, 6666, Some(&TESTS_SEAL_KEY))
+        produce_block(&mut cm, &mut world, &[], 1, &victim, 6666, Some(&TESTS_SEAL_KEY), None)
             .unwrap();
         let honest = cm.chain().get_block(1).unwrap().clone();
 
@@ -3314,7 +3500,7 @@ mod tests {
         let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
         cm.process_block(genesis_block_from(&create_genesis_block(6666)))
             .unwrap();
-        produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, Some(&TESTS_SEAL_KEY))
+        produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, Some(&TESTS_SEAL_KEY), None)
             .unwrap();
 
         let mut stripped = cm.chain().get_block(1).unwrap().clone();
@@ -3341,7 +3527,7 @@ mod tests {
         cm.process_block(genesis_block_from(&create_genesis_block(6666)))
             .unwrap();
 
-        let err = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, None).unwrap_err();
+        let err = produce_block(&mut cm, &mut world, &[], 1, &miner, 6666, None, None).unwrap_err();
         assert!(
             err.contains("no validator key"),
             "expected a refusal to produce, got: {err}"
