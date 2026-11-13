@@ -600,17 +600,28 @@ impl TigerNode {
         // entitled to propose it. A block from an unauthorised proposer is
         // rejected before any work is done on it.
         //
-        // A node started without a validator list is a pure follower: it has no
-        // way to know the authority set in advance, so it adopts the set it
-        // observes, one proposer per block. That is bounded to the case where
-        // the operator configured no validators; a node given a validator list
-        // enforces exactly that list and learns nothing from the network.
+        // A node with an empty authority set cannot verify anything: it would
+        // have to accept whoever proposes first, which lets one attacker own
+        // the chain. That is only ever acceptable on a private development
+        // chain, so it is behind an explicit opt-in. A public node started
+        // without a validator set refuses every block instead.
         {
             let mut consensus = self.consensus.lock().await;
             if !consensus.is_authorised_proposer(block.header.number, &block.header.miner) {
                 if self.config.validators.is_empty() {
-                    info!(
-                        "adopting {} as a validator, learned from block {}",
+                    if !self.config.allow_unlisted_validators {
+                        return Err(anyhow::anyhow!(
+                            "block {} was proposed by {}, but this node has no validator \
+                             set; refusing to adopt a proposer from the network (start \
+                             with --validators, or --allow-unlisted-validators on a \
+                             private chain)",
+                            block.header.number,
+                            block.header.miner
+                        ));
+                    }
+                    warn!(
+                        "adopting {} as a validator, learned from block {}; this node is \
+                         running in unlisted-validator mode and has no fixed authority set",
                         block.header.miner, block.header.number
                     );
                     consensus.register_validator(
@@ -2721,9 +2732,13 @@ mod tests {
             .join(format!("tiger-node-test-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
 
+        // These tests model a private development chain where the authority
+        // set is learned from the first proposer, so the opt-in is set here.
+        // A public node runs with a pinned set and this flag off.
         let config = Config {
             chain_id: 6666,
             validators: vec![],
+            allow_unlisted_validators: true,
             data_dir: data_dir.to_string_lossy().into_owned(),
             ..Config::default_mainnet()
         };
@@ -2761,6 +2776,54 @@ mod tests {
         let reward = genesis_block_reward(&create_genesis_block(6666));
         produce_block(cm, world, txs, number, miner, 6666, Some(&TESTS_SEAL_KEY), reward).unwrap();
         cm.chain().get_block(number).cloned().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_public_node_refuses_a_block_from_an_unlisted_proposer() {
+        // Same setup as `node_and_producer`, but the node is a public node: it
+        // was started without a validator set and without the development
+        // opt-in, so it must not learn an authority set from the network.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let data_dir = std::env::temp_dir()
+            .join(format!("tiger-node-public-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        let config = Config {
+            chain_id: 6666,
+            validators: vec![],
+            allow_unlisted_validators: false,
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            ..Config::default_mainnet()
+        };
+        let genesis = create_genesis_block(6666);
+        let node = Arc::new(
+            TigerNode::from_genesis(config, genesis.clone())
+                .await
+                .expect("node must initialize"),
+        );
+        node.start().await.expect("node must start");
+
+        let mut producer_cm = chain_manager();
+        producer_cm
+            .process_block(genesis_block_from(&genesis))
+            .unwrap();
+        let mut producer_world = state_from_genesis(&genesis);
+        let miner = format!("0x{}", tiger_blockchain::hex_encode(&[0xaa; 20]));
+        let block = build_block(&mut producer_cm, &mut producer_world, 1, &miner, &[]);
+
+        let err = node
+            .import_block(block)
+            .await
+            .expect_err("an unlisted proposer must be rejected");
+        assert!(
+            format!("{err}").contains("no validator set"),
+            "the error must explain the missing authority set, got: {err}"
+        );
+
+        // The head must not have moved.
+        let cm = node.get_chain_manager().await;
+        assert_eq!(cm.chain().height(), 0);
     }
 
     #[tokio::test]
@@ -2851,9 +2914,13 @@ mod tests {
             std::time::SystemTime::now()
         ));
         let _ = std::fs::remove_dir_all(&data_dir);
+        // These tests model a private development chain where the authority
+        // set is learned from the first proposer, so the opt-in is set here.
+        // A public node runs with a pinned set and this flag off.
         let config = Config {
             chain_id: 6666,
             validators: vec![],
+            allow_unlisted_validators: true,
             data_dir: data_dir.to_string_lossy().into_owned(),
             ..Config::default_mainnet()
         };
@@ -2992,6 +3059,7 @@ mod tests {
         let config = Config {
             chain_id: 6666,
             validators: vec![],
+            allow_unlisted_validators: true,
             data_dir: std::env::temp_dir()
                 .join(format!("tiger-reorg-test-{}", std::process::id()))
                 .to_string_lossy()
@@ -3670,6 +3738,7 @@ mod tests {
         Config {
             chain_id: 6666,
             validators: vec![],
+            allow_unlisted_validators: true,
             data_dir: dir.to_string_lossy().into_owned(),
             ..Config::default_mainnet()
         }

@@ -63,6 +63,10 @@ pub struct Config {
     /// minimum. An empty list means this node is not a validator and will
     /// follow the chain without producing blocks.
     pub validators: Vec<String>,
+    /// Accept a block from a proposer that is not in the validator set and add
+    /// it to the set. Only safe on a private development chain: on a public
+    /// network it hands the chain to whoever proposes first.
+    pub allow_unlisted_validators: bool,
     /// Floor reported by `eth_gasPrice` on an empty chain, in wei.
     pub min_gas_price: u64,
     /// Gas ceiling for `eth_call` and `eth_estimateGas`.
@@ -97,6 +101,7 @@ impl Config {
         validator_addr: Option<String>,
         validator_key: Option<String>,
         validators: Vec<String>,
+        allow_unlisted_validators: bool,
         epoch_length: u64,
         slot_duration_secs: u64,
         metrics_enabled: bool,
@@ -121,6 +126,7 @@ impl Config {
             validator_addr,
             validator_key,
             validators,
+            allow_unlisted_validators,
             epoch_length,
             slot_duration_secs,
             block_reward: DEFAULT_BLOCK_REWARD,
@@ -157,6 +163,7 @@ impl Config {
             slot_duration_secs: 3,
             block_reward: DEFAULT_BLOCK_REWARD,
             validators: Vec::new(),
+            allow_unlisted_validators: false,
             min_gas_price: DEFAULT_MIN_GAS_PRICE,
             call_gas_limit: DEFAULT_CALL_GAS_LIMIT,
             
@@ -190,6 +197,7 @@ impl Config {
             slot_duration_secs: 3,
             block_reward: DEFAULT_BLOCK_REWARD,
             validators: Vec::new(),
+            allow_unlisted_validators: false,
             min_gas_price: DEFAULT_MIN_GAS_PRICE,
             call_gas_limit: DEFAULT_CALL_GAS_LIMIT,
             

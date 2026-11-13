@@ -49,3 +49,6 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+[[bin]]
+name = "tiger-indexer"
+path = "src/main.rs"

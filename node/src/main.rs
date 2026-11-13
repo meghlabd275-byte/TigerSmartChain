@@ -154,6 +154,13 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     validators: Vec<String>,
 
+    /// Accept a block from a proposer that is not in the validator set and add
+    /// it to the set. This hands the chain to whoever proposes first, so it is
+    /// only safe on a private development chain. On a public network, always
+    /// pin the authority set in genesis or with `--validators`.
+    #[arg(long, default_value = "false")]
+    allow_unlisted_validators: bool,
+
     /// Validator private key (hex).
     ///
     /// Passing a key here exposes it to every account on the host through the
@@ -253,6 +260,7 @@ async fn main() -> Result<()> {
         args.validator_addr,
         validator_key,
         args.validators,
+        args.allow_unlisted_validators,
         args.epoch_length,
         args.slot_duration_secs,
         args.metrics_enabled,
