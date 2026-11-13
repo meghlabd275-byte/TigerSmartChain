@@ -1122,6 +1122,23 @@ async fn call_contract_traced(
     let mut world = node.world_state().lock().await.clone();
     let mut host = tiger_evm::transition::StateHost::new(&mut world);
 
+    // A call straight to a precompile address (0x01..0x09) has no code to run:
+    // the built-in function *is* the contract. Without this the top-level call
+    // loads empty code and reports success with empty output, which is exactly
+    // how a wallet that verifies a signature through `ecrecover` would accept
+    // every signature. The same dispatch the interpreter uses for an inner
+    // call is used here, so a direct call and an in-contract call agree.
+    if let Some(address) = to {
+        let precompile = tiger_evm::Address(address);
+        if tiger_evm::precompiles::is_precompile(&precompile) {
+            let gas = node.config().call_gas_limit;
+            return match tiger_evm::precompiles::run(&precompile, &data, gas) {
+                Ok(out) => Ok((out.output, out.gas_used, Vec::new())),
+                Err(e) => Err(e.reason),
+            };
+        }
+    }
+
     // The Host trait must be in scope to call `code` on the host.
     use tiger_evm::Host as _;
     let code = match to {
@@ -2301,6 +2318,56 @@ mod tests {
         assert_eq!(
             parse_header("POST / HTTP/1.1\r\nORIGIN:   https://b.example  \r\n", "Origin"),
             Some("https://b.example".to_string())
+        );
+    }
+    /// A call straight to a precompile address must run the built-in function.
+    ///
+    /// Without the top-level dispatch the call loads empty code and reports
+    /// success with empty output, so a wallet verifying a signature through
+    /// `ecrecover` (0x01) would accept every signature. This pins the exact
+    /// NIST SHA-256 vector for the empty input.
+    #[tokio::test]
+    async fn eth_call_dispatches_a_precompile_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "tiger-rpc-precompile-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = crate::config::Config {
+            chain_id: 6666,
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
+            data_dir: dir.to_string_lossy().into_owned(),
+            ..crate::config::Config::default_mainnet()
+        };
+        let node = std::sync::Arc::new(
+            crate::node::TigerNode::from_genesis(config, crate::node::create_genesis_block(6666))
+                .await
+                .expect("node must initialize"),
+        );
+        node.start().await.expect("node must start");
+
+        let request: RpcRequest = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                { "to": "0x0000000000000000000000000000000000000002", "data": "0x" },
+                "latest"
+            ]
+        }))
+        .unwrap();
+        let response = dispatch(&node, request).await;
+        let result = serde_json::to_value(&response).unwrap();
+        let output = result
+            .get("result")
+            .and_then(|v| v.as_str())
+            .expect("a precompile call must return a result");
+        // SHA-256 of the empty input.
+        assert_eq!(
+            output,
+            "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 
