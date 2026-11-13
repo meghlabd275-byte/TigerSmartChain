@@ -2679,6 +2679,49 @@ impl Drop for TigerNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A genesis file written the way geth and its family write one: camelCase
+    /// keys, a `clique` block, no `nonce` field, and a hex `difficulty`.
+    #[test]
+    fn a_standard_ethereum_genesis_file_is_accepted() {
+        let json = r#"{
+            "config": {
+                "chainId": 6666,
+                "homesteadBlock": 0,
+                "eip150Block": 0,
+                "eip155Block": 0,
+                "eip158Block": 0,
+                "byzantiumBlock": 0,
+                "constantinopleBlock": 0,
+                "petersburgBlock": 0,
+                "istanbulBlock": 0,
+                "berlinBlock": 0,
+                "londonBlock": 0,
+                "clique": { "period": 1, "epoch": 30000 }
+            },
+            "difficulty": "0x1",
+            "gasLimit": "0x1c9c380",
+            "timestamp": "0x0",
+            "extraData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "alloc": {
+                "0x70997970C51812dc3A010C7d01b50e0d17dc79C8": {
+                    "balance": "0x200000000000000000000000000000000000000000000000000000000000000"
+                }
+            }
+        }"#;
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        normalise_genesis_keys(&mut value);
+        let genesis: Genesis = serde_json::from_value(value)
+            .expect("a standard geth genesis must parse without a `nonce` field");
+        assert_eq!(genesis.config.chain_id, 6666);
+        assert_eq!(genesis.gas_limit, "0x1c9c380");
+        assert_eq!(genesis.alloc.len(), 1);
+        // The alloc key keeps its original spelling; address parsing is
+        // case-insensitive at the point the account is installed.
+        assert!(genesis.alloc.keys().any(|k| k.eq_ignore_ascii_case(
+            "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+        )));
+    }
     use tiger_blockchain::types::Transaction;
     use tiger_blockchain::{block_hash, sign_transaction, transactions_root};
     use tiger_consensus::posa::MIN_STAKE;

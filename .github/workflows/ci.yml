@@ -128,9 +128,12 @@ jobs:
       - name: Install
         working-directory: contracts
         run: npm ci
-      - name: Compile and test
+      - name: Compile
         working-directory: contracts
-        run: npm test --if-present
+        run: npm run compile
+      - name: Test
+        working-directory: contracts
+        run: npm test
 
   secrets:
     name: Secret scan
