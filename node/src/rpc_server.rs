@@ -234,7 +234,18 @@ pub async fn serve_listener(
 pub async fn serve_metrics(node: Arc<TigerNode>, addr: String) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     log::info!("Metrics server listening on {addr}");
+    serve_metrics_listener(listener, node).await
+}
 
+/// Serve metrics on an already-bound listener.
+///
+/// Separated from `serve_metrics` so the caller can bind first and fail startup
+/// on a port conflict, rather than discovering the failure only after the node
+/// is already running.
+pub async fn serve_metrics_listener(
+    listener: TcpListener,
+    node: Arc<TigerNode>,
+) -> std::io::Result<()> {
     loop {
         let (mut stream, _peer) = match listener.accept().await {
             Ok(connection) => connection,

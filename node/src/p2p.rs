@@ -703,25 +703,26 @@ impl P2pService {
             }
 
             PeerMessage::GetBlocks { from, count } => {
-                let blocks = {
+                let (blocks, head) = {
                     let cm = self.node.get_chain_manager().await;
                     let chain = cm.chain();
                     let head = chain.height();
                     let end = from.saturating_add(count.min(SYNC_BATCH)).min(head + 1);
-                    (from..end)
+                    let blocks = (from..end)
                         .filter_map(|n| chain.get_block(n).cloned())
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (blocks, head)
                 };
                 debug!("GetBlocks({from}, {count}) -> {} block(s)", blocks.len());
                 if !blocks.is_empty() {
-                    if let Ok(frame) = encode_message(&PeerMessage::Blocks(blocks)) {
+                    if let Ok(frame) = encode_message(&PeerMessage::Blocks { blocks, head }) {
                         let peer = connection.lock().await;
                         peer.try_send_frame(frame);
                     }
                 }
             }
 
-            PeerMessage::Blocks(blocks) => {
+            PeerMessage::Blocks { blocks, head } => {
                 let before = {
                     let cm = self.node.get_chain_manager().await;
                     cm.chain().height()
@@ -741,26 +742,17 @@ impl P2pService {
                         }
                     }
                 }
-                // A full batch means the peer has more. Asking again straight
-                // away is what turns one batch per status into a catch-up that
-                // runs to the head. The request is only repeated when the
-                // batch actually advanced this node: if nothing imported, the
-                // next request would be for the same range and would spin.
+                // The peer's head at the moment it built the reply is fresh,
+                // unlike the `Status` height, so asking again until we reach it
+                // closes the gap instead of stopping one ping interval short.
+                // Repeating only when the batch advanced this node keeps a
+                // non-advancing request from spinning on the same range.
                 let after = {
                     let cm = self.node.get_chain_manager().await;
                     cm.chain().height()
                 };
-                if after > before {
-                    let peer_height = {
-                        let manager = self.manager.lock().await;
-                        manager.peer_height(&peer_id)
-                    };
-                    if let Some(peer_height) = peer_height {
-                        if peer_height > after {
-                            self.request_blocks(connection, after + 1, peer_height - after)
-                                .await;
-                        }
-                    }
+                if after > before && head > after {
+                    self.request_blocks(connection, after + 1, head - after).await;
                 }
             }
 
@@ -929,7 +921,7 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
 ///
 /// The configuration uses `:30303` for "every interface", which the standard
 /// library does not accept; it needs a host part.
-fn normalize_listen_addr(addr: &str) -> String {
+pub(crate) fn normalize_listen_addr(addr: &str) -> String {
     if let Some(port) = addr.strip_prefix(':') {
         return format!("0.0.0.0:{port}");
     }

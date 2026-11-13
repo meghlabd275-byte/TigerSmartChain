@@ -1243,12 +1243,21 @@ impl TigerNode {
         self.spawn_finality();
 
         // Start the JSON-RPC server so wallets and the explorer can reach the
-        // chain. Without it the node has no client interface at all.
+        // chain. Without it the node has no client interface at all. The
+        // listener is bound here, before the task is spawned, so a port that is
+        // already taken fails startup loudly. A node that sealed blocks with no
+        // reachable RPC would look healthy in its logs while no wallet could
+        // talk to it.
         if self.config.rpc_enabled {
-            let node = Arc::clone(self);
             let addr = self.config.rpc_addr.clone();
+            let bind = crate::p2p::normalize_listen_addr(&addr);
+            let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
+                anyhow::anyhow!("cannot bind the JSON-RPC listener on {addr}: {e}")
+            })?;
+            info!("JSON-RPC server listening on {addr}");
+            let node = Arc::clone(self);
             tokio::spawn(async move {
-                if let Err(e) = crate::rpc_server::serve(Arc::clone(&node), addr.clone()).await {
+                if let Err(e) = crate::rpc_server::serve_listener(listener, node).await {
                     error!("JSON-RPC server on {addr} stopped: {e}");
                 }
             });
@@ -1261,10 +1270,15 @@ impl TigerNode {
         // pool depth and validator set are for the operator's monitoring
         // system, not for every wallet that can reach the RPC.
         if self.config.metrics_enabled {
-            let node = Arc::clone(self);
             let addr = self.config.metrics_addr.clone();
+            let bind = crate::p2p::normalize_listen_addr(&addr);
+            let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
+                anyhow::anyhow!("cannot bind the metrics listener on {addr}: {e}")
+            })?;
+            info!("metrics server listening on {addr}");
+            let node = Arc::clone(self);
             tokio::spawn(async move {
-                if let Err(e) = crate::rpc_server::serve_metrics(Arc::clone(&node), addr.clone()).await {
+                if let Err(e) = crate::rpc_server::serve_metrics_listener(listener, node).await {
                     error!("metrics server on {addr} stopped: {e}");
                 }
             });
@@ -1274,10 +1288,15 @@ impl TigerNode {
         // that polls for new heads or logs holds the node open to the same
         // load as a busy explorer; one subscription replaces that polling.
         if self.config.ws_enabled {
-            let node = Arc::clone(self);
             let addr = self.config.ws_addr.clone();
+            let bind = crate::p2p::normalize_listen_addr(&addr);
+            let listener = tokio::net::TcpListener::bind(&bind).await.map_err(|e| {
+                anyhow::anyhow!("cannot bind the WebSocket listener on {addr}: {e}")
+            })?;
+            info!("WebSocket JSON-RPC listening on {addr}");
+            let node = Arc::clone(self);
             tokio::spawn(async move {
-                if let Err(e) = crate::ws_server::serve(Arc::clone(&node), addr.clone()).await {
+                if let Err(e) = crate::ws_server::serve_listener(listener, node).await {
                     error!("WebSocket server on {addr} stopped: {e}");
                 }
             });
@@ -3241,6 +3260,9 @@ mod tests {
             validators: vec![],
             allow_unlisted_validators: true,
             data_dir: data_dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let genesis = create_genesis_block(6666);
@@ -3295,6 +3317,9 @@ mod tests {
             validators: vec![],
             allow_unlisted_validators: false,
             data_dir: data_dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let genesis = create_genesis_block(6666);
@@ -3423,6 +3448,9 @@ mod tests {
             validators: vec![],
             allow_unlisted_validators: true,
             data_dir: data_dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
 
@@ -3565,6 +3593,9 @@ mod tests {
                 .join(format!("tiger-reorg-test-{}", std::process::id()))
                 .to_string_lossy()
                 .into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let node = Arc::new(
@@ -4242,6 +4273,9 @@ mod tests {
             validators: vec![],
             allow_unlisted_validators: true,
             data_dir: dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         }
     }
@@ -4370,6 +4404,9 @@ mod tests {
             validator_key: Some(format!("0x{}", tiger_blockchain::hex_encode(&key))),
             validator_addr: None,
             data_dir: dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let node = TigerNode::from_genesis(config, create_genesis_block(6666))
@@ -4584,6 +4621,9 @@ mod tests {
             allow_unlisted_validators: true,
             validator_key: Some(format!("0x{}", "5c".repeat(32))),
             data_dir: data_dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let node = Arc::new(
@@ -4679,6 +4719,9 @@ mod tests {
                     allow_unlisted_validators: true,
                     validator_key: Some(format!("0x{}", "5c".repeat(32))),
                     data_dir: data_dir.to_string_lossy().into_owned(),
+                    rpc_enabled: false,
+                    ws_enabled: false,
+                    metrics_enabled: false,
                     ..Config::default_mainnet()
                 },
                 genesis.clone(),
@@ -4713,6 +4756,9 @@ mod tests {
             allow_unlisted_validators: true,
             validator_key: Some(format!("0x{}", "5c".repeat(32))),
             data_dir: data_dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let node = Arc::new(
@@ -4845,6 +4891,9 @@ mod tests {
             allow_unlisted_validators: true,
             validator_key: Some(format!("0x{}", "5c".repeat(32))),
             data_dir: data_dir.to_string_lossy().into_owned(),
+            rpc_enabled: false,
+            ws_enabled: false,
+            metrics_enabled: false,
             ..Config::default_mainnet()
         };
         let node = Arc::new(

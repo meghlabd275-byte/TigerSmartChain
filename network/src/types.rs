@@ -256,8 +256,14 @@ pub enum PeerMessage {
     Block(Box<crate::Block>),
     /// Ask for a range of block numbers, for bulk sync.
     GetBlocks { from: u64, count: u64 },
-    /// A range of blocks, in ascending order.
-    Blocks(Vec<crate::Block>),
+    /// A range of blocks, in ascending order, together with the sender's head
+    /// height at the moment the reply was built.
+    ///
+    /// Carrying the height here is what lets a syncing node keep asking: the
+    /// `Status` height is only refreshed on the ping interval, so a follower
+    /// that gated its next request on it would stop one interval short of the
+    /// head and never catch up.
+    Blocks { blocks: Vec<crate::Block>, head: u64 },
     /// A peer's periodic proof of life.
     Ping(u64),
     /// The reply to [`PeerMessage::Ping`].
