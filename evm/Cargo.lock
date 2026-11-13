@@ -571,6 +571,7 @@ name = "tiger-crypto"
 version = "1.0.0"
 dependencies = [
  "cc",
+ "hex",
  "log",
  "serde",
  "serde_json",

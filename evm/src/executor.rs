@@ -139,6 +139,69 @@ impl Executor {
             }};
         }
 
+        // Charge a dynamic gas cost on top of the opcode's static base. Sets
+        // `success = false` (an out-of-gas halt) when the charge cannot be
+        // paid, so the caller must stop.
+        macro_rules! charge_dynamic {
+            ($cost:expr) => {{
+                let cost: u64 = $cost;
+                if gas_used.checked_add(cost).map(|g| g > ctx.gas).unwrap_or(true) {
+                    success = false;
+                } else {
+                    gas_used += cost;
+                }
+            }};
+        }
+
+        // EIP-2929: charge the cold surcharge when `address` is touched for the
+        // first time in this transaction, and warm it either way. The charge is
+        // the *additional* cost over the opcode's warm base, which the static
+        // gas table already applied.
+        macro_rules! charge_account_access {
+            ($address:expr) => {{
+                let warm = ctx
+                    .accessed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .warm_address(&$address);
+                if !warm {
+                    charge_dynamic!(COLD_ACCOUNT_ACCESS_COST);
+                    if !success {
+                        break;
+                    }
+                }
+            }};
+        }
+
+        // EIP-2929: the cold surcharge for a storage slot, plus warming it.
+        macro_rules! charge_slot_access {
+            ($slot:expr) => {{
+                let warm = ctx
+                    .accessed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .warm_slot(&ctx.address, &$slot);
+                if !warm {
+                    charge_dynamic!(COLD_SLOAD_COST);
+                    if !success {
+                        break;
+                    }
+                }
+            }};
+        }
+
+        // The per-word dynamic fee for a copy opcode: 3 gas per 32-byte word,
+        // over and above the flat base. `G_copy` for CALLDATACOPY/CODECOPY/
+        // RETURNDATACOPY/MCOPY is 3.
+        macro_rules! charge_copy_words {
+            ($len:expr) => {{
+                charge_dynamic!((($len as u64).div_ceil(32)).saturating_mul(3));
+                if !success {
+                    break;
+                }
+            }};
+        }
+
         let mut pending: Option<Step> = None;
         let mut step_count = 0usize;
         let capture_memory = tracer.wants_memory();
@@ -271,6 +334,9 @@ impl Executor {
                     let l = len.as_u64() as usize;
                     charge_memory!(o, l);
                     if !success { break; }
+                    // EIP-spec per-word charge: 6 gas per 32-byte word hashed.
+                    charge_dynamic!(((l as u64).div_ceil(32)).saturating_mul(6));
+                    if !success { break; }
                     let data = ctx.memory.load(o, l);
                     let hash = keccak256(&data);
                     ctx.stack.push(EvmWord::from_be_bytes(&hash));
@@ -281,6 +347,7 @@ impl Executor {
                     match ctx.stack.pop() {
                         Some(word) => {
                             let target = address_from_word(&word);
+                            charge_account_access!(target);
                             ctx.stack.push(host.balance(&target));
                         }
                         None => { success = false; break; }
@@ -314,6 +381,7 @@ impl Executor {
                     let l = len.as_u64() as usize;
                     charge_memory!(d, l);
                     if !success { break; }
+                    charge_copy_words!(l);
                     let mut chunk = vec![0u8; l];
                     if o < ctx.data.len() {
                         let avail = ctx.data.len() - o;
@@ -331,6 +399,7 @@ impl Executor {
                     let l = len.as_u64() as usize;
                     charge_memory!(d, l);
                     if !success { break; }
+                    charge_copy_words!(l);
                     let mut chunk = vec![0u8; l];
                     if o < code.len() {
                         let avail = code.len() - o;
@@ -344,6 +413,7 @@ impl Executor {
                     match ctx.stack.pop() {
                         Some(word) => {
                             let target = address_from_word(&word);
+                            charge_account_access!(target);
                             let len = host.code(&target).len() as u64;
                             ctx.stack.push(EvmWord::from_u64(len));
                         }
@@ -358,12 +428,14 @@ impl Executor {
                     let (dest_off, off, len) = pop3!();
                     if !success { break; }
                     let target = address_from_word(&target_word);
+                    charge_account_access!(target);
                     let ext_code = host.code(&target);
                     let d = dest_off.as_u64() as usize;
                     let o = off.as_u64() as usize;
                     let l = len.as_u64() as usize;
                     charge_memory!(d, l);
                     if !success { break; }
+                    charge_copy_words!(l);
                     let mut chunk = vec![0u8; l];
                     if o < ext_code.len() {
                         let take = (ext_code.len() - o).min(l);
@@ -380,6 +452,7 @@ impl Executor {
                     let l = len.as_u64() as usize;
                     charge_memory!(d, l);
                     if !success { break; }
+                    charge_copy_words!(l);
                     let mut chunk = vec![0u8; l];
                     if o < ctx.return_data.len() {
                         let avail = ctx.return_data.len() - o;
@@ -392,6 +465,7 @@ impl Executor {
                     match ctx.stack.pop() {
                         Some(word) => {
                             let target = address_from_word(&word);
+                            charge_account_access!(target);
                             ctx.stack.push(host.code_hash(&target));
                         }
                         None => { success = false; break; }
@@ -459,11 +533,30 @@ impl Executor {
                 }
                 Opcode::SLOAD => {
                     if let Some(key) = ctx.stack.pop() {
+                        charge_slot_access!(key);
                         ctx.stack.push(host.storage(&ctx.address, &key));
                     } else { success = false; break; }
                 }
                 Opcode::SSTORE => {
                     let (key, value) = pop2!();
+                    if !success { break; }
+                    // EIP-2929: a cold slot pays the cold surcharge before the
+                    // write.
+                    charge_slot_access!(key);
+                    // EIP-2200/2929 dynamic cost, derived from the slot's
+                    // current value: 100 for a no-op write, 20000 to set a zero
+                    // slot, 2900 to overwrite a non-zero one. Charging the flat
+                    // 20000 for every write would over-bill every update and
+                    // make `eth_estimateGas` unfaithful.
+                    let current = host.storage(&ctx.address, &key);
+                    let dynamic = if current == value {
+                        WARM_STORAGE_READ_COST
+                    } else if current.is_zero() {
+                        20_000
+                    } else {
+                        2_900
+                    };
+                    charge_dynamic!(dynamic);
                     if !success { break; }
                     host.set_storage(&ctx.address, key, value);
                 }
@@ -784,8 +877,35 @@ impl Executor {
                     if !success { break; }
                     let calldata = ctx.memory.load(io, il);
 
+                    // EIP-2929: the callee's account is charged the cold
+                    // surcharge the first time the transaction touches it.
+                    charge_account_access!(to);
+
+                    // EIP-150 surcharges. A call that carries value pays 9000
+                    // extra; a call that creates the callee's account pays a
+                    // further 25000. Without these a contract could spawn
+                    // accounts and move value for the price of a bare CALL,
+                    // which is the classic state-bloat attack.
+                    if has_value && !value_word.is_zero() {
+                        charge_dynamic!(9000);
+                        if !success { break; }
+                        if opcode == Opcode::CALL
+                            && !crate::precompiles::is_precompile(&to)
+                            && !host.exists(&to)
+                        {
+                            charge_dynamic!(25_000);
+                            if !success { break; }
+                        }
+                    }
+
+                    // EIP-150: the caller may forward at most 63/64 of its
+                    // remaining gas. The forwarded gas is charged to the caller
+                    // here; whatever the callee does not use is returned when
+                    // its execution ends.
                     let available_gas = ctx.gas.saturating_sub(gas_used);
-                    let call_gas = gas_arg.as_u64().min(available_gas);
+                    let forwarded_cap = available_gas - available_gas / 64;
+                    let call_gas = gas_arg.as_u64().min(forwarded_cap);
+                    gas_used += call_gas;
 
                     // DELEGATECALL and CALLCODE run the callee's code in the
                     // caller's storage context; CALL and STATICCALL use the
@@ -901,10 +1021,17 @@ impl Executor {
                     child.block_coinbase = ctx.block_coinbase.clone();
                     child.block_basefee = ctx.block_basefee;
                     child.chain_id = ctx.chain_id;
+                    // The warm/cold sets are transaction-scoped, so every frame
+                    // shares the parent's. A frame that reverts does not
+                    // un-warm what it touched.
+                    child.accessed = ctx.accessed.clone();
 
                     let child_res =
                         self.execute_traced_with_host(&callee_code, &mut child, host, tracer);
-                    gas_used += child_res.gas_used;
+                    // The child was given `call_gas`; it reports what it used,
+                    // so the caller is refunded the difference.
+                    let child_used = child_res.gas_used.min(call_gas);
+                    gas_used = gas_used.saturating_sub(call_gas).saturating_add(child_used);
 
                     // Copy the return data into the caller's memory, truncated
                     // to the requested output length as the spec requires.
@@ -1735,5 +1862,93 @@ mod tests {
         assert!(result.success);
         // Three PUSH1 (3 each) + CALLDATACOPY base (3) = 12; no memory charge.
         assert_eq!(result.gas_used, 12);
+    }
+
+    // ---- EIP-2929 warm/cold and dynamic gas ----
+
+    /// Build a code snippet that SLOADs slot 0 and stops.
+    fn sload_slot0() -> Vec<u8> {
+        vec![0x60, 0x00, 0x54, 0x00]
+    }
+
+    #[test]
+    fn the_first_sload_of_a_slot_pays_the_cold_surcharge() {
+        // PUSH1 0 (3) + SLOAD warm base (100) + cold surcharge (2100) = 2203.
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        let result = Executor::new().execute(&sload_slot0(), &mut ctx);
+        assert!(result.success);
+        assert_eq!(result.gas_used, 3 + 100 + 2_100);
+    }
+
+    #[test]
+    fn a_second_sload_of_the_same_slot_is_warm() {
+        // PUSH1 0, SLOAD (cold), POP, PUSH1 0, SLOAD (warm), STOP.
+        let code = vec![
+            0x60, 0x00, 0x54, 0x50, // PUSH1 0, SLOAD, POP
+            0x60, 0x00, 0x54, 0x00, // PUSH1 0, SLOAD, STOP
+        ];
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success);
+        // 3+100+2100 + 2(pop) + 3+100 = 2308
+        assert_eq!(result.gas_used, 3 + 100 + 2_100 + 2 + 3 + 100);
+    }
+
+    #[test]
+    fn a_cold_balance_of_a_new_address_pays_the_cold_surcharge() {
+        // PUSH20 <addr> BALANCE STOP: PUSH20 (3) + BALANCE warm (100) + cold
+        // account surcharge (2600) = 2703.
+        let mut code = vec![0x73];
+        code.extend_from_slice(&[0x11u8; 20]);
+        code.extend_from_slice(&[0x31, 0x00]); // BALANCE, STOP
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success);
+        assert_eq!(result.gas_used, 3 + 100 + 2_600);
+    }
+
+    #[test]
+    fn sha3_charges_six_gas_per_word_hashed() {
+        // PUSH1 32 (len), PUSH1 0 (offset), SHA3, STOP.
+        let code = vec![0x60, 0x20, 0x60, 0x00, 0x20, 0x00];
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success);
+        // 3 + 3 + SHA3 base (30) + memory expansion for 32 bytes
+        // (1 word -> 3) + 6 per word (6) = 45.
+        assert_eq!(result.gas_used, 3 + 3 + 30 + 3 + 6);
+    }
+
+    #[test]
+    fn a_storage_clear_refund_does_not_exceed_the_dynamic_sstore_cost() {
+        // The dynamic SSTORE cost for a no-op write is the warm read cost,
+        // not the flat 20000, so an identical rewrite is cheap.
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        // PUSH1 1 (value), PUSH1 0 (key), SSTORE, STOP.
+        let code = vec![0x60, 0x01, 0x60, 0x00, 0x55, 0x00];
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success);
+        // 3+3 + SSTORE warm base (0) + cold slot (2100) + set-from-zero (20000)
+        assert_eq!(result.gas_used, 3 + 3 + 2_100 + 20_000);
+    }
+
+    #[test]
+    fn a_second_identical_sstore_is_charged_the_warm_read_cost() {
+        let code = vec![
+            0x60, 0x01, 0x60, 0x00, 0x55, // PUSH1 1, PUSH1 0, SSTORE
+            0x60, 0x01, 0x60, 0x00, 0x55, // same again
+            0x00,
+        ];
+        let mut ctx = ExecutionContext::new();
+        ctx.gas = 100_000;
+        let result = Executor::new().execute(&code, &mut ctx);
+        assert!(result.success);
+        // first: 3+3+2100+20000 ; second: 3+3+0(warm)+100(no-op)
+        assert_eq!(result.gas_used, 6 + 2_100 + 20_000 + 6 + 100);
     }
 }

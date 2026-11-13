@@ -1055,13 +1055,33 @@ async fn estimate_gas(node: &Arc<TigerNode>, params: &Value) -> Result<u64, Stri
     }
     drop(world);
 
-    let output = call_contract(node, params).await?;
-    // Report the gas a successful call would need, plus the intrinsic charge.
-    Ok(21_000u64.saturating_add(output.len() as u64 * 16))
+    // Report the gas the call actually consumes, plus the intrinsic charge the
+    // transaction would pay before executing. Estimating from the output size,
+    // as an earlier version did, has nothing to do with the real cost.
+    let (_output, used, _accessed) = call_contract_traced(node, params).await?;
+    Ok(used.saturating_add(21_000))
 }
 
 /// `eth_call`: execute a read-only call against a state snapshot.
 async fn call_contract(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<u8>, String> {
+    let (output, _used, _accessed) = call_contract_traced(node, params).await?;
+    Ok(output)
+}
+
+/// Execute a read-only call and also report the gas it consumed and every
+/// account and storage slot it touched, which is exactly what an EIP-2930
+/// access list should contain.
+async fn call_contract_traced(
+    node: &Arc<TigerNode>,
+    params: &Value,
+) -> Result<
+    (
+        Vec<u8>,
+        u64,
+        Vec<(tiger_evm::Address, Vec<tiger_evm::types::EvmWord>)>,
+    ),
+    String,
+> {
     let call = params
         .get(0)
         .ok_or_else(|| "missing call object".to_string())?;
@@ -1112,6 +1132,15 @@ async fn call_contract(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<u8>,
         v
     };
     ctx.data = data;
+    // EIP-2929: the sender and the callee begin warm, so they do not appear as
+    // cold accesses in the reported access list.
+    {
+        let mut set = ctx.accessed.lock().unwrap_or_else(|e| e.into_inner());
+        set.warm_address(&tiger_evm::Address(caller));
+        if let Some(address) = to {
+            set.warm_address(&tiger_evm::Address(address));
+        }
+    }
     ctx.gas = node.config().call_gas_limit;
     ctx.chain_id = node.config().chain_id;
     ctx.block_number = {
@@ -1122,8 +1151,22 @@ async fn call_contract(node: &Arc<TigerNode>, params: &Value) -> Result<Vec<u8>,
     let executor = tiger_evm::Executor::new();
     let result = executor.execute_with_host(&code, &mut ctx, &mut host);
 
+    // Read the touched sets before the context is dropped. The EIP-2929 sets
+    // are exactly the access list a caller would need to pre-warm.
+    let accessed = {
+        let set = ctx.accessed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by_address: std::collections::BTreeMap<
+            tiger_evm::Address,
+            Vec<tiger_evm::types::EvmWord>,
+        > = std::collections::BTreeMap::new();
+        for (address, slot) in set.slots() {
+            by_address.entry(address).or_default().push(slot);
+        }
+        by_address.into_iter().collect()
+    };
+
     if result.success {
-        Ok(result.output)
+        Ok((result.output, result.gas_used, accessed))
     } else {
         Err("execution reverted".to_string())
     }
@@ -1895,14 +1938,27 @@ async fn block_receipts(node: &Arc<TigerNode>, params: &Value) -> Result<Value, 
 
 /// `eth_createAccessList`: run a call and report the state it touched.
 ///
-/// The EVM here has no access-list optimisation and TigerSmartChain has no
-/// EIP-2930/1559 pricing, so the honest result is an empty access list plus the
-/// real gas estimate. Reporting an invented list would be worse than reporting
-/// none.
+/// The call is executed against a state snapshot with EIP-2929 warm/cold
+/// tracking active, so the returned list is the real set of accounts and slots
+/// the call read or wrote — exactly what a client should pre-warm to avoid the
+/// cold surcharges on the real transaction.
 async fn create_access_list(node: &Arc<TigerNode>, params: &Value) -> Result<Value, String> {
+    let (_output, _used, accessed) = call_contract_traced(node, params).await?;
+    let access_list: Vec<Value> = accessed
+        .into_iter()
+        .map(|(address, slots)| {
+            json!({
+                "address": address.to_hex(),
+                "storageKeys": slots
+                    .iter()
+                    .map(|slot| format!("0x{}", hex::encode(slot.0)))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     let gas = estimate_gas(node, params).await?;
     Ok(json!({
-        "accessList": [],
+        "accessList": access_list,
         "gasUsed": hex_u64_str(gas),
     }))
 }

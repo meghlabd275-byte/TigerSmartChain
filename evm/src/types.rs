@@ -520,6 +520,74 @@ pub struct TraceOrigin {
     pub value: EvmWord,
 }
 
+/// EIP-2929 warm/cold access tracking for one transaction.
+///
+/// The sets are transaction-scoped: an address or slot touched anywhere in the
+/// transaction — including by a nested call — is warm for the rest of it, and
+/// a frame that reverts does not un-warm what it touched. That is why the sets
+/// live on the execution context and are shared with every child frame rather
+/// than being rebuilt per frame.
+///
+/// A transaction always starts with the sender, the recipient and (for a
+/// precompile) the precompile itself warm, plus whatever an EIP-2930 access
+/// list names.
+#[derive(Debug, Clone, Default)]
+pub struct AccessSet {
+    addresses: std::collections::HashSet<Address>,
+    slots: std::collections::HashSet<(Address, EvmWord)>,
+}
+
+impl AccessSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Warm `address`, returning true if it was already warm.
+    pub fn warm_address(&mut self, address: &Address) -> bool {
+        !self.addresses.insert(*address)
+    }
+
+    /// Warm a storage slot, returning true if it was already warm.
+    pub fn warm_slot(&mut self, address: &Address, slot: &EvmWord) -> bool {
+        !self.slots.insert((*address, slot.clone()))
+    }
+
+    /// Whether `address` is already warm.
+    pub fn is_warm_address(&self, address: &Address) -> bool {
+        self.addresses.contains(address)
+    }
+
+    /// Whether a storage slot is already warm.
+    pub fn is_warm_slot(&self, address: &Address, slot: &EvmWord) -> bool {
+        self.slots.contains(&(*address, slot.clone()))
+    }
+
+    /// Every address warmed so far, for `eth_createAccessList`.
+    pub fn addresses(&self) -> Vec<Address> {
+        self.addresses.iter().copied().collect()
+    }
+
+    /// Every storage slot warmed so far, for `eth_createAccessList`.
+    pub fn slots(&self) -> Vec<(Address, EvmWord)> {
+        self.slots.iter().cloned().collect()
+    }
+
+    /// Warm every address and slot named by an EIP-2930 access list.
+    pub fn apply_access_list(&mut self, entries: &[(Address, Vec<EvmWord>)]) {
+        for (address, keys) in entries {
+            self.warm_address(address);
+            for key in keys {
+                self.warm_slot(address, key);
+            }
+        }
+    }
+}
+
+/// EIP-2929 warm/cold charge for an account or storage access.
+pub const COLD_ACCOUNT_ACCESS_COST: u64 = 2_600;
+pub const COLD_SLOAD_COST: u64 = 2_100;
+pub const WARM_STORAGE_READ_COST: u64 = 100;
+
 /// Execution Context
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
@@ -546,6 +614,12 @@ pub struct ExecutionContext {
     pub storage: Storage,
     /// Transient storage (EIP-1153): cleared after each transaction.
     pub transient: Storage,
+    /// EIP-2929 warm/cold sets, shared by every frame of one transaction.
+    ///
+    /// An `Arc<Mutex<..>>` rather than `Rc<RefCell<..>>` because a context is
+    /// carried across `.await` points in the RPC layer, which requires `Send`.
+    /// The lock is uncontended: execution of one transaction is single-threaded.
+    pub accessed: std::sync::Arc<std::sync::Mutex<AccessSet>>,
     /// Chain/environment block info for BLOCKHASH/NUMBER/TIMESTAMP/etc.
     pub block_number: u64,
     pub block_timestamp: u64,
@@ -573,6 +647,7 @@ impl ExecutionContext {
             memory: Memory::new(),
             storage: Storage::new(),
             transient: Storage::new(),
+            accessed: std::sync::Arc::new(std::sync::Mutex::new(AccessSet::new())),
             block_number: 0,
             block_timestamp: 0,
             block_gas_limit: 30_000_000,

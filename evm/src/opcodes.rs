@@ -47,7 +47,9 @@ impl GasCost {
     pub const SAR: u64 = 3;
     pub const SHA3: u64 = 30;
     pub const ADDRESS: u64 = 2;
-    pub const BALANCE: u64 = 700;
+    /// EIP-2929 warm cost. A cold access pays this plus
+    /// `COLD_ACCOUNT_ACCESS_COST`; the surcharge is applied dynamically.
+    pub const BALANCE: u64 = 100;
     pub const ORIGIN: u64 = 2;
     pub const CALLER: u64 = 2;
     pub const CALLVALUE: u64 = 2;
@@ -57,11 +59,11 @@ impl GasCost {
     pub const CODESIZE: u64 = 2;
     pub const CODECOPY: u64 = 3;
     pub const GASPRICE: u64 = 2;
-    pub const EXTCODESIZE: u64 = 700;
-    pub const EXTCODECOPY: u64 = 700;
+    pub const EXTCODESIZE: u64 = 100;
+    pub const EXTCODECOPY: u64 = 100;
     pub const RETURNDATASIZE: u64 = 2;
     pub const RETURNDATACOPY: u64 = 3;
-    pub const EXTCODEHASH: u64 = 700;
+    pub const EXTCODEHASH: u64 = 100;
     pub const BLOCKHASH: u64 = 20;
     pub const COINBASE: u64 = 2;
     pub const TIMESTAMP: u64 = 2;
@@ -77,8 +79,12 @@ impl GasCost {
     pub const MLOAD: u64 = 3;
     pub const MSTORE: u64 = 3;
     pub const MSTORE8: u64 = 3;
+    /// EIP-2929 warm cost. A cold slot pays this plus `COLD_SLOAD_COST`.
     pub const SLOAD: u64 = 100;
-    pub const SSTORE: u64 = 20_000;
+    /// The SSTORE charge is fully dynamic (EIP-2200/2929): it depends on the
+    /// slot's current value and on whether the slot is warm. The executor
+    /// computes it; the static base is zero.
+    pub const SSTORE: u64 = 0;
     pub const JUMP: u64 = 8;
     pub const JUMPI: u64 = 10;
     pub const PC: u64 = 2;
@@ -94,11 +100,13 @@ impl GasCost {
     pub const LOG3: u64 = 1500;
     pub const LOG4: u64 = 1875;
     pub const CREATE: u64 = 32000;
-    pub const CALL: u64 = 700;
-    pub const CALLCODE: u64 = 700;
-    pub const DELEGATECALL: u64 = 700;
+    /// EIP-2929 warm cost. A cold callee pays this plus
+    /// `COLD_ACCOUNT_ACCESS_COST`, applied dynamically.
+    pub const CALL: u64 = 100;
+    pub const CALLCODE: u64 = 100;
+    pub const DELEGATECALL: u64 = 100;
     pub const CREATE2: u64 = 32000;
-    pub const STATICCALL: u64 = 700;
+    pub const STATICCALL: u64 = 100;
     pub const RETURN: u64 = 0;
     pub const REVERT: u64 = 0;
     /// 0xfe INVALID: per spec consumes *all* remaining gas. We model that with

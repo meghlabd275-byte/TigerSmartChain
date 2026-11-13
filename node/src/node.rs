@@ -2469,7 +2469,74 @@ pub fn transaction_to_request(
         max_priority_fee_per_gas: tx
             .max_priority_fee_per_gas
             .map(|fee| parse_u256(&format!("0x{fee:x}"))),
+        // The access list is carried in its RLP wire form, because the signing
+        // hash commits to it byte-for-byte. Decoding it here recovers the
+        // addresses and keys the transaction pre-warms.
+        access_list: tx
+            .access_list
+            .as_deref()
+            .map(decode_access_list)
+            .unwrap_or_default(),
     })
+}
+
+/// Decode an EIP-2930 access list from its RLP wire form into the addresses
+/// and storage keys it names.
+///
+/// The wire form is `[[address, [key, ...]], ...]`. A malformed list decodes to
+/// an empty list rather than panicking: the transaction's intrinsic gas then
+/// reflects no pre-warming, which is safe, and the signature check that
+/// produced the sender already committed to the exact bytes.
+fn decode_access_list(hex_value: &str) -> Vec<(tiger_evm::types::Address, Vec<tiger_evm::types::EvmWord>)> {
+    use tiger_state::rlp::RlpItem;
+
+    let bytes = match hex_decode_checked(hex_value) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let item = match tiger_state::rlp::decode(&bytes) {
+        Ok(item) => item,
+        Err(_) => return Vec::new(),
+    };
+    let entries = match item {
+        RlpItem::List(entries) => entries,
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut fields = match entry {
+            RlpItem::List(fields) if fields.len() == 2 => fields.into_iter(),
+            _ => return Vec::new(),
+        };
+        let address = match fields.next() {
+            Some(RlpItem::Bytes(a)) if a.len() == 20 => {
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&a);
+                tiger_evm::types::Address(addr)
+            }
+            _ => return Vec::new(),
+        };
+        let keys = match fields.next() {
+            Some(RlpItem::List(keys)) => {
+                let mut out_keys = Vec::with_capacity(keys.len());
+                for key in keys {
+                    match key {
+                        RlpItem::Bytes(k) if k.len() == 32 => {
+                            let mut slot = [0u8; 32];
+                            slot.copy_from_slice(&k);
+                            out_keys.push(tiger_evm::types::EvmWord(slot));
+                        }
+                        _ => return Vec::new(),
+                    }
+                }
+                out_keys
+            }
+            _ => return Vec::new(),
+        };
+        out.push((address, keys));
+    }
+    out
 }
 
 /// Parse a `0x`-prefixed 20-byte address.
@@ -3420,6 +3487,7 @@ mod tests {
             data: vec![],
             sender: caller,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome =

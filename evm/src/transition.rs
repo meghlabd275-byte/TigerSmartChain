@@ -36,6 +36,10 @@ pub const CALLDATA_NONZERO_BYTE_GAS: u64 = 16;
 pub const CONTRACT_CREATION_GAS: u64 = 32_000;
 /// Gas refunded for clearing a storage slot to zero, capped at half the used gas.
 pub const STORAGE_CLEAR_REFUND: u64 = 4_800;
+/// EIP-2930: intrinsic charge per address named in an access list.
+pub const ACCESS_LIST_ADDRESS_GAS: u64 = 2_400;
+/// EIP-2930: intrinsic charge per storage key named in an access list.
+pub const ACCESS_LIST_STORAGE_KEY_GAS: u64 = 1_900;
 
 /// Why a transaction could not be applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +112,11 @@ pub struct TransactionRequest {
     /// EIP-1559 maximum priority fee per gas. `None` for a legacy or EIP-2930
     /// transaction, whose `gas_price` is the price paid outright.
     pub max_priority_fee_per_gas: Option<[u8; 32]>,
+    /// EIP-2930/1559 access list: the addresses and storage keys the
+    /// transaction pre-warms. Charged 2400 per address and 1900 per key at
+    /// intrinsic-gas time, and warmed for the whole transaction under
+    /// EIP-2929.
+    pub access_list: Vec<(crate::types::Address, Vec<EvmWord>)>,
 }
 
 /// The outcome of applying a transaction.
@@ -133,6 +142,18 @@ pub struct TransitionOutcome {
 /// The intrinsic gas cost of a transaction: the base charge plus the per-byte
 /// calldata cost, plus the creation surcharge for a deployment.
 pub fn intrinsic_gas(data: &[u8], is_creation: bool) -> u64 {
+    intrinsic_gas_with_access_list(data, is_creation, 0, 0)
+}
+
+/// The intrinsic gas cost including the EIP-2930 access-list surcharge:
+/// 2400 per address and 1900 per storage key. Pre-warming is not free — the
+/// charge is what keeps an access list from being a way to touch state cheaply.
+pub fn intrinsic_gas_with_access_list(
+    data: &[u8],
+    is_creation: bool,
+    access_addresses: usize,
+    access_keys: usize,
+) -> u64 {
     let mut gas = TRANSACTION_BASE_GAS;
     if is_creation {
         gas += CONTRACT_CREATION_GAS;
@@ -144,6 +165,8 @@ pub fn intrinsic_gas(data: &[u8], is_creation: bool) -> u64 {
             CALLDATA_NONZERO_BYTE_GAS
         };
     }
+    gas = gas.saturating_add(ACCESS_LIST_ADDRESS_GAS.saturating_mul(access_addresses as u64));
+    gas = gas.saturating_add(ACCESS_LIST_STORAGE_KEY_GAS.saturating_mul(access_keys as u64));
     gas
 }
 
@@ -340,7 +363,13 @@ pub fn apply_transaction_traced(
 
     // 2. Intrinsic gas is charged before anything runs.
     let is_creation = tx.to.is_none();
-    let intrinsic = intrinsic_gas(&tx.data, is_creation);
+    let access_keys: usize = tx.access_list.iter().map(|(_, keys)| keys.len()).sum();
+    let intrinsic = intrinsic_gas_with_access_list(
+        &tx.data,
+        is_creation,
+        tx.access_list.len(),
+        access_keys,
+    );
     if tx.gas_limit < intrinsic {
         return Err(TransitionError::IntrinsicGasTooLow {
             required: intrinsic,
@@ -393,6 +422,19 @@ pub fn apply_transaction_traced(
     ctx.block_basefee = block.base_fee;
     ctx.chain_id = block.chain_id;
 
+    // EIP-2929: the transaction begins with the sender and the recipient (or
+    // the created address) warm, plus everything its access list names.
+    // Without this every transaction would pay a cold-access charge for the
+    // account it is talking to.
+    {
+        let mut accessed = ctx.accessed.lock().unwrap_or_else(|e| e.into_inner());
+        accessed.warm_address(&crate::Address(sender));
+        if let Some(to) = tx.to {
+            accessed.warm_address(&crate::Address(to));
+        }
+        accessed.apply_access_list(&tx.access_list);
+    }
+
     let (exec_code, exec_address, contract_address) = match &tx.to {
         Some(to) => (host.code(&crate::Address(*to)), *to, None),
         None => {
@@ -413,6 +455,9 @@ pub fn apply_transaction_traced(
     // recorder, so the recorded before/after values are the real transitions
     // this execution caused.
     let mut diffs = TraceDiffs::default();
+    // A creation whose runtime code exceeds the EIP-170 limit fails; the flag
+    // is set inside the recording block and applied to the result afterwards.
+    let mut oversize_creation = false;
     let result = {
         let mut recording = crate::diff::StateDiffRecorder::new(&mut host);
 
@@ -437,10 +482,18 @@ pub fn apply_transaction_traced(
         let result =
             executor.execute_traced_with_host(&exec_code, &mut ctx, &mut recording, tracer);
 
-        // A creation deploys the returned code at the new address.
+        // A creation deploys the returned code at the new address, subject to
+        // the EIP-170 runtime code-size limit. The CREATE opcode applies the
+        // same check to a contract it deploys, but a transaction that deploys
+        // directly runs its init code at the top level, so the limit must be
+        // enforced here too or a transaction could deploy unbounded code.
         if result.success {
             if let Some(address) = contract_address {
-                recording.set_code(&crate::Address(address), result.output.clone());
+                if result.output.len() > crate::executor::MAX_CODE_SIZE {
+                    oversize_creation = true;
+                } else {
+                    recording.set_code(&crate::Address(address), result.output.clone());
+                }
             }
         }
 
@@ -448,6 +501,10 @@ pub fn apply_transaction_traced(
         diffs.balances = recording.balance_diffs();
         result
     };
+    let mut result = result;
+    if oversize_creation {
+        result.success = false;
+    }
 
     // If the transaction reverted, discard every state change it made —
     // storage writes, the value transfer, created code — while keeping the
@@ -672,6 +729,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -705,6 +763,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(64);
@@ -770,6 +829,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(128);
@@ -810,6 +870,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(64);
@@ -855,6 +916,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let mut tracer = crate::trace::StepTracerBuffer::new(64);
@@ -887,6 +949,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         assert_eq!(
@@ -916,6 +979,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         assert_eq!(
@@ -940,6 +1004,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         assert_eq!(
@@ -970,6 +1035,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -1013,6 +1079,7 @@ mod tests {
             data: init_code,
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -1042,6 +1109,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -1073,6 +1141,7 @@ mod tests {
             data: vec![0x00],
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &request, &block()).unwrap();
@@ -1110,6 +1179,7 @@ mod tests {
             data: init,
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &request, &block()).unwrap();
@@ -1154,6 +1224,7 @@ mod tests {
             data: Vec::new(),
             sender,
             max_priority_fee_per_gas: None,
+            access_list: Vec::new(),
         };
 
         let outcome = apply_transaction(&mut state, &tx, &block()).unwrap();
@@ -1185,6 +1256,7 @@ mod tests {
             nonce: 0,
             gas_price: wei(1000),
             max_priority_fee_per_gas: Some(wei(10)),
+            access_list: Vec::new(),
             gas_limit: 21_000,
             to: Some(addr(0x22)),
             value: wei(0),
@@ -1228,6 +1300,7 @@ mod tests {
             nonce: 0,
             gas_price: wei(100),
             max_priority_fee_per_gas: Some(wei(1)),
+            access_list: Vec::new(),
             gas_limit: 21_000,
             to: Some(addr(0x22)),
             value: wei(0),
@@ -1260,6 +1333,7 @@ mod tests {
             nonce: 0,
             gas_price: wei(7),
             max_priority_fee_per_gas: Some(wei(7)),
+            access_list: Vec::new(),
             gas_limit: 21_000,
             to: Some(addr(0x22)),
             value: wei(0),
